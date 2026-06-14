@@ -1,0 +1,142 @@
+# ============================================================================
+# TinyOS Enhanced — .gitignore
+# ============================================================================
+
+# --- Build artifacts ---
+*.o
+*.a
+*.elf
+*.bin
+*.iso
+*.d
+bin/
+dist/
+build/
+# built kernel copied into the ISO tree:
+iso/boot/kernel.elf
+
+# --- Disk images ---
+*.img
+*.qcow2
+
+# --- Keys / secrets — NEVER commit private key material ---
+# (src/trusted_signing_key.h is the PUBLIC verification key and IS tracked.)
+*.pem
+*.key
+id_rsa
+id_ed25519
+hardcoded_rsa_keys.h
+host_rsa_key_details.txt
+host_rsa_key.pem
+keys/
+
+# --- Runtime / debug capture artifacts ---
+serial.log
+serial_*.log
+panic.log
+qemu.log
+*.pcap
+network_trace.txt
+log/
+firstexec-trials.log
+
+# --- Personal ops scripts (not part of the OS; reference a specific GitHub repo) ---
+publish.sh
+
+# --- Vendored / generated, not project source ---
+lib/
+pyvenv.cfg
+__pycache__/
+*.pyc
+screenshots/
+*.mov
+*.tar.gz
+
+# --- Ad-hoc developer test scripts / host-side reference programs ---
+# Not part of the published product (the canonical harness is verify-exec.sh at
+# the repo root). Kept on disk locally; not tracked or published.
+test/
+
+# --- SSH/SSHD/RSA removed from the build (kept on disk, not compiled) ---
+src/ssh.c
+src/ssh.h
+src/ssh_crypto.c
+src/ssh_crypto.h
+src/rsa.c
+src/rsa.h
+src/ssh.c.backup
+src/ssh.c.bak
+src/ssh_clean.txt
+
+# --- OS / editor cruft ---
+.DS_Store
+.playwright-mcp/
+
+# --- Historical / superseded docs cut from the public set (kept on disk, not published) ---
+# The public repo ships a curated 13-doc set; everything below is retained locally
+# only. publish.sh exports `git archive HEAD` (tracked files only), so these never
+# reach GitHub regardless — these patterns just keep them out of the index too.
+firstexec-trial.sh
+doc/AI_PROMPTING_GUIDE_FOR_OS_DEVELOPMENT.md
+doc/ARP_CACHE_LEARNING_FIX.md
+doc/BUG_REPORT_FAT32_CRASH.md
+doc/CHANGELOG_PASSWORD_FIX.md
+doc/CLAUDE.md
+doc/CROSS_DRIVE_ACCESS_ANALYSIS.md
+doc/CRYPTO_DEBUGGING_STATUS.md
+doc/CRYPTO_PHASE1_COMPLETE.md
+doc/DEEP_DIVE_ISSUES.md
+doc/DEEP_DIVE_SUMMARY.md
+doc/DEEP_SECURITY_AUDIT_FIXES.md
+doc/DEEP_SECURITY_AUDIT_SUMMARY.md
+doc/DHCP_ARP_FIX.md
+doc/DHCP_FIREWALL_FIX.md
+doc/DHCP_FIX_SUMMARY.md
+doc/DHCP_MUTEX_FIX.md
+doc/DHCP_TIMING_FIX.md
+doc/DIAGNOSTIC_OUTPUT_GUIDE.md
+doc/DOUBLE_FREE_PROTECTION.md
+doc/DRIVE_SWITCHING_FIX.md
+doc/DRIVE_SWITCH_BUG.md
+doc/ECDSA_PHASE1.2_COMPLETE.md
+doc/EDR_PHASE4_IMPLEMENTATION_PRIORITY.md
+doc/EDR_PHASE4_ROADMAP.md
+doc/EDR_PHASES_COMPARISON.md
+doc/ENTROPY_SECURITY_FIXES.md
+doc/ETC_FIXED.md
+doc/FINAL_PHASE_SECURITY_REVIEW.md
+doc/LAZY_FPU_IMPLEMENTATION.md
+doc/LS_FIX_SUMMARY.md
+doc/MULTITASKING_STATUS.md
+doc/MUTEX_IMPLEMENTATION_SUMMARY.md
+doc/MUTEX_MIGRATION_PLAN.md
+doc/MUTEX_PHASE1_COMPLETE.md
+doc/PASSWORD_BUG_INVESTIGATION.md
+doc/RSA_FIX_SUMMARY.md
+doc/SECURITY_AUDIT_PHASE2.md
+doc/SECURITY_AUDIT_REMEDIATION.md
+doc/SECURITY_AUDIT_REPORT.md
+doc/SECURITY_AUDIT_RESPONSE.md
+doc/SECURITY_FIXES_COMPLETED.md
+doc/SECURITY_FIXES_PROGRESS.md
+doc/SECURITY_FIXES_STATUS.md
+doc/SECURITY_ROADMAP_2025.md
+doc/SESSION_SUMMARY_2025-01-17.md
+doc/SHELL_COMMANDS_AUDIT.md
+doc/SSHD_USERSPACE_ANALYSIS.md
+doc/SSH_DEBUG_SUMMARY.md
+doc/SSH_FIX_SUMMARY.md
+doc/SSH_IMPLEMENTATION_STATUS.md
+doc/SSH_SECURITY.md
+doc/SSH_TEST_RESULTS.md
+doc/STDIO_IMPLEMENTATION_COMPLETE.md
+doc/STDIO_MIGRATION_COMPLETE.md
+doc/TCP_SERVER_FIX.md
+doc/TESTING_INSTRUCTIONS.md
+doc/THIRD_LEVEL_SECURITY_REVIEW.md
+doc/TINYOS_V1.10_COMPLETE.md
+doc/TinyOS Kernel Dev Status 20251102.txt
+doc/TinyOS_review_20251116.txt
+doc/Understanding QEMU debug log.txt
+doc/WX_PAE_IMPLEMENTATION_PLAN.md
+doc/vibe-code-your-own-OS-readme.txt
