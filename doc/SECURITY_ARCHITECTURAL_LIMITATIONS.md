@@ -122,7 +122,7 @@ If you plan to build a production OS based on TinyOS concepts:
 4. ✅ **SHOULD IMPLEMENT**: Per-process resource limits (rlimits)
 5. ✅ **SHOULD IMPLEMENT**: Stack canaries for kernel stacks
 6. ✅ **SHOULD IMPLEMENT**: Address Space Layout Randomization (ASLR)
-7. ✅ **SHOULD IMPLEMENT**: W^X (Writable XOR Executable) memory protections
+7. ✅ **SHOULD IMPLEMENT**: W^X (Writable XOR Executable) memory protections — *implemented for user mappings via the PAE NX bit (June 2026); see SECURITY_HARDENING.md*
 
 ---
 
