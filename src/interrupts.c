@@ -305,7 +305,7 @@ void isr_common_handler(interrupt_regs_t* regs)
 
             #ifndef PRODUCTION_BUILD
             /* Development: Show CR2 on console for debugging */
-            kprintf("CR2=0x%08x\n", cr2);
+            kprintf("CR2=0x%08x\n", (unsigned int)cr2);
             #else
             /* Production: CR2 only in audit logs, not on console */
             (void)cr2;  /* Will be used in audit_log below */
@@ -326,17 +326,18 @@ void isr_common_handler(interrupt_regs_t* regs)
             /* Log to audit system */
             audit_log(AUDIT_SEC_MEMORY_VIOLATION, AUDIT_CRITICAL, uid,
                       "Page fault: PID=%u addr=0x%08x %s %s %s err=0x%x",
-                      pid, cr2,
+                      pid, (unsigned int)cr2,
                       present ? "PROT" : "NOT_PRESENT",
                       write ? "WRITE" : "READ",
                       user ? "USER" : "KERNEL",
-                      err);
+                      (unsigned int)err);
 
             /* Additional logging for potential exploit attempts */
             if (user && !present) {
                 /* User mode accessing unmapped memory - potential exploit */
                 audit_log(AUDIT_SEC_EXPLOIT_ATTEMPT, AUDIT_CRITICAL, uid,
-                          "Possible exploit: user process accessing unmapped memory 0x%08x", cr2);
+                          "Possible exploit: user process accessing unmapped memory 0x%08x",
+                          (unsigned int)cr2);
             }
         }
 

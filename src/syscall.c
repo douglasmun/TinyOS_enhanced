@@ -1038,7 +1038,8 @@ int sys_mseal(uint32_t addr, uint32_t size) {
     task_t* cur = scheduler_get_current_task();
     uint16_t cur_uid = cur ? cur->uid : 0;
     audit_log(AUDIT_MEMORY_SEAL, AUDIT_INFO, cur_uid,
-              "Sealed memory region 0x%08x - 0x%08x", addr, addr + size);
+              "Sealed memory region 0x%08x - 0x%08x",
+              (unsigned int)addr, (unsigned int)(addr + size));
 
     return 0;
 }
@@ -1162,7 +1163,8 @@ static void syscall_dispatch(struct cpu_state* state) {
         kprintf("[SYSCALL] CRITICAL: Syscall %d from NULL task (kernel bug!)\n",
                 syscall_num);
         audit_log(AUDIT_SEC_EXPLOIT_ATTEMPT, AUDIT_CRITICAL, 0,
-                  "SECURITY VIOLATION: Syscall %d from NULL context", syscall_num);
+                  "SECURITY VIOLATION: Syscall %d from NULL context",
+                  (int)syscall_num);
         panic("SECURITY: Syscall from NULL task (possible kernel exploit)");
     }
 
@@ -1176,7 +1178,7 @@ static void syscall_dispatch(struct cpu_state* state) {
         /* AUDIT: Log blocked syscall for forensic analysis */
         audit_log(AUDIT_SEC_POLICY_VIOLATION, AUDIT_CRITICAL, current_task->uid,
                   "EDR blocked syscall %d for PID %d (%s)",
-                  syscall_num, current_task->pid, current_task->name);
+                  (int)syscall_num, (int)current_task->pid, current_task->name);
 
         state->eax = (uint32_t)(-EPERM);  // Operation not permitted
         return;

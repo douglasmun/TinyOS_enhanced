@@ -331,7 +331,7 @@ bool edr_response_terminate(task_t* task) {
     /* Audit log (outside critical section to minimize interrupt latency) */
     audit_log(AUDIT_RESPONSE, AUDIT_CRITICAL, task->uid,
               "Process terminated: PID=%d, name=%s, reason=malware",
-              task->pid, task->name);
+              (int)task->pid, task->name);
 
     /* Log remediation */
     char desc[64];
@@ -479,7 +479,7 @@ bool edr_response_quarantine_file(const char* filepath) {
                 elapsed_ticks);
         audit_log(AUDIT_RESPONSE, AUDIT_WARN, 0,
                   "QUARANTINE SLOW: source='%s' ticks=%u (possible race)",
-                  canonical_source, elapsed_ticks);
+                  canonical_source, (unsigned int)elapsed_ticks);
     }
 
     /* Set read-only permissions */
@@ -518,7 +518,7 @@ bool edr_response_block_network(task_t* task) {
     /* Audit log */
     audit_log(AUDIT_RESPONSE, AUDIT_CRITICAL, task->uid,
               "Network blocked: PID=%d, closed_sockets=%d",
-              task->pid, closed_count);
+              (int)task->pid, closed_count);
 
     kprintf("[EDR RESPONSE] STUB: Network blocking for PID %d (would close %d sockets)\n",
             task->pid, closed_count);
@@ -595,7 +595,7 @@ bool edr_response_execute(task_t* task, response_action_t action, const char* re
             /* Alert admin (just log for now) */
             kprintf("[EDR RESPONSE] ALERT: %s\n", reason ? reason : "Threat detected");
             audit_log(AUDIT_ALERT, AUDIT_CRITICAL, task->uid,
-                      "EDR Alert: PID=%d, %s", task->pid, reason ? reason : "");
+                      "EDR Alert: PID=%d, %s", (int)task->pid, reason ? reason : "");
             success = true;
             break;
 

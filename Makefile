@@ -188,6 +188,7 @@ iso/boot/grub/grub.cfg: | iso/boot/grub
 
 # Build ISO OUTSIDE the iso/ tree to avoid xorriso self-inclusion
 dist/tinyos.iso: kernel.elf iso/boot/grub/grub.cfg | dist
+	@test -n "$(GRUBMKRESCUE)" || (echo "Missing grub-mkrescue; install grub-mkrescue or set GRUBMKRESCUE=/path/to/grub-mkrescue"; exit 1)
 	cp kernel.elf iso/boot/kernel.elf
 	$(GRUBMKRESCUE) -o $@ iso
 

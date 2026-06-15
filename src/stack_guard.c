@@ -111,7 +111,7 @@ void __stack_chk_fail(void) {
     /* Log to audit system for forensics */
     audit_log(AUDIT_SEC_STACK_CORRUPTION, AUDIT_CRITICAL, uid,
               "Stack canary corruption detected (PID=%u, canary=0x%08x, possible exploit)",
-              pid, __stack_chk_guard);
+              pid, (unsigned int)__stack_chk_guard);
 
     kprintf("\n");
     kprintf("*****************************************************************\n");

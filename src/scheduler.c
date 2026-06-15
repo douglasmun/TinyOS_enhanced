@@ -265,7 +265,7 @@ static void scheduler_remove_task_locked(task_t* task) {
             audit_log(AUDIT_SYS_CRASH, AUDIT_CRITICAL, 0,
                       "FATAL: Scheduler ready queue corruption detected "
                       "(PID=%u '%s', iterations=%d, max=%d)",
-                      task->pid, task->name, iterations,
+                      (unsigned int)task->pid, task->name, iterations,
                       MAX_SCHEDULER_LIST_ITERATIONS);
 
             // Panic - corrupted scheduler state is unrecoverable

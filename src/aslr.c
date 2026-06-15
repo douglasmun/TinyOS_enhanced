@@ -119,7 +119,7 @@ void aslr_init(void) {
     /* Audit log: ASLR enabled with quality info */
     audit_log(AUDIT_SYS_CONFIG_CHANGE, AUDIT_INFO, 0,
               "ASLR initialized (entropy=%u bits, quality=%s)",
-              aslr_stats.entropy_bits, quality_str);
+              (unsigned int)aslr_stats.entropy_bits, quality_str);
 }
 
 /*=============================================================================
