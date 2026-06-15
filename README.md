@@ -36,6 +36,20 @@ The cryptography is implemented from scratch for educational purposes and has no
 
 A prebuilt, bootable **demo ISO** is published on the [**Releases**](../../releases) page so you can try TinyOS Enhanced without setting up a cross-toolchain. Just QEMU.
 
+**Verify the download (recommended).** The ISO is signed with [minisign](https://jedisct1.github.io/minisign/). Grab `tinyos.iso` and `tinyos.iso.minisig` from the release, then:
+
+```sh
+minisign -Vm tinyos.iso -P RWSjOIBH4PaSwMQGL52OOQP7tyEu2p3Z83If58oyBxuatlkOnuBo2qOF
+```
+
+The release-signing public key is published **here in the README** (and in the release notes) so you can obtain it independently of the asset:
+
+```
+RWSjOIBH4PaSwMQGL52OOQP7tyEu2p3Z83If58oyBxuatlkOnuBo2qOF
+```
+
+A plain SHA-256 is also given in the [release notes](../../releases/tag/v2.0) for a quick integrity check. Either way, this is an educational OS — only run it in a throwaway VM.
+
 **Recommended — with a virtual NIC (DHCP completes immediately):**
 
 ```sh
