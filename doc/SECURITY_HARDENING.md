@@ -919,7 +919,7 @@ CFLAGS += -fno-pic       # No position-independent code (kernel)
 ### Short Term (v1.21)
 - ✅ **Stack Guard**: Complete
 - ✅ **ASLR**: Complete
-- 🔜 **W^X (Write XOR Execute)**: Memory pages cannot be both writable and executable
+- ✅ **W^X (Write XOR Execute)**: Enforced for user mappings via the PAE NX bit (June 2026) — writable pages are NX, code is R+X read-only, W+X ELF segments rejected
 
 ### Medium Term (v1.22+)
 - 🔜 **Heap ASLR**: Randomize heap allocations (requires heap implementation)
@@ -959,7 +959,7 @@ TinyOS v1.20 now implements **production-grade exploit mitigation** comparable t
 
 ✅ **Stack Guard**: Runtime buffer overflow detection
 ✅ **ASLR**: Memory layout randomization
-🔜 **W^X**: Code/data separation (next milestone)
+✅ **W^X**: Code/data separation enforced for user mappings via the PAE NX bit (June 2026)
 
 **Security Posture**: From **vulnerable** to **hardened** in two major releases.
 
@@ -989,8 +989,16 @@ TinyOS v1.20 now implements **production-grade exploit mitigation** comparable t
 | **NX Bit Support** | ✅ Complete | EFER.NXE enablement, NX flag support |
 | **W^X Audit** | ✅ Complete | `pae_wx_audit()` scans for violations |
 | **Shell Commands** | ✅ Complete | `pae` (status), `wxaudit` (violations) |
-| **Boot Integration** | ⏳ Pending | Requires boot.s modification for CR4.PAE |
-| **Active Enforcement** | ⏳ Pending | Currently infrastructure only |
+| **Boot Integration** | ✅ Complete | PAE + EFER.NXE enabled at boot; PAE is the active paging mode |
+| **Active Enforcement** | ✅ Complete | User mappings carry the hardware NX bit; non-executable user pages (data, rodata, stack) are NX, code is R+X read-only, and writable+executable ELF load segments are rejected |
+
+> **User-mode W^X is enforced as of the June 2026 NX fix.** Generic user mappings
+> previously passed 32-bit page flags that dropped the high `PAE_NX` bit before the
+> PAE mapper; `map_page()`/`map_user_memory()` now take `uint64_t` flags so NX
+> survives. The ELF loader marks non-executable segments NX, rejects W+X segments,
+> and re-maps code read-only after copy; user stacks are `PAE_PAGE_STACK` (RW+NX).
+> Runtime-verified in ENFORCE mode (signed `hello.elf` runs in ring 3, data-segment
+> writes included, no fault).
 
 ### What's Implemented
 
