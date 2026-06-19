@@ -1,0 +1,64 @@
+name: Security finding
+description: Report a vulnerability or weakness in a kernel security mechanism.
+title: "[Security]: "
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for security findings (memory safety, privilege escalation, crypto, auth,
+        W^X/NX, ASLR, signing, audit log, etc.). If you believe the issue is sensitive and
+        should not be disclosed publicly, please contact the maintainer privately rather
+        than opening a public issue.
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity (your assessment)
+      options:
+        - Critical (privilege escalation / RCE / auth bypass)
+        - High (memory corruption / crypto break)
+        - Medium (info leak / DoS)
+        - Low (hardening / defense-in-depth gap)
+        - Informational
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected mechanism
+      options:
+        - ELF code signing / secure boot
+        - W^X / NX / PAE paging
+        - Stack guard / TSS / guard pages
+        - ASLR
+        - Credential store / PBKDF2 / auth
+        - Crypto (sha256, ECDSA, CSPRNG)
+        - Networking / anti-spoofing
+        - PMM / capabilities
+        - Audit log
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is the weakness, and what is the impact?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction / proof of concept
+      description: Steps, code, or trace demonstrating the issue. Reference file:line where possible.
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: Suggested fix (optional)
+  - type: input
+    id: commit
+    attributes:
+      label: Commit / version
+      description: Which commit or release the finding applies to.

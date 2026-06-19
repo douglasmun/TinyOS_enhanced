@@ -1,0 +1,25 @@
+name: Question / support
+description: Ask about building, running, or using TinyOS.
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before asking, please check the [User Guide](https://github.com/douglasmun/TinyOS_enhanced/blob/main/doc/USER_GUIDE.md).
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you've tried
+      description: Commands run, docs read, and any output you got.
+  - type: input
+    id: host
+    attributes:
+      label: Host environment (if relevant)
+      placeholder: macOS 15.5, QEMU 9.x, i686-elf-gcc 14.x

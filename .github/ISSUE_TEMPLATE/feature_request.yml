@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a new kernel, driver, or userspace capability.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What gap or limitation does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed capability
+      description: What should be added or changed?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Subsystem
+      options:
+        - Kernel core / scheduler / memory
+        - Drivers (keyboard, timer, NIC, etc.)
+        - Filesystem (RAMFS / FAT32)
+        - Networking
+        - Userspace / shell / syscalls
+        - Security
+        - Build / tooling / docs
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered (optional)
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes (optional)
+      description: This is an educational single-CPU i386 kernel with no libc — keep scope in mind.

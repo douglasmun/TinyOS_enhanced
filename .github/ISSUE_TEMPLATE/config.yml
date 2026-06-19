@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Build & run help
+    url: https://github.com/douglasmun/TinyOS_enhanced/blob/main/doc/USER_GUIDE.md
+    about: Boot, login, shell, and networking walkthrough — check here first.
+  - name: Security hardening reference
+    url: https://github.com/douglasmun/TinyOS_enhanced/blob/main/doc/SECURITY_HARDENING.md
+    about: Full reference for the kernel's security mechanisms.

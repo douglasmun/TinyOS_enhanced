@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a crash, triple fault, boot failure, or incorrect behavior.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. TinyOS is an educational 32-bit (i386) Multiboot2 kernel.
+        Please include enough detail to reproduce — most issues are environment- or build-flag-specific.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, in one or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact sequence — build, boot, login, and any shell commands typed (e.g. `exec /hello.elf`).
+      placeholder: |
+        1. make -j8 kernel.elf
+        2. build ISO, boot in QEMU
+        3. set root password, login
+        4. run `...`
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual behavior
+    validations:
+      required: true
+  - type: input
+    id: build-flags
+    attributes:
+      label: Build flags
+      description: Any non-default flags (e.g. -DELF_PERMISSIVE_SIGNATURES, -DTINYOS_FAST_KDF, -DTINYOS_DEV).
+      placeholder: none (default fail-closed build)
+  - type: input
+    id: qemu-cmd
+    attributes:
+      label: QEMU command
+      description: The exact command line used to launch.
+      placeholder: qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom dist/tinyos.iso -boot d -m 256M ...
+  - type: textarea
+    id: serial-log
+    attributes:
+      label: Serial log / panic output
+      description: |
+        Relevant lines from the `-serial file:LOG` output. For faults, include the panic
+        (EIP, CR2, fault type). Filter EDR noise with `grep -v Suspicious`.
+      render: text
+  - type: input
+    id: host
+    attributes:
+      label: Host environment
+      description: OS, QEMU version, toolchain (i686-elf-gcc / nasm versions).
+      placeholder: macOS 15.5, QEMU 9.x, i686-elf-gcc 14.x, nasm 2.16
+    validations:
+      required: true
