@@ -6,6 +6,16 @@ single-core, console-only, intended to run under QEMU, and its from-scratch cryp
 **not** had external review. Please calibrate expectations accordingly — but security
 reports are genuinely welcome, since security mechanisms are the whole point of the project.
 
+## Supported versions
+
+Fixes land on the `main` branch only; there are no maintained release branches. Please
+report against the latest `main` commit (or the most recent tagged release / demo ISO).
+
+| Version            | Supported          |
+| ------------------ | ------------------ |
+| `main` (latest)    | :white_check_mark: |
+| Older commits/tags | :x:                |
+
 ## Reporting a vulnerability
 
 **Please do not open a public issue or discussion for a security vulnerability.**
@@ -57,11 +67,24 @@ Out of scope:
   physical/hypervisor-level access outside the kernel's threat model.
 - Theoretical findings with no reproducible path under the supported QEMU setup.
 
+Before reporting, it may help to check what is already implemented or documented as an
+accepted limitation:
+
+- [`doc/SECURITY_HARDENING.md`](doc/SECURITY_HARDENING.md) — the security mechanisms in place.
+- [`doc/SECURITY_ARCHITECTURAL_LIMITATIONS.md`](doc/SECURITY_ARCHITECTURAL_LIMITATIONS.md) —
+  known, accepted architectural limits.
+
 ## Release artifacts
 
 Released demo ISOs are signed with [minisign](https://jedisct1.github.io/minisign/)
-(`tinyos.iso.minisig`). If you believe a published artifact is inauthentic or its signature
-doesn't verify, report it privately as above.
+(`tinyos.iso.minisig`). Verify with the public key published in the README:
+
+```
+RWSjOIBH4PaSwMQGL52OOQP7tyEu2p3Z83If58oyBxuatlkOnuBo2qOF
+```
+
+If you believe a published artifact is inauthentic or its signature doesn't verify, report
+it privately as above.
 
 ## Disclosure
 
