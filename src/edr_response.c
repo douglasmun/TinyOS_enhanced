@@ -32,14 +32,6 @@
 #include <stdbool.h>
 
 /* Simple string functions to avoid system headers */
-static void resp_strncpy(char* dest, const char* src, size_t n) {
-    size_t i;
-    for (i = 0; i < n - 1 && src[i]; i++) {
-        dest[i] = src[i];
-    }
-    dest[i] = '\0';
-}
-
 static size_t resp_strlen(const char* str) __attribute__((unused));
 static size_t resp_strlen(const char* str) {
     size_t len = 0;
@@ -203,7 +195,7 @@ static void log_remediation(response_action_t action, uint16_t pid,
     record->success = success;
 
     if (description) {
-        resp_strncpy(record->description, description, sizeof(record->description));
+        SAFE_STRNCPY(record->description, description, sizeof(record->description));
     }
 
     g_remediation_count = (g_remediation_count + 1) % MAX_REMEDIATION_LOG;

@@ -25,19 +25,9 @@ static alias_t alias_table[ALIAS_MAX_COUNT];
 
 /*=============================================================================
  * String Helper Functions
- * SECURITY FIX: Removed unsafe my_strcpy, using safe_strcpy from util.h instead
+ * SECURITY FIX: Removed unsafe my_strcpy/my_strncpy; use SAFE_STRNCPY (strlcpy
+ * semantics, always null-terminates) from util.h instead.
  *=============================================================================*/
-
-static char* my_strncpy(char* dest, const char* src, size_t n) {
-    size_t i;
-    for (i = 0; i < n && src[i] != '\0'; i++) {
-        dest[i] = src[i];
-    }
-    for (; i < n; i++) {
-        dest[i] = '\0';
-    }
-    return dest;
-}
 
 /*=============================================================================
  * Helper Functions
@@ -203,8 +193,7 @@ int env_set(const char* name, const char* value) {
     int idx = env_find(name);
     if (idx >= 0) {
         /* Update existing variable */
-        my_strncpy(env_table[idx].value, value, ENV_MAX_VALUE_LEN - 1);
-        env_table[idx].value[ENV_MAX_VALUE_LEN - 1] = '\0';
+        SAFE_STRNCPY(env_table[idx].value, value, ENV_MAX_VALUE_LEN);
         CRITICAL_SECTION_EXIT();
         return 0;
     }
@@ -217,11 +206,8 @@ int env_set(const char* name, const char* value) {
     }
 
     /* Create new variable */
-    my_strncpy(env_table[idx].name, name, ENV_MAX_NAME_LEN - 1);
-    env_table[idx].name[ENV_MAX_NAME_LEN - 1] = '\0';
-
-    my_strncpy(env_table[idx].value, value, ENV_MAX_VALUE_LEN - 1);
-    env_table[idx].value[ENV_MAX_VALUE_LEN - 1] = '\0';
+    SAFE_STRNCPY(env_table[idx].name, name, ENV_MAX_NAME_LEN);
+    SAFE_STRNCPY(env_table[idx].value, value, ENV_MAX_VALUE_LEN);
 
     env_table[idx].exported = false;
     env_table[idx].in_use = true;
@@ -442,8 +428,7 @@ int env_find_in_path(const char* command, char* resolved_path, size_t path_size)
 
     /* If command contains '/', it's already a path */
     if (strchr(command, '/')) {
-        my_strncpy(resolved_path, command, path_size - 1);
-        resolved_path[path_size - 1] = '\0';
+        SAFE_STRNCPY(resolved_path, command, path_size);
         return 0;
     }
 
@@ -455,8 +440,7 @@ int env_find_in_path(const char* command, char* resolved_path, size_t path_size)
 
     /* PATH is colon-separated list of directories */
     char path_copy[ENV_MAX_VALUE_LEN];
-    my_strncpy(path_copy, path, ENV_MAX_VALUE_LEN - 1);
-    path_copy[ENV_MAX_VALUE_LEN - 1] = '\0';
+    SAFE_STRNCPY(path_copy, path, ENV_MAX_VALUE_LEN);
 
     char* dir = path_copy;
     char* next;
@@ -490,8 +474,7 @@ int env_find_in_path(const char* command, char* resolved_path, size_t path_size)
 
             /* TODO: Check if file exists (requires filesystem support) */
             /* For now, just return the first candidate */
-            my_strncpy(resolved_path, full_path, path_size - 1);
-            resolved_path[path_size - 1] = '\0';
+            SAFE_STRNCPY(resolved_path, full_path, path_size);
             return 0;
         }
 
@@ -574,8 +557,7 @@ int alias_set(const char* name, const char* command) {
             return -1;  /* Invalid index */
         }
         /* Update existing alias */
-        my_strncpy(alias_table[idx].command, command, ALIAS_MAX_CMD_LEN - 1);
-        alias_table[idx].command[ALIAS_MAX_CMD_LEN - 1] = '\0';
+        SAFE_STRNCPY(alias_table[idx].command, command, ALIAS_MAX_CMD_LEN);
         CRITICAL_SECTION_EXIT();
         return 0;
     }
@@ -594,11 +576,8 @@ int alias_set(const char* name, const char* command) {
     }
 
     /* Create new alias */
-    my_strncpy(alias_table[idx].name, name, ALIAS_MAX_NAME_LEN - 1);
-    alias_table[idx].name[ALIAS_MAX_NAME_LEN - 1] = '\0';
-
-    my_strncpy(alias_table[idx].command, command, ALIAS_MAX_CMD_LEN - 1);
-    alias_table[idx].command[ALIAS_MAX_CMD_LEN - 1] = '\0';
+    SAFE_STRNCPY(alias_table[idx].name, name, ALIAS_MAX_NAME_LEN);
+    SAFE_STRNCPY(alias_table[idx].command, command, ALIAS_MAX_CMD_LEN);
 
     alias_table[idx].in_use = true;
 

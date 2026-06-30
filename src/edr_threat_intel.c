@@ -63,14 +63,6 @@ static char* ti_strtok(char* str, const char* delim) {
     return token;
 }
 
-static void ti_strncpy(char* dest, const char* src, size_t n) {
-    size_t i;
-    for (i = 0; i < n - 1 && src[i]; i++) {
-        dest[i] = src[i];
-    }
-    dest[i] = '\0';
-}
-
 static int ti_atoi(const char* str) {
     int result = 0;
     int sign = 1;
@@ -298,7 +290,7 @@ bool edr_ti_add_file_hash(const uint8_t hash[TI_HASH_SIZE], uint8_t severity, co
     entry->active = true;
 
     if (name) {
-        ti_strncpy(entry->name, name, sizeof(entry->name));
+        SAFE_STRNCPY(entry->name, name, sizeof(entry->name));
     }
 
     g_ti_db.hash_count++;
@@ -344,7 +336,7 @@ bool edr_ti_add_ip(uint32_t ip, uint8_t severity, const char* description) {
     entry->active = true;
 
     if (description) {
-        ti_strncpy(entry->description, description, sizeof(entry->description));
+        SAFE_STRNCPY(entry->description, description, sizeof(entry->description));
     }
 
     g_ti_db.ip_count++;

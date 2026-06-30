@@ -58,3 +58,25 @@ char* strchr(const char* s, int c);
  * If src length >= size, dst will be truncated
  */
 size_t safe_strcpy(char* dst, const char* src, size_t size);
+
+/**
+ * @brief Safe replacement for strncpy (strlcpy semantics).
+ *
+ * Unlike strncpy(), this ALWAYS null-terminates @p dst (when @p size > 0) and
+ * does not pad the remainder with NULs. Pass the FULL destination buffer size
+ * as @p size (NOT size-1) — the macro reserves room for the terminator itself.
+ *
+ * @param dst  Destination buffer
+ * @param src  Source string
+ * @param size Full size of @p dst in bytes
+ */
+#define SAFE_STRNCPY(dst, src, size) (safe_strcpy((dst), (src), (size)))
+
+/**
+ * @brief SAFE_STRNCPY for a fixed-size array destination.
+ *
+ * Uses sizeof on @p arr so the size can never be passed wrong. ONLY valid when
+ * @p arr is a real array — passing a pointer takes sizeof(pointer) and silently
+ * truncates. Use SAFE_STRNCPY with an explicit size for pointer destinations.
+ */
+#define SAFE_STRNCPY_ARR(arr, src) (safe_strcpy((arr), (src), sizeof(arr)))
