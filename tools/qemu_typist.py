@@ -73,15 +73,19 @@ def read_serial():
         return ""
 
 
-def wait_for(text, timeout=120, since=0):
-    """Wait until `text` appears in serial AFTER byte offset `since`.
-    Returns the new total serial length, or raises on timeout."""
+def wait_for(text, timeout=240, since=0):
+    """Wait until `text` appears in serial at/after byte offset `since`.
+
+    Returns a cursor positioned JUST PAST the matched text (not the full file
+    length) so the next wait resumes from there: this neither skips content
+    that was already buffered when the previous match resolved, nor re-matches
+    an earlier identical banner. Raises on timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         data = read_serial()
         idx = data.find(text, since)
         if idx >= 0:
-            return len(data)
+            return idx + len(text)
         time.sleep(0.4)
     tail = read_serial()[-600:]
     raise SystemExit(f"typist: TIMEOUT waiting for {text!r}\n--- serial tail ---\n{tail}")
@@ -117,23 +121,27 @@ def main():
     end = wait_for("Enter new root password:", timeout=180)
     type_str(sock, PASSWORD + "\n")
 
-    end = wait_for("Confirm new root password:", timeout=60, since=end)
+    end = wait_for("Confirm new root password:", timeout=120, since=end)
     type_str(sock, PASSWORD + "\n")
 
-    end = wait_for("Root password set successfully!", timeout=120, since=end)
+    # PBKDF2 (100k iters) runs here -> slow under TCG; wait generously.
+    end = wait_for("Root password set successfully!", timeout=240, since=end)
     print("typist: root password set")
 
     # 2) Login as root (username echoes -> verify)
-    end = wait_for("TinyOS login:", timeout=60, since=end)
+    end = wait_for("TinyOS login:", timeout=120, since=end)
     type_verified(sock, "root\n")
-    end = wait_for("Password:", timeout=30, since=end)
+    end = wait_for("Password:", timeout=60, since=end)
     type_str(sock, PASSWORD + "\n")
 
-    end = wait_for("Login successful", timeout=120, since=end)
+    # Another PBKDF2 verify on login -> slow.
+    end = wait_for("Login successful", timeout=240, since=end)
     print("typist: logged in as root")
 
-    # 3) Decline regular-user creation -> straight to shell
-    end = wait_for("create a regular user now? (y/n):", timeout=60, since=end)
+    # 3) Decline regular-user creation -> straight to shell.
+    #    The SECURITY RECOMMENDATION banner + y/n prompt can lag well behind
+    #    "Login successful" under TCG host-load spikes, so wait generously.
+    end = wait_for("create a regular user now? (y/n):", timeout=180, since=end)
     type_str(sock, "n\n")
 
     # 4) At the shell, run the signed exec as the FIRST command
