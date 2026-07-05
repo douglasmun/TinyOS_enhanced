@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TinyOS in your browser</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { padding: 20px 24px 8px; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  h1 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: var(--accent); }
+  .sub { color: var(--muted); font-size: 14px; margin: 0; max-width: 70ch; }
+  main { display: flex; flex-wrap: wrap; gap: 16px; padding: 16px 24px 32px; align-items: flex-start; }
+  .col { flex: 1 1 520px; min-width: 340px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .panel > .cap { padding: 8px 12px; font-size: 12px; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--muted); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  /* v86 text screen */
+  #screen_container { background: #000; padding: 8px; overflow: auto; }
+  #screen_container div {
+    white-space: pre; font: 15px/1.05 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: #b3b3b3;
+  }
+  #screen_container canvas { display: none; }
+  /* serial */
+  #serial { height: 340px; overflow: auto; margin: 0; padding: 10px 12px; background: #010409;
+    font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; color: #7ee787; white-space: pre-wrap; word-break: break-word; }
+  .toolbar { display: flex; gap: 8px; align-items: center; padding: 12px 0; flex-wrap: wrap; }
+  button { background: #21262d; color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 14px; font-size: 14px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 600; }
+  #status { font-size: 13px; color: var(--muted); }
+  #status b { color: var(--warn); }
+  #status.running b { color: var(--ok); }
+  .note { font-size: 12.5px; color: var(--muted); line-height: 1.5; margin: 10px 0 0; }
+  .note code { background: #21262d; padding: 1px 5px; border-radius: 4px; }
+  a { color: var(--accent); }
+  kbd { background: #21262d; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px;
+    padding: 1px 5px; font: 12px ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Boot <span class="mono">TinyOS</span> in your browser</h1>
+  <p class="sub">A 32-bit i386 hobby OS &mdash; PAE paging, ring-3 user processes, ECDSA-signed
+  <code>exec</code> &mdash; running unmodified on the <a href="https://github.com/copy/v86">v86</a>
+  x86-to-WebAssembly emulator. Nothing leaves your machine; the whole PC is emulated in this tab.</p>
+</header>
+
+<main>
+  <div class="col">
+    <div class="panel">
+      <div class="cap"><span>VGA text console</span><span id="screen-hint">80&times;25</span></div>
+      <div id="screen_container"><div></div><canvas></canvas></div>
+    </div>
+    <div class="toolbar">
+      <button id="start" class="primary">Start</button>
+      <button id="reset" disabled>Reset</button>
+      <span id="status">Idle &mdash; press <b>Start</b> to boot.</span>
+    </div>
+    <p class="note">
+      First boot asks you to <b>set a root password</b>, then log in. Click the console and type.
+      Under the emulator the crypto (PBKDF2 100k, bit-serial ECDSA) is slow &mdash; password setup and
+      the first <code>exec</code> take a little while. Try <code>help</code>, <code>ls D:</code>,
+      then <code>exec /hello.elf</code> (verifies an ECDSA signature, then prints
+      <em>Hello from ELF!</em> from ring&nbsp;3).
+    </p>
+  </div>
+
+  <div class="col">
+    <div class="panel">
+      <div class="cap"><span>Serial log (COM1)</span><span id="serial-bytes">0 B</span></div>
+      <pre id="serial"></pre>
+    </div>
+    <p class="note">
+      This mirrors the kernel's <code>-serial</code> output: boot log, PAE init, entropy/RDRAND health,
+      and the signed-<code>exec</code> verification. <code>[EDR ADVANCED] &hellip; Suspicious memory</code>
+      lines are the EDR daemon and are filtered out here.
+    </p>
+    <p class="note">
+      No hard disk is attached in this demo, so drive <b>C:</b> (FAT32) is unavailable
+      (<code>[IDE] not initialized</code> is expected); <b>D:</b> is an in-memory RAMFS and works.
+      Networking is off (v86 has no e1000). Source &amp; feasibility write-up:
+      <a href="https://github.com/douglasmun/TinyOS_enhanced">github.com/douglasmun/TinyOS_enhanced</a>.
+    </p>
+  </div>
+</main>
+
+<script src="vendor/libv86.js"></script>
+<script>
+(function () {
+  "use strict";
+  var startBtn = document.getElementById("start");
+  var resetBtn = document.getElementById("reset");
+  var statusEl = document.getElementById("status");
+  var serialEl = document.getElementById("serial");
+  var serialBytesEl = document.getElementById("serial-bytes");
+  var emulator = null;
+  var serialText = "";
+  var serialBytes = 0;
+  var lineBuf = "";
+
+  function setStatus(html, running) {
+    statusEl.innerHTML = html;
+    statusEl.className = running ? "running" : "";
+  }
+
+  function appendSerialLine(line) {
+    // filter EDR "Suspicious" spam
+    if (line.indexOf("Suspicious") !== -1) return;
+    serialText += line + "\n";
+    // cap buffer
+    if (serialText.length > 200000) serialText = serialText.slice(-160000);
+    serialEl.textContent = serialText;
+    serialEl.scrollTop = serialEl.scrollHeight;
+  }
+
+  function onSerialByte(byte) {
+    serialBytes++;
+    serialBytesEl.textContent = (serialBytes < 1024)
+      ? serialBytes + " B" : (serialBytes / 1024).toFixed(1) + " KB";
+    var ch = String.fromCharCode(byte);
+    if (ch === "\n") { appendSerialLine(lineBuf); lineBuf = ""; }
+    else if (ch !== "\r") { lineBuf += ch; }
+  }
+
+  function start() {
+    startBtn.disabled = true;
+    setStatus("Booting &mdash; SeaBIOS &rarr; GRUB &rarr; kernel&hellip;", true);
+    emulator = new V86({
+      wasm_path: "vendor/v86.wasm",
+      bios: { url: "vendor/seabios.bin" },
+      vga_bios: { url: "vendor/vgabios.bin" },
+      cdrom: { url: "tinyos.iso" },
+      memory_size: 256 * 1024 * 1024,
+      vga_memory_size: 8 * 1024 * 1024,
+      boot_order: 0x123,           // CD-ROM first
+      screen_container: document.getElementById("screen_container"),
+      autostart: true,
+    });
+
+    emulator.add_listener("serial0-output-byte", onSerialByte);
+    emulator.add_listener("emulator-started", function () {
+      setStatus("Running &mdash; click the console and type. First boot sets a root password.", true);
+      resetBtn.disabled = false;
+    });
+    // Focus keyboard into the emulator on click
+    document.getElementById("screen_container").addEventListener("click", function () {
+      if (emulator) emulator.keyboard_set_status(true);
+    });
+  }
+
+  function reset() {
+    if (!emulator) return;
+    resetBtn.disabled = true;
+    serialText = ""; serialBytes = 0; lineBuf = "";
+    serialEl.textContent = ""; serialBytesEl.textContent = "0 B";
+    emulator.restart();
+    setStatus("Rebooting&hellip;", true);
+    resetBtn.disabled = false;
+  }
+
+  startBtn.addEventListener("click", start);
+  resetBtn.addEventListener("click", reset);
+})();
+</script>
+</body>
+</html>
