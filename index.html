@@ -22,15 +22,19 @@
   .panel > .cap { padding: 8px 12px; font-size: 12px; letter-spacing: .04em; text-transform: uppercase;
     color: var(--muted); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
   /* v86 text screen */
-  #screen_container { background: #000; padding: 8px; overflow: auto; }
+  #screen_container { background: #000; padding: 8px; overflow: auto; max-height: 70vh; resize: vertical; }
   #screen_container div {
     white-space: pre; font: 15px/1.05 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     color: #b3b3b3;
   }
   #screen_container canvas { display: none; }
   /* serial */
-  #serial { height: 340px; overflow: auto; margin: 0; padding: 10px 12px; background: #010409;
+  #serial { height: 60vh; min-height: 240px; overflow: auto; resize: vertical; margin: 0; padding: 10px 12px; background: #010409;
     font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; color: #7ee787; white-space: pre-wrap; word-break: break-word; }
+  .cap button.mini { background: #21262d; color: var(--muted); border: 1px solid var(--border); border-radius: 5px;
+    padding: 2px 8px; font-size: 11px; text-transform: none; letter-spacing: 0; cursor: pointer; }
+  .cap button.mini:hover { border-color: var(--accent); color: var(--fg); }
+  .cap .right { display: flex; gap: 8px; align-items: center; }
   .toolbar { display: flex; gap: 8px; align-items: center; padding: 12px 0; flex-wrap: wrap; }
   button { background: #21262d; color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
     padding: 8px 14px; font-size: 14px; cursor: pointer; }
@@ -58,7 +62,7 @@
 <main>
   <div class="col">
     <div class="panel">
-      <div class="cap"><span>VGA text console</span><span id="screen-hint">80&times;25</span></div>
+      <div class="cap"><span>VGA text console &mdash; live 80&times;25 (drag edge to resize)</span><span id="screen-hint">80&times;25</span></div>
       <div id="screen_container"><div></div><canvas></canvas></div>
     </div>
     <div class="toolbar">
@@ -77,13 +81,18 @@
 
   <div class="col">
     <div class="panel">
-      <div class="cap"><span>Serial log (COM1)</span><span id="serial-bytes">0 B</span></div>
+      <div class="cap"><span>Serial log (COM1) &mdash; scrollable history</span>
+        <span class="right"><button id="serial-copy" class="mini" type="button">Copy</button><span id="serial-bytes">0 B</span></span></div>
       <pre id="serial"></pre>
     </div>
     <p class="note">
       This mirrors the kernel's <code>-serial</code> output: boot log, PAE init, entropy/RDRAND health,
       and the signed-<code>exec</code> verification. <code>[EDR ADVANCED] &hellip; Suspicious memory</code>
       lines are the EDR daemon and are filtered out here.
+      <b>This panel is the scrollback</b> &mdash; the VGA console above only shows the live 80&times;25
+      screen, so to re-read past boot/<code>exec</code> messages scroll here (autoscroll pauses while you
+      scroll up and resumes at the bottom). Drag the bottom edge of either panel to resize it, or hit
+      <b>Copy</b> to grab the whole log.
     </p>
     <p class="note">
       No hard disk is attached in this demo, so drive <b>C:</b> (FAT32) is unavailable
@@ -107,6 +116,24 @@
   var serialText = "";
   var serialBytes = 0;
   var lineBuf = "";
+  var stickToBottom = true;
+
+  // Pause autoscroll when the user scrolls up to read history; resume at the bottom.
+  serialEl.addEventListener("scroll", function () {
+    var atBottom = serialEl.scrollHeight - serialEl.scrollTop - serialEl.clientHeight < 24;
+    stickToBottom = atBottom;
+  });
+
+  var copyBtn = document.getElementById("serial-copy");
+  copyBtn.addEventListener("click", function () {
+    var done = function (ok) {
+      copyBtn.textContent = ok ? "Copied" : "Copy failed";
+      setTimeout(function () { copyBtn.textContent = "Copy"; }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(serialText).then(function () { done(true); }, function () { done(false); });
+    } else { done(false); }
+  });
 
   function setStatus(html, running) {
     statusEl.innerHTML = html;
@@ -120,7 +147,7 @@
     // cap buffer
     if (serialText.length > 200000) serialText = serialText.slice(-160000);
     serialEl.textContent = serialText;
-    serialEl.scrollTop = serialEl.scrollHeight;
+    if (stickToBottom) serialEl.scrollTop = serialEl.scrollHeight;
   }
 
   function onSerialByte(byte) {
@@ -161,7 +188,7 @@
   function reset() {
     if (!emulator) return;
     resetBtn.disabled = true;
-    serialText = ""; serialBytes = 0; lineBuf = "";
+    serialText = ""; serialBytes = 0; lineBuf = ""; stickToBottom = true;
     serialEl.textContent = ""; serialBytesEl.textContent = "0 B";
     emulator.restart();
     setStatus("Rebooting&hellip;", true);
