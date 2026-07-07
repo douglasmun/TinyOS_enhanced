@@ -100,6 +100,13 @@
       Networking is off (v86 has no e1000). Source &amp; feasibility write-up:
       <a href="https://github.com/douglasmun/TinyOS_enhanced">github.com/douglasmun/TinyOS_enhanced</a>.
     </p>
+    <p class="note">
+      <b>Heads up:</b> v86's emulated CPU has no NX (No-eXecute) bit support, so W^X
+      enforcement can't fully engage here. Running <code>secstatus</code> or
+      <code>wxaudit</code> may print a long flood of <code>[W^X] VIOLATION</code> lines &mdash;
+      that's an emulator limitation, not a kernel bug. On real hardware or in QEMU
+      (which does support NX) the same build reports zero violations.
+    </p>
   </div>
 </main>
 
