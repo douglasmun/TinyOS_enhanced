@@ -56,10 +56,10 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO carries the same content as the signed `v2.0` release asset
-(SHA-256 `d8d96400f6dadc1b0acb960bedb58439273500df20a72dd5e810383ad7ed14b0` as of
-2026-07-07 — includes the W^X NX-coverage fix from PR #17 and the wxaudit
-console-flood cap from PR #19). Note `i686-elf-grub-mkrescue` is
+The committed ISO carries the same content as the signed `v2.2` release asset
+(SHA-256 `7d562bcc66b1e9d0227a36b03125d8be5e421d8a5061cdbc7f9452f2cef0a1e8` as of
+2026-08-06 — includes the framebuffer console, userspace libc + FAT32 exec,
+and blocking syscalls from PR #26). Note `i686-elf-grub-mkrescue` is
 non-deterministic, so a fresh rebuild will hash differently even with
 identical inputs.
 
