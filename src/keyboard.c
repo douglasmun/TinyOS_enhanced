@@ -397,19 +397,27 @@ char keyboard_getchar(void) {
      * where the IRQ fires between the check and the sleep. Before the
      * scheduler starts (first-boot setup, early login), task_current() is
      * NULL and we fall back to the original hlt poll. */
-    while (buffer_is_empty()) {
-        if (task_current() != NULL) {
-            CRITICAL_SECTION_ENTER();
-            if (buffer_is_empty()) {
-                wait_queue_sleep(&kbd_waitq);  /* releases critical section */
+    for (;;) {
+        while (buffer_is_empty()) {
+            if (task_current() != NULL) {
+                CRITICAL_SECTION_ENTER();
+                if (buffer_is_empty()) {
+                    wait_queue_sleep(&kbd_waitq);  /* releases critical section */
+                } else {
+                    CRITICAL_SECTION_EXIT();
+                }
             } else {
-                CRITICAL_SECTION_EXIT();
+                __asm__ volatile("hlt");
             }
-        } else {
-            __asm__ volatile("hlt");
+        }
+        /* buffer_get() re-checks emptiness internally and returns 0 if
+         * another consumer drained the buffer between our loop exit and the
+         * fetch — re-block instead of delivering a spurious NUL. */
+        char c = buffer_get();
+        if (c != 0) {
+            return c;
         }
     }
-    return buffer_get();
 }
 
 char keyboard_getchar_nonblock(void) {

@@ -132,22 +132,30 @@ static void put_at(char c, uint8_t a, uint32_t x, uint32_t y) {
 }
 
 static void scroll(void) {
-    /* Move the whole text area up one text row. The framebuffer band copy is
-     * a forward memmove (dst < src). Padding bytes past width*4 within the
-     * pitch are copied too, which is harmless. */
-    uint8_t* fb = (uint8_t*)(uintptr_t)fb_phys;
-    const uint32_t band = FBCON_CELL_H * fb_pitch;
-    const uint32_t text_px_h = text_rows * FBCON_CELL_H;
-
-    memmove(fb, fb + band, (text_px_h - FBCON_CELL_H) * fb_pitch);
-    fill_band(text_px_h - FBCON_CELL_H, FBCON_CELL_H,
-              palette[(VGA_DEFAULT_ATTR >> 4) & 0x0Fu]);
-
-    memmove(&shadow[0][0], &shadow[1][0],
-            (text_rows - 1u) * sizeof(shadow[0]));
+    /* Shift the shadow up one row and re-render only the cells whose value
+     * changed. This is write-only with respect to the framebuffer — the whole
+     * point of the shadow buffer — where a framebuffer memmove would read
+     * ~1 MB of slow (write-through-mapped) framebuffer per scrolled line, all
+     * inside the caller's interrupts-off window. Unchanged cells (blank over
+     * blank is the common case) cost one shadow compare and no pixel I/O.
+     * Callers erase the cursor overlay before scrolling, so skipping an
+     * unchanged cell never leaves a stale overlay behind. */
     const uint16_t blank = (uint16_t)(' ' | ((uint16_t)VGA_DEFAULT_ATTR << 8));
-    for (uint32_t x = 0; x < FBCON_MAX_COLS; ++x) {
-        shadow[text_rows - 1u][x] = blank;
+
+    for (uint32_t y = 0; y + 1u < text_rows; ++y) {
+        for (uint32_t x = 0; x < text_cols; ++x) {
+            const uint16_t nv = shadow[y + 1u][x];
+            if (shadow[y][x] != nv) {
+                shadow[y][x] = nv;
+                render_cell(x, y);
+            }
+        }
+    }
+    for (uint32_t x = 0; x < text_cols; ++x) {
+        if (shadow[text_rows - 1u][x] != blank) {
+            shadow[text_rows - 1u][x] = blank;
+            render_cell(x, text_rows - 1u);
+        }
     }
 }
 
@@ -199,14 +207,15 @@ void fbcon_clear(void) {
 void fbcon_putc(char c) {
     uint32_t flags = disable_interrupts();
 
-    cursor_erase();
-
     if (c == '\n') {
+        cursor_erase();
         cur_col = 0; ++cur_row;
         if (cur_row >= text_rows) { scroll(); cur_row = text_rows - 1u; }
     } else if (c == '\r') {
+        cursor_erase();
         cur_col = 0;
     } else if (c == '\b') {
+        cursor_erase();
         if (cur_col > 0) {
             cur_col--;
         } else if (cur_row > 0) {
@@ -214,6 +223,8 @@ void fbcon_putc(char c) {
             cur_col = text_cols - 1u;
         }
     } else {
+        /* No separate cursor_erase: put_at fully re-renders the cursor cell
+         * (every pixel), which erases the overlay as a side effect. */
         put_at(c, VGA_DEFAULT_ATTR, cur_col, cur_row);
         advance();
     }

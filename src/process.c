@@ -1534,12 +1534,18 @@ void task_sleep(uint32_t ticks) {
         return;
     }
 
-    // Calculate wake-up time
+    // State transition and dequeue must be atomic against the timer IRQ:
+    // once state is SLEEPING, scheduler_schedule_from_interrupt re-adds any
+    // expired sleeper with no ready-queue membership check. A tick landing
+    // between the state write and scheduler_remove_task (trivially hit with
+    // ticks == 1) would append a task that is still linked in the circular
+    // ready queue, corrupting the list.
+    CRITICAL_SECTION_ENTER();
     task->wake_tick = pit_get_ticks() + ticks;
     task->state = TASK_STATE_SLEEPING;
-
-    // Remove from ready queue and yield CPU
     scheduler_remove_task(task);
+    CRITICAL_SECTION_EXIT();
+
     scheduler_yield();
 }
 

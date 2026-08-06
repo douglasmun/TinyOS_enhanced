@@ -120,6 +120,44 @@ void syscall_handler_c(struct cpu_state* state);
  * System Call: Exit
  * Terminate the current process
  *-----------------------------------------------------------------------------*/
+/*=============================================================================
+ * EXIT RECORDS
+ *
+ * The ZOMBIE window lasts less than a tick (the timer-IRQ cleanup drain
+ * recycles the slot before any sleeping waiter runs), so waitpid can almost
+ * never read exit_status out of the task slot. sys_exit therefore also logs
+ * {pid, generation, status} into this small ring; sys_waitpid consults it
+ * when the slot is already gone. Old entries are overwritten FIFO — a waiter
+ * that polls every tick cannot fall 16 exits behind on this system.
+ *===========================================================================*/
+#define EXIT_RECORDS 16
+static struct {
+    uint32_t pid;
+    uint32_t generation;
+    int status;
+} exit_records[EXIT_RECORDS];
+static int exit_record_next;
+
+static void exit_record_store(uint32_t pid, uint32_t generation, int status) {
+    /* Called with interrupts disabled (sys_exit's cleanup window) */
+    exit_records[exit_record_next].pid = pid;
+    exit_records[exit_record_next].generation = generation;
+    exit_records[exit_record_next].status = status;
+    exit_record_next = (exit_record_next + 1) % EXIT_RECORDS;
+}
+
+static bool exit_record_find(uint32_t pid, uint32_t generation, int* status) {
+    /* Caller holds a critical section */
+    for (int i = 0; i < EXIT_RECORDS; i++) {
+        if (exit_records[i].pid == pid &&
+            exit_records[i].generation == generation) {
+            *status = exit_records[i].status;
+            return true;
+        }
+    }
+    return false;
+}
+
 void sys_exit(int status) {
     kprintf("\n[SYSCALL] Process exited with status %d\n", status);
 
@@ -187,6 +225,10 @@ void sys_exit(int status) {
          *===================================================================*/
         current->exit_status = status;
         current->state = TASK_STATE_ZOMBIE;
+        /* The post-switch reaper zeroes pid and recycles the slot within a
+         * tick — before a task_sleep(1)-polling waiter ever runs again — so
+         * the status must be preserved outside the slot to be observable. */
+        exit_record_store(current->pid, current->generation, status);
 
         /* Step 4: Remove from ready queue NOW to avoid race condition */
         // where timer interrupt tries to schedule/remove the same task
@@ -557,18 +599,24 @@ int sys_waitpid(int pid) {
     }
     CRITICAL_SECTION_EXIT();
 
+    /* The status is truncated POSIX-style to 0..255 so a child's negative
+     * exit code can never collide with this syscall's own -Exxx errors. */
     while (1) {
         CRITICAL_SECTION_ENTER();
         task_t* child = task_get_validated(pid, generation);
         if (!child) {
-            /* Exited and reaped (or slot recycled) — status lost */
+            /* Slot already reaped/recycled — recover the status from the
+             * exit-record ring (the common path: the reaper wins the race
+             * against a tick-sleeping waiter every time). */
+            int status = 0;
+            exit_record_find(pid, generation, &status);
             CRITICAL_SECTION_EXIT();
-            return 0;
+            return status & 0xFF;
         }
         if (child->state == TASK_STATE_ZOMBIE) {
             int status = child->exit_status;
             CRITICAL_SECTION_EXIT();
-            return status;
+            return status & 0xFF;
         }
         CRITICAL_SECTION_EXIT();
         task_sleep(1);

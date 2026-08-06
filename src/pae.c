@@ -1074,10 +1074,13 @@ void pae_free_user_pdpt(uint32_t pdpt_phys) {
 
             uint64_t pt_phys = pd[j] & PAE_FRAME_MASK;
 
-            /* PD[0] holds kernel mappings copied at creation - skip page
-             * tables shared with the kernel page directory */
-            if (i == 0 && (page_directories[0][j] & PAE_PRESENT) &&
-                (page_directories[0][j] & PAE_FRAME_MASK) == pt_phys) {
+            /* Creation copies kernel PDEs from ALL four PDs by value (PD[0]
+             * RAM identity map, PD[3] framebuffer/MMIO), so the shared-PT
+             * skip must cover every slot — gating on i == 0 alone would free
+             * the kernel's live PD[3] page tables on the first process exit,
+             * corrupting fbcon translations once the frame is reused. */
+            if ((page_directories[i][j] & PAE_PRESENT) &&
+                (page_directories[i][j] & PAE_FRAME_MASK) == pt_phys) {
                 continue;
             }
 

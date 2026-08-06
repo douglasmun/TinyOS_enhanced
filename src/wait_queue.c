@@ -321,13 +321,20 @@ void wait_queue_wakeup_all(wait_queue_t* wq) {
  *=============================================================================*/
 
 void wait_queue_remove_task(task_t* task) {
-    if (!task || !task->blocked_on_wq) {
+    if (!task) {
         return;
     }
 
     CRITICAL_SECTION_ENTER();
 
+    /* blocked_on_wq must be read under the critical section: an IRQ-context
+     * wait_queue_wakeup between an unlocked check and the lock would clear
+     * it, and dereferencing the stale value here would walk address 0. */
     wait_queue_t* wq = (wait_queue_t*)task->blocked_on_wq;
+    if (!wq) {
+        CRITICAL_SECTION_EXIT();
+        return;
+    }
     for (int i = 0; i < wq->count; i++) {
         if (wq->waiting_tasks[i] == task) {
             for (int j = i; j < wq->count - 1; j++) {

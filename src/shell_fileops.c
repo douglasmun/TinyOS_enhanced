@@ -1374,7 +1374,8 @@ void cmd_exec(int argc, char* argv[]) {
      * pathless "/file" goes to the legacy default driver (RAMFS). */
     int fd = vfs_open(path, VFS_O_RDONLY);
     if (fd < 0) {
-        kprintf("[EXEC] ERROR: Cannot open file '%s'\n", path);
+        stream_printf(get_current_streams(),
+                      "exec: cannot open file '%s'\n", path);
         return;
     }
 
@@ -1385,8 +1386,9 @@ void cmd_exec(int argc, char* argv[]) {
         ssize_t n = vfs_read(fd, exec_buffer + file_size,
                              EXEC_BUFFER_SIZE - file_size);
         if (n < 0) {
-            kprintf("[EXEC] ERROR: Read failed for '%s' (error %d)\n",
-                    path, (int)n);
+            stream_printf(get_current_streams(),
+                          "exec: read failed for '%s' (error %d)\n",
+                          path, (int)n);
             vfs_close(fd);
             return;
         }
@@ -1401,9 +1403,19 @@ void cmd_exec(int argc, char* argv[]) {
          * buffer-sized file from an oversized one. */
         uint8_t probe;
         ssize_t n = vfs_read(fd, &probe, 1);
+        if (n < 0) {
+            /* A read error is not EOF — treating it as such would hand a
+             * silently truncated image to the loader. */
+            stream_printf(get_current_streams(),
+                          "exec: read failed for '%s' (error %d)\n",
+                          path, (int)n);
+            vfs_close(fd);
+            return;
+        }
         if (n > 0) {
-            kprintf("[EXEC] ERROR: File too large (max %u bytes for security)\n",
-                    EXEC_MAX_FILE_SIZE);
+            stream_printf(get_current_streams(),
+                          "exec: file too large (max %u bytes)\n",
+                          EXEC_MAX_FILE_SIZE);
             vfs_close(fd);
             return;
         }
@@ -1411,7 +1423,7 @@ void cmd_exec(int argc, char* argv[]) {
     vfs_close(fd);
 
     if (file_size == 0) {
-        kprintf("[EXEC] ERROR: File is empty\n");
+        stream_printf(get_current_streams(), "exec: file is empty\n");
         return;
     }
 
@@ -1445,10 +1457,14 @@ void cmd_exec(int argc, char* argv[]) {
         scheduler_add_task(task);
         kprintf("[EXEC] Process added to scheduler\n");
 
-        // Wait for child process to terminate
+        // Wait for child process to terminate. Poll with generation
+        // validation, same as sys_waitpid: PIDs are random 16-bit values and
+        // the allocator can hand a just-reaped child's PID to a new task, so
+        // a bare task_get(pid) loop could latch onto an unrelated process.
         kprintf("[EXEC] Waiting for process to complete...\n");
+        uint32_t child_generation = task->generation;
         while (1) {
-            task_t* child = task_get(pid);
+            task_t* child = task_get_validated(pid, child_generation);
             if (!child || child->state == TASK_STATE_TERMINATED) {
                 break;  // Child has finished
             }
