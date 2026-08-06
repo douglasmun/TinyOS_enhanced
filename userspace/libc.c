@@ -1,0 +1,287 @@
+/*=============================================================================
+ * libc.c - Minimal freestanding C library for TinyOS user programs
+ *=============================================================================*/
+#include "libc.h"
+
+/*-----------------------------------------------------------------------------
+ * Raw syscalls (int 0x80, number in eax, args in ebx/ecx/edx)
+ *---------------------------------------------------------------------------*/
+int syscall0(int num) {
+    int ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(num));
+    return ret;
+}
+
+int syscall1(int num, uint32_t arg1) {
+    int ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(num), "b"(arg1));
+    return ret;
+}
+
+int syscall3(int num, uint32_t arg1, uint32_t arg2, uint32_t arg3) {
+    int ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"(num), "b"(arg1), "c"(arg2), "d"(arg3));
+    return ret;
+}
+
+/*-----------------------------------------------------------------------------
+ * Process
+ *---------------------------------------------------------------------------*/
+void exit(int status) {
+    syscall1(SYS_EXIT, (uint32_t)status);
+    for (;;) { }
+}
+
+int getpid(void) { return syscall0(SYS_GETPID); }
+int getuid(void) { return syscall0(SYS_GETUID); }
+int getgid(void) { return syscall0(SYS_GETGID); }
+void yield(void)  { syscall0(SYS_YIELD); }
+int sleep_ms(uint32_t ms) { return syscall1(SYS_SLEEP, ms); }
+int waitpid(int pid) { return syscall1(SYS_WAITPID, (uint32_t)pid); }
+
+/*-----------------------------------------------------------------------------
+ * I/O
+ *---------------------------------------------------------------------------*/
+int write(int fd, const void* buf, size_t len) {
+    return syscall3(SYS_WRITE, (uint32_t)fd, (uint32_t)(uintptr_t)buf,
+                    (uint32_t)len);
+}
+
+int read(int fd, void* buf, size_t len) {
+    (void)fd;  /* kernel sys_read always reads the console */
+    return syscall3(SYS_READ, (uint32_t)(uintptr_t)buf, (uint32_t)len, 0);
+}
+
+int putchar(int c) {
+    char ch = (char)c;
+    write(1, &ch, 1);
+    return (unsigned char)c;
+}
+
+void print(const char* s) {
+    write(1, s, strlen(s));
+}
+
+int puts(const char* s) {
+    print(s);
+    putchar('\n');
+    return 0;
+}
+
+int getchar(void) {
+    char c;
+    int n = read(0, &c, 1);
+    return (n == 1) ? (unsigned char)c : -1;
+}
+
+int readline(char* buf, size_t size) {
+    if (size == 0) return -1;
+    int n = read(0, buf, size - 1);
+    if (n < 0) return n;
+    if (n > 0 && buf[n - 1] == '\n') n--;
+    buf[n] = '\0';
+    return n;
+}
+
+/*-----------------------------------------------------------------------------
+ * printf — supports %c %s %d %i %u %x %p %%, no width/precision.
+ * Output is batched into a buffer to keep syscall count low.
+ *---------------------------------------------------------------------------*/
+typedef struct {
+    char buf[128];
+    size_t len;
+    int total;
+} out_t;
+
+static void out_flush(out_t* o) {
+    if (o->len > 0) {
+        write(1, o->buf, o->len);
+        o->len = 0;
+    }
+}
+
+static void out_ch(out_t* o, char c) {
+    if (o->len == sizeof(o->buf)) out_flush(o);
+    o->buf[o->len++] = c;
+    o->total++;
+}
+
+static void out_str(out_t* o, const char* s) {
+    while (*s) out_ch(o, *s++);
+}
+
+static void out_udec(out_t* o, uint32_t v) {
+    char tmp[12];
+    int i = 0;
+    do { tmp[i++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    while (i > 0) out_ch(o, tmp[--i]);
+}
+
+static void out_hex(out_t* o, uint32_t v) {
+    static const char digits[] = "0123456789abcdef";
+    char tmp[8];
+    int i = 0;
+    do { tmp[i++] = digits[v & 0xF]; v >>= 4; } while (v);
+    while (i > 0) out_ch(o, tmp[--i]);
+}
+
+int vprintf(const char* fmt, va_list ap) {
+    out_t o = { .len = 0, .total = 0 };
+
+    for (; *fmt; fmt++) {
+        if (*fmt != '%') {
+            out_ch(&o, *fmt);
+            continue;
+        }
+        fmt++;
+        switch (*fmt) {
+        case 'c': out_ch(&o, (char)va_arg(ap, int)); break;
+        case 's': {
+            const char* s = va_arg(ap, const char*);
+            out_str(&o, s ? s : "(null)");
+            break;
+        }
+        case 'd':
+        case 'i': {
+            int v = va_arg(ap, int);
+            if (v < 0) { out_ch(&o, '-'); out_udec(&o, (uint32_t)(-(int64_t)v)); }
+            else out_udec(&o, (uint32_t)v);
+            break;
+        }
+        case 'u': out_udec(&o, va_arg(ap, uint32_t)); break;
+        case 'x': out_hex(&o, va_arg(ap, uint32_t)); break;
+        case 'p':
+            out_str(&o, "0x");
+            out_hex(&o, (uint32_t)(uintptr_t)va_arg(ap, void*));
+            break;
+        case '%': out_ch(&o, '%'); break;
+        case '\0': fmt--; break;
+        default:
+            out_ch(&o, '%');
+            out_ch(&o, *fmt);
+            break;
+        }
+    }
+
+    out_flush(&o);
+    return o.total;
+}
+
+int printf(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vprintf(fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+/*-----------------------------------------------------------------------------
+ * Strings
+ *---------------------------------------------------------------------------*/
+size_t strlen(const char* s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+int strcmp(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+int strncmp(const char* a, const char* b, size_t n) {
+    for (; n > 0; n--, a++, b++) {
+        if (*a != *b) return (unsigned char)*a - (unsigned char)*b;
+        if (*a == '\0') return 0;
+    }
+    return 0;
+}
+
+char* strcpy(char* dst, const char* src) {
+    char* d = dst;
+    while ((*d++ = *src++)) { }
+    return dst;
+}
+
+char* strncpy(char* dst, const char* src, size_t n) {
+    size_t i = 0;
+    for (; i < n && src[i]; i++) dst[i] = src[i];
+    for (; i < n; i++) dst[i] = '\0';
+    return dst;
+}
+
+char* strchr(const char* s, int c) {
+    for (;; s++) {
+        if (*s == (char)c) return (char*)s;
+        if (*s == '\0') return NULL;
+    }
+}
+
+void* memcpy(void* dst, const void* src, size_t n) {
+    unsigned char* d = dst;
+    const unsigned char* s = src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+void* memmove(void* dst, const void* src, size_t n) {
+    unsigned char* d = dst;
+    const unsigned char* s = src;
+    if (d < s) {
+        while (n--) *d++ = *s++;
+    } else if (d > s) {
+        d += n; s += n;
+        while (n--) *--d = *--s;
+    }
+    return dst;
+}
+
+void* memset(void* dst, int c, size_t n) {
+    unsigned char* d = dst;
+    while (n--) *d++ = (unsigned char)c;
+    return dst;
+}
+
+int memcmp(const void* a, const void* b, size_t n) {
+    const unsigned char* pa = a;
+    const unsigned char* pb = b;
+    for (; n > 0; n--, pa++, pb++) {
+        if (*pa != *pb) return *pa - *pb;
+    }
+    return 0;
+}
+
+/*-----------------------------------------------------------------------------
+ * Conversion
+ *---------------------------------------------------------------------------*/
+int atoi(const char* s) {
+    int neg = 0;
+    int v = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') s++;
+    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+    return neg ? -v : v;
+}
+
+/*-----------------------------------------------------------------------------
+ * Heap — 16 KB static arena, bump allocation, free() is a no-op
+ *---------------------------------------------------------------------------*/
+#define HEAP_SIZE 16384
+
+static unsigned char heap[HEAP_SIZE] __attribute__((aligned(8)));
+static size_t heap_used;
+
+void* malloc(size_t size) {
+    size = (size + 7u) & ~(size_t)7u;
+    if (size == 0 || size > HEAP_SIZE - heap_used) return NULL;
+    void* p = &heap[heap_used];
+    heap_used += size;
+    return p;
+}
+
+void free(void* ptr) {
+    (void)ptr;
+}

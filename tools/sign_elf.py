@@ -247,8 +247,24 @@ def main():
         print(f"ERROR: Input file not found: {input_path}")
         sys.exit(1)
 
+    # Load the pinned dev signing key (matches src/trusted_signing_key.h).
+    # The kernel rejects any other key in ENFORCE mode, so ephemeral keys are
+    # only a fallback for keyless checkouts (produces unloadable binaries).
+    private_key = None
+    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            '..', 'keys', 'tinyos_dev_signing_key.pem')
+    if os.path.exists(key_path):
+        from cryptography.hazmat.primitives import serialization
+        with open(key_path, 'rb') as f:
+            private_key = serialization.load_pem_private_key(
+                f.read(), password=None, backend=default_backend())
+        print(f"[*] Using pinned dev signing key: {key_path}")
+    else:
+        print(f"[!] WARNING: {key_path} not found — generating EPHEMERAL key;")
+        print("[!] the kernel's pinned-key check will REJECT this binary.")
+
     try:
-        sign_elf(input_path, output_path)
+        sign_elf(input_path, output_path, private_key=private_key)
         print("")
         print("[*] Verifying signature...")
         verify_signature(output_path)

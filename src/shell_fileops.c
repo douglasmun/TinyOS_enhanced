@@ -1318,8 +1318,8 @@ void cmd_rm(int argc, char* argv[]) {
 /*=============================================================================
  * COMMAND: exec - Execute ELF binary
  *=============================================================================*/
-#define EXEC_BUFFER_SIZE 16384  // 16KB buffer for ELF files
 #define EXEC_MAX_FILE_SIZE 65536  // 64KB maximum ELF size (DoS prevention)
+#define EXEC_BUFFER_SIZE EXEC_MAX_FILE_SIZE
 
 void cmd_exec(int argc, char* argv[]) {
     if (argc < 2) {
@@ -1339,8 +1339,11 @@ void cmd_exec(int argc, char* argv[]) {
      */
     static uint8_t exec_buffer[EXEC_BUFFER_SIZE];
 
-    /* Build absolute path if needed */
-    if (path[0] != '/') {
+    /* Build absolute path if needed.
+     * Drive-letter paths ("C:/prog.elf") are already absolute — the VFS
+     * routes them to the mounted driver — so leave them untouched. */
+    bool has_drive = (path[0] != '\0' && path[1] == ':');
+    if (path[0] != '/' && !has_drive) {
         /* Relative path - make it absolute */
         if (strcmp(current_dir, "/") == 0) {
             /* In root, just prepend / */
@@ -1367,58 +1370,67 @@ void cmd_exec(int argc, char* argv[]) {
 
     kprintf("[EXEC] Loading '%s'...\n", path);
 
-    // Open the file for reading
-    int fd = ramfs_open(path, RAMFS_FLAG_READ);
+    /* Open via the VFS so drive-letter paths (C: FAT32, D: RAMFS) work;
+     * pathless "/file" goes to the legacy default driver (RAMFS). */
+    int fd = vfs_open(path, VFS_O_RDONLY);
     if (fd < 0) {
         kprintf("[EXEC] ERROR: Cannot open file '%s'\n", path);
         return;
     }
 
-    // Get file size by reading the file node
-    ramfs_node_t* node = ramfs_find(path);
-    if (!node || node->type != RAMFS_TYPE_FILE) {
-        kprintf("[EXEC] ERROR: '%s' is not a file\n", path);
-        ramfs_close(fd);
-        return;
+    /* Read the whole file; the VFS has no stat, so size = bytes read.
+     * The buffer itself enforces EXEC_MAX_FILE_SIZE (DoS prevention). */
+    uint32_t file_size = 0;
+    while (file_size < EXEC_BUFFER_SIZE) {
+        ssize_t n = vfs_read(fd, exec_buffer + file_size,
+                             EXEC_BUFFER_SIZE - file_size);
+        if (n < 0) {
+            kprintf("[EXEC] ERROR: Read failed for '%s' (error %d)\n",
+                    path, (int)n);
+            vfs_close(fd);
+            return;
+        }
+        if (n == 0) {
+            break;  /* EOF */
+        }
+        file_size += (uint32_t)n;
     }
 
-    uint32_t file_size = node->size;
-    kprintf("[EXEC] File size: %u bytes\n", file_size);
+    if (file_size == EXEC_BUFFER_SIZE) {
+        /* Buffer full — probe for one more byte to distinguish an exactly
+         * buffer-sized file from an oversized one. */
+        uint8_t probe;
+        ssize_t n = vfs_read(fd, &probe, 1);
+        if (n > 0) {
+            kprintf("[EXEC] ERROR: File too large (max %u bytes for security)\n",
+                    EXEC_MAX_FILE_SIZE);
+            vfs_close(fd);
+            return;
+        }
+    }
+    vfs_close(fd);
 
-    /* SECURITY FIX: DoS prevention - check file size limits BEFORE allocating/reading
-     * This prevents malicious large files from consuming resources
-     */
     if (file_size == 0) {
         kprintf("[EXEC] ERROR: File is empty\n");
-        ramfs_close(fd);
         return;
     }
 
-    if (file_size > EXEC_MAX_FILE_SIZE) {
-        kprintf("[EXEC] ERROR: File too large (max %u bytes for security)\n", EXEC_MAX_FILE_SIZE);
-        ramfs_close(fd);
-        return;
+    kprintf("[EXEC] File size: %u bytes\n", file_size);
+
+    /* Process name = basename of the path (after any drive prefix) */
+    const char* proc_name = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/' && p[1] != '\0') {
+            proc_name = p + 1;
+        }
     }
-
-    if (file_size > EXEC_BUFFER_SIZE) {
-        kprintf("[EXEC] ERROR: File exceeds buffer size (max %d bytes)\n", EXEC_BUFFER_SIZE);
-        ramfs_close(fd);
-        return;
-    }
-
-    // Read file contents into local buffer
-    int bytes_read = ramfs_read(fd, exec_buffer, file_size);
-    ramfs_close(fd);
-
-    if (bytes_read != (int)file_size) {
-        kprintf("[EXEC] ERROR: Failed to read file (read %d/%u bytes)\n",
-                bytes_read, file_size);
-        return;
+    if (has_drive && proc_name == path) {
+        proc_name = path + 2;
     }
 
     kprintf("[EXEC] File loaded successfully\n");
     // Load ELF and create process
-    int pid = elf_load_process(exec_buffer, file_size, node->name);
+    int pid = elf_load_process(exec_buffer, file_size, proc_name);
 
     if (pid < 0) {
         kprintf("[EXEC] ERROR: Failed to load ELF executable\n");
@@ -1440,7 +1452,7 @@ void cmd_exec(int argc, char* argv[]) {
             if (!child || child->state == TASK_STATE_TERMINATED) {
                 break;  // Child has finished
             }
-            scheduler_yield();  // Give other tasks a chance to run
+            task_sleep(1);  // Block a tick (10 ms) instead of yield-spinning
         }
 
         /*
