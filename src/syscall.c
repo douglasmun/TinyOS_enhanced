@@ -493,6 +493,69 @@ void sys_yield(void) {
     scheduler_yield();
 }
 
+/*-----------------------------------------------------------------------------
+ * System Call: Sleep
+ * Block the calling task for at least `ms` milliseconds. The task leaves the
+ * ready queue entirely (TASK_STATE_SLEEPING) and the scheduler re-queues it
+ * once pit ticks reach wake_tick — no busy-waiting, no yield-spinning.
+ *-----------------------------------------------------------------------------*/
+int sys_sleep(uint32_t ms) {
+    /* Cap at 1 hour to bound wake_tick arithmetic against overflow abuse */
+    if (ms > 3600000u) {
+        ms = 3600000u;
+    }
+    /* PIT runs at 100 Hz (kernel.c pit_init(100)): 1 tick = 10 ms.
+     * Round up so sleep(1) still blocks for at least one tick. */
+    uint32_t ticks = (ms + 9u) / 10u;
+    if (ticks == 0) {
+        scheduler_yield();
+        return 0;
+    }
+    task_sleep(ticks);
+    return 0;
+}
+
+/*-----------------------------------------------------------------------------
+ * System Call: Waitpid
+ * Block until the process `pid` has exited; returns its exit status, or
+ * -ECHILD if no such live process exists. Uses tick-sleep polling (the
+ * process table has no parent/child waiter lists); each poll costs one
+ * 10 ms tick of latency, which is fine for an educational OS.
+ *
+ * SECURITY: only root or the owner of the target process may wait on it —
+ * prevents an unprivileged process from siphoning another user's exit codes.
+ *-----------------------------------------------------------------------------*/
+int sys_waitpid(int pid) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (pid <= 0 || (uint32_t)pid == self->pid) {
+        return -EINVAL;
+    }
+
+    task_t* target = task_get(pid);
+    if (!target) {
+        return -ECHILD;
+    }
+    if (self->euid != 0 && target->uid != self->uid) {
+        return -EPERM;
+    }
+
+    while (1) {
+        task_t* child = task_get(pid);
+        if (!child) {
+            /* Slot already recycled — exited, status lost */
+            return 0;
+        }
+        if (child->state == TASK_STATE_ZOMBIE ||
+            child->state == TASK_STATE_TERMINATED) {
+            return child->exit_status;
+        }
+        task_sleep(1);
+    }
+}
+
 /*=============================================================================
  * USER/GROUP MANAGEMENT SYSCALLS (v1.10)
  *===========================================================================*/
@@ -1342,6 +1405,14 @@ static void syscall_dispatch(struct cpu_state* state) {
              * arg2 = size (uint32_t)
              *===============================================================*/
             ret = sys_mseal(arg1, arg2);
+            break;
+
+        case SYS_SLEEP:
+            ret = sys_sleep(arg1);
+            break;
+
+        case SYS_WAITPID:
+            ret = sys_waitpid((int)arg1);
             break;
 
         default:

@@ -29,6 +29,10 @@
 /* Cryptographic Operations (v1.13) */
 #define SYS_CRYPTO     13   // Cryptographic operations (DH, RSA, etc.)
 
+/* Blocking primitives (v2.2) */
+#define SYS_SLEEP      17   // Sleep for N milliseconds (blocks, timer wake)
+#define SYS_WAITPID    18   // Wait for a child process to exit
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -165,6 +169,8 @@ int sys_write(int fd, const char* buf, size_t len);
 int sys_read(char* buf, size_t len);
 int sys_getpid(void);
 void sys_yield(void);
+int sys_sleep(uint32_t ms);
+int sys_waitpid(int pid);
 
 /* User/Group Management Syscalls (v1.10) */
 uint16_t sys_getuid(void);
