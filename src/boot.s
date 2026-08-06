@@ -26,7 +26,19 @@ dd MB2_LEN
 dd MB2_CSUM
 
 
+; framebuffer request tag (type 5): ask GRUB for a 640x480x32 linear
+; framebuffer. flags bit0 = optional, so boot still succeeds in plain VGA
+; text mode if the platform cannot provide one (fbcon.c then stays inactive).
+align 8, db 0
+dw 5   ; type = framebuffer
+dw 1   ; flags = optional
+dd 20  ; size
+dd 640 ; width
+dd 480 ; height
+dd 32  ; depth (bpp)
+
 ; required end tag
+align 8, db 0
 dw 0 ; type
 dw 0 ; flags
 dd 8 ; size

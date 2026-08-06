@@ -18,6 +18,7 @@
 #include "kprintf.h"
 #include "critical.h"
 #include "util.h"  /* For kernel_panic() */
+#include "fbcon.h" /* Framebuffer range for pre-paging identity map */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -577,6 +578,24 @@ void pae_init(void) {
         kprintf("[PAE] W^X enforcement limited\n");
     }
 
+    /* Map the VBE linear framebuffer (fbcon), if active. It lives above RAM
+     * (e.g. 0xFD000000 on QEMU) so the identity-map loop above never covers
+     * it, and the very next kprintf after paging goes live would page-fault.
+     * Must happen before CR3 load / CR0.PG. Write-through, supervisor-only,
+     * and NX where available (bit 63 is reserved without EFER.NXE — e.g. v86). */
+    {
+        uint32_t fb_phys, fb_size;
+        if (fbcon_get_range(&fb_phys, &fb_size)) {
+            uint64_t fb_flags = PAE_PRESENT | PAE_READWRITE | PAE_WRITETHROUGH |
+                                (nx_enabled ? PAE_NX : 0);
+            for (uint32_t off = 0; off < fb_size; off += 4096u) {
+                pae_map_page(fb_phys + off, (uint64_t)fb_phys + off, fb_flags);
+            }
+            kprintf("[PAE] Mapped framebuffer 0x%08x (%u KB)\n",
+                    fb_phys, fb_size / 1024u);
+        }
+    }
+
     /* Step 6: Enable PAE in CR4 */
     kprintf("[PAE] Enabling CR4.PAE bit\n");
 
@@ -974,26 +993,19 @@ uint32_t pae_create_user_pdpt(void) {
             pae_atomic_write_pde(&new_pd[j], 0);
         }
 
-        /* Copy kernel mappings from current page directory */
-        /* Identity-mapped kernel space (size determined by pmm_total_frames()) */
-        /* In PAE: Each PD entry maps 2 MB, need enough entries to cover all RAM */
-        /* These mappings are in PD[0] (first 1 GB virtual address space) */
-        if (i == 0) {
-            kprintf("[PAE] Copying kernel mappings to PD[0]...\n");
-            /* Copy all mapped entries (up to 512 entries = 1 GB max per PD) */
-            for (int j = 0; j < PAE_PD_ENTRIES; j++) {
-                /*=============================================================
-                 * SECURITY FIX (Issue 7.1): Use atomic write for PDE copy
-                 *===========================================================*/
-                pae_atomic_write_pde(&new_pd[j], page_directories[0][j]);
-                if (new_pd[j] & PAE_PRESENT) {
-                    kprintf("[PAE]   PD[0][%d] = 0x%016llx\n", j, new_pd[j]);
-                }
-            }
+        /* Copy kernel mappings from the current page directories.
+         * PD[0] holds the RAM identity map (kernel + user link range; user
+         * PTEs are copy-on-write'd into private PTs by pae_map_page_into).
+         * PD[3] holds supervisor-only MMIO such as the VBE framebuffer
+         * (0xFD000000) — it MUST be present in user PDPTs or any fbcon
+         * output while a user CR3 is active page-faults and triple-faults.
+         * PD[1]/PD[2] are currently empty; copying them is a no-op. */
+        for (int j = 0; j < PAE_PD_ENTRIES; j++) {
+            /*=============================================================
+             * SECURITY FIX (Issue 7.1): Use atomic write for PDE copy
+             *===========================================================*/
+            pae_atomic_write_pde(&new_pd[j], page_directories[i][j]);
         }
-
-        /* User-space entries (PD[1-3] entirely) already zeroed above */
-        /* PD[0] contains kernel identity mappings that were just copied */
     }
 
     kprintf("[PAE] Created user PDPT at phys=0x%08x\n", pdpt_phys);
