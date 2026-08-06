@@ -39,6 +39,7 @@ LDFLAGS := -T src/linker.ld -ffreestanding -nostdlib -Wl,--build-id=none
 SRC := \
   src/kernel.c \
   src/vga.c \
+  src/fbcon.c \
   src/multiboot.c \
   src/util.c \
   src/idt.c \

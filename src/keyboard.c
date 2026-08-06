@@ -8,6 +8,8 @@
 #include "pic.h"
 #include "critical.h"  /* For atomic buffer access */
 #include "serial.h"    /* For serial input fallback */
+#include "process.h"   /* task_current(): gate blocking reads on task context */
+#include "wait_queue.h" /* Blocking keyboard reads (v2.2) */
 
 /*-----------------------------------------------------------------------------
  * Scancode to ASCII Translation Tables
@@ -108,10 +110,20 @@ static inline int buffer_count(void) {
     return (buffer_write_pos - buffer_read_pos + KBD_BUFFER_SIZE) % KBD_BUFFER_SIZE;
 }
 
+/* Tasks blocked in keyboard_getchar() waiting for input (v2.2) */
+static wait_queue_t kbd_waitq;
+
 static inline void buffer_put(char c) {
     if (!buffer_is_full()) {
         input_buffer[buffer_write_pos] = c;
         buffer_write_pos = (buffer_write_pos + 1) % KBD_BUFFER_SIZE;
+
+        /* Wake one blocked reader. Runs in IRQ context with interrupts
+         * already off; critical sections nest, and wakeup only moves the
+         * task to the ready queue (no immediate switch). */
+        CRITICAL_SECTION_ENTER();
+        wait_queue_wakeup(&kbd_waitq);
+        CRITICAL_SECTION_EXIT();
 
         /*
          * CRITICAL: Memory barrier to ensure IRQ handler's writes are visible
@@ -332,6 +344,9 @@ void keyboard_init(void) {
     buffer_read_pos = 0;
     buffer_write_pos = 0;
 
+    /* No blocked readers yet */
+    wait_queue_init(&kbd_waitq);
+
     /*=========================================================================
      * INITIALIZATION: Initialize keyboard state, but don't unmask IRQ yet
      *
@@ -374,11 +389,35 @@ char keyboard_getchar(void) {
      * FUTURE: For production OS, implement per-process keyboard buffers or
      * proper TTY discipline layers to isolate input streams.
      *=======================================================================*/
-    /* Block until character is available */
-    while (buffer_is_empty()) {
-        __asm__ volatile("hlt");
+    /* Block until character is available.
+     *
+     * v2.2: In task context (scheduler running), block on a wait queue so the
+     * reader leaves the ready queue entirely; the keyboard IRQ wakes it. The
+     * empty-check is re-done under the critical section to close the race
+     * where the IRQ fires between the check and the sleep. Before the
+     * scheduler starts (first-boot setup, early login), task_current() is
+     * NULL and we fall back to the original hlt poll. */
+    for (;;) {
+        while (buffer_is_empty()) {
+            if (task_current() != NULL) {
+                CRITICAL_SECTION_ENTER();
+                if (buffer_is_empty()) {
+                    wait_queue_sleep(&kbd_waitq);  /* releases critical section */
+                } else {
+                    CRITICAL_SECTION_EXIT();
+                }
+            } else {
+                __asm__ volatile("hlt");
+            }
+        }
+        /* buffer_get() re-checks emptiness internally and returns 0 if
+         * another consumer drained the buffer between our loop exit and the
+         * fetch — re-block instead of delivering a spurious NUL. */
+        char c = buffer_get();
+        if (c != 0) {
+            return c;
+        }
     }
-    return buffer_get();
 }
 
 char keyboard_getchar_nonblock(void) {

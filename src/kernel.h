@@ -70,9 +70,25 @@ struct PACKED mb1_mmap_entry {
 /* ------------------------- Multiboot v2 ------------------------- */
 struct PACKED mb2_tag { uint32_t type, size; };
 
-enum { MB2_TAG_END = 0, MB2_TAG_CMDLINE = 1, MB2_TAG_BOOTLOADER = 2, MB2_TAG_MMAP = 6 };
+enum { MB2_TAG_END = 0, MB2_TAG_CMDLINE = 1, MB2_TAG_BOOTLOADER = 2, MB2_TAG_MMAP = 6,
+       MB2_TAG_FRAMEBUFFER = 8 };
 
 struct PACKED mb2_tag_string { uint32_t type, size; char str[]; };
+
+/* Framebuffer info tag (type 8). The trailing RGB field descriptors are only
+ * valid when fb_type == 1 (direct RGB color). */
+struct PACKED mb2_tag_framebuffer {
+    uint32_t type, size;
+    uint64_t addr;                 /* physical framebuffer address */
+    uint32_t pitch;                /* bytes per scanline */
+    uint32_t width, height;        /* pixels */
+    uint8_t  bpp;
+    uint8_t  fb_type;              /* 0=indexed, 1=RGB, 2=EGA text */
+    uint16_t reserved;
+    uint8_t  red_pos,   red_mask_size;
+    uint8_t  green_pos, green_mask_size;
+    uint8_t  blue_pos,  blue_mask_size;
+};
 
 struct PACKED mb2_tag_mmap {
     uint32_t type, size;

@@ -4,6 +4,7 @@
 #include "kernel.h"
 #include "pic.h"
 #include "critical.h"  /* For interrupt protection (race condition fix) */
+#include "fbcon.h"     /* Framebuffer console backend (VBE via Multiboot2) */
 
 /*=============================================================================
  * VGA BUFFER POINTER
@@ -190,6 +191,8 @@ static void cursor_enable(void) {
  *
  *============================================================================*/
 void console_clear(void) {
+    if (fbcon_active()) { fbcon_clear(); return; }
+
     uint32_t flags = disable_interrupts();
 
     for (uint32_t y = 0; y < VGA_HEIGHT; ++y)
@@ -266,6 +269,8 @@ static void advance(void) {
  *
  *============================================================================*/
 void console_backspace(void) {
+    if (fbcon_active()) { fbcon_backspace(); return; }
+
     uint32_t flags = disable_interrupts();
 
     /* Only move back if not at start of screen */
@@ -306,6 +311,8 @@ void console_backspace(void) {
  *
  *============================================================================*/
 void console_putc(char c) {
+    if (fbcon_active()) { fbcon_putc(c); return; }
+
     /*=========================================================================
      * ARCHITECTURE (v1.13): Special Character Handling
      *
@@ -526,6 +533,8 @@ void console_put_dec_i32(int32_t v){
  *   y - Row position (0-24)
  *============================================================================*/
 void console_putchar_at(char c, uint8_t x, uint8_t y) {
+    if (fbcon_active()) { fbcon_putchar_at(c, x, y); return; }
+
     if (x >= VGA_WIDTH || y >= VGA_HEIGHT) return;
     vga_put_at(c, attr, x, y);
 }
@@ -543,6 +552,8 @@ void console_putchar_at(char c, uint8_t x, uint8_t y) {
  *   y - Row position (0-24)
  *============================================================================*/
 void console_set_cursor_pos(uint8_t x, uint8_t y) {
+    if (fbcon_active()) { fbcon_set_cursor_pos(x, y); return; }
+
     uint32_t flags = disable_interrupts();
 
     if (x >= VGA_WIDTH) x = VGA_WIDTH - 1;

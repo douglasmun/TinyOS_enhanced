@@ -149,6 +149,7 @@ void wait_queue_sleep(wait_queue_t* wq) {
     /* Add task to wait queue (atomic with interrupts disabled) */
     wq->waiting_tasks[wq->count] = current;
     wq->count++;
+    current->blocked_on_wq = wq;
 
     /*=========================================================================
      * DEBUGGING OUTPUT
@@ -246,6 +247,7 @@ void wait_queue_wakeup(wait_queue_t* wq) {
     }
     wq->waiting_tasks[wq->count - 1] = NULL;
     wq->count--;
+    task_to_wake->blocked_on_wq = NULL;
 
     /*=========================================================================
      * DEBUGGING OUTPUT
@@ -307,8 +309,43 @@ void wait_queue_wakeup_all(wait_queue_t* wq) {
         }
         wq->waiting_tasks[wq->count - 1] = NULL;
         wq->count--;
+        task_to_wake->blocked_on_wq = NULL;
 
         /* Wake the task */
         scheduler_wakeup_task(task_to_wake);
     }
+}
+
+/*=============================================================================
+ * STALE-ENTRY REMOVAL (EXTERNAL TERMINATION)
+ *=============================================================================*/
+
+void wait_queue_remove_task(task_t* task) {
+    if (!task) {
+        return;
+    }
+
+    CRITICAL_SECTION_ENTER();
+
+    /* blocked_on_wq must be read under the critical section: an IRQ-context
+     * wait_queue_wakeup between an unlocked check and the lock would clear
+     * it, and dereferencing the stale value here would walk address 0. */
+    wait_queue_t* wq = (wait_queue_t*)task->blocked_on_wq;
+    if (!wq) {
+        CRITICAL_SECTION_EXIT();
+        return;
+    }
+    for (int i = 0; i < wq->count; i++) {
+        if (wq->waiting_tasks[i] == task) {
+            for (int j = i; j < wq->count - 1; j++) {
+                wq->waiting_tasks[j] = wq->waiting_tasks[j + 1];
+            }
+            wq->waiting_tasks[wq->count - 1] = NULL;
+            wq->count--;
+            break;
+        }
+    }
+    task->blocked_on_wq = NULL;
+
+    CRITICAL_SECTION_EXIT();
 }

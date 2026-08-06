@@ -679,6 +679,17 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
     }
 
     mutex_unlock(&fat32_mutex);
+
+    /* A zero-byte result here is NOT EOF: position < file_size was verified
+     * above, so the only way to copy nothing is a cluster chain that ended
+     * early (directory entry's file_size larger than the chain — corruption).
+     * Returning 0 would be indistinguishable from EOF and let callers treat
+     * a truncated file as complete. */
+    if (bytes_read == 0 && size > 0) {
+        kprintf("[FAT32] ERROR: Cluster chain shorter than file size "
+                "(corrupt directory entry?)\n");
+        return -1;
+    }
     return bytes_read;
 }
 

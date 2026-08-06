@@ -164,6 +164,18 @@ void wait_queue_wakeup(wait_queue_t* wq);
  */
 void wait_queue_wakeup_all(wait_queue_t* wq);
 
+/*=============================================================================
+ * FUNCTION: wait_queue_remove_task
+ * PURPOSE: Detach a task from whatever wait queue it is blocked on (if any)
+ *=============================================================================
+ * Called from the external-termination path (task_terminate): a task killed
+ * while blocked on a wait queue would otherwise leave a stale pointer in the
+ * queue that silently consumes a later wakeup (or spuriously wakes whatever
+ * task recycles the slot). Uses the task's blocked_on_wq back-pointer; no-op
+ * when the task is not on a queue. Takes its own critical section (nests).
+ *=============================================================================*/
+void wait_queue_remove_task(task_t* task);
+
 /**
  * @brief Get number of tasks waiting on queue
  *

@@ -2,6 +2,7 @@
  *  kernel.c Ã¢â‚¬â€œ TinyOS Main Kernel Entry Point and Initialization
  *=============================================================================*/
 #include "kernel.h"
+#include "fbcon.h"
 #include "idt.h"
 #include "pmm.h"
 #include "paging.h"
@@ -110,8 +111,20 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     /* Initialize serial port (COM1) for debug output */
     serial_init();
 
-    /* Clear VGA screen and reset cursor */
+    /* Activate the framebuffer console if GRUB honored the Multiboot2
+     * framebuffer tag (boot.s). Must run before the first console output;
+     * falls back silently to VGA text mode when no usable mode was set. */
+    fbcon_early_init(magic, (const void*)(uintptr_t)info_ptr);
+
+    /* Clear screen (framebuffer or VGA text) and reset cursor */
     console_clear();
+
+    if (fbcon_active()) {
+        uint32_t fb_w, fb_h, fb_cols, fb_rows;
+        fbcon_get_mode(&fb_w, &fb_h, &fb_cols, &fb_rows);
+        kprintf("[FBCON] Framebuffer console %ux%ux32 (%ux%u text)\n",
+                fb_w, fb_h, fb_cols, fb_rows);
+    }
 
     /* Disable interrupts during initialization */
     __asm__ volatile("cli");

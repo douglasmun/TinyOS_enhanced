@@ -26,6 +26,10 @@ KEYMAP = {
     ".": "dot",
     "-": "minus",
     "_": "shift-minus",
+    ";": "semicolon",
+    ":": "shift-semicolon",
+    ",": "comma",
+    "=": "equal",
 }
 for c in "abcdefghijklmnopqrstuvwxyz0123456789":
     KEYMAP[c] = c
@@ -145,15 +149,19 @@ def main():
     type_str(sock, "n\n")
 
     # 4) At the shell, run the signed exec as the FIRST command
-    #    (give the shell a beat to draw its prompt)
+    #    (give the shell a beat to draw its prompt).
+    #    Overridable so harnesses can exercise other binaries/paths
+    #    (e.g. TINYOS_EXEC_CMD="exec C:/info.elf").
+    exec_cmd = os.environ.get("TINYOS_EXEC_CMD", "exec /hello.elf")
+    expect = os.environ.get("TINYOS_EXPECT", "Hello from ELF")
     time.sleep(2)
-    print("typist: sending 'exec /hello.elf'")
-    type_verified(sock, "exec /hello.elf\n", timeout=60)
+    print(f"typist: sending '{exec_cmd}'")
+    type_verified(sock, exec_cmd + "\n", timeout=60)
 
     # 5) Wait for the ENFORCE verify result + the program output
     try:
-        wait_for("Hello from ELF", timeout=240, since=end)
-        print("typist: 'Hello from ELF!' observed")
+        wait_for(expect, timeout=240, since=end)
+        print(f"typist: '{expect}' observed")
     except SystemExit as e:
         # surface whatever we got; the bash verdict will classify
         print(str(e), file=sys.stderr)
