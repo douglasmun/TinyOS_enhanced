@@ -2,7 +2,25 @@
 
 Educational 32-bit (i386) Multiboot2 kernel in freestanding C + NASM. Single CPU,
 interrupt-driven, round-robin scheduler with kernel threads and ring-3 user processes.
-No libc — only the kernel's own helpers (`util.c` memcpy/memset/strlen, `kprintf`, etc.).
+No kernel libc — only the kernel's own helpers (`util.c` memcpy/memset/strlen,
+`kprintf`, etc.). Userspace has a tiny libc (`userspace/libc.{h,c}`, PR #26).
+
+## To-do next (post-v2.2 roadmap)
+
+Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
+1. **Background jobs** — `exec foo.elf &`, `ps`/`kill` for user processes
+   (`cmd_exec` currently blocks, so only one user process ever runs); make
+   `sys_waitpid` block on a wait queue instead of tick-polling (exit-record
+   ring stays as the status store).
+2. **SYS_SPAWN + pipes** — processes starting processes, shell pipelines.
+   Skip `fork()` (PAE, no COW pages).
+3. **FAT32 write support** — cluster alloc + dirent update + `vfs_write`.
+4. **Userspace shell** (capstone, depends on 1–3).
+
+Fold into whichever PR comes first (low-severity, known): `unmap_page_range`
+is a PAE no-op (failed ELF loads leak PT frames); `cmd_exec` doesn't reap
+task/PDPT on `task_create_user` failure; user guard page not wired into the
+#PF handler; AUDIT-8E IDS-not-wired gap.
 
 ## Build & run
 
