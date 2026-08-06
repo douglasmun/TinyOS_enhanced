@@ -185,6 +185,7 @@ void sys_exit(int status) {
          * The scheduler's cleanup code will transition ZOMBIE → TERMINATED
          * after we've switched away and it's safe to free the stack.
          *===================================================================*/
+        current->exit_status = status;
         current->state = TASK_STATE_ZOMBIE;
 
         /* Step 4: Remove from ready queue NOW to avoid race condition */
@@ -534,24 +535,42 @@ int sys_waitpid(int pid) {
         return -EINVAL;
     }
 
-    task_t* target = task_get(pid);
-    if (!target) {
-        return -ECHILD;
+    /* Capture the target's generation up front so a recycled slot with a
+     * reused PID is never mistaken for the process we were asked to wait on
+     * (same PID-reuse hazard task_get_validated exists for). State and
+     * exit_status are only ever read under a critical section: the post-switch
+     * reaper frees/recycles the slot, and a preemption between lookup and read
+     * would otherwise hand back another task's fields. */
+    uint32_t generation;
+    CRITICAL_SECTION_ENTER();
+    {
+        task_t* target = task_get(pid);
+        if (!target) {
+            CRITICAL_SECTION_EXIT();
+            return -ECHILD;
+        }
+        if (self->euid != 0 && target->uid != self->uid) {
+            CRITICAL_SECTION_EXIT();
+            return -EPERM;
+        }
+        generation = target->generation;
     }
-    if (self->euid != 0 && target->uid != self->uid) {
-        return -EPERM;
-    }
+    CRITICAL_SECTION_EXIT();
 
     while (1) {
-        task_t* child = task_get(pid);
+        CRITICAL_SECTION_ENTER();
+        task_t* child = task_get_validated(pid, generation);
         if (!child) {
-            /* Slot already recycled — exited, status lost */
+            /* Exited and reaped (or slot recycled) — status lost */
+            CRITICAL_SECTION_EXIT();
             return 0;
         }
-        if (child->state == TASK_STATE_ZOMBIE ||
-            child->state == TASK_STATE_TERMINATED) {
-            return child->exit_status;
+        if (child->state == TASK_STATE_ZOMBIE) {
+            int status = child->exit_status;
+            CRITICAL_SECTION_EXIT();
+            return status;
         }
+        CRITICAL_SECTION_EXIT();
         task_sleep(1);
     }
 }

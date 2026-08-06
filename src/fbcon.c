@@ -305,7 +305,13 @@ void fbcon_early_init(uint32_t magic, const void* mb2_info) {
     const uint32_t w = fbtag->width, h = fbtag->height;
     if (w < FBCON_MIN_WIDTH || w > FBCON_MAX_WIDTH) return;
     if (h < FBCON_MIN_HEIGHT || h > FBCON_MAX_HEIGHT) return;
-    if (fbtag->pitch < w * 4u) return;
+    /* Bound pitch both ways: below by the row's pixel data, above by the
+     * widest supported mode. An unbounded bootloader-supplied pitch would
+     * overflow the 32-bit fb_height * fb_pitch products in fb_line() and
+     * fbcon_get_range(), mapping the wrong range and writing outside it. */
+    if (fbtag->pitch < w * 4u || fbtag->pitch > FBCON_MAX_WIDTH * 4u) return;
+    /* The whole framebuffer must fit below 4 GB (PAE32-addressable). */
+    if (fbtag->addr + (uint64_t)h * fbtag->pitch > 0x100000000ULL) return;
     /* RGB field positions must fit a 32-bit pixel */
     if (fbtag->red_pos > 24u || fbtag->green_pos > 24u || fbtag->blue_pos > 24u)
         return;

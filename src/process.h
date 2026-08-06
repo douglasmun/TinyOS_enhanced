@@ -281,6 +281,9 @@ typedef struct task {
     // Exit status (for ZOMBIE state)
     int exit_status;                 // Exit status code for zombies
 
+    // Wait-queue back-pointer (void* to avoid a header cycle with wait_queue.h)
+    void* blocked_on_wq;             // wait_queue_t* while blocked on one, else NULL
+
     // Context switch tracking
     bool has_run_before;             // true if task has been switched to at least once
 

@@ -11,6 +11,7 @@
 #include "stdio.h"
 #include "aslr.h"    /* For stack randomization */
 #include "critical.h" /* For CRITICAL_SECTION macros (Issue 5.1) */
+#include "wait_queue.h" /* For wait_queue_remove_task() on external kill */
 #include "vfs.h"     /* For capability flags (CAP_ALL, etc.) - EDR Phase 1 */
 #include "edr_behavioral.h"  /* EDR Phase 2: Behavioral detection */
 #include "edr_advanced.h"    /* EDR Phase 3: Advanced detection */
@@ -703,6 +704,7 @@ int task_create_kernel(void (*entry)(void), const char* name) {
 
     // Exit status
     task->exit_status = 0;
+    task->blocked_on_wq = NULL;
 
     // Initialize per-process stream context (stdin/stdout/stderr)
     streams_init(&task->streams);
@@ -1076,6 +1078,7 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
 
     // Exit status
     task->exit_status = 0;
+    task->blocked_on_wq = NULL;
 
     // Initialize per-process stream context (stdin/stdout/stderr)
     streams_init(&task->streams);
@@ -1384,6 +1387,11 @@ void task_terminate(uint32_t pid) {
         }
 
         kprintf("[PROCESS] Terminating task PID=%d '%s'\n", task->pid, task->name);
+
+        // A task killed while blocked on a wait queue must be detached from it,
+        // or the stale entry consumes a later wakeup / spuriously wakes the
+        // slot's next occupant. No-op unless blocked_on_wq is set.
+        wait_queue_remove_task(task);
 
         // Clean up streams (close any open file descriptors)
         streams_cleanup(&task->streams);
