@@ -201,6 +201,16 @@ typedef struct task {
     uint32_t user_stack_pages_phys[256];  // Physical addresses of user stack pages (max 256 pages = 1MB)
     uint16_t user_stack_pages;       // Number of user stack pages actually allocated (configurable: 8-256)
     uint32_t user_guard_page_phys;   // Physical address of user stack guard page (for stack overflow detection)
+    uint32_t user_guard_page_virt;   // Virtual address the guard is mapped at (CR2 compare in the #PF handler)
+
+    /* Parent process, recorded as a {pid, generation} VALUE PAIR rather than a
+     * task_t* on purpose: a parent can exit and have its slot recycled while
+     * the child is still alive, and a raw pointer would then alias an
+     * unrelated task (the PID-reuse hazard task_get_validated exists for).
+     * Zero pid = no parent (kernel tasks, the shell itself). Used by `jobs`
+     * to list a shell's own children. */
+    uint32_t parent_pid;
+    uint32_t parent_generation;
     uint32_t guard_page_phys;        // Physical address of kernel stack guard page (for stack overflow detection)
     uint32_t stack_pages_phys[KERNEL_TASK_STACK_PAGES];   // Physical addresses of kernel stack pages (KERNEL_TASK_STACK_PAGES for kernel tasks, 8 for user tasks)
 

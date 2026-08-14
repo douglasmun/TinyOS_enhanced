@@ -152,6 +152,61 @@ void cmd_ps_extended(int argc, char** argv) {
 }
 
 /*=============================================================================
+ * COMMAND: jobs - List background processes started by this shell
+ *
+ * Unlike `ps` (every task on the system), this lists only children of the
+ * calling shell — the processes `exec ... &` started from this session.
+ *
+ * Parent identity is matched on the {pid, generation} PAIR, never pid alone:
+ * PIDs are random 16-bit values that get recycled, so a bare pid comparison
+ * could show an unrelated task as this shell's child after the original
+ * parent's slot was reused.
+ *=============================================================================*/
+void cmd_jobs(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+
+    stream_context_t* ctx = get_current_streams();
+
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        stream_printf(ctx, "jobs: no current task context\n");
+        return;
+    }
+    uint32_t self_pid = self->pid;
+    uint32_t self_gen = self->generation;
+
+    task_t** tasks;
+    int count;
+
+    CRITICAL_SECTION_ENTER();
+    count = scheduler_get_all_tasks(&tasks);
+    CRITICAL_SECTION_EXIT();
+
+    int shown = 0;
+    for (int i = 0; i < count; i++) {
+        task_t* task = tasks[i];
+
+        if (!task || task->pid == 0) continue;
+        if (task->state == TASK_STATE_TERMINATED) continue;
+        if (task->parent_pid != self_pid) continue;
+        if (task->parent_generation != self_gen) continue;
+
+        if (shown == 0) {
+            stream_printf(ctx, "PID  STATE  NAME\n");
+            stream_printf(ctx, "---  -----  ----\n");
+        }
+        stream_printf(ctx, "%-3d  %-5s  %s\n",
+                      task->pid, get_state_string(task->state), task->name);
+        shown++;
+    }
+
+    if (shown == 0) {
+        stream_printf(ctx, "No background jobs\n");
+    }
+}
+
+/*=============================================================================
  * COMMAND: top - Real-time system monitor
  *=============================================================================*/
 void cmd_top(int argc, char** argv) {

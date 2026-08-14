@@ -14,6 +14,7 @@
 #include "editor.h"
 #include "stdio.h"
 #include "critical.h"
+#include "syscall.h"   /* For sys_waitpid() — foreground exec blocks on it */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -1323,19 +1324,35 @@ void cmd_rm(int argc, char* argv[]) {
 
 void cmd_exec(int argc, char* argv[]) {
     if (argc < 2) {
-        kprintf("Usage: exec <file>\n");
+        kprintf("Usage: exec <file> [&]\n");
         return;
     }
+
+    /* A trailing "&" runs the process in the background: load it, add it to
+     * the scheduler and return to the prompt immediately instead of blocking
+     * until it exits. The shell tokenizer splits on spaces, so "&" arrives as
+     * its own argv entry ("exec foo.elf&" without a space is NOT treated as
+     * background — it would name a file "foo.elf&", which is what the user
+     * literally typed). */
+    bool background = (argc >= 3 && strcmp(argv[argc - 1], "&") == 0);
 
     const char* path = argv[1];
     char abs_path[MAX_PATH];
 
     /*
-     * Static (not stack) buffer: cmd_exec runs on the shell's 64KB task
-     * kernel stack, and the ELF verify path (SHA-256 + ECDSA) is deep. A
+     * Static (not stack) buffer: cmd_exec runs on the shell's kernel task
+     * stack (KERNEL_TASK_STACK_PAGES = 32 pages = 128KB; it was 64KB when
+     * this comment was first written, which the full signed-exec chain
+     * overflowed), and the ELF verify path (SHA-256 + ECDSA) is deep. A
      * 16KB stack buffer here previously overflowed the task stack and
-     * silently corrupted the signature hash computation. cmd_exec is only
-     * invoked from the single-threaded shell, so a static buffer is safe.
+     * silently corrupted the signature hash computation.
+     *
+     * INVARIANT: cmd_exec is invoked only from the single-threaded shell, so
+     * one load is ever in flight and a static buffer is safe. Background jobs
+     * preserve this — `exec foo.elf &` still returns through this one caller
+     * before the next command is read. A future SYS_SPAWN (roadmap item 2)
+     * would let a *process* trigger a load concurrently and BREAK it; that
+     * change must give the buffer a lock or a per-caller allocation.
      */
     static uint8_t exec_buffer[EXEC_BUFFER_SIZE];
 
@@ -1445,7 +1462,14 @@ void cmd_exec(int argc, char* argv[]) {
     int pid = elf_load_process(exec_buffer, file_size, proc_name);
 
     if (pid < 0) {
-        kprintf("[EXEC] ERROR: Failed to load ELF executable\n");
+        /* elf_load_process owns its own teardown: every failure path after
+         * task_create_user goes through elf_abort_load(), which restores
+         * kernel CR3 and task_terminate()s the partial process (freeing the
+         * PDPT, page tables, stacks and slot). Nothing to reap here — a
+         * second task_terminate() on the freed slot would risk hitting a
+         * recycled task. */
+        stream_printf(get_current_streams(),
+                      "exec: failed to load '%s'\n", path);
         return;
     }
 
@@ -1457,19 +1481,25 @@ void cmd_exec(int argc, char* argv[]) {
         scheduler_add_task(task);
         kprintf("[EXEC] Process added to scheduler\n");
 
-        // Wait for child process to terminate. Poll with generation
-        // validation, same as sys_waitpid: PIDs are random 16-bit values and
-        // the allocator can hand a just-reaped child's PID to a new task, so
-        // a bare task_get(pid) loop could latch onto an unrelated process.
-        kprintf("[EXEC] Waiting for process to complete...\n");
-        uint32_t child_generation = task->generation;
-        while (1) {
-            task_t* child = task_get_validated(pid, child_generation);
-            if (!child || child->state == TASK_STATE_TERMINATED) {
-                break;  // Child has finished
-            }
-            task_sleep(1);  // Block a tick (10 ms) instead of yield-spinning
+        if (background) {
+            /* Background: hand the process to the scheduler and return to the
+             * prompt. No wait, and no reap here — the scheduler's post-switch
+             * cleanup queue enqueues any ZOMBIE/TERMINATED task unconditionally
+             * (scheduler.c), so an unwaited background child is still reaped.
+             * Use `ps` to watch it and `jobs` to list this shell's children. */
+            stream_printf(get_current_streams(), "[%d] %s\n", pid, proc_name);
+            return;
         }
+
+        // Wait for the child to terminate via the same wait-queue path
+        // userspace waitpid() uses, rather than a second hand-rolled poll
+        // loop: one blocking implementation to get right, and every
+        // foreground `exec` exercises it. sys_waitpid does its own generation
+        // validation (PIDs are random 16-bit values and the allocator can hand
+        // a just-reaped child's PID to a new task) and returns as soon as the
+        // child is recorded dead, so no tick-granular polling is involved.
+        kprintf("[EXEC] Waiting for process to complete...\n");
+        sys_waitpid(pid);
 
         /*
          * CRITICAL: Reap the zombie process
@@ -1492,7 +1522,13 @@ void cmd_exec(int argc, char* argv[]) {
 
         kprintf("[EXEC] Process completed\n");
     } else {
+        /* Loaded successfully but the slot vanished before we could schedule
+         * it (terminated mid-load, e.g. an EDR false positive). The image and
+         * its address space are still allocated, so reap them rather than
+         * leaking a fully-built process. task_terminate is a no-op if the
+         * slot is already gone. */
         kprintf("[EXEC] WARNING: Could not find task to add to scheduler\n");
+        task_terminate((uint32_t)pid);
     }
 }
 

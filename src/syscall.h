@@ -99,7 +99,11 @@
  * SECURITY (v1.11): Maximum syscall number for range validation
  * Update this whenever adding new syscalls
  *-----------------------------------------------------------------------------*/
-#define MAX_SYSCALL_NUM  16  // Highest valid syscall number (updated for Phase 14)
+/* Must cover the HIGHEST number defined above, not the highest in this block:
+ * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
+ * dispatcher cases, but this bound stayed at 16 when they were added, so the
+ * range check rejected both before dispatch and userspace could never block. */
+#define MAX_SYSCALL_NUM  18  // Highest valid syscall number (SYS_WAITPID)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -171,6 +175,19 @@ int sys_getpid(void);
 void sys_yield(void);
 int sys_sleep(uint32_t ms);
 int sys_waitpid(int pid);
+
+/*-----------------------------------------------------------------------------
+ * Record a process death and wake every sys_waitpid() waiter.
+ *
+ * sys_exit calls this on the clean-exit path. task_terminate MUST call it too:
+ * a process killed externally (kill, #PF, guard-page hit) never runs sys_exit,
+ * and since waiters now BLOCK on a wait queue instead of polling every tick,
+ * an unwoken waiter would hang forever rather than merely noticing late.
+ *
+ * Takes its own critical section (they nest), so callers already inside one —
+ * such as sys_exit's cleanup window — can call it directly.
+ *---------------------------------------------------------------------------*/
+void waitpid_notify_death(uint32_t pid, uint32_t generation, int status);
 
 /* User/Group Management Syscalls (v1.10) */
 uint16_t sys_getuid(void);

@@ -140,3 +140,6 @@ doc/TinyOS_review_20251116.txt
 doc/Understanding QEMU debug log.txt
 doc/WX_PAE_IMPLEMENTATION_PLAN.md
 doc/vibe-code-your-own-OS-readme.txt
+bgjobs.log
+bgjobs-trace.log
+scratchpad/

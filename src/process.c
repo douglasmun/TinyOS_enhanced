@@ -12,6 +12,7 @@
 #include "aslr.h"    /* For stack randomization */
 #include "critical.h" /* For CRITICAL_SECTION macros (Issue 5.1) */
 #include "wait_queue.h" /* For wait_queue_remove_task() on external kill */
+#include "syscall.h"    /* For waitpid_notify_death() on external kill */
 #include "vfs.h"     /* For capability flags (CAP_ALL, etc.) - EDR Phase 1 */
 #include "edr_behavioral.h"  /* EDR Phase 2: Behavioral detection */
 #include "edr_advanced.h"    /* EDR Phase 3: Advanced detection */
@@ -565,6 +566,7 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     task->kernel_stack_phys = stack_pages[0];  // First stack page (for compatibility)
     // No user stack for kernel tasks
     task->user_guard_page_phys = 0;
+    task->user_guard_page_virt = 0;
     task->user_stack_pages = 0;  // Kernel tasks have no user stack
     for (int i = 0; i < 256; i++) {  // Max 256 pages (1MB)
         task->user_stack_pages_phys[i] = 0;
@@ -801,6 +803,17 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
     /* SECURITY (v1.11): Use safe_strcpy with full buffer size */
     safe_strcpy(task->name, name, TASK_NAME_LEN);
 
+    /* Record the creator as parent: whoever is running when a user task is
+     * created is the process that started it (the shell, for `exec`). Stored
+     * as {pid, generation} so a recycled parent slot can never be mistaken for
+     * the real parent. memset above already left these zero (= no parent) for
+     * the case where there is no current task (early boot). */
+    task_t* creator = scheduler_get_current_task();
+    if (creator) {
+        task->parent_pid = creator->pid;
+        task->parent_generation = creator->generation;
+    }
+
     // Allocate guard page and kernel stack (for syscalls) - same as kernel tasks
     uint32_t guard_page_phys = pmm_alloc();
     if (guard_page_phys == 0) {
@@ -1007,6 +1020,13 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
     map_page(user_guard_virt, user_guard_page_phys,
              (user_stack_flags & ~PAGE_PRESENT));  // Present=0
     flush_tlb_single(user_guard_virt);
+
+    /* Record the VIRTUAL address, not just the frame: a ring-3 fault reports
+     * CR2 as a user virtual address, and ASLR moves stack_base every exec, so
+     * the handler cannot recompute this. Storing only user_guard_page_phys
+     * (as before) left the handler with nothing to compare against, which is
+     * why user-stack overflow fell through to the generic page-fault path. */
+    task->user_guard_page_virt = user_guard_virt;
 
     /* Map user stack pages into USER page directory (virtual -> physical) */
     for (int i = 0; i < stack_pages; i++) {
@@ -1346,6 +1366,7 @@ void task_free_resources(task_t* task) {
             pmm_free(task->user_guard_page_phys);
             task->user_guard_page_phys = 0;
         }
+        task->user_guard_page_virt = 0;
         // Free all user stack pages (using actual allocated count)
         for (int i = 0; i < task->user_stack_pages; i++) {
             if (task->user_stack_pages_phys[i] != 0) {
@@ -1392,6 +1413,16 @@ void task_terminate(uint32_t pid) {
         // or the stale entry consumes a later wakeup / spuriously wakes the
         // slot's next occupant. No-op unless blocked_on_wq is set.
         wait_queue_remove_task(task);
+
+        // An externally killed task never runs sys_exit, so nothing else would
+        // record its status or wake anyone blocked in waitpid() on it. Waiters
+        // block on a wait queue rather than polling, so skipping this hangs
+        // them permanently instead of just delaying them a tick. 0x7F follows
+        // the shell convention for "died abnormally"; it is indistinguishable
+        // from a deliberate exit(127) until waitpid grows real WIFSIGNALED
+        // encoding, which is fine for now — the point is that the waiter is
+        // released at all.
+        waitpid_notify_death(task->pid, task->generation, 0x7F);
 
         // Clean up streams (close any open file descriptors)
         streams_cleanup(&task->streams);

@@ -88,7 +88,8 @@ Type `help` for the full command list. Commonly used commands:
 | `find`, `grep`, `echo` | Search and text utilities |
 | `mount` | Show mounted drives (`C:`=FAT32, `D:`=RAMFS) |
 | `fatls` | List files on the FAT32 `C:` drive |
-| `exec /hello.elf` | Load and run a **signed** user program in ring 3 |
+| `exec /hello.elf [&]` | Load and run a **signed** user program in ring 3 (`&` = background) |
+| `jobs` | List this shell's background jobs |
 | `ps`, `kill <pid>` | List / terminate processes |
 | `passwd [user]`, `su [user]`, `logout` | Account management |
 | `whoami`, `id`, `env`, `set`, `export`, `alias`, `history` | Session/environment |
@@ -107,6 +108,24 @@ The bundled `hello.elf`/`shell` are signed with that key, so they execute;
 unsigned or tampered binaries are **rejected (fail-closed)** by default. (For local
 development that accepts unsigned binaries, the kernel can be built with
 `-DELF_PERMISSIVE_SIGNATURES` — see the README. The demo ISO is the enforced build.)
+
+### Background jobs
+
+Append `&` to run a program in the background: the shell prints `[pid] name` and
+returns to the prompt immediately instead of blocking until the child exits.
+
+```
+$ exec /sleeper.elf &
+[25160] sleeper.elf
+Sleeper started
+$ jobs
+PID    STATE  NAME
+25160  SLEEP  sleeper.elf
+```
+
+`jobs` lists only *this* shell's children (matched on both PID and generation, so
+a recycled PID can't impersonate a job); `ps` shows every process on the system.
+A background job you never wait for is still reaped automatically when it exits.
 
 ---
 

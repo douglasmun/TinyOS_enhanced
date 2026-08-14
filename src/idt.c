@@ -254,6 +254,43 @@ void page_fault_handler(struct regs* r) {
         }
     }
 
+    /*=========================================================================
+     * USER STACK GUARD PAGE DETECTION
+     *
+     * Separate from the kernel check above: that one compares CR2 against
+     * PHYSICAL addresses (valid only because kernel stacks are identity
+     * mapped). A ring-3 fault reports CR2 as a USER VIRTUAL address in the
+     * faulting task's own PDPT, so the comparison must be against the guard's
+     * virtual address, recorded at task_create_user time (ASLR re-randomises
+     * the stack base every exec, so it cannot be recomputed here).
+     *
+     * Without this, a user-stack overflow — the exact case the guard page was
+     * armed for in commit 51e4f36 — fell through to the generic page-fault
+     * path below and reported as an ordinary not-present fault, hiding the
+     * cause. Only the offending process dies; the kernel keeps running.
+     *=======================================================================*/
+    if (current_task && !current_task->is_kernel_task &&
+        current_task->user_guard_page_virt != 0) {
+        uint32_t fault_page = faulting_address & 0xFFFFF000;
+        uint32_t user_guard = current_task->user_guard_page_virt & 0xFFFFF000;
+        if (fault_page == user_guard) {
+            kprintf("\n*** USER STACK OVERFLOW DETECTED ***\n");
+            kprintf("Process PID=%d '%s' overflowed its user stack\n",
+                    current_task->pid, current_task->name);
+            kprintf("CR2=0x%08x guard=0x%08x EIP=0x%08x CS=0x%04x (err=0x%08x)\n",
+                    faulting_address, user_guard, r->eip, r->cs, r->err_code);
+            kprintf("Terminating process to prevent memory corruption...\n\n");
+
+            task_terminate(current_task->pid);
+
+            /* The faulting task is not the current kernel context's owner in
+             * any resumable sense — force a reschedule. */
+            __asm__ volatile("int $0x20");
+
+            while(1) { __asm__ volatile("hlt"); }
+        }
+    }
+
     kprintf("\n*** PAGE FAULT ***\n");
     kprintf("Faulting address: 0x%08x\n", faulting_address);
     kprintf("Error code: 0x%08x\n", r->err_code);

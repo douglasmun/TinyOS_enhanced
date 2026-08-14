@@ -263,6 +263,42 @@ bool elf_verify_signature(const void* elf_data, size_t elf_size) {
 }
 
 /*=============================================================================
+ * FUNCTION: elf_abort_load
+ * PURPOSE: Tear down a partially-loaded process after a mid-load failure
+ *
+ * Every failure path after task_create_user() owns two things the caller
+ * cannot see: the task slot and its user PDPT (page directory, page tables,
+ * stacks, guard pages). Returning -1 without freeing them leaked an entire
+ * address space per failed load — a far bigger leak than the page-table
+ * frames AUDIT-10E's unmap_page_range() was meant to reclaim, and one that
+ * unmap_page_range() never fixed: it is a legacy-paging-only walker that has
+ * no PDPT parameter and reaches the current address space through a recursive
+ * mapping that does not exist under PAE (it logged a warning and returned).
+ *
+ * task_terminate() is the correct teardown here. The failing task is never
+ * the current task (the shell is), so it takes the non-self-exit branch:
+ * task_free_resources() -> free_page_directory() -> pae_free_user_pdpt(),
+ * which already frees user page tables, all four page directories and the
+ * PDPT while skipping page tables still shared with the kernel (the COW
+ * invariant from commit 1596a04). task_free_resources() is idempotent, so
+ * this composes safely with the scheduler cleanup queue.
+ *
+ * ORDER IS LOAD-BEARING: the caller runs with CR3 pointing at the user PDPT
+ * so it can write into the process image. CR3 must be restored to the kernel
+ * PDPT BEFORE the teardown frees the very tables the CPU is translating
+ * through, or the next memory access faults on freed page tables.
+ *
+ * @param pid        PID returned by task_create_user()
+ * @param kernel_cr3 Kernel CR3 saved before switching to the user PDPT
+ *===========================================================================*/
+static void elf_abort_load(int pid, uint32_t kernel_cr3) {
+    __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+    if (pid >= 0) {
+        task_terminate((uint32_t)pid);
+    }
+}
+
+/*=============================================================================
  * FUNCTION: elf_load_process
  * PURPOSE: Load ELF executable and create a process
  *=============================================================================*/
@@ -663,12 +699,18 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
     task_t* task = task_get_any(pid);
     if (!task) {
         kprintf("[ELF] ERROR: Failed to get task structure (pid=%d)\n", pid);
+        /* The task exists (we just created it) even though the lookup failed,
+         * so its PDPT still needs freeing. CR3 is still the kernel's here —
+         * the switch below has not happened yet — so tear down directly. */
+        task_terminate((uint32_t)pid);
         return -1;
     }
     if (task->state == TASK_STATE_TERMINATED) {
         /* The fresh task was killed during load (likely an EDR false positive
          * on a not-yet-running process). Don't map an ELF into a dead task;
-         * report clearly. The terminated slot is reclaimed by the scheduler. */
+         * report clearly. A task terminated while not running has already had
+         * its resources and slot freed by task_terminate's non-self-exit
+         * branch, so there is nothing left to release here. */
         kprintf("[ELF] ERROR: task pid=%d was terminated during load (EDR?) — aborting exec\n", pid);
         return -1;
     }
@@ -764,8 +806,7 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
             for (uint32_t j = 0; j < num_allocated; j++) {
                 pmm_free(allocated_frames[j]);
             }
-            unmap_page_range(USER_MIN_ADDR, max_vaddr);
-            __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+            elf_abort_load(pid, kernel_cr3);
             return -1;
         }
 
@@ -864,14 +905,11 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
             }
 
             /*=============================================================
-             * SECURITY FIX (AUDIT 10E): Free Page Tables
-             * Unmap entire user address space to free any page tables
-             * that were allocated by map_page().
+             * SECURITY FIX (AUDIT 10E, corrected): Free the task and its
+             * whole address space — page tables, page directories, PDPT,
+             * stacks and slot. Restores kernel CR3 first; see elf_abort_load.
              *===========================================================*/
-            unmap_page_range(USER_MIN_ADDR, max_vaddr);
-
-            // Switch back to kernel page directory before returning
-            __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+            elf_abort_load(pid, kernel_cr3);
             return -1;
         }
         segment_end = vaddr + memsz;
@@ -904,14 +942,10 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
                 }
 
                 /*=============================================================
-                 * SECURITY FIX (AUDIT 10E): Free Page Tables
-                 * Unmap entire user address space to free any page tables
-                 * that were allocated by map_page().
+                 * SECURITY FIX (AUDIT 10E, corrected): Free the task and its
+                 * whole address space — see elf_abort_load.
                  *===========================================================*/
-                unmap_page_range(USER_MIN_ADDR, max_vaddr);
-
-                // Switch back to kernel page directory before returning
-                __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+                elf_abort_load(pid, kernel_cr3);
                 return -1;
             }
 
@@ -930,13 +964,10 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
                 pmm_free(phys_frame);
 
                 /*=============================================================
-                 * SECURITY FIX (AUDIT 10E): Free Page Tables
-                 * Unmap entire user address space to free any page tables
-                 * that were allocated by map_page().
+                 * SECURITY FIX (AUDIT 10E, corrected): Free the task and its
+                 * whole address space — see elf_abort_load.
                  *===========================================================*/
-                unmap_page_range(USER_MIN_ADDR, max_vaddr);
-
-                __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+                elf_abort_load(pid, kernel_cr3);
                 return -1;
             }
 
