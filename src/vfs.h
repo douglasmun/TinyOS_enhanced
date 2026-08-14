@@ -128,6 +128,16 @@ typedef int32_t ssize_t;                /* Signed size type for I/O operations *
 #define VFS_O_DIRECTORY     0x0800  /* Open a directory for readdir, not a file */
 
 /*=============================================================================
+ * SEEK ORIGINS (vfs_lseek `whence`)
+ *
+ * Values match POSIX so the userspace SEEK_* in libc.h can be passed straight
+ * through without a translation table that could drift out of sync.
+ *===========================================================================*/
+#define VFS_SEEK_SET        0       /* Absolute: offset from start of file */
+#define VFS_SEEK_CUR        1       /* Relative to the current position */
+#define VFS_SEEK_END        2       /* Relative to end of file (offset <= 0) */
+
+/*=============================================================================
  * Directory entry (SYS_READDIR ABI)
  *
  * This crosses the ring 0/3 boundary, so the layout is FIXED: userspace
@@ -160,6 +170,7 @@ typedef struct {
 #define VFS_EEXIST          -17     /* File exists */
 #define VFS_EIO             -5      /* I/O error (media write / metadata flush failed) */
 #define VFS_EOVERFLOW       -75     /* Value too large for defined data type (POSIX) */
+#define VFS_ENOSYS          -38     /* Operation not implemented by this driver */
 
 /*=============================================================================
  * PHASE 9: No /dev/mem or /dev/kmem (Security-by-Omission)
@@ -303,6 +314,31 @@ typedef struct file_operations {
      * that is only VFS_MAX_FDS deep.
      */
     int (*stat)(const char* path, vfs_dirent_t* out);
+
+    /**
+     * @brief Reposition an open file's read/write cursor
+     * @param private_data Driver-specific data (from open)
+     * @param offset Signed displacement, interpreted per `whence`
+     * @param whence VFS_SEEK_SET / VFS_SEEK_CUR / VFS_SEEK_END
+     * @return Resulting absolute position, or negative error code
+     *
+     * 32-bit throughout, matching ssize_t and the uint32_t file sizes both
+     * drivers use: the syscall ABI passes 32-bit registers, so a wider offset
+     * could not cross the ring boundary intact anyway.
+     *
+     * `whence` is resolved by the DRIVER, not by the VFS layer, because the
+     * driver is the only holder of the current position and the file size —
+     * vfs_file_descriptor_t's `offset` field has never been maintained. Doing
+     * the arithmetic here would mean keeping a second copy of the cursor at
+     * the VFS layer that read()/write() do not update, so SEEK_CUR would drift
+     * away from the real position after the first read.
+     *
+     * Seeking past EOF clamps to the file size rather than creating a sparse
+     * region: neither driver can represent a hole, and FAT32's own seek has
+     * always clamped, so the alternative would be two different behaviours
+     * for the same syscall depending on the drive letter.
+     */
+    ssize_t (*seek)(void* private_data, ssize_t offset, int whence);
 
 } file_operations_t;
 
@@ -484,6 +520,19 @@ ssize_t vfs_readdir(int fd, void* buf, size_t size);
  * of the VFS_MAX_FDS descriptors.
  */
 int vfs_stat(const char* path, vfs_dirent_t* out);
+
+/**
+ * @brief Reposition an open file's read/write cursor
+ * @param fd Global VFS descriptor
+ * @param offset Signed displacement, interpreted per `whence`
+ * @param whence VFS_SEEK_SET / VFS_SEEK_CUR / VFS_SEEK_END
+ * @return Resulting absolute position, or negative error code
+ *
+ * Seeking past EOF clamps to the file size (see the .seek op for why). A
+ * driver without .seek returns -ENOSYS rather than silently ignoring the
+ * call, so a caller can tell "not supported here" from "moved to 0".
+ */
+ssize_t vfs_lseek(int fd, ssize_t offset, int whence);
 
 /**
  * @brief Iterate through mounted drives

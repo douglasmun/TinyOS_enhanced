@@ -204,6 +204,14 @@ void ramfs_init(void);
 /* File operations */
 int ramfs_open(const char* path, uint8_t flags);
 int ramfs_read(int fd, void* buf, size_t count);
+
+/* Cursor control. `pos` was always there and advanced by read/write; these
+ * are what let RAMFS back SYS_LSEEK. ramfs_seek clamps past-EOF to the file
+ * size, matching fat32_seek. ramfs_tell/ramfs_fd_size exist because SEEK_CUR
+ * and SEEK_END are resolved inside the driver — see the .seek op in vfs.h. */
+int ramfs_seek(int fd, uint32_t offset);
+int ramfs_tell(int fd);
+int ramfs_fd_size(int fd);
 int ramfs_write(int fd, const void* buf, size_t count);
 void ramfs_close(int fd);
 int ramfs_unlink(const char* path);

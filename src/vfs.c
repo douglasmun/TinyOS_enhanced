@@ -1261,3 +1261,44 @@ int vfs_stat(const char* path, vfs_dirent_t* out) {
 
     return driver_ops->stat(canonical_path, out);
 }
+
+/*=============================================================================
+ * FUNCTION: vfs_lseek
+ * PURPOSE: Reposition an open file's read/write cursor
+ *
+ * A thin dispatcher on purpose. The whence arithmetic and the past-EOF clamp
+ * both happen in the driver, because the driver is the only holder of the
+ * live position and size: vfs_fd_table[fd].offset has never been maintained
+ * by read/write, so doing SEEK_CUR here would drift from the real cursor
+ * after the first read. See the .seek op in vfs.h.
+ *===========================================================================*/
+ssize_t vfs_lseek(int fd, ssize_t offset, int whence) {
+    if (!vfs_initialized) {
+        return VFS_EINVAL;
+    }
+
+    if (fd < 0 || fd >= VFS_MAX_FDS) {
+        return VFS_EBADF;
+    }
+
+    if (!vfs_fd_table[fd].in_use) {
+        return VFS_EBADF;
+    }
+
+    /* Reject an unknown origin here rather than letting each driver decide:
+     * otherwise a driver that defaulted to SEEK_SET would silently move the
+     * cursor for a caller that passed garbage. */
+    if (whence != VFS_SEEK_SET && whence != VFS_SEEK_CUR &&
+        whence != VFS_SEEK_END) {
+        return VFS_EINVAL;
+    }
+
+    /* -ENOSYS, not "moved to 0": a caller must be able to tell "this
+     * filesystem cannot seek" from a successful seek to the start. */
+    if (!vfs_fd_table[fd].ops || !vfs_fd_table[fd].ops->seek) {
+        return VFS_ENOSYS;
+    }
+
+    return vfs_fd_table[fd].ops->seek(vfs_fd_table[fd].private_data,
+                                      offset, whence);
+}

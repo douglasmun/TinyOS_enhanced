@@ -45,11 +45,11 @@
 #define SYS_READDIR    22   // Read directory entries from a fd opened on a dir
 #define SYS_STAT       23   // Metadata for a path, without opening it
 
-/* No SYS_LSEEK yet: the VFS has no seek operation (file_operations_t has no
- * .seek and vfs_file_t's `offset` is unused). Only FAT32 has fat32_seek();
- * RAMFS has none, so a seek syscall would work on C: and fail on D:. Adding
- * one means a VFS seek op plus a RAMFS implementation — deliberately left to
- * the change that needs it rather than shipped half-working here. */
+/* SYS_LSEEK needed a VFS .seek op and a RAMFS implementation first, so that
+ * it could not work on C: and fail on D:. Both now exist (ramfs_seek/tell/
+ * fd_size, fat32_tell/fd_size), and whence is resolved in the driver because
+ * only the driver holds the live position — see the .seek op in vfs.h. */
+#define SYS_LSEEK      24   // Reposition an open fd's cursor
 
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
@@ -121,7 +121,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  23  // Highest valid syscall number (SYS_STAT)
+#define MAX_SYSCALL_NUM  24  // Highest valid syscall number (SYS_LSEEK)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -247,6 +247,18 @@ int sys_readdir(int fd, void* user_buf, uint32_t size);
  * @return 0 on success, negative errno on failure
  */
 int sys_stat(const char* user_path, void* user_buf, uint32_t size);
+
+/**
+ * @brief Reposition an open fd's read/write cursor
+ * @param fd Per-process fd (3+) from SYS_OPEN
+ * @param offset Signed displacement, interpreted per `whence`
+ * @param whence SEEK_SET / SEEK_CUR / SEEK_END (VFS_SEEK_* values)
+ * @return Resulting absolute position, or negative errno
+ *
+ * Seeking past EOF clamps to the file size on both drives rather than
+ * creating a sparse region — neither driver can represent a hole.
+ */
+int sys_lseek(int fd, int32_t offset, int whence);
 
 /*-----------------------------------------------------------------------------
  * Record a process death and wake every sys_waitpid() waiter.

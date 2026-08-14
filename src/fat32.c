@@ -1012,6 +1012,40 @@ int fat32_seek(int fd, uint32_t offset) {
 }
 
 /*-----------------------------------------------------------------------------
+ * FUNCTION: fat32_tell
+ * PURPOSE: Current cursor position of an open fd
+ *
+ * SEEK_CUR is resolved inside the driver (see the .seek op in vfs.h) and
+ * open_files is static here, so the value has to come out through an
+ * accessor rather than by exposing the descriptor table.
+ *
+ * No mutex: this is a single aligned 32-bit read, which cannot tear on i386,
+ * and taking the lock here would deadlock nothing but buys nothing either —
+ * fat32_seek re-validates and clamps under the lock immediately afterwards,
+ * so a concurrent write can only make the value stale, never inconsistent.
+ *---------------------------------------------------------------------------*/
+int fat32_tell(int fd) {
+    if (fd < 0 || fd >= FAT32_MAX_OPEN_FILES || !open_files[fd].in_use) {
+        return -1;
+    }
+    return (int)open_files[fd].position;
+}
+
+/*-----------------------------------------------------------------------------
+ * FUNCTION: fat32_fd_size
+ * PURPOSE: Size of the file an open fd refers to (for SEEK_END)
+ *
+ * Reads the live descriptor rather than the on-disk dirent, so it is correct
+ * for a file that has been written but not yet flushed.
+ *---------------------------------------------------------------------------*/
+int fat32_fd_size(int fd) {
+    if (fd < 0 || fd >= FAT32_MAX_OPEN_FILES || !open_files[fd].in_use) {
+        return -1;
+    }
+    return (int)open_files[fd].file_size;
+}
+
+/*-----------------------------------------------------------------------------
  * FUNCTION: fat32_create
  * PURPOSE: Create a new file (Phase 2)
  * NOTE: For now, only supports creating files in root directory

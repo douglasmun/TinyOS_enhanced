@@ -136,6 +136,15 @@ int fat32_read(int fd, void* buffer, uint32_t size);
 int fat32_write(int fd, const void* buffer, uint32_t size);
 int fat32_seek(int fd, uint32_t offset);
 
+/* Current position / size of an OPEN fd. SEEK_CUR and SEEK_END are resolved
+ * inside the driver (see the .seek op in vfs.h), and open_files is static to
+ * fat32.c, so the values have to come out through an accessor rather than by
+ * exposing the descriptor table. Both return a negative value on a bad fd.
+ * Size comes from the live descriptor, not a directory lookup, so it is
+ * correct for a file that is still being written. */
+int fat32_tell(int fd);
+int fat32_fd_size(int fd);
+
 /* Drop an open file's contents (O_TRUNC): frees the cluster chain, zeroes the
  * size, and flushes the directory entry. Returns 0 on success, -1 on error. */
 int fat32_truncate(int fd);

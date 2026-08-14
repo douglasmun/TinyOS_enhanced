@@ -79,6 +79,11 @@ int stat(const char* path, void* buf, size_t size) {
                     (uint32_t)(uintptr_t)buf, (uint32_t)size);
 }
 
+int lseek(int fd, int offset, int whence) {
+    return syscall3(SYS_LSEEK, (uint32_t)fd, (uint32_t)offset,
+                    (uint32_t)whence);
+}
+
 int putchar(int c) {
     char ch = (char)c;
     write(1, &ch, 1);
