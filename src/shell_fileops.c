@@ -1170,6 +1170,68 @@ void cmd_write(int argc, char* argv[]) {
         return;
     }
 
+    /*=========================================================================
+     * DRIVE ROUTING: an explicit "X:" prefix goes through the VFS, which
+     * dispatches to the mounted driver (C: = FAT32, D: = RAMFS). Without this
+     * the command was hard-wired to ramfs_open, so `write C:/NOTES.TXT hi`
+     * silently created a RAMFS file instead of a persistent FAT32 one — the
+     * FAT32 write path was unreachable from the shell.
+     *
+     * Bare paths keep the historical RAMFS behaviour so existing scripts and
+     * the RAMFS-based `>` redirection are unaffected.
+     *=======================================================================*/
+    const char* target = argv[1];
+    bool has_drive = ((target[0] >= 'A' && target[0] <= 'Z') ||
+                      (target[0] >= 'a' && target[0] <= 'z')) && target[1] == ':';
+
+    if (has_drive) {
+        /* VFS wants the drive letter kept: "C:/NOTES.TXT". Normalise case so
+         * the mount lookup matches. */
+        char vfs_path[MAX_PATH];
+        size_t plen = strlen(target);
+        if (plen >= sizeof(vfs_path)) {
+            kprintf("write: path too long (would be truncated) - refusing to operate\n");
+            return;
+        }
+        safe_strcpy(vfs_path, target, sizeof(vfs_path));
+        if (vfs_path[0] >= 'a' && vfs_path[0] <= 'z') {
+            vfs_path[0] = vfs_path[0] - 'a' + 'A';
+        }
+
+        /* O_TRUNC so rewriting a file replaces it rather than leaving the
+         * tail of a longer previous version behind. */
+        int vfd = vfs_open(vfs_path, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+        if (vfd < 0) {
+            kprintf("Error: Cannot open file '%s' (code %d)\n", vfs_path, vfd);
+            return;
+        }
+
+        for (int i = 2; i < argc; i++) {
+            size_t len = strlen(argv[i]);
+            if (vfs_write(vfd, argv[i], len) < 0) {
+                kprintf("Error: Write failed\n");
+                vfs_close(vfd);
+                return;
+            }
+            if (i < argc - 1 && vfs_write(vfd, " ", 1) < 0) {
+                kprintf("Error: Write failed\n");
+                vfs_close(vfd);
+                return;
+            }
+        }
+
+        /* The FAT32 directory entry is flushed on close; a failure here means
+         * the size/first-cluster update did not reach the disk, so the file
+         * would read back empty. Report it rather than claiming success. */
+        if (vfs_close(vfd) < 0) {
+            kprintf("Error: Failed to flush '%s' to disk\n", vfs_path);
+            return;
+        }
+
+        kprintf("Written to %s\n", vfs_path);
+        return;
+    }
+
     char abs_path[MAX_PATH];
     const char* path = resolve_path(argv[1], abs_path, sizeof(abs_path));
 

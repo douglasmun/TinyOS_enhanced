@@ -94,13 +94,33 @@ static void fat32_free_handle(fat32_fd_handle_t* handle) {
  * SECURITY FIX (Issue 8.2): Now uses type-safe fat32_fd_handle_t* instead of integer cast
  */
 static int fat32_vfs_open(const char* path, int flags, void** private_data) {
-    /* FAT32 currently only supports read operations */
-    (void)flags;  /* Unused for now */
-
     /* Open file using FAT32 */
     int fat32_fd = fat32_open(path);
+
+    /*=========================================================================
+     * O_CREAT: create the file, then open it for real.
+     *
+     * This used to ignore `flags` entirely, so opening a nonexistent file on
+     * C: with VFS_O_CREAT just returned ENOENT — there was no way to create a
+     * FAT32 file through the VFS at all, which is why the write path was
+     * unreachable from the shell even though fat32_write existed.
+     *=======================================================================*/
+    if (fat32_fd < 0 && (flags & VFS_O_CREAT)) {
+        if (fat32_create(path) != 0) {
+            return VFS_ENOENT;
+        }
+        fat32_fd = fat32_open(path);
+    }
+
     if (fat32_fd < 0) {
         return VFS_ENOENT;  /* File not found or other error */
+    }
+
+    /* O_TRUNC on an existing file: drop its contents so a rewrite doesn't
+     * leave the tail of the previous, longer file behind. */
+    if ((flags & VFS_O_TRUNC) && fat32_truncate(fat32_fd) != 0) {
+        fat32_close(fat32_fd);
+        return VFS_EINVAL;
     }
 
     /* Allocate type-safe handle */
@@ -130,13 +150,19 @@ static int fat32_vfs_close(void* private_data) {
         return VFS_EINVAL;
     }
 
-    /* Close the FAT32 file */
-    fat32_close(handle->fat32_fd);
+    /* Close the FAT32 file. The return value matters now that close flushes
+     * the directory entry: a failure there means the data is on disk but the
+     * dirent still reports the old size, so the file reads back empty. Report
+     * it instead of silently claiming success.
+     *
+     * The handle is freed either way — the FAT32 descriptor is already
+     * released, so keeping the pool slot would just leak it. */
+    int rc = fat32_close(handle->fat32_fd);
 
     /* Free the handle back to the pool */
     fat32_free_handle(handle);
 
-    return 0;
+    return (rc == 0) ? 0 : VFS_EIO;
 }
 
 /**

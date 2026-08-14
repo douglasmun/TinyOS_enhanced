@@ -13,10 +13,25 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
    shared wait queue woken by `waitpid_notify_death()` (exit-record ring stays
    as the status store). `ps`/`kill` and zombie reaping already worked.
    Harness: `verify-bgjobs.sh` + `userspace/sleeper.c`.
-2. **SYS_SPAWN + pipes** — processes starting processes, shell pipelines.
-   Skip `fork()` (PAE, no COW pages). **NEXT.**
-3. **FAT32 write support** — cluster alloc + dirent update + `vfs_write`.
-4. **Userspace shell** (capstone, depends on 1–3).
+2. ~~**SYS_SPAWN + pipes**~~ **DONE** — fd-aware I/O (PR #31), `SYS_SPAWN` +
+   full argc/argv (#32), shell pipelines `cmd | cmd` (#33). `fork()` skipped
+   deliberately (PAE, no COW pages).
+3. ~~**FAT32 write support**~~ **DONE** — cluster alloc already existed; the
+   missing half was the **dirent writeback** (data + FAT chain reached the disk
+   but the directory entry still said "size 0, no cluster", so files read back
+   empty after a remount). `fat32_file_t` now records `dirent_cluster` /
+   `dirent_index` and `flush_dirent` updates size + first cluster on write and
+   close. Also fixed: empty-file first-cluster allocation (a write at position
+   0 with `first_cluster == 0` fell through to `cluster_to_sector(0)`, which
+   underflows into the FAT/boot region), the cluster-advance branch,
+   `fat32_seek` at an exact cluster boundary (broke append), and duplicate
+   dirents from `fat32_create`. `fat32_vfs_open` now honours `O_CREAT`/`O_TRUNC`
+   (it ignored `flags` entirely, which is why the write path was unreachable
+   from the shell) and `cmd_write` routes an explicit `X:` prefix through the
+   VFS. Harness: `verify-fat32-write.sh` (boots twice against ONE disk image;
+   boot 2 must re-read the file and see a non-zero `fatls` size).
+   Still root-directory-only. **NEXT: item 4.**
+4. **Userspace shell** (capstone, depends on 1–3 — now all done).
 
 Hygiene: the three exec-path items are **done** (failure paths now restore CR3
 then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard

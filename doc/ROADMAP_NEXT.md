@@ -33,10 +33,52 @@ wait-queue machinery gives shell pipelines (`cat file | grep x`).
 Deliberately skip `fork()`: under PAE with no COW pages it's a swamp; spawn
 gives 90% of the educational value.
 
-## 3. FAT32 write support
-FS story is read-only persistence today. Cluster allocation + directory-entry
-update + `vfs_write` wiring means the editor can save to `C:` and files
-survive reboot. Biggest bang for making it feel like an OS rather than a demo.
+## 3. FAT32 write support — DONE
+Files written to `C:` now survive a reboot. `fat32_write` already allocated
+clusters, but nothing wrote the result back into the **directory entry**, so
+the data and the FAT chain reached the disk while the dirent still said
+"size 0, no first cluster" — after a remount the file read back empty. The
+descriptor now records where its 8.3 entry lives (`dirent_cluster`,
+`dirent_index`) and `flush_dirent` pushes size + first cluster back on write
+and on close.
+
+Four further write-path bugs were fixed alongside it:
+- **Empty file never allocated.** A freshly created file has
+  `first_cluster == current_cluster == 0`; the old allocation test
+  (`current_cluster >= EOC || at a cluster boundary`) was false at position 0,
+  so the write fell through to `cluster_to_sector(0)`, which computes
+  `(0-2)*sectors_per_cluster` and underflows into the FAT/boot-sector region.
+  The first cluster is now allocated up front.
+- **Cluster advance.** The old "move to next cluster" branch `continue`d and
+  relied on the top-of-loop test to allocate, which re-read the boundary
+  condition and could allocate twice. Advance/extend is now explicit.
+- **`fat32_seek` at an exact cluster boundary** walked one cluster too far and
+  hit EOC — precisely the append case (seek to EOF of a file whose size is a
+  multiple of the cluster size). It now stops on the last existing cluster.
+- **`fat32_create` allowed duplicates** — creating an existing name appended a
+  SECOND dirent with the same 8.3 name; `find_dir_entry` returned the first, so
+  the duplicate's clusters became unreachable. It now refuses, and recycled
+  (`0xE5`) slots are zeroed so no stale cluster/timestamp fields survive.
+
+Wiring: `fat32_vfs_open` ignored its `flags` entirely, so `VFS_O_CREAT` on a
+nonexistent `C:` file just returned ENOENT — the write path was unreachable
+from the shell even though `fat32_write` existed. It now honours `O_CREAT` and
+`O_TRUNC` (new `fat32_truncate` frees the chain so a shorter rewrite doesn't
+leave the previous tail behind), and `fat32_vfs_close` propagates flush
+failures as `VFS_EIO` instead of discarding them. `cmd_write` routes an
+explicit `X:` prefix through the VFS (it was hard-wired to `ramfs_open`, so
+`write C:/F.TXT` silently made a RAMFS file); bare paths keep RAMFS behaviour.
+
+Test harness: `verify-fat32-write.sh` — boots QEMU **twice against the same
+disk image**. Boot 1 writes and reads back; boot 2 is a fresh kernel that must
+re-read the same content, confirm `fatls` reports a non-zero size (the
+assertion that specifically catches a missing dirent writeback), and overwrite
+with a shorter body to prove `O_TRUNC` truncates. Credentials are kernel-only
+and not persisted, so both boots re-run first-boot setup while the FAT32
+volume persists.
+
+Still limited to the **root directory** and to `fat32_create`'s first root
+cluster; subdirectory creation and multi-cluster root scans remain future work.
 
 ## 4. Move the shell to userspace (capstone)
 Deferred design item; depends on 1–3 (shell needs spawn, waitpid, file
@@ -62,4 +104,6 @@ Known, low-severity, from the PR #1 audit (see memory `exec-failure-path-leaks`)
   (unrelated to the exec path; split out deliberately).
 
 ## Recommendation
-1 (+ hygiene) is done. Next PR: 2 (SYS_SPAWN + pipes).
+1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
+dependencies (spawn, waitpid, file syscalls) are now all in place. The
+AUDIT-8E IDS-not-wired gap is still open and independent of that work.
