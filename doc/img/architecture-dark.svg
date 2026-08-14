@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700" width="1000" height="700" font-family="'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="TinyOS Enhanced architecture. Ring-3 user processes reach the kernel only through the int 0x80 privilege boundary, where copy_user validates every buffer and ECDSA P-256 verification gates every ELF load fail-closed; unsigned binaries are rejected at that boundary. Below it the ring-0 kernel provides process scheduling, PAE memory protection, a VFS over FAT32 and RAMFS, and a TCP/IP stack, all driving i386 hardware.">
+  <title>TinyOS Enhanced — architecture</title>
+
+  <defs>
+    <marker id="arr-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#58a6ff"/>
+    </marker>
+    <marker id="arr-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#3fb950"/>
+    </marker>
+    <marker id="arr-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#f85149"/>
+    </marker>
+    <marker id="arr-yellow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#e3b341"/>
+    </marker>
+    <marker id="arr-cyan" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#38bdf8"/>
+    </marker>
+    <marker id="arr-purple" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#8b5cf6"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1000" height="700" fill="#0d1117"/>
+
+  <!-- Title -->
+  <text x="500" y="34" text-anchor="middle" fill="#58a6ff" font-size="19" font-weight="bold">TinyOS Enhanced — architecture</text>
+  <text x="500" y="53" text-anchor="middle" fill="#8b949e" font-size="11">32-bit i386 · Multiboot2 · 81 kernel modules · preemptive, single core · freestanding C + NASM</text>
+
+  <!-- ═══════════ RING 3 ═══════════ -->
+  <rect x="24" y="70" width="952" height="96" rx="8" fill="#111823" stroke="#30363d" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="38" y="90" fill="#58a6ff" font-size="11.5" font-weight="bold">RING 3 · USER MODE</text>
+  <text x="176" y="90" fill="#8b949e" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">linked at 0x08000000 · private PAE address space per process</text>
+
+  <rect x="38" y="102" width="166" height="52" rx="6" fill="#1f3a5f" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="121" y="122" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">hello.elf</text>
+  <text x="121" y="139" text-anchor="middle" fill="#c9d1d9" font-size="10">signed · ring 3</text>
+
+  <rect x="216" y="102" width="166" height="52" rx="6" fill="#1f3a5f" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="299" y="122" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">spawner.elf</text>
+  <text x="299" y="139" text-anchor="middle" fill="#c9d1d9" font-size="10">SYS_SPAWN + argv</text>
+
+  <rect x="394" y="102" width="166" height="52" rx="6" fill="#1f3a5f" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="477" y="122" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">sleeper.elf</text>
+  <text x="477" y="139" text-anchor="middle" fill="#c9d1d9" font-size="10">blocks on SYS_SLEEP</text>
+
+  <rect x="572" y="102" width="166" height="52" rx="6" fill="#1e1e3a" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="655" y="122" text-anchor="middle" fill="#8b5cf6" font-size="12" font-weight="bold" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">tiny libc</text>
+  <text x="655" y="139" text-anchor="middle" fill="#c9d1d9" font-size="10">crt0 · printf · malloc</text>
+
+  <rect x="784" y="102" width="178" height="52" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3"/>
+  <text x="873" y="122" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">unsigned binary</text>
+  <text x="873" y="139" text-anchor="middle" fill="#c9d1d9" font-size="10">tampered / no trailer</text>
+
+  <!-- arrows into the gate -->
+  <line x1="121" y1="154" x2="121" y2="196" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+  <text x="129" y="179" fill="#58a6ff" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">syscall</text>
+  <line x1="299" y1="154" x2="299" y2="196" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+  <line x1="477" y1="154" x2="477" y2="196" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+  <line x1="873" y1="154" x2="873" y2="196" stroke="#f85149" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#arr-red)"/>
+  <text x="881" y="179" fill="#f85149" font-size="10" font-weight="bold" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">rejected</text>
+
+  <!-- ═══════════ PRIVILEGE BOUNDARY ═══════════ -->
+  <rect x="24" y="198" width="952" height="78" rx="8" fill="#2d2a1a" stroke="#e3b341" stroke-width="2"/>
+  <text x="38" y="218" fill="#e3b341" font-size="11.5" font-weight="bold">PRIVILEGE BOUNDARY</text>
+  <text x="190" y="218" fill="#8b949e" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">the only way into the kernel</text>
+
+  <rect x="38" y="228" width="222" height="32" rx="5" fill="#1a1508" stroke="#e3b341" stroke-width="1.3"/>
+  <text x="149" y="249" text-anchor="middle" fill="#e3b341" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">int 0x80 · 20 syscalls</text>
+
+  <rect x="272" y="228" width="248" height="32" rx="5" fill="#1a1508" stroke="#e3b341" stroke-width="1.3"/>
+  <text x="396" y="249" text-anchor="middle" fill="#e3b341" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">copy_user · bounds + fault safe</text>
+
+  <rect x="532" y="228" width="430" height="32" rx="5" fill="#1a1508" stroke="#e3b341" stroke-width="1.3"/>
+  <text x="747" y="249" text-anchor="middle" fill="#e3b341" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">ECDSA P-256 verify — fail-closed, ENFORCE by default</text>
+
+  <!-- gate -> kernel -->
+  <line x1="149" y1="276" x2="149" y2="318" stroke="#e3b341" stroke-width="1.8" marker-end="url(#arr-yellow)"/>
+  <text x="157" y="301" fill="#e3b341" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">dispatch</text>
+  <line x1="747" y1="276" x2="747" y2="318" stroke="#e3b341" stroke-width="1.8" marker-end="url(#arr-yellow)"/>
+  <text x="755" y="301" fill="#e3b341" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">load only if PASS</text>
+
+  <!-- ═══════════ RING 0 ═══════════ -->
+  <rect x="24" y="320" width="952" height="234" rx="8" fill="#111823" stroke="#30363d" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="38" y="340" fill="#3fb950" font-size="11.5" font-weight="bold">RING 0 · KERNEL</text>
+  <text x="154" y="340" fill="#8b949e" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">no libc — freestanding C + NASM</text>
+
+  <rect x="38" y="350" width="222" height="106" rx="6" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="149" y="370" text-anchor="middle" fill="#3fb950" font-size="11.5" font-weight="bold">Process &amp; scheduling</text>
+  <text x="50" y="390" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">round-robin, preemptive (PIT)</text>
+  <text x="50" y="406" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">kernel threads + ring-3 tasks</text>
+  <text x="50" y="422" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">wait queues · blocking waitpid</text>
+  <text x="50" y="438" fill="#8b949e" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">pid + generation tuples</text>
+
+  <rect x="272" y="350" width="222" height="106" rx="6" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="383" y="370" text-anchor="middle" fill="#3fb950" font-size="11.5" font-weight="bold">Memory</text>
+  <text x="284" y="390" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">PAE paging · NX / W^X</text>
+  <text x="284" y="406" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">PMM · double-free detection</text>
+  <text x="284" y="422" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">ASLR · stack guard pages</text>
+  <text x="284" y="438" fill="#8b949e" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">per-process PDPT (COW tables)</text>
+
+  <rect x="506" y="350" width="222" height="106" rx="6" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="617" y="370" text-anchor="middle" fill="#3fb950" font-size="11.5" font-weight="bold">Storage — VFS</text>
+  <text x="518" y="390" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">permission checks in VFS layer</text>
+  <text x="518" y="406" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">C:  FAT32  (read)</text>
+  <text x="518" y="422" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">D:  RAMFS  (read/write)</text>
+  <text x="518" y="438" fill="#8b949e" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">drivers stay stdio-agnostic</text>
+
+  <rect x="740" y="350" width="222" height="106" rx="6" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="851" y="370" text-anchor="middle" fill="#3fb950" font-size="11.5" font-weight="bold">Network</text>
+  <text x="752" y="390" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">TCP · IP · ICMP · ARP</text>
+  <text x="752" y="406" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">DHCP · DNS</text>
+  <text x="752" y="422" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">firewall + IDS (compile-time)</text>
+  <text x="752" y="438" fill="#8b949e" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">anti-spoofing checks</text>
+
+  <rect x="38" y="470" width="556" height="66" rx="6" fill="#1e1e3a" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="316" y="490" text-anchor="middle" fill="#8b5cf6" font-size="11.5" font-weight="bold">Shell (kernel task) · stream layer</text>
+  <text x="316" y="509" text-anchor="middle" fill="#c9d1d9" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">jobs &amp; background exec · redirection &gt; &lt; · pipelines cmd | cmd</text>
+  <text x="316" y="525" text-anchor="middle" fill="#8b949e" font-size="9.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">stages run sequentially · 4 KB pipe buffer</text>
+
+  <!-- Sits between the two hardware drops (x=617, x=851), so the dashed
+       VFS/NIC lines pass either side of it rather than through its text. -->
+  <rect x="640" y="470" width="188" height="66" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1.5"/>
+  <text x="734" y="490" text-anchor="middle" fill="#f85149" font-size="11.5" font-weight="bold">Security &amp; crypto</text>
+  <text x="734" y="508" text-anchor="middle" fill="#c9d1d9" font-size="9.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">AES · SHA-2 · HMAC · PBKDF2</text>
+  <text x="734" y="524" text-anchor="middle" fill="#c9d1d9" font-size="9.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">ECDSA · ECDHE · HKDF · EDR</text>
+
+  <rect x="864" y="470" width="98" height="66" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1.5"/>
+  <text x="913" y="490" text-anchor="middle" fill="#f85149" font-size="11.5" font-weight="bold">Audit</text>
+  <text x="913" y="508" text-anchor="middle" fill="#c9d1d9" font-size="9.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">tamper-evident</text>
+  <text x="913" y="524" text-anchor="middle" fill="#c9d1d9" font-size="9.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">credential store</text>
+
+  <!-- kernel -> hardware -->
+  <line x1="383" y1="536" x2="383" y2="580" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-green)"/>
+
+  <!-- VFS and NIC reach hardware directly, dropping through the gap to the
+       right of the security panel so neither line crosses its text. -->
+  <line x1="617" y1="456" x2="617" y2="580" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-cyan)"/>
+  <text x="625" y="566" fill="#38bdf8" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">block I/O</text>
+
+  <line x1="851" y1="456" x2="851" y2="580" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-cyan)"/>
+  <text x="859" y="566" fill="#38bdf8" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">DMA + IRQ</text>
+
+  <!-- ═══════════ HARDWARE ═══════════ -->
+  <rect x="24" y="582" width="952" height="62" rx="8" fill="#111823" stroke="#30363d" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="38" y="602" fill="#38bdf8" font-size="11.5" font-weight="bold">HARDWARE · i386</text>
+
+  <rect x="178" y="594" width="146" height="36" rx="5" fill="#1a2a3a" stroke="#38bdf8" stroke-width="1.3"/>
+  <text x="251" y="617" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">PIC · PIT · IDT</text>
+
+  <rect x="336" y="594" width="146" height="36" rx="5" fill="#1a2a3a" stroke="#38bdf8" stroke-width="1.3"/>
+  <text x="409" y="617" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">IDE disk</text>
+
+  <rect x="494" y="594" width="146" height="36" rx="5" fill="#1a2a3a" stroke="#38bdf8" stroke-width="1.3"/>
+  <text x="567" y="617" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">Intel e1000 NIC</text>
+
+  <rect x="652" y="594" width="146" height="36" rx="5" fill="#1a2a3a" stroke="#38bdf8" stroke-width="1.3"/>
+  <text x="725" y="617" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">VBE framebuffer</text>
+
+  <rect x="810" y="594" width="152" height="36" rx="5" fill="#1a2a3a" stroke="#38bdf8" stroke-width="1.3"/>
+  <text x="886" y="617" text-anchor="middle" fill="#38bdf8" font-size="10.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">RDRAND / RDSEED</text>
+
+  <!-- ═══════════ LEGEND ═══════════ -->
+  <rect x="24" y="656" width="952" height="32" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="38" y="676" fill="#8b949e" font-size="11" font-weight="bold">LEGEND</text>
+
+  <rect x="104" y="666" width="12" height="12" rx="2" fill="#1f3a5f" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="122" y="677" fill="#c9d1d9" font-size="11">ring-3 user process</text>
+
+  <rect x="252" y="666" width="12" height="12" rx="2" fill="#2d2a1a" stroke="#e3b341" stroke-width="1.5"/>
+  <text x="270" y="677" fill="#c9d1d9" font-size="11">privilege boundary</text>
+
+  <rect x="398" y="666" width="12" height="12" rx="2" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="416" y="677" fill="#c9d1d9" font-size="11">ring-0 kernel subsystem</text>
+
+  <rect x="576" y="666" width="12" height="12" rx="2" fill="#3a1a1a" stroke="#f85149" stroke-width="1.5"/>
+  <text x="594" y="677" fill="#c9d1d9" font-size="11">security / rejected</text>
+
+  <rect x="726" y="666" width="12" height="12" rx="2" fill="#1e1e3a" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="744" y="677" fill="#c9d1d9" font-size="11">shell &amp; libc</text>
+
+  <rect x="844" y="666" width="12" height="12" rx="2" fill="#1a2a3a" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="862" y="677" fill="#c9d1d9" font-size="11">hardware / I/O</text>
+</svg>
