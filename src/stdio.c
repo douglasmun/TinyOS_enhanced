@@ -338,6 +338,17 @@ int stdin_getline(stream_context_t* ctx, char* buffer, size_t size) {
         return -1;
     }
 
+    /* size == 1 leaves room for the terminator and nothing else. Handled here
+     * rather than in each case below because every one of them loops on
+     * `pos < size - 1` with an unsigned size: at size == 1 that wraps to
+     * SIZE_MAX and the loop writes far past a one-byte buffer. Returning the
+     * empty string is the honest answer -- zero characters fit -- and it keeps
+     * the underflow unreachable no matter which stream type is added later. */
+    if (size == 1) {
+        buffer[0] = '\0';
+        return 0;
+    }
+
     if (!ctx->stdin_stream.is_open) {
         return -1;
     }

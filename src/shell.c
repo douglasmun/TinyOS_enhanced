@@ -296,16 +296,23 @@ static void parse_and_execute(char* cmd_line);
  * the survivable choice; run_pipeline reports the truncation to the user by
  * comparing the byte count it collects against what the stage produced.
  */
-static size_t g_pipeline_dropped;   /* bytes the sink had to discard */
+/* Carries both halves of the sink's state through the callback's single void*,
+ * so the drop count lives and dies with the stage it belongs to. It was a
+ * file-scope static, which meant a count left over from one stage could be
+ * reported against the next. */
+typedef struct {
+    pipe_buffer_t* pipe;
+    size_t dropped;             /* bytes the sink had to discard */
+} pipeline_sink_t;
 
 static void pipeline_capture_putc(void* ctx, char c) {
-    pipe_buffer_t* pipe = (pipe_buffer_t*)ctx;
-    if (!pipe) return;
-    if (pipe_available(pipe) >= PIPE_BUFFER_SIZE) {
-        g_pipeline_dropped++;
+    pipeline_sink_t* sink = (pipeline_sink_t*)ctx;
+    if (!sink || !sink->pipe) return;
+    if (pipe_available(sink->pipe) >= PIPE_BUFFER_SIZE) {
+        sink->dropped++;
         return;
     }
-    pipe_write(pipe, &c, 1);
+    pipe_write(sink->pipe, &c, 1);
 }
 
 static void run_pipeline(const char* cmd_line) {
@@ -344,6 +351,10 @@ static void run_pipeline(const char* cmd_line) {
 
     for (int stage = 0; stage < pipeline.cmd_count; stage++) {
         bool is_last = (stage == pipeline.cmd_count - 1);
+
+        /* Fresh per stage, so a previous stage's drop count is never reported
+         * against this one. */
+        pipeline_sink_t sink = { &out_pipe, 0 };
 
         /* --- stdin: feed in whatever the previous stage produced. --- */
         if (stage > 0) {
@@ -396,9 +407,8 @@ static void run_pipeline(const char* cmd_line) {
              * down immediately after, so kernel logging outside this window
              * still reaches the console. */
             void* prev_ctx = NULL;
-            g_pipeline_dropped = 0;
             kprintf_capture_fn prev = kprintf_set_capture(pipeline_capture_putc,
-                                                          &out_pipe, &prev_ctx);
+                                                          &sink, &prev_ctx);
             parse_and_execute(stage_cmd);
             kprintf_set_capture(prev, prev_ctx, NULL);
         } else {
@@ -413,7 +423,7 @@ static void run_pipeline(const char* cmd_line) {
             /* The pipe holds at most PIPE_BUFFER_SIZE and stage_out is exactly
              * that big, so this clamp is a belt-and-braces bound, not the real
              * truncation point -- overflow is dropped by the capture sink,
-             * which counts it in g_pipeline_dropped. */
+             * which counts it in sink.dropped. */
             if (produced > sizeof(stage_out)) {
                 produced = sizeof(stage_out);
             }
@@ -432,11 +442,11 @@ static void run_pipeline(const char* cmd_line) {
             pipe_destroy(&out_pipe);
             out_pipe_live = false;
 
-            if (g_pipeline_dropped > 0) {
+            if (sink.dropped > 0) {
                 kprintf("shell: stage %d output truncated at %u bytes "
                         "(%u dropped)\n",
                         stage + 1, (unsigned)PIPE_BUFFER_SIZE,
-                        (unsigned)g_pipeline_dropped);
+                        (unsigned)sink.dropped);
             }
         }
 
