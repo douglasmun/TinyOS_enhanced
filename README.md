@@ -20,7 +20,10 @@ The cryptography is implemented from scratch for educational purposes and has no
 ## Architecture
 
 <p align="center">
-  <img src="doc/img/architecture.svg" alt="TinyOS Enhanced architecture: ring-3 user processes reach the kernel only through the int 0x80 privilege boundary, where copy_user validates every buffer and ECDSA P-256 verification gates every ELF load fail-closed. Below it the ring-0 kernel provides process scheduling, PAE memory protection, a VFS over FAT32 and RAMFS, and a TCP/IP stack, all driving i386 hardware." width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="doc/img/architecture-dark.svg">
+    <img src="doc/img/architecture.svg" alt="TinyOS Enhanced architecture: ring-3 user processes reach the kernel only through the int 0x80 privilege boundary, where copy_user validates every buffer and ECDSA P-256 verification gates every ELF load fail-closed. Below it the ring-0 kernel provides process scheduling, PAE memory protection, a VFS over FAT32 and RAMFS, and a TCP/IP stack, all driving i386 hardware." width="100%">
+  </picture>
 </p>
 
 Everything a user process can ask of the kernel goes through one gate: `int 0x80`. Buffers crossing it are validated by `copy_user`, and **no ELF is loaded until its ECDSA P-256 signature verifies** — fail-closed, so an unsigned or tampered binary is rejected at that boundary rather than partway through loading.
