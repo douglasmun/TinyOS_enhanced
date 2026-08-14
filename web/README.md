@@ -57,7 +57,7 @@ git add -f web/tinyos.iso
 ```
 
 The committed ISO carries the same content as the signed `v2.3` release asset
-(SHA-256 `632a5825b6329a6bebc5256b113531ee7dbafab902800499f9beda6c22336077` as of
+(SHA-256 `7be022ebe6e165100e821f33e16d85d1e89cb939729dc995fd7f661f0d461a96` as of
 2026-08-14 — adds background jobs, fd-aware I/O, `SYS_SPAWN` + argv, and shell
 pipelines from PRs #30–#33, on top of the v2.2 framebuffer console, userspace
 libc + FAT32 exec, and blocking syscalls). Note `i686-elf-grub-mkrescue` is
