@@ -167,7 +167,7 @@ void _start(void) {
 
         // Read command
         memset(cmd_buffer, 0, sizeof(cmd_buffer));
-        int bytes_read = read(cmd_buffer, sizeof(cmd_buffer) - 1);
+        int bytes_read = read(0, cmd_buffer, sizeof(cmd_buffer) - 1);
 
         if (bytes_read > 0) {
             // Null-terminate

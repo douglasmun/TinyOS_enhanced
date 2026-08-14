@@ -44,6 +44,13 @@ typedef struct {
     int fd;                 /* File descriptor (for files) */
     void* data;             /* Type-specific data pointer */
     bool is_open;           /* Stream is open */
+    /* True when this stream's fd is owned by someone else (it was inherited
+     * via streams_inherit) and must NOT be closed when this context is reset
+     * or cleaned up. Without it, a child that inherits a redirected stdout
+     * closes the creator's fd on exit — and since task_terminate() runs
+     * streams_cleanup() on every task, ANY inheriting task dying would yank
+     * the descriptor out from under the shell that opened it. */
+    bool borrowed;
 } stream_t;
 
 /**
@@ -112,6 +119,33 @@ void stderr_reset(stream_context_t* ctx);
  * @param ctx Stream context
  */
 void streams_cleanup(stream_context_t* ctx);
+
+/**
+ * @brief Copy a creator's streams onto a freshly created child
+ *
+ * task_create_user_ex() unconditionally streams_init()s a new task, i.e. resets
+ * it to console, so a child could never start out attached to whatever its
+ * creator was writing to. Call this after creation and BEFORE the child is
+ * handed to the scheduler to give it the creator's stdin/stdout/stderr instead.
+ *
+ * Inheritance is OPT-IN: a task that never has this called on it keeps the
+ * console default, so existing behaviour is unchanged.
+ *
+ * OWNERSHIP: this is a shallow copy, matching how stream_context_t is embedded
+ * by value in task_t, so for STREAM_TYPE_FILE both contexts end up holding the
+ * same RAMFS fd number. The child's copies are marked `borrowed`, which stops
+ * its stream resets — including the streams_cleanup() that task_terminate()
+ * runs on every dying task — from closing the fd; the creator stays the sole
+ * owner and closes it exactly once. That keeps a child's exit from yanking the
+ * descriptor out from under the shell, but it does NOT make the fd outlive the
+ * creator: the child must not survive the creator's own close. Foreground exec
+ * satisfies that by blocking; anything else (background jobs, pipes) needs
+ * refcounted or dup'd fds first.
+ *
+ * @param child   Child's stream context (destination)
+ * @param creator Creator's stream context (source)
+ */
+void streams_inherit(stream_context_t* child, const stream_context_t* creator);
 
 /*=============================================================================
  * Stream I/O Operations

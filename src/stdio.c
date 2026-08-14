@@ -34,18 +34,42 @@ void streams_init(stream_context_t* ctx) {
     ctx->stdin_stream.fd = -1;
     ctx->stdin_stream.data = NULL;
     ctx->stdin_stream.is_open = true;
+    ctx->stdin_stream.borrowed = false;
 
     /* Initialize stdout to console (VGA) */
     ctx->stdout_stream.type = STREAM_TYPE_CONSOLE;
     ctx->stdout_stream.fd = -1;
     ctx->stdout_stream.data = NULL;
     ctx->stdout_stream.is_open = true;
+    ctx->stdout_stream.borrowed = false;
 
     /* Initialize stderr to console (VGA) */
     ctx->stderr_stream.type = STREAM_TYPE_CONSOLE;
     ctx->stderr_stream.fd = -1;
     ctx->stderr_stream.data = NULL;
     ctx->stderr_stream.is_open = true;
+    ctx->stderr_stream.borrowed = false;
+}
+
+void streams_inherit(stream_context_t* child, const stream_context_t* creator) {
+    if (!child || !creator) {
+        return;
+    }
+
+    /* Shallow copy — see the ownership caveat in stdio.h. Done field-by-field
+     * rather than as a struct assignment so that adding a stream later forces
+     * a deliberate decision here about whether it should be inherited. */
+    child->stdin_stream  = creator->stdin_stream;
+    child->stdout_stream = creator->stdout_stream;
+    child->stderr_stream = creator->stderr_stream;
+
+    /* The creator keeps ownership of any fd behind these streams. Marking the
+     * child's copies borrowed stops stdin_reset/stdout_reset/stderr_reset —
+     * and therefore streams_cleanup(), which task_terminate() runs on every
+     * dying task — from closing a descriptor the creator is still using. */
+    child->stdin_stream.borrowed  = true;
+    child->stdout_stream.borrowed = true;
+    child->stderr_stream.borrowed = true;
 }
 
 int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
@@ -62,7 +86,8 @@ int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
      * bounds BEFORE passing to ramfs. If FD is corrupted (bug or exploit),
      * out-of-bounds array access could occur in ramfs.
      */
-    if (ctx->stdin_stream.is_open &&
+    if (!ctx->stdin_stream.borrowed &&
+        ctx->stdin_stream.is_open &&
         ctx->stdin_stream.type == STREAM_TYPE_FILE &&
         ctx->stdin_stream.fd >= 0 &&
         ctx->stdin_stream.fd < RAMFS_MAX_FDS) {
@@ -77,7 +102,12 @@ int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
      * Attack: cmd < /tmp/input where attacker can replace /tmp/input with
      * symlink to /etc/shadow before open.
      *=======================================================================*/
-    int fd = ramfs_open(filename, RAMFS_FLAG_READ | RAMFS_FLAG_NOFOLLOW);
+    /* RAMFS_FLAG_INHERIT: RAMFS closes every fd on exec by default (see
+     * ramfs_close_on_exec), which would leave an exec'd child's inherited stdin
+     * pointing at an already-closed descriptor. The opener still owns and closes
+     * this fd; INHERIT only exempts it from the exec sweep. */
+    int fd = ramfs_open(filename,
+                        RAMFS_FLAG_READ | RAMFS_FLAG_NOFOLLOW | RAMFS_FLAG_INHERIT);
     if (fd < 0) {
         /* SECURITY FIX: Restore stdin to console on error
          * If we closed the previous stdin FD but failed to open new file,
@@ -86,6 +116,7 @@ int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
         ctx->stdin_stream.type = STREAM_TYPE_CONSOLE;
         ctx->stdin_stream.fd = -1;
         ctx->stdin_stream.is_open = true;
+        ctx->stdin_stream.borrowed = false;
         return -1;  /* File doesn't exist or can't be opened */
     }
 
@@ -94,6 +125,8 @@ int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
     ctx->stdin_stream.fd = fd;
     ctx->stdin_stream.data = NULL;
     ctx->stdin_stream.is_open = true;
+    /* This context opened the fd, so it owns it and must close it on reset. */
+    ctx->stdin_stream.borrowed = false;
 
     return 0;
 }
@@ -106,7 +139,8 @@ int stdout_redirect_to_file(stream_context_t* ctx, const char* filename, bool ap
     /* SECURITY FIX: Close previous stdout file descriptor to prevent FD leak
      * SECURITY FIX: Defensive FD bounds checking (defense-in-depth)
      */
-    if (ctx->stdout_stream.is_open &&
+    if (!ctx->stdout_stream.borrowed &&
+        ctx->stdout_stream.is_open &&
         ctx->stdout_stream.type == STREAM_TYPE_FILE &&
         ctx->stdout_stream.fd >= 0 &&
         ctx->stdout_stream.fd < RAMFS_MAX_FDS) {
@@ -119,7 +153,9 @@ int stdout_redirect_to_file(stream_context_t* ctx, const char* filename, bool ap
      *
      * TOCTOU DEFENSE: Prevent symlink attacks on stdout redirection.
      *=======================================================================*/
-    int fd = ramfs_open(filename, RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW);
+    /* RAMFS_FLAG_INHERIT — same reason as stdin_redirect_from_file above. */
+    int fd = ramfs_open(filename,
+                        RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW | RAMFS_FLAG_INHERIT);
     if (fd < 0) {
         /* File doesn't exist, try to create it */
         /* Note: RAMFS doesn't have a create-specific flag,
@@ -133,6 +169,7 @@ int stdout_redirect_to_file(stream_context_t* ctx, const char* filename, bool ap
         ctx->stdout_stream.type = STREAM_TYPE_CONSOLE;
         ctx->stdout_stream.fd = -1;
         ctx->stdout_stream.is_open = true;
+        ctx->stdout_stream.borrowed = false;
         return -1;
     }
 
@@ -144,6 +181,8 @@ int stdout_redirect_to_file(stream_context_t* ctx, const char* filename, bool ap
     ctx->stdout_stream.fd = fd;
     ctx->stdout_stream.data = NULL;
     ctx->stdout_stream.is_open = true;
+    /* This context opened the fd, so it owns it and must close it on reset. */
+    ctx->stdout_stream.borrowed = false;
 
     return 0;
 }
@@ -156,7 +195,8 @@ void stdin_reset(stream_context_t* ctx) {
     /* Close file descriptor if open
      * SECURITY FIX: Defensive FD bounds checking
      */
-    if (ctx->stdin_stream.type == STREAM_TYPE_FILE &&
+    if (!ctx->stdin_stream.borrowed &&
+        ctx->stdin_stream.type == STREAM_TYPE_FILE &&
         ctx->stdin_stream.fd >= 0 &&
         ctx->stdin_stream.fd < RAMFS_MAX_FDS) {
         ramfs_close(ctx->stdin_stream.fd);
@@ -167,6 +207,7 @@ void stdin_reset(stream_context_t* ctx) {
     ctx->stdin_stream.fd = -1;
     ctx->stdin_stream.data = NULL;
     ctx->stdin_stream.is_open = true;
+    ctx->stdin_stream.borrowed = false;
 }
 
 void stdout_reset(stream_context_t* ctx) {
@@ -177,7 +218,8 @@ void stdout_reset(stream_context_t* ctx) {
     /* Close file descriptor if open
      * SECURITY FIX: Defensive FD bounds checking
      */
-    if (ctx->stdout_stream.type == STREAM_TYPE_FILE &&
+    if (!ctx->stdout_stream.borrowed &&
+        ctx->stdout_stream.type == STREAM_TYPE_FILE &&
         ctx->stdout_stream.fd >= 0 &&
         ctx->stdout_stream.fd < RAMFS_MAX_FDS) {
         ramfs_close(ctx->stdout_stream.fd);
@@ -188,6 +230,7 @@ void stdout_reset(stream_context_t* ctx) {
     ctx->stdout_stream.fd = -1;
     ctx->stdout_stream.data = NULL;
     ctx->stdout_stream.is_open = true;
+    ctx->stdout_stream.borrowed = false;
 }
 
 void stderr_reset(stream_context_t* ctx) {
@@ -198,7 +241,8 @@ void stderr_reset(stream_context_t* ctx) {
     /* stderr typically stays on console, but support redirection
      * SECURITY FIX: Defensive FD bounds checking
      */
-    if (ctx->stderr_stream.type == STREAM_TYPE_FILE &&
+    if (!ctx->stderr_stream.borrowed &&
+        ctx->stderr_stream.type == STREAM_TYPE_FILE &&
         ctx->stderr_stream.fd >= 0 &&
         ctx->stderr_stream.fd < RAMFS_MAX_FDS) {
         ramfs_close(ctx->stderr_stream.fd);
@@ -209,6 +253,7 @@ void stderr_reset(stream_context_t* ctx) {
     ctx->stderr_stream.fd = -1;
     ctx->stderr_stream.data = NULL;
     ctx->stderr_stream.is_open = true;
+    ctx->stderr_stream.borrowed = false;
 }
 
 void streams_cleanup(stream_context_t* ctx) {
@@ -248,10 +293,30 @@ int stdin_read(stream_context_t* ctx, char* buffer, size_t size) {
             /* TODO: Read from pipe buffer */
             return -1;
 
-        case STREAM_TYPE_CONSOLE:
-            /* Read from keyboard - not implemented for raw reads */
-            /* This would require keyboard buffer implementation */
-            return -1;
+        case STREAM_TYPE_CONSOLE: {
+            /* Line-oriented keyboard read. This used to return -1 ("not
+             * implemented"), with the equivalent loop living inline in
+             * sys_read; that made the console the one stdin type a user
+             * process could read, and only by bypassing the stream layer.
+             * The loop is here now so sys_read can go through stdin_read for
+             * every type. keyboard_getchar() BLOCKS, so the first character
+             * costs an unbounded wait — same as before, just relocated. */
+            size_t i = 0;
+            while (i < size) {
+                char c = keyboard_getchar();
+                if (c == '\n') {
+                    buffer[i++] = c;
+                    break;          /* deliver the line, newline included */
+                } else if (c == '\b') {
+                    if (i > 0) {
+                        i--;        /* echo is handled in the keyboard IRQ */
+                    }
+                } else {
+                    buffer[i++] = c;
+                }
+            }
+            return (int)i;
+        }
 
         case STREAM_TYPE_NULL:
             /* Reading from /dev/null returns EOF */

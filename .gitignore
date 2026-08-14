@@ -142,4 +142,6 @@ doc/WX_PAE_IMPLEMENTATION_PLAN.md
 doc/vibe-code-your-own-OS-readme.txt
 bgjobs.log
 bgjobs-trace.log
+redirect.log
+redirect-trace.log
 scratchpad/

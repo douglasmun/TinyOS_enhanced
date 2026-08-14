@@ -30,6 +30,9 @@ KEYMAP = {
     ":": "shift-semicolon",
     ",": "comma",
     "=": "equal",
+    ">": "shift-dot",
+    "<": "shift-comma",
+    "|": "shift-backslash",
 }
 for c in "abcdefghijklmnopqrstuvwxyz0123456789":
     KEYMAP[c] = c

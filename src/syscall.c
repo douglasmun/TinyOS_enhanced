@@ -12,6 +12,7 @@
 #include "wait_queue.h"
 #include "serial.h"
 #include "keyboard.h"
+#include "stdio.h"     // fd-aware I/O: stdout_write/stderr_write/stdin_read
 #include "copy_user.h" // SECURITY: TOCTOU fix - safe user memory access
 #include "util.h"      // For kernel_panic()
 #include "critical.h"  // For disable_interrupts/restore_interrupts
@@ -299,14 +300,27 @@ void sys_exit(int status) {
 
 /*-----------------------------------------------------------------------------
  * System Call: Write
- * Write data to console
+ * Write data to the stream bound to `fd` in the calling task's stream context.
+ *
+ * fd is now honoured: 1 -> stdout, 2 -> stderr, anything else -> -EBADF.
+ * Previously fd was discarded and every write went straight to console_putc +
+ * serial_putc, which hardwired a user process's stdout to the console and made
+ * redirection and pipes impossible no matter what task->streams said.
+ *
+ * The default stream type is still STREAM_TYPE_CONSOLE, whose stdout_write case
+ * is kprintf-per-char == console_putc + serial_putc, so unredirected output is
+ * byte-for-byte what it was before.
  *
  * SECURITY FIX: Uses copy_from_user() to prevent TOCTOU race conditions
  * where user unmaps buffer between validation and access.
  *-----------------------------------------------------------------------------*/
 int sys_write(int fd, const char* buf, size_t len) {
-    // Ignore fd for now (always write to console)
-    (void)fd;
+    /* Reject unknown descriptors up front. stdin (0) is not writable. Note the
+     * check happens before the len == 0 early-out so that a bad fd is reported
+     * as such rather than silently succeeding on a zero-length write. */
+    if (fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+        return -EBADF;
+    }
 
     /*=========================================================================
      * SECURITY FIX (CRITICAL): Validate buffer pointer to prevent NULL dereference
@@ -383,6 +397,16 @@ int sys_write(int fd, const char* buf, size_t len) {
     char kernel_buf[WRITE_CHUNK_SIZE];
     size_t total_written = 0;
 
+    /* Resolve the destination once, outside the copy loop. A task always has an
+     * embedded stream_context_t (streams_init'd at creation), so this is only
+     * NULL if there is no current task at all — a syscall from a kernel thread
+     * context that isn't a task, which shouldn't happen but is cheap to guard. */
+    task_t* writer = scheduler_get_current_task();
+    stream_context_t* streams = writer ? &writer->streams : get_current_streams();
+    if (!streams) {
+        return -EFAULT;
+    }
+
     while (total_written < len) {
         /* Calculate chunk size (min of remaining data and buffer size) */
         size_t chunk_size = len - total_written;
@@ -411,13 +435,22 @@ int sys_write(int fd, const char* buf, size_t len) {
             return (total_written > 0) ? (int)total_written : ret;
         }
 
-        /* Now safe to access kernel_buf - output to console and serial */
-        for (size_t i = 0; i < chunk_size; i++) {
-            console_putc(kernel_buf[i]);
-            serial_putc(kernel_buf[i]);
-        }
+        /* Now safe to access kernel_buf - hand it to the bound stream. */
+        int wrote = (fd == STDERR_FILENO)
+                        ? stderr_write(streams, kernel_buf, chunk_size)
+                        : stdout_write(streams, kernel_buf, chunk_size);
 
-        total_written += chunk_size;
+        /* A short write means the sink filled up or the stream is closed; a
+         * negative one means it failed outright. Either way stop here and
+         * report the bytes that actually landed, so a caller looping on the
+         * return value doesn't spin re-sending data the stream won't take. */
+        if (wrote < 0) {
+            return (total_written > 0) ? (int)total_written : wrote;
+        }
+        total_written += (size_t)wrote;
+        if ((size_t)wrote < chunk_size) {
+            break;
+        }
     }
 
     return (int)total_written;
@@ -425,12 +458,25 @@ int sys_write(int fd, const char* buf, size_t len) {
 
 /*-----------------------------------------------------------------------------
  * System Call: Read
- * Read data from console (keyboard)
+ * Read data from the stream bound to `fd` in the calling task's stream context.
+ *
+ * ABI CHANGE: sys_read previously took no fd at all — it was sys_read(buf, len)
+ * and read keyboard_getchar() directly, so a user process could never read from
+ * a redirected stdin or a pipe. It now takes fd as arg1 (matching sys_write's
+ * shape and POSIX read()), which shifts buf/len to arg2/arg3 in the dispatcher.
+ * userspace/libc.c's read() wrapper was passing a dummy fd it then dropped;
+ * it now forwards the real one. Any out-of-tree user binary built against the
+ * old 2-argument form must be rebuilt.
  *
  * SECURITY FIX: Uses copy_to_user() to prevent TOCTOU race conditions
  * where user unmaps buffer between validation and write.
  *-----------------------------------------------------------------------------*/
-int sys_read(char* buf, size_t len) {
+int sys_read(int fd, char* buf, size_t len) {
+    /* Only stdin is readable. stdout/stderr are write-only here. */
+    if (fd != STDIN_FILENO) {
+        return -EBADF;
+    }
+
     /*=========================================================================
      * SECURITY FIX (CRITICAL): Validate buffer pointer to prevent NULL dereference
      * If buf is NULL and len > 0, this is an invalid request from userspace
@@ -513,28 +559,21 @@ int sys_read(char* buf, size_t len) {
     memset(kernel_buf, 0, READ_MAX_SIZE);
 
     size_t read_size = (len > READ_MAX_SIZE) ? READ_MAX_SIZE : len;
-    size_t i = 0;
 
-    /*
-     * Read characters from keyboard into kernel buffer
-     */
-    while (i < read_size) {
-        char c = keyboard_getchar();  /* Blocks until character available */
-
-        /* Handle special characters */
-        if (c == '\n') {
-            kernel_buf[i++] = c;
-            break;  /* End of line */
-        } else if (c == '\b') {
-            /* Backspace */
-            if (i > 0) {
-                i--;
-                /* Echo already handled in keyboard IRQ handler */
-            }
-        } else {
-            kernel_buf[i++] = c;
-        }
+    /* Same resolution as sys_write: prefer the calling task's own streams. */
+    task_t* reader = scheduler_get_current_task();
+    stream_context_t* streams = reader ? &reader->streams : get_current_streams();
+    if (!streams) {
+        return -EFAULT;
     }
+
+    /* Fill the kernel buffer from whatever stdin is bound to (keyboard by
+     * default, a file if redirected, a pipe once those are wired up). */
+    int n = stdin_read(streams, kernel_buf, read_size);
+    if (n < 0) {
+        return -EIO;
+    }
+    size_t i = (size_t)n;
 
     /*=========================================================================
      * SECURITY: Safe copy to user space with exception handling
@@ -1408,18 +1447,21 @@ static void syscall_dispatch(struct cpu_state* state) {
             /*=================================================================
              * SECURITY (v1.13): Integer Signedness Validation
              *
-             * CRITICAL: arg2 (length) comes from user space as a register value.
+             * CRITICAL: arg3 (length) comes from user space as a register value.
              * If user passes -1 (0xFFFFFFFF), casting to size_t makes it a
              * huge positive value (4GB), bypassing buffer size checks.
              *
              * DEFENSE: Reject suspiciously large values that could be negative
              * integers. Max reasonable read: 1MB per syscall.
+             *
+             * NOTE: this checks arg3, not arg2 — sys_read gained an fd as arg1,
+             * so buf/len moved up one register (ebx=fd, ecx=buf, edx=len).
              *===============================================================*/
-            if ((uint32_t)arg2 > (1024 * 1024)) {  /* > 1MB */
+            if ((uint32_t)arg3 > (1024 * 1024)) {  /* > 1MB */
                 ret = -EINVAL;  /* Invalid argument */
                 break;
             }
-            ret = sys_read((char*)arg1, (size_t)arg2);
+            ret = sys_read((int)arg1, (char*)arg2, (size_t)arg3);
             break;
             
         case SYS_GETPID:
