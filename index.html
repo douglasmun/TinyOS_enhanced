@@ -22,12 +22,24 @@
   .panel > .cap { padding: 8px 12px; font-size: 12px; letter-spacing: .04em; text-transform: uppercase;
     color: var(--muted); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
   /* v86 text screen */
-  #screen_container { background: #000; padding: 8px; overflow: auto; max-height: 70vh; resize: vertical; }
+  /* Two render paths share this panel. Early boot, before the kernel switches
+     to VBE, draws into the text div below; fitConsole() sizes its font so all
+     80 columns fit rather than clipping at a hardcoded 15px. Once the
+     framebuffer is up, v86 hides that div and uses the canvas instead — see the
+     canvas rule below, which is what keeps the live screen inside the panel. */
+  #screen_container { background: #000; padding: 8px; overflow: hidden; max-height: 70vh; resize: vertical; }
   #screen_container div {
-    white-space: pre; font: 15px/1.05 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: var(--vga-font, 15px); line-height: 1.05;
     color: #b3b3b3;
   }
-  #screen_container canvas { display: none; }
+  /* Once the kernel switches to the VBE framebuffer, v86 hides the text div and
+     draws into this canvas, sizing it inline (e.g. width:1280px) to the guest
+     resolution. That overflows the panel, so scale it down to fit; the
+     !important is required to beat v86's own inline width/height. v86 toggles
+     `display` between the two, so only width/height are overridden here —
+     forcing display would show the canvas during text mode too. */
+  #screen_container canvas { max-width: 100% !important; height: auto !important; }
   /* serial */
   #serial { height: 60vh; min-height: 240px; overflow: auto; resize: vertical; margin: 0; padding: 10px 12px; background: #010409;
     font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; color: #7ee787; white-space: pre-wrap; word-break: break-word; }
@@ -62,7 +74,7 @@
 <main>
   <div class="col">
     <div class="panel">
-      <div class="cap"><span>VGA text console &mdash; live 80&times;25 (drag edge to resize)</span><span id="screen-hint">80&times;25</span></div>
+      <div class="cap"><span>VGA console &mdash; live guest screen (drag bottom edge to resize)</span><span id="screen-hint">scaled to fit</span></div>
       <div id="screen_container"><div></div><canvas></canvas></div>
     </div>
     <div class="toolbar">
@@ -89,7 +101,7 @@
       This mirrors the kernel's <code>-serial</code> output: boot log, PAE init, entropy/RDRAND health,
       and the signed-<code>exec</code> verification. <code>[EDR ADVANCED] &hellip; Suspicious memory</code>
       lines are the EDR daemon and are filtered out here.
-      <b>This panel is the scrollback</b> &mdash; the VGA console above only shows the live 80&times;25
+      <b>This panel is the scrollback</b> &mdash; the VGA console above only shows the current guest
       screen, so to re-read past boot/<code>exec</code> messages scroll here (autoscroll pauses while you
       scroll up and resumes at the bottom). Drag the bottom edge of either panel to resize it, or hit
       <b>Copy</b> to grab the whole log.
@@ -141,6 +153,35 @@
       navigator.clipboard.writeText(serialText).then(function () { done(true); }, function () { done(false); });
     } else { done(false); }
   });
+
+  // Pick the largest font size at which all 80 columns still fit the panel.
+  // The glyph advance is measured rather than assumed: monospace fonts differ
+  // in their width-to-size ratio, and the stack falls back differently per OS.
+  var screenEl = document.getElementById("screen_container");
+  var VGA_COLS = 80;
+
+  function fitConsole() {
+    var avail = screenEl.clientWidth - 16;          // minus the 8px padding each side
+    if (avail <= 0) return;
+
+    var probe = document.createElement("span");
+    probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;" +
+      "font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:100px";
+    probe.textContent = "0".repeat(VGA_COLS);
+    document.body.appendChild(probe);
+    var widthAt100 = probe.getBoundingClientRect().width;
+    document.body.removeChild(probe);
+    if (!widthAt100) return;
+
+    // Floor to 0.1px so rounding can never push the last column over the edge.
+    var size = Math.floor((avail / widthAt100) * 100 * 10) / 10;
+    size = Math.max(6, Math.min(size, 20));
+    document.documentElement.style.setProperty("--vga-font", size + "px");
+  }
+
+  fitConsole();
+  window.addEventListener("resize", fitConsole);
+  if (window.ResizeObserver) new ResizeObserver(fitConsole).observe(screenEl);
 
   function setStatus(html, running) {
     statusEl.innerHTML = html;
