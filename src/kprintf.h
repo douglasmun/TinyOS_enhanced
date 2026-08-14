@@ -1,3 +1,39 @@
+#pragma once
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/**
+ * @brief Per-character sink used by the console capture hook.
+ */
+typedef void (*kprintf_capture_fn)(void* ctx, char c);
+
+/**
+ * @brief Divert console output (kputc) to a callback, or restore it.
+ * @param fn  Callback receiving each character, or NULL to emit to the console
+ *            as usual.
+ * @param ctx Opaque pointer passed back to @p fn.
+ * @param prev_ctx If non-NULL, receives the previously installed context so the
+ *                 caller can restore an outer hook exactly.
+ * @return The previously installed callback (NULL if none).
+ *
+ * WHY THIS EXISTS: the shell's builtins print with kprintf, so piping their
+ * output requires intercepting the console emit point.  Redirecting one sink is
+ * less error-prone than rewriting every call site.
+ *
+ * SCOPE: install it around the smallest possible region and restore it
+ * immediately, saving/restoring both the function and the context.  While a
+ * hook is installed EVERY kprintf in the system is captured, including kernel
+ * logging from interrupt handlers and the EDR daemon, so a hook left installed
+ * silently swallows kernel diagnostics into unrelated buffers.
+ *
+ * Declared outside the NO_DEBUG_LOGGING guard below: that guard compiles
+ * kprintf itself away, but the capture plumbing is a real function in
+ * kprintf.c either way and its type must stay visible.
+ */
+kprintf_capture_fn kprintf_set_capture(kprintf_capture_fn fn, void* ctx,
+                                       void** prev_ctx);
+
 #ifdef NO_DEBUG_LOGGING
 #define kprintf(...) ((void)0)
 #else

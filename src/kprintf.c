@@ -8,8 +8,42 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/*=============================================================================
+ * CONSOLE CAPTURE HOOK
+ *
+ * The shell's builtins (cmd_echo, cmd_ls, ...) print with kprintf, i.e. straight
+ * to the console, so their output cannot be piped by the stream layer alone.
+ * Converting all ~75 call sites was the alternative; redirecting the ONE console
+ * emit point is smaller and cannot miss a site.
+ *
+ * This is deliberately OPT-IN and explicitly scoped, NOT keyed on the current
+ * task's stdout stream type: genuine kernel logging ([EXEC], [SPAWN], EDR
+ * alerts) shares this path, and capturing that into a user's pipe would both
+ * corrupt the pipeline data and hide kernel diagnostics. run_pipeline() installs
+ * the hook around a single builtin call and removes it immediately after, so
+ * only output produced by that call is diverted.
+ *
+ * Single CPU, and the hook is set/cleared without yielding in between, so a
+ * plain global needs no lock.
+ *=============================================================================*/
+static kprintf_capture_fn g_capture = NULL;
+static void* g_capture_ctx = NULL;
+
+kprintf_capture_fn kprintf_set_capture(kprintf_capture_fn fn, void* ctx,
+                                       void** prev_ctx) {
+    kprintf_capture_fn prev = g_capture;
+    if (prev_ctx) *prev_ctx = g_capture_ctx;
+    g_capture = fn;
+    g_capture_ctx = ctx;
+    return prev;
+}
+
 /* ---------- low-level unified sink ---------- */
 static inline void kputc(char c) {          /* mirror to both sinks */
+    if (g_capture) {
+        g_capture(g_capture_ctx, c);
+        return;
+    }
     console_putc(c);
     serial_putc(c);
 }

@@ -264,6 +264,183 @@ static void cmd_echo(int argc, char* argv[]) {
  * Command Parser
  *---------------------------------------------------------------------------*/
 
+static void parse_and_execute(char* cmd_line);
+
+/*-----------------------------------------------------------------------------
+ * Pipeline execution
+ *
+ * Stages run SEQUENTIALLY, not concurrently: stage N is run to completion with
+ * its stdout bound to a pipe, then that pipe becomes stage N+1's stdin. The
+ * shell is a single kernel task and its builtins are direct function calls, so
+ * there is no second thread of control to run a downstream stage while an
+ * upstream one is still producing. Real concurrent pipelines need each stage to
+ * be its own process (SYS_SPAWN, already in place) plus fd-level plumbing so a
+ * spawned child inherits a pipe end; until then this gives correct DATA FLOW
+ * with the caveat below.
+ *
+ * CONSEQUENCE, stated plainly: a stage that produces more than PIPE_BUFFER_SIZE
+ * (4KB) of output would block forever waiting for a reader that cannot run
+ * until it finishes. To keep that from becoming a hang, the pipe's read end is
+ * closed if a stage overruns, so the writer gets -EPIPE and the line fails
+ * loudly instead of wedging the shell. Long outputs are therefore truncated,
+ * which is reported.
+ *---------------------------------------------------------------------------*/
+/*
+ * Console-capture sink for a pipeline stage: one character into the stage's
+ * stdout pipe.
+ *
+ * Deliberately NON-BLOCKING.  pipe_write() blocks when the buffer fills, and it
+ * is woken by a reader -- but in this sequential pipeline the shell task IS the
+ * reader, and it is currently inside the stage call, so nothing would ever
+ * drain the pipe and the shell would hang forever.  Dropping the overflow is
+ * the survivable choice; run_pipeline reports the truncation to the user by
+ * comparing the byte count it collects against what the stage produced.
+ */
+static size_t g_pipeline_dropped;   /* bytes the sink had to discard */
+
+static void pipeline_capture_putc(void* ctx, char c) {
+    pipe_buffer_t* pipe = (pipe_buffer_t*)ctx;
+    if (!pipe) return;
+    if (pipe_available(pipe) >= PIPE_BUFFER_SIZE) {
+        g_pipeline_dropped++;
+        return;
+    }
+    pipe_write(pipe, &c, 1);
+}
+
+static void run_pipeline(const char* cmd_line) {
+    /* Static, not stack: pipe_buffer_t is PIPE_BUFFER_SIZE + change (~4KB) and
+     * the shell task's kernel stack also carries the whole exec chain. Safe
+     * because the shell is single-threaded and one pipeline runs at a time. */
+    static pipe_buffer_t stage_pipe;   /* Feeds stage N's stdin */
+    static pipe_buffer_t out_pipe;     /* Captures stage N's stdout */
+    static char stage_out[PIPE_BUFFER_SIZE];
+
+    pipeline_t pipeline;
+    if (parse_pipeline(cmd_line, &pipeline) != 0) {
+        kprintf("shell: invalid pipeline (max %d stages)\n", MAX_PIPE_STAGES);
+        return;
+    }
+
+    if (pipeline.cmd_count < 2) {
+        /* A lone '|' with nothing on one side. */
+        kprintf("shell: syntax error near '|'\n");
+        return;
+    }
+
+    stream_context_t* streams = get_current_streams();
+    if (!streams) {
+        kprintf("shell: cannot run pipeline - no task context\n");
+        return;
+    }
+
+    /* Carries stage N's output into stage N+1. Empty for the first stage. */
+    size_t carry_len = 0;
+
+    for (int stage = 0; stage < pipeline.cmd_count; stage++) {
+        bool is_last = (stage == pipeline.cmd_count - 1);
+
+        /* --- stdin: feed in whatever the previous stage produced. --- */
+        if (stage > 0) {
+            pipe_init(&stage_pipe);
+            if (carry_len > 0 &&
+                pipe_write(&stage_pipe, stage_out, carry_len) < 0) {
+                kprintf("shell: pipe write failed\n");
+                pipe_destroy(&stage_pipe);
+                return;
+            }
+            /* Close the write end BEFORE the stage runs: with no concurrent
+             * writer, the data is already complete, and this is what lets the
+             * reader see EOF instead of blocking once it drains the buffer. */
+            pipe_close_write(&stage_pipe);
+
+            streams->stdin_stream.type = STREAM_TYPE_PIPE;
+            streams->stdin_stream.data = &stage_pipe;
+            streams->stdin_stream.fd = -1;
+            streams->stdin_stream.is_open = true;
+            streams->stdin_stream.borrowed = false;
+        }
+
+        /* --- stdout: capture into a fresh pipe unless this is the last stage,
+         *     which writes to wherever the shell's stdout already points. --- */
+        if (!is_last) {
+            pipe_init(&out_pipe);
+            streams->stdout_stream.type = STREAM_TYPE_PIPE;
+            streams->stdout_stream.data = &out_pipe;
+            streams->stdout_stream.fd = -1;
+            streams->stdout_stream.is_open = true;
+            streams->stdout_stream.borrowed = false;
+        }
+
+        /* Run the stage. parse_and_execute re-enters this file's dispatch
+         * chain; it sees no '|' in a single stage, so this does not recurse. */
+        char stage_cmd[512];
+        size_t n = 0;
+        while (pipeline.commands[stage][n] && n < sizeof(stage_cmd) - 1) {
+            stage_cmd[n] = pipeline.commands[stage][n];
+            n++;
+        }
+        stage_cmd[n] = '\0';
+
+        if (!is_last) {
+            /* The builtins print with kprintf, straight to the console, so
+             * pointing stdout_stream at the pipe is not enough on its own --
+             * without this hook `echo hi | cat` would print "hi" to the console
+             * and pipe nothing.  Installed only around the stage call and torn
+             * down immediately after, so kernel logging outside this window
+             * still reaches the console. */
+            void* prev_ctx = NULL;
+            g_pipeline_dropped = 0;
+            kprintf_capture_fn prev = kprintf_set_capture(pipeline_capture_putc,
+                                                          &out_pipe, &prev_ctx);
+            parse_and_execute(stage_cmd);
+            kprintf_set_capture(prev, prev_ctx, NULL);
+        } else {
+            parse_and_execute(stage_cmd);
+        }
+
+        /* --- Collect this stage's output for the next one. --- */
+        if (!is_last) {
+            stdout_reset(streams);
+
+            size_t produced = pipe_available(&out_pipe);
+            /* The pipe holds at most PIPE_BUFFER_SIZE and stage_out is exactly
+             * that big, so this clamp is a belt-and-braces bound, not the real
+             * truncation point -- overflow is dropped by the capture sink,
+             * which counts it in g_pipeline_dropped. */
+            if (produced > sizeof(stage_out)) {
+                produced = sizeof(stage_out);
+            }
+
+            carry_len = 0;
+            if (produced > 0) {
+                int got = pipe_read(&out_pipe, stage_out, produced);
+                if (got > 0) {
+                    carry_len = (size_t)got;
+                }
+            }
+
+            /* Closing the read end turns any further writes into -EPIPE, so a
+             * stage that overran cannot block on a pipe nobody will drain. */
+            pipe_close_read(&out_pipe);
+            pipe_destroy(&out_pipe);
+
+            if (g_pipeline_dropped > 0) {
+                kprintf("shell: stage %d output truncated at %u bytes "
+                        "(%u dropped)\n",
+                        stage + 1, (unsigned)PIPE_BUFFER_SIZE,
+                        (unsigned)g_pipeline_dropped);
+            }
+        }
+
+        /* Release this stage's stdin pipe now that the stage has finished. */
+        if (stage > 0) {
+            stdin_reset(streams);
+            pipe_destroy(&stage_pipe);
+        }
+    }
+}
+
 static void parse_and_execute(char* cmd_line) {
     char* argv[MAX_ARGS];
     int argc = 0;
@@ -292,14 +469,8 @@ static void parse_and_execute(char* cmd_line) {
     }
 
     if (has_pipe) {
-        /* Pipes are NOT supported yet — kernel-level output capture between
-         * stages isn't implemented. Previously we ran each stage UNPIPED and
-         * then printed a "not implemented" note, which produced silently wrong
-         * results (the user saw commands "run" and assumed the data flowed).
-         * Fail cleanly instead: reject the line without executing anything, so
-         * the user is never misled. Still record it in history for recall. */
         history_add(cmd_line);
-        kprintf("shell: pipes ('|') are not supported yet\n");
+        run_pipeline(cmd_copy);
         return;
     }
 
