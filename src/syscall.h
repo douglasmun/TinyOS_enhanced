@@ -170,7 +170,9 @@ void idt_setup_syscall(void);
  *-----------------------------------------------------------------------------*/
 void sys_exit(int status);
 int sys_write(int fd, const char* buf, size_t len);
-int sys_read(char* buf, size_t len);
+/* fd is honoured and must be STDIN_FILENO; both route through the calling
+ * task's stream_context_t rather than the console/keyboard directly. */
+int sys_read(int fd, char* buf, size_t len);
 int sys_getpid(void);
 void sys_yield(void);
 int sys_sleep(uint32_t ms);
@@ -237,13 +239,13 @@ static inline int write(int fd, const char* buf, size_t len) {
     return ret;
 }
 
-// Read from console (placeholder)
-static inline int read(char* buf, size_t len) {
+// Read from the stream bound to fd (0 = stdin)
+static inline int read(int fd, char* buf, size_t len) {
     int ret;
     __asm__ volatile (
         "int $0x80"
         : "=a"(ret)
-        : "a"(SYS_READ), "b"(buf), "c"(len)
+        : "a"(SYS_READ), "b"(fd), "c"(buf), "d"(len)
     );
     return ret;
 }

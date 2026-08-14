@@ -393,8 +393,16 @@ static void parse_and_execute(char* cmd_line) {
                     ramfs_close(redir_fd);
                     redir_fd = -1;
                 }
+                /* RAMFS_FLAG_INHERIT is required, not optional: RAMFS defaults
+                 * every fd to close-on-exec, and elf.c calls
+                 * ramfs_close_on_exec() while loading the child. Without the
+                 * flag, `exec prog > file` hands the child a stdout bound to an
+                 * fd that exec itself just closed, and every write returns -1.
+                 * The shell still owns and closes this fd; INHERIT only exempts
+                 * it from the exec sweep. */
                 redir_fd = ramfs_open(cmd_ctx.redirects[i].filename,
-                                     RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW);
+                                     RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW |
+                                     RAMFS_FLAG_INHERIT);
                 if (redir_fd < 0) {
                     /* File doesn't exist, create it */
                     int touch_fd = ramfs_open(cmd_ctx.redirects[i].filename,
@@ -402,7 +410,8 @@ static void parse_and_execute(char* cmd_line) {
                     if (touch_fd >= 0) {
                         ramfs_close(touch_fd);
                         redir_fd = ramfs_open(cmd_ctx.redirects[i].filename,
-                                            RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW);
+                                            RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW |
+                                            RAMFS_FLAG_INHERIT);
                     }
                 }
                 has_output_redir = (redir_fd >= 0);
@@ -417,8 +426,16 @@ static void parse_and_execute(char* cmd_line) {
                     ramfs_close(redir_fd);
                     redir_fd = -1;
                 }
+                /* RAMFS_FLAG_INHERIT is required, not optional: RAMFS defaults
+                 * every fd to close-on-exec, and elf.c calls
+                 * ramfs_close_on_exec() while loading the child. Without the
+                 * flag, `exec prog > file` hands the child a stdout bound to an
+                 * fd that exec itself just closed, and every write returns -1.
+                 * The shell still owns and closes this fd; INHERIT only exempts
+                 * it from the exec sweep. */
                 redir_fd = ramfs_open(cmd_ctx.redirects[i].filename,
-                                     RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW);
+                                     RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW |
+                                     RAMFS_FLAG_INHERIT);
                 if (redir_fd < 0) {
                     /* File doesn't exist, create it */
                     int touch_fd = ramfs_open(cmd_ctx.redirects[i].filename,
@@ -426,7 +443,8 @@ static void parse_and_execute(char* cmd_line) {
                     if (touch_fd >= 0) {
                         ramfs_close(touch_fd);
                         redir_fd = ramfs_open(cmd_ctx.redirects[i].filename,
-                                            RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW);
+                                            RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW |
+                                            RAMFS_FLAG_INHERIT);
                     }
                 }
                 has_output_redir = (redir_fd >= 0);
@@ -491,13 +509,43 @@ static void parse_and_execute(char* cmd_line) {
         return;
     }
 
+    /* Bind an output redirection to stdout.
+     *
+     * `has_output_redir` was previously set and never read: the shell opened
+     * the target file, left stdout pointing at the console, and closed the fd
+     * again at the end of the command — so `cmd > file` silently printed to
+     * the console and wrote nothing. Point stdout_stream at the fd that was
+     * already opened above rather than calling stdout_redirect_to_file(),
+     * which would open the file a second time and leak this fd.
+     *
+     * The reset at the end of this function restores the console before
+     * ramfs_close(redir_fd), so stdout never references a closed fd. */
+    stream_context_t* out_streams = NULL;
+    if (has_output_redir) {
+        out_streams = get_current_streams();
+        if (out_streams) {
+            out_streams->stdout_stream.type = STREAM_TYPE_FILE;
+            out_streams->stdout_stream.fd = redir_fd;
+            out_streams->stdout_stream.data = NULL;
+            out_streams->stdout_stream.is_open = true;
+            /* The shell opened redir_fd, so it owns it: stdout_reset() below is
+             * what actually closes it. A child that inherits this stream gets a
+             * borrowed copy instead and leaves the fd alone when it exits. */
+            out_streams->stdout_stream.borrowed = false;
+        }
+    }
+
     /* Handle input redirection: set up stdin stream */
     stream_context_t* streams = NULL;
     if (cmd_ctx.has_input_redir) {
         streams = get_current_streams();
         if (!streams) {
             kprintf("shell: cannot redirect input - no task context\n");
-            if (redir_fd >= 0) {
+            /* stdout may already be bound to redir_fd at this point; unbind it
+             * first so it isn't left pointing at a descriptor we then close. */
+            if (out_streams) {
+                stdout_reset(out_streams);
+            } else if (redir_fd >= 0) {
                 ramfs_close(redir_fd);
             }
             return;
@@ -505,7 +553,9 @@ static void parse_and_execute(char* cmd_line) {
         /* Redirect stdin to read from file */
         if (stdin_redirect_from_file(streams, cmd_ctx.input_file) < 0) {
             kprintf("shell: %s: cannot open file for reading\n", cmd_ctx.input_file);
-            if (redir_fd >= 0) {
+            if (out_streams) {
+                stdout_reset(out_streams);
+            } else if (redir_fd >= 0) {
                 ramfs_close(redir_fd);
             }
             return;
@@ -671,8 +721,15 @@ static void parse_and_execute(char* cmd_line) {
         }
     }
 
-    /* Clean up redirection file descriptor */
-    if (redir_fd >= 0) {
+    /* Clean up the redirection file descriptor.
+     *
+     * When stdout was bound to it, stdout_reset() closes the fd itself as part
+     * of restoring the console, so closing it again here would be a double
+     * close (and could later close an unrelated recycled fd). Ownership passes
+     * to the stream in that case; only the unbound path closes it directly. */
+    if (out_streams) {
+        stdout_reset(out_streams);
+    } else if (redir_fd >= 0) {
         ramfs_close(redir_fd);
     }
 

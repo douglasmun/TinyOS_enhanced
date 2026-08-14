@@ -50,8 +50,8 @@ int write(int fd, const void* buf, size_t len) {
 }
 
 int read(int fd, void* buf, size_t len) {
-    (void)fd;  /* kernel sys_read always reads the console */
-    return syscall3(SYS_READ, (uint32_t)(uintptr_t)buf, (uint32_t)len, 0);
+    return syscall3(SYS_READ, (uint32_t)fd, (uint32_t)(uintptr_t)buf,
+                    (uint32_t)len);
 }
 
 int putchar(int c) {

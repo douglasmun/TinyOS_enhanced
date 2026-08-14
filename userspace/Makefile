@@ -14,7 +14,7 @@ CFLAGS  := -m32 -ffreestanding -fno-pic -fno-builtin -fno-stack-protector \
 LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
 # User programs to build
-PROGRAMS := hello.elf shell.elf info.elf
+PROGRAMS := hello.elf shell.elf info.elf sleeper.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -41,6 +41,14 @@ info.elf: info.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c info.c -o info.o
 	$(LD) $(LDFLAGS) -o info.elf crt0.o info.o libc.o -lgcc
 	@echo "Built info.elf"
+
+# sleeper.elf is the background-jobs test fixture (see verify-bgjobs.sh); it
+# was previously built by hand, which left no way to rebuild it after an ABI
+# change without rediscovering the command.
+sleeper.elf: sleeper.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c sleeper.c -o sleeper.o
+	$(LD) $(LDFLAGS) -o sleeper.elf crt0.o sleeper.o libc.o -lgcc
+	@echo "Built sleeper.elf"
 
 # shell.elf provides its own _start and syscall wrappers
 shell.elf: shell.c user.ld

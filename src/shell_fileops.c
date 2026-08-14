@@ -1478,6 +1478,27 @@ void cmd_exec(int argc, char* argv[]) {
     // Add to scheduler
     task_t* task = task_get(pid);
     if (task) {
+        /* Hand the child this shell's streams before it can run. Now that
+         * sys_write honours fd via task->streams, a child left on the default
+         * console context would ignore an active `exec prog > file`
+         * redirection and print to the console instead. Must happen before
+         * scheduler_add_task: after that the child is runnable and could
+         * write on the next tick.
+         *
+         * FOREGROUND ONLY. streams_inherit is a shallow copy, so parent and
+         * child would share the same RAMFS fd NUMBER with no refcount. The
+         * shell closes that fd and resets stdin as soon as the command line
+         * finishes (shell.c), which for a background child happens while it is
+         * still running — every subsequent write would hit a closed, possibly
+         * recycled fd. Blocking on the child, as the foreground path does,
+         * keeps the fd alive for exactly as long as the child can use it.
+         * A background job therefore keeps the console default and ignores
+         * redirection; lifting that needs refcounted or dup'd fds, which
+         * belongs with the pipe work rather than here. */
+        if (!background) {
+            streams_inherit(&task->streams, get_current_streams());
+        }
+
         scheduler_add_task(task);
         kprintf("[EXEC] Process added to scheduler\n");
 
