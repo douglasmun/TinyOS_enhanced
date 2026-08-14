@@ -212,6 +212,14 @@ bool stdin_has_data(stream_context_t* ctx);
  */
 bool stdin_is_file(stream_context_t* ctx);
 
+/**
+ * @brief Is stdin currently a pipe?
+ *
+ * Distinct from stdin_is_file(): commands that refuse to read the keyboard
+ * (because nothing can signal EOF there) should still accept a pipe.
+ */
+bool stdin_is_pipe(stream_context_t* ctx);
+
 /*=============================================================================
  * Helper Functions
  *=============================================================================*/

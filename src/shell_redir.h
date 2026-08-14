@@ -172,6 +172,17 @@ int pipe_read(pipe_buffer_t* pipe, char* data, size_t size);
 size_t pipe_available(const pipe_buffer_t* pipe);
 
 /**
+ * @brief Release a pipe's resources
+ *
+ * Closes both ends (waking anyone blocked on them so they observe EOF/EPIPE)
+ * and frees the page holding the two wait queues. Safe to call on a pipe whose
+ * ends are already closed. After this the pipe must not be read or written.
+ *
+ * @param pipe Pipe buffer to destroy
+ */
+void pipe_destroy(pipe_buffer_t* pipe);
+
+/**
  * @brief Close write end of pipe (readers will get EOF when empty)
  *
  * @param pipe Pipe buffer

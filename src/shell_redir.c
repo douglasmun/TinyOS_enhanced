@@ -203,8 +203,13 @@ int parse_pipeline(const char* cmd_line, pipeline_t* pipeline) {
     size_t cmd_pos = 0;
 
     while (*src && cmd_idx < MAX_PIPE_STAGES) {
-        /* Skip leading spaces */
-        while (*src == ' ') src++;
+        /* Skip LEADING spaces only, i.e. while this stage is still empty.
+         * Testing cmd_pos is what makes it "leading": this loop body runs once
+         * per character, so an unconditional skip here eats the separators
+         * INSIDE a stage too, turning "cat -n" into "cat-n" and every
+         * multi-word stage into an unknown command. */
+        while (*src == ' ' && cmd_pos == 0) src++;
+        if (!*src) break;
 
         /* Check for pipe operator */
         if (*src == '|') {
@@ -384,6 +389,20 @@ int pipe_write(pipe_buffer_t* pipe, const char* data, size_t size) {
          * wait_queue.h lines 84-93 and wait_queue.c lines 71-107.
          *===================================================================*/
         while (pipe->data_size >= PIPE_BUFFER_SIZE) {
+            /*=================================================================
+             * BROKEN PIPE (re-check): the entry test above only proves the
+             * read end was open when the write STARTED. A writer parked here
+             * on a full pipe is woken by pipe_close_read() precisely because
+             * the reader went away; without this re-check it would loop
+             * straight back to sleep and block forever on a pipe nobody will
+             * ever drain. Report partial progress if we already wrote some
+             * bytes, so the caller can tell how much made it through.
+             *===============================================================*/
+            if (pipe->read_closed) {
+                CRITICAL_SECTION_EXIT();
+                return total_written > 0 ? (int)total_written : -EPIPE;
+            }
+
             /* Pipe is full, block until space available */
             wait_queue_sleep(writers);
             /* When we wake up, critical section is NOT held, re-acquire */
@@ -524,6 +543,51 @@ size_t pipe_available(const pipe_buffer_t* pipe) {
  * Both functions wake up waiters so they can detect the closed state.
  *=============================================================================*/
 
+void pipe_destroy(pipe_buffer_t* pipe) {
+    if (!pipe) {
+        return;
+    }
+
+    /* Close both ends first. Any task still blocked in pipe_read/pipe_write is
+     * woken by these and observes EOF/EPIPE, so it leaves the queues before we
+     * free the page they live in. Freeing with waiters still parked would hand
+     * the frame back to the PMM while sleeping tasks hold pointers into it. */
+    pipe_close_write(pipe);
+    pipe_close_read(pipe);
+
+    CRITICAL_SECTION_ENTER();
+
+    /* Both queues live in ONE page (readers at offset 0, writers at +2048),
+     * so the single pmm_free below releases both. */
+    void* page = pipe->readers;
+
+    if (page) {
+        int still_waiting = wait_queue_count((wait_queue_t*)pipe->readers) +
+                            wait_queue_count((wait_queue_t*)pipe->writers);
+        if (still_waiting > 0) {
+            /* A woken task has not been scheduled yet, so it is still recorded
+             * on the queue. Freeing now would be a use-after-free the moment it
+             * runs. Leak the page instead: a bounded one-page leak beats
+             * corrupting whatever gets that frame next. */
+            kprintf("[PIPE] WARNING: %d task(s) still queued, leaking wait-queue page\n",
+                    still_waiting);
+            page = NULL;
+        }
+    }
+
+    pipe->readers = NULL;
+    pipe->writers = NULL;
+    pipe->data_size = 0;
+    pipe->read_pos = 0;
+    pipe->write_pos = 0;
+
+    CRITICAL_SECTION_EXIT();
+
+    if (page) {
+        pmm_free((uint32_t)(uintptr_t)page);
+    }
+}
+
 void pipe_close_write(pipe_buffer_t* pipe) {
     if (!pipe) {
         return;
@@ -532,9 +596,12 @@ void pipe_close_write(pipe_buffer_t* pipe) {
     CRITICAL_SECTION_ENTER();
     pipe->write_closed = true;
 
-    /* Wake up readers so they can detect EOF */
+    /* Wake EVERY reader, not one: EOF is a broadcast condition. Each waiter
+     * must observe write_closed and return 0; wait_queue_wakeup() releases a
+     * single task, leaving any others asleep forever on a pipe that will
+     * never receive another byte. */
     if (pipe->readers) {
-        wait_queue_wakeup((wait_queue_t*)pipe->readers);
+        wait_queue_wakeup_all((wait_queue_t*)pipe->readers);
     }
 
     CRITICAL_SECTION_EXIT();
@@ -548,9 +615,10 @@ void pipe_close_read(pipe_buffer_t* pipe) {
     CRITICAL_SECTION_ENTER();
     pipe->read_closed = true;
 
-    /* Wake up writers so they can detect EPIPE */
+    /* Wake EVERY writer, for the same reason as EOF above: EPIPE applies to
+     * all of them, and a single wakeup would strand the rest. */
     if (pipe->writers) {
-        wait_queue_wakeup((wait_queue_t*)pipe->writers);
+        wait_queue_wakeup_all((wait_queue_t*)pipe->writers);
     }
 
     CRITICAL_SECTION_EXIT();

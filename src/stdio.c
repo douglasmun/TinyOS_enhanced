@@ -2,6 +2,7 @@
  * stdio.c - Standard I/O Streams Implementation
  *=============================================================================*/
 #include "stdio.h"
+#include "shell_redir.h"  /* pipe_buffer_t and pipe_read/pipe_write */
 #include "process.h"
 #include "ramfs.h"
 #include "kprintf.h"
@@ -290,7 +291,12 @@ int stdin_read(stream_context_t* ctx, char* buffer, size_t size) {
             return -1;
 
         case STREAM_TYPE_PIPE:
-            /* TODO: Read from pipe buffer */
+            /* Blocks until data arrives, or returns 0 at EOF (all writers
+             * closed). data holds the pipe_buffer_t the stream was bound to. */
+            if (ctx->stdin_stream.data) {
+                return pipe_read((pipe_buffer_t*)ctx->stdin_stream.data,
+                                 buffer, size);
+            }
             return -1;
 
         case STREAM_TYPE_CONSOLE: {
@@ -332,6 +338,17 @@ int stdin_getline(stream_context_t* ctx, char* buffer, size_t size) {
         return -1;
     }
 
+    /* size == 1 leaves room for the terminator and nothing else. Handled here
+     * rather than in each case below because every one of them loops on
+     * `pos < size - 1` with an unsigned size: at size == 1 that wraps to
+     * SIZE_MAX and the loop writes far past a one-byte buffer. Returning the
+     * empty string is the honest answer -- zero characters fit -- and it keeps
+     * the underflow unreachable no matter which stream type is added later. */
+    if (size == 1) {
+        buffer[0] = '\0';
+        return 0;
+    }
+
     if (!ctx->stdin_stream.is_open) {
         return -1;
     }
@@ -364,9 +381,38 @@ int stdin_getline(stream_context_t* ctx, char* buffer, size_t size) {
             return (int)pos;
         }
 
-        case STREAM_TYPE_PIPE:
-            /* TODO: Read line from pipe buffer */
-            return -1;
+        case STREAM_TYPE_PIPE: {
+            /* One byte at a time: pipe_read has no lookahead, so reading a
+             * block would consume bytes past the newline that belong to the
+             * NEXT line and there is nowhere to push them back. */
+            if (!ctx->stdin_stream.data) {
+                return -1;
+            }
+            pipe_buffer_t* pipe = (pipe_buffer_t*)ctx->stdin_stream.data;
+            size_t pos = 0;
+
+            while (pos < size - 1) {
+                char c;
+                int n = pipe_read(pipe, &c, 1);
+                if (n < 0) {
+                    return n;        /* Error */
+                }
+                if (n == 0) {
+                    break;           /* EOF: return what we have */
+                }
+                if (c == '\n') {
+                    break;           /* Line complete; newline not stored */
+                }
+                buffer[pos++] = c;
+            }
+
+            buffer[pos] = '\0';
+            /* Distinguish "EOF with nothing read" from "empty line". */
+            if (pos == 0 && pipe->write_closed && pipe_available(pipe) == 0) {
+                return 0;
+            }
+            return (int)pos;
+        }
 
         case STREAM_TYPE_CONSOLE:
             /* Reading line from keyboard not implemented here */
@@ -402,7 +448,11 @@ int stdout_write(stream_context_t* ctx, const char* data, size_t size) {
             return -1;
 
         case STREAM_TYPE_PIPE:
-            /* TODO: Write to pipe buffer */
+            /* Blocks while the pipe is full; -EPIPE once the read end closes. */
+            if (ctx->stdout_stream.data) {
+                return pipe_write((pipe_buffer_t*)ctx->stdout_stream.data,
+                                  data, size);
+            }
             return -1;
 
         case STREAM_TYPE_CONSOLE:
@@ -441,7 +491,12 @@ int stderr_write(stream_context_t* ctx, const char* data, size_t size) {
             return -1;
 
         case STREAM_TYPE_PIPE:
-            /* stderr typically not piped, but support it */
+            /* stderr is not piped by `|` (which redirects stdout only), but a
+             * caller can bind it explicitly, so honour it rather than fail. */
+            if (ctx->stderr_stream.data) {
+                return pipe_write((pipe_buffer_t*)ctx->stderr_stream.data,
+                                  data, size);
+            }
             return -1;
 
         case STREAM_TYPE_CONSOLE:
@@ -471,7 +526,12 @@ bool stdin_has_data(stream_context_t* ctx) {
             return true;
 
         case STREAM_TYPE_PIPE:
-            /* TODO: Check pipe buffer */
+            /* Buffered bytes, or EOF — both make a read return without
+             * blocking, which is what callers use this to decide. */
+            if (ctx->stdin_stream.data) {
+                pipe_buffer_t* pipe = (pipe_buffer_t*)ctx->stdin_stream.data;
+                return pipe_available(pipe) > 0 || pipe->write_closed;
+            }
             return false;
 
         case STREAM_TYPE_CONSOLE:
@@ -491,6 +551,13 @@ bool stdin_is_file(stream_context_t* ctx) {
         return false;
     }
     return ctx->stdin_stream.type == STREAM_TYPE_FILE;
+}
+
+bool stdin_is_pipe(stream_context_t* ctx) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->stdin_stream.type == STREAM_TYPE_PIPE;
 }
 
 /*=============================================================================

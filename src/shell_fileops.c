@@ -738,8 +738,11 @@ void cmd_cat(int argc, char* argv[]) {
     if (use_stdin) {
         /* Read from stdin */
         streams = get_current_streams();
-        if (!stdin_is_file(streams)) {
-            stream_printf(ctx, "cat: reading from keyboard not supported (use files or redirection)\n");
+        /* A pipe is a perfectly good stdin -- the read loop below is
+         * stream-agnostic.  The case this rejects is the CONSOLE: reading from
+         * the keyboard here would block the shell with no way to signal EOF. */
+        if (!stdin_is_file(streams) && !stdin_is_pipe(streams)) {
+            stream_printf(ctx, "cat: reading from keyboard not supported (use files, pipes or redirection)\n");
             return;
         }
     } else {

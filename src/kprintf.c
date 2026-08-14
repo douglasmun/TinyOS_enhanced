@@ -3,13 +3,65 @@
  *============================================================================*/
 #include "kernel.h"
 #include "kprintf.h"
+#include "process.h"    /* task_current() — the capture hook's owner check */
 #include "serial.h"
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdbool.h>
 
+/*=============================================================================
+ * CONSOLE CAPTURE HOOK
+ *
+ * The shell's builtins (cmd_echo, cmd_ls, ...) print with kprintf, i.e. straight
+ * to the console, so their output cannot be piped by the stream layer alone.
+ * Converting all ~75 call sites was the alternative; redirecting the ONE console
+ * emit point is smaller and cannot miss a site.
+ *
+ * This is deliberately OPT-IN and explicitly scoped, NOT keyed on the current
+ * task's stdout stream type: genuine kernel logging ([EXEC], [SPAWN], EDR
+ * alerts) shares this path, and capturing that into a user's pipe would both
+ * corrupt the pipeline data and hide kernel diagnostics. run_pipeline() installs
+ * the hook around a single builtin call and removes it immediately after, so
+ * only output produced by that call is diverted.
+ *
+ * OWNERSHIP (load-bearing): the hook is bound to the task that installed it and
+ * applies ONLY while that task is the running one.  It is NOT enough to install
+ * and clear it around the stage call, because a stage can BLOCK: `exec` is a
+ * valid pipeline stage and cmd_exec calls sys_waitpid, which sleeps on a wait
+ * queue and yields.  With a hook that ignored the current task, every other
+ * task's kprintf -- EDR alerts, timer softirq logging, and kernel PANIC
+ * messages -- would be diverted into a 4KB pipe buffer and silently dropped
+ * once it filled.  Comparing task_current() against the owner makes the
+ * diversion end the instant the scheduler switches away, and resume when the
+ * owner is scheduled again.
+ *
+ * Single CPU and the owner check is a plain pointer compare, so no lock is
+ * needed; task_current() is NULL before scheduler_start(), which simply means
+ * early-boot output is never captured.
+ *=============================================================================*/
+static kprintf_capture_fn g_capture = NULL;
+static void* g_capture_ctx = NULL;
+static const void* g_capture_owner = NULL;
+
+kprintf_capture_fn kprintf_set_capture(kprintf_capture_fn fn, void* ctx,
+                                       void** prev_ctx) {
+    kprintf_capture_fn prev = g_capture;
+    if (prev_ctx) *prev_ctx = g_capture_ctx;
+    g_capture = fn;
+    g_capture_ctx = ctx;
+    /* Bind to whoever is installing it. Clearing (fn == NULL) drops the owner
+     * too, so a stale pointer can never re-arm capture for a recycled slot. */
+    g_capture_owner = fn ? (const void*)task_current() : NULL;
+    return prev;
+}
+
 /* ---------- low-level unified sink ---------- */
 static inline void kputc(char c) {          /* mirror to both sinks */
+    if (g_capture && g_capture_owner &&
+        (const void*)task_current() == g_capture_owner) {
+        g_capture(g_capture_ctx, c);
+        return;
+    }
     console_putc(c);
     serial_putc(c);
 }

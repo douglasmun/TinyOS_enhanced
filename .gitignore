@@ -149,3 +149,7 @@ argv.log
 argv-trace.log
 spawn.log
 spawn-trace.log
+pipes.log
+pipes-trace.log
+pipes-exec.log
+pipes-exec-trace.log
