@@ -99,7 +99,11 @@
  * SECURITY (v1.11): Maximum syscall number for range validation
  * Update this whenever adding new syscalls
  *-----------------------------------------------------------------------------*/
-#define MAX_SYSCALL_NUM  16  // Highest valid syscall number (updated for Phase 14)
+/* Must cover the HIGHEST number defined above, not the highest in this block:
+ * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
+ * dispatcher cases, but this bound stayed at 16 when they were added, so the
+ * range check rejected both before dispatch and userspace could never block. */
+#define MAX_SYSCALL_NUM  18  // Highest valid syscall number (SYS_WAITPID)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
