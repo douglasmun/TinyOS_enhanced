@@ -530,7 +530,7 @@ int shell_login_prompt(void) {
     kprintf("   (\\_/) Hearty <3\n");
     kprintf("   (o.o) Thoughts ooO\n");
     kprintf("*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*\n");
-    kprintf("  TinyOS v2.0 Login System\n");
+    kprintf("  %s Login System\n", TINYOS_VERSION_NAME);
     kprintf("*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*\n");
     kprintf("\n");
 

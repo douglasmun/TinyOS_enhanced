@@ -16,6 +16,18 @@
 #endif
 
 /*=============================================================================
+ * Release version — the single source of truth for every user-visible version
+ * string (boot banner, login header, /etc/issue, /etc/motd).
+ *
+ * These were four independent hardcoded literals and all four had drifted: the
+ * boot banner still said v2.0 two releases after v2.2 shipped, and /etc/issue
+ * and /etc/motd still said v1.10. Bump TINYOS_VERSION here when cutting a
+ * release and every consumer follows.
+ *===========================================================================*/
+#define TINYOS_VERSION      "2.3"
+#define TINYOS_VERSION_NAME "TinyOS v" TINYOS_VERSION
+
+/*=============================================================================
  * Secure Memory Zeroing - Inline version for password clearing
  * Uses volatile to prevent compiler optimization from removing the writes
  * Simpler than crypto_secure_zero() to avoid memory corruption issues

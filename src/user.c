@@ -2,6 +2,7 @@
  * user.c - User and Group Management Implementation
  *=============================================================================*/
 #include "user.h"
+#include "kernel.h"  /* TINYOS_VERSION_NAME for /etc/issue and /etc/motd */
 #include "kprintf.h"
 #include "util.h"
 #include "time.h"
@@ -1426,7 +1427,11 @@ void user_create_etc_structure(void) {
      *-----------------------------------------------------------------------*/
     fd = ramfs_open("/etc/issue", RAMFS_FLAG_WRITE);
     if (fd >= 0) {
-        ramfs_write(fd, "TinyOS v1.10 - Multi-User Operating System\n", 44);
+        /* strlen, not a hand-counted literal: this line and the motd below
+         * carried a byte count that had to be edited in lockstep with the
+         * text, and both had silently gone stale at v1.10. */
+        ramfs_write(fd, TINYOS_VERSION_NAME " - Multi-User Operating System\n",
+                    strlen(TINYOS_VERSION_NAME " - Multi-User Operating System\n"));
         ramfs_write(fd, "\n", 1);
 #ifdef TINYOS_DEV
         /* Development mode: Show default credentials with warning */
@@ -1449,7 +1454,8 @@ void user_create_etc_structure(void) {
      *-----------------------------------------------------------------------*/
     fd = ramfs_open("/etc/motd", RAMFS_FLAG_WRITE);
     if (fd >= 0) {
-        ramfs_write(fd, "Welcome to TinyOS v1.10!\n", 25);
+        ramfs_write(fd, "Welcome to " TINYOS_VERSION_NAME "!\n",
+                    strlen("Welcome to " TINYOS_VERSION_NAME "!\n"));
         ramfs_write(fd, "\n", 1);
         ramfs_write(fd, "This is a multi-user operating system with:\n", 45);
         ramfs_write(fd, "  - User authentication and authorization\n", 43);
