@@ -536,3 +536,46 @@ void handle_copy_user_fault(void) {
 uint32_t get_copy_user_fault_address(void) {
     return copy_ctx.fault_addr;
 }
+
+/*=============================================================================
+ * FUNCTION: copy_string_from_user
+ *=============================================================================
+ * Copies a NUL-terminated string from user space, one byte at a time.
+ *
+ * The byte-at-a-time loop is deliberate. A bulk copy would have to guess how
+ * much to read: guess high and a perfectly valid string that ends a few bytes
+ * before an unmapped page makes the whole call fault; guess low and long
+ * strings are silently truncated. Fetching until the terminator reads exactly
+ * the bytes the string occupies and not one more.
+ *
+ * Each byte goes through copy_from_user() rather than a raw dereference so the
+ * user-space bounds check and the page-fault recovery hook stay in one place.
+ * That costs a call per byte, which is acceptable: this is used for paths and
+ * argv entries at process-creation time, never in a hot loop.
+ *============================================================================*/
+int copy_string_from_user(char* kernel_dst, const char* user_src, size_t max_len) {
+    if (!kernel_dst || !user_src) {
+        return -EFAULT;
+    }
+    if (max_len == 0) {
+        return -EINVAL;  /* No room even for the terminator */
+    }
+
+    for (size_t i = 0; i < max_len; i++) {
+        char c;
+        int rc = copy_from_user(&c, user_src + i, 1);
+        if (rc < 0) {
+            return rc;   /* -EFAULT / -EINVAL, already the right sign */
+        }
+
+        kernel_dst[i] = c;
+        if (c == '\0') {
+            return (int)i;   /* Length excluding the terminator */
+        }
+    }
+
+    /* Ran out of room before finding a terminator. Refuse rather than hand
+     * back a truncated string the caller might treat as complete. */
+    kernel_dst[0] = '\0';
+    return -ENAMETOOLONG;
+}

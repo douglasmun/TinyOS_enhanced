@@ -22,6 +22,7 @@
 #define SYS_GETGID 6
 #define SYS_SLEEP  17
 #define SYS_WAITPID 18
+#define SYS_SPAWN  19
 
 /* Raw syscall wrappers */
 int syscall0(int num);
@@ -36,6 +37,12 @@ int  getgid(void);
 void yield(void);
 int  sleep_ms(uint32_t ms);      /* blocks; timer wakes the task */
 int  waitpid(int pid);           /* blocks until pid exits; returns status */
+
+/* Load `path` and start it as a child process. Returns the child PID (> 0) or
+ * a negative errno. Does NOT block — waitpid() on the result to wait for it.
+ * argv is a NULL-terminated array (argv[0] conventionally the program name);
+ * pass NULL for none. The child inherits this process's stdin/stdout/stderr. */
+int  spawn(const char* path, char* const* argv);
 
 /* I/O — fd 1 is the console; read is line-buffered and blocks */
 int  write(int fd, const void* buf, size_t len);

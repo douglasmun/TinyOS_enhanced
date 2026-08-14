@@ -1319,8 +1319,6 @@ void cmd_rm(int argc, char* argv[]) {
 /*=============================================================================
  * COMMAND: exec - Execute ELF binary
  *=============================================================================*/
-#define EXEC_MAX_FILE_SIZE 65536  // 64KB maximum ELF size (DoS prevention)
-#define EXEC_BUFFER_SIZE EXEC_MAX_FILE_SIZE
 
 void cmd_exec(int argc, char* argv[]) {
     if (argc < 2) {
@@ -1339,22 +1337,6 @@ void cmd_exec(int argc, char* argv[]) {
     const char* path = argv[1];
     char abs_path[MAX_PATH];
 
-    /*
-     * Static (not stack) buffer: cmd_exec runs on the shell's kernel task
-     * stack (KERNEL_TASK_STACK_PAGES = 32 pages = 128KB; it was 64KB when
-     * this comment was first written, which the full signed-exec chain
-     * overflowed), and the ELF verify path (SHA-256 + ECDSA) is deep. A
-     * 16KB stack buffer here previously overflowed the task stack and
-     * silently corrupted the signature hash computation.
-     *
-     * INVARIANT: cmd_exec is invoked only from the single-threaded shell, so
-     * one load is ever in flight and a static buffer is safe. Background jobs
-     * preserve this — `exec foo.elf &` still returns through this one caller
-     * before the next command is read. A future SYS_SPAWN (roadmap item 2)
-     * would let a *process* trigger a load concurrently and BREAK it; that
-     * change must give the buffer a lock or a per-caller allocation.
-     */
-    static uint8_t exec_buffer[EXEC_BUFFER_SIZE];
 
     /* Build absolute path if needed.
      * Drive-letter paths ("C:/prog.elf") are already absolute — the VFS
@@ -1387,65 +1369,6 @@ void cmd_exec(int argc, char* argv[]) {
 
     kprintf("[EXEC] Loading '%s'...\n", path);
 
-    /* Open via the VFS so drive-letter paths (C: FAT32, D: RAMFS) work;
-     * pathless "/file" goes to the legacy default driver (RAMFS). */
-    int fd = vfs_open(path, VFS_O_RDONLY);
-    if (fd < 0) {
-        stream_printf(get_current_streams(),
-                      "exec: cannot open file '%s'\n", path);
-        return;
-    }
-
-    /* Read the whole file; the VFS has no stat, so size = bytes read.
-     * The buffer itself enforces EXEC_MAX_FILE_SIZE (DoS prevention). */
-    uint32_t file_size = 0;
-    while (file_size < EXEC_BUFFER_SIZE) {
-        ssize_t n = vfs_read(fd, exec_buffer + file_size,
-                             EXEC_BUFFER_SIZE - file_size);
-        if (n < 0) {
-            stream_printf(get_current_streams(),
-                          "exec: read failed for '%s' (error %d)\n",
-                          path, (int)n);
-            vfs_close(fd);
-            return;
-        }
-        if (n == 0) {
-            break;  /* EOF */
-        }
-        file_size += (uint32_t)n;
-    }
-
-    if (file_size == EXEC_BUFFER_SIZE) {
-        /* Buffer full — probe for one more byte to distinguish an exactly
-         * buffer-sized file from an oversized one. */
-        uint8_t probe;
-        ssize_t n = vfs_read(fd, &probe, 1);
-        if (n < 0) {
-            /* A read error is not EOF — treating it as such would hand a
-             * silently truncated image to the loader. */
-            stream_printf(get_current_streams(),
-                          "exec: read failed for '%s' (error %d)\n",
-                          path, (int)n);
-            vfs_close(fd);
-            return;
-        }
-        if (n > 0) {
-            stream_printf(get_current_streams(),
-                          "exec: file too large (max %u bytes)\n",
-                          EXEC_MAX_FILE_SIZE);
-            vfs_close(fd);
-            return;
-        }
-    }
-    vfs_close(fd);
-
-    if (file_size == 0) {
-        stream_printf(get_current_streams(), "exec: file is empty\n");
-        return;
-    }
-
-    kprintf("[EXEC] File size: %u bytes\n", file_size);
-
     /* Process name = basename of the path (after any drive prefix) */
     const char* proc_name = path;
     for (const char* p = path; *p; p++) {
@@ -1457,9 +1380,38 @@ void cmd_exec(int argc, char* argv[]) {
         proc_name = path + 2;
     }
 
-    kprintf("[EXEC] File loaded successfully\n");
-    // Load ELF and create process
-    int pid = elf_load_process(exec_buffer, file_size, proc_name);
+    /* Build the child's argv from the rest of the command line.
+     *
+     * `exec prog a b c` gives the child argv == {"prog", "a", "b", "c"}: by
+     * convention argv[0] is the program name, and the shell's own argv[0]
+     * ("exec") and argv[1] (the path) are not part of it. A trailing "&" is a
+     * shell directive, not an argument, so it is dropped — `background` was
+     * computed from it above.
+     *
+     * The strings point into the shell's tokenizer buffer, which is fine: they
+     * are copied onto the child's stack during creation and are not referenced
+     * afterwards. Over-long vectors are rejected here rather than silently
+     * truncated, so the child never sees a partial command line. */
+    int last_arg = background ? argc - 1 : argc;   /* exclude a trailing "&" */
+    if (last_arg - 2 > USER_ARGV_MAX - 1) {        /* -1: argv[0] is the name */
+        stream_printf(get_current_streams(),
+                      "exec: too many arguments (max %d)\n", USER_ARGV_MAX - 1);
+        return;
+    }
+
+    const char* child_argv[USER_ARGV_MAX];
+    int child_argc = 0;
+    child_argv[child_argc++] = proc_name;
+    for (int i = 2; i < last_arg; i++) {
+        child_argv[child_argc++] = argv[i];
+    }
+
+    /* Read + verify + create, all inside elf.c under the exec lock. The lock
+     * is released before this returns, so the foreground wait below does not
+     * serialize the child's entire RUNTIME against every other loader — only
+     * its load. sys_spawn goes through this same function. */
+    const char* err = NULL;
+    int pid = elf_exec_from_path(path, proc_name, child_argc, child_argv, &err);
 
     if (pid < 0) {
         /* elf_load_process owns its own teardown: every failure path after
@@ -1468,8 +1420,8 @@ void cmd_exec(int argc, char* argv[]) {
          * PDPT, page tables, stacks and slot). Nothing to reap here — a
          * second task_terminate() on the freed slot would risk hitting a
          * recycled task. */
-        stream_printf(get_current_streams(),
-                      "exec: failed to load '%s'\n", path);
+        stream_printf(get_current_streams(), "exec: %s: %s\n",
+                      path, err ? err : "failed to load");
         return;
     }
 

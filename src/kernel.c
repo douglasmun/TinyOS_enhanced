@@ -29,6 +29,7 @@
 #include "elf.h"
 #include "hello_elf_data.h"
 #include "sleeper_elf_data.h"
+#include "spawner_elf_data.h"
 #include "shell_elf_data.h"
 #include "shell.h"
 #include "keyboard.h"
@@ -750,6 +751,13 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         if (elf_fd >= 0) {
             ramfs_write(elf_fd, hello_elf_data, hello_elf_data_len);
             ramfs_close(elf_fd);
+            /* RAMFS creates files 0600 (RAMFS_DEFAULT_FILE_MODE), which is
+             * root-only. These are programs meant to be run BY user processes:
+             * task_create_user gives a ring-3 task uid 1000, so without an
+             * other-readable mode SYS_SPAWN's open fails with -EACCES. The
+             * shell's own `exec` is unaffected (it runs as root), which is why
+             * only the spawn path exposed this. */
+            ramfs_chmod("/hello.elf", 0755);
         }
     }
 
@@ -762,6 +770,31 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         if (sleeper_fd >= 0) {
             ramfs_write(sleeper_fd, sleeper_elf_data, sleeper_elf_data_len);
             ramfs_close(sleeper_fd);
+            /* RAMFS creates files 0600 (RAMFS_DEFAULT_FILE_MODE), which is
+             * root-only. These are programs meant to be run BY user processes:
+             * task_create_user gives a ring-3 task uid 1000, so without an
+             * other-readable mode SYS_SPAWN's open fails with -EACCES. The
+             * shell's own `exec` is unaffected (it runs as root), which is why
+             * only the spawn path exposed this. */
+            ramfs_chmod("/sleeper.elf", 0755);
+        }
+    }
+
+    /* spawner.elf exercises SYS_SPAWN from ring 3: it spawns /hello.elf with
+     * arguments and waits for it. `exec` alone cannot prove that path, since
+     * the shell loads processes from inside the kernel. */
+    {
+        int spawner_fd = ramfs_open("/spawner.elf", RAMFS_FLAG_WRITE);
+        if (spawner_fd >= 0) {
+            ramfs_write(spawner_fd, spawner_elf_data, spawner_elf_data_len);
+            ramfs_close(spawner_fd);
+            /* RAMFS creates files 0600 (RAMFS_DEFAULT_FILE_MODE), which is
+             * root-only. These are programs meant to be run BY user processes:
+             * task_create_user gives a ring-3 task uid 1000, so without an
+             * other-readable mode SYS_SPAWN's open fails with -EACCES. The
+             * shell's own `exec` is unaffected (it runs as root), which is why
+             * only the spawn path exposed this. */
+            ramfs_chmod("/spawner.elf", 0755);
         }
     }
 

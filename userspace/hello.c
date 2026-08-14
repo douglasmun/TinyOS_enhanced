@@ -7,9 +7,16 @@
  *=============================================================================*/
 #include "libc.h"
 
-int main(void) {
+int main(int argc, char** argv) {
     print("Hello from ELF!\n");
     print("This is a user mode program loaded from ELF format.\n");
+
+    /* Echo the argument vector. verify-argv.sh greps for these lines, so keep
+     * the "argv[N]=" shape byte-identical. */
+    for (int i = 0; i < argc; i++) {
+        printf("argv[%d]=%s\n", i, argv[i]);
+    }
+
     print("Yielding...\n");
 
     for (int i = 0; i < 3; i++) {

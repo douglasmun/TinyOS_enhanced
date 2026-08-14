@@ -12,6 +12,9 @@
 #include "sha256.h" /* PHASE 17: Hash computation */
 #include "secure_boot.h" /* Pinned trusted signing key */
 #include "critical.h"    /* disable_interrupts/restore_interrupts around ecdsa_verify */
+#include "mutex.h"       /* elf_exec_lock: serialize the exec path's static buffers */
+#include "vfs.h"         /* elf_exec_from_path: read the image before loading it */
+#include "errno.h"
 #include <stddef.h>
 
 /*=============================================================================
@@ -299,10 +302,154 @@ static void elf_abort_load(int pid, uint32_t kernel_cr3) {
 }
 
 /*=============================================================================
+ * Exec-path serialization (see elf_exec_lock() in elf.h for the rationale)
+ *
+ * Non-recursive on purpose: the exec path must never re-enter itself, and a
+ * recursive lock would hide that bug instead of reporting it.
+ *===========================================================================*/
+/* Statically initialised rather than lazily via mutex_init(): there is no
+ * elf_init() to call it from, and a "first caller initialises it" check would
+ * itself be the race it is meant to prevent. mutex_init() only zeroes the
+ * fields and stores name/flags, so this is the identical resting state. */
+static mutex_t exec_path_mutex = {
+    .locked = false,
+    .owner_pid = 0,
+    .lock_count = 0,
+    .waiters = {0},
+    .num_waiters = 0,
+    .flags = 0,          /* non-recursive: re-entering the exec path is a bug */
+    .name = "exec_path",
+};
+
+void elf_exec_lock(void) {
+    mutex_lock(&exec_path_mutex);
+}
+
+void elf_exec_unlock(void) {
+    mutex_unlock(&exec_path_mutex);
+}
+
+/*=============================================================================
+ * FUNCTION: elf_exec_from_path
+ * PURPOSE: Read an executable from the VFS and start it, under the exec lock
+ *===========================================================================*/
+#define EXEC_MAX_FILE_SIZE 65536  /* 64KB maximum ELF size (DoS prevention) */
+
+int elf_exec_from_path(const char* path, const char* name,
+                       int argc, const char* const* argv,
+                       const char** err) {
+    /* Static, not stack: 64KB would blow the 128KB kernel task stack that the
+     * deep read -> sha256 -> ecdsa_verify chain below already runs on. Safe
+     * only because the exec lock below serializes every caller. */
+    static uint8_t exec_buffer[EXEC_MAX_FILE_SIZE];
+
+    const char* reason = NULL;
+    int result;
+
+    if (!path || !name) {
+        if (err) *err = "invalid argument";
+        return -EINVAL;
+    }
+
+    /* Held across BOTH the read and the load: the buffer must not change
+     * between being filled and being hashed/signature-checked. */
+    elf_exec_lock();
+
+    /* Open via the VFS so drive-letter paths (C: FAT32, D: RAMFS) work;
+     * pathless "/file" goes to the legacy default driver (RAMFS). */
+    int fd = vfs_open(path, VFS_O_RDONLY);
+    if (fd < 0) {
+        reason = "cannot open file";
+        /* Propagate the driver's own code rather than flattening everything to
+         * -ENOENT: "no free descriptor" and "no such file" need different
+         * fixes, and the caller cannot tell them apart otherwise. */
+        result = fd;
+        goto out;
+    }
+
+    /* Read the whole file; the VFS has no stat, so size = bytes read.
+     * The buffer itself enforces EXEC_MAX_FILE_SIZE (DoS prevention). */
+    uint32_t file_size = 0;
+    while (file_size < EXEC_MAX_FILE_SIZE) {
+        ssize_t n = vfs_read(fd, exec_buffer + file_size,
+                             EXEC_MAX_FILE_SIZE - file_size);
+        if (n < 0) {
+            vfs_close(fd);
+            reason = "read failed";
+            result = -EIO;
+            goto out;
+        }
+        if (n == 0) {
+            break;  /* EOF */
+        }
+        file_size += (uint32_t)n;
+    }
+
+    if (file_size == EXEC_MAX_FILE_SIZE) {
+        /* Buffer full — probe for one more byte to distinguish an exactly
+         * buffer-sized file from an oversized one. */
+        uint8_t probe;
+        ssize_t n = vfs_read(fd, &probe, 1);
+        if (n < 0) {
+            /* A read error is not EOF — treating it as such would hand a
+             * silently truncated image to the loader. */
+            vfs_close(fd);
+            reason = "read failed";
+            result = -EIO;
+            goto out;
+        }
+        if (n > 0) {
+            vfs_close(fd);
+            reason = "file too large";
+            result = -E2BIG;
+            goto out;
+        }
+    }
+    vfs_close(fd);
+
+    if (file_size == 0) {
+        reason = "file is empty";
+        result = -ENOEXEC;
+        goto out;
+    }
+
+    kprintf("[EXEC] File size: %u bytes\n", file_size);
+
+    int pid = elf_load_process_argv(exec_buffer, file_size, name, argc, argv);
+    if (pid < 0) {
+        /* elf_load_process_argv owns its own teardown: every failure path
+         * after task creation goes through elf_abort_load(), which restores
+         * kernel CR3 and terminates the partial process. Nothing to reap. */
+        reason = "failed to load";
+        result = -ENOEXEC;
+        goto out;
+    }
+    result = pid;
+
+out:
+    /* Released before returning, so the caller can block (waiting on the
+     * child) without serializing every other loader against that wait. */
+    elf_exec_unlock();
+    if (err) {
+        *err = reason;
+    }
+    return result;
+}
+
+/*=============================================================================
  * FUNCTION: elf_load_process
  * PURPOSE: Load ELF executable and create a process
  *=============================================================================*/
 int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
+    return elf_load_process_argv(elf_data, elf_size, name, 0, NULL);
+}
+
+/*=============================================================================
+ * FUNCTION: elf_load_process_argv
+ * PURPOSE: Load ELF executable and create a process, passing it an argv vector
+ *=============================================================================*/
+int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
+                          int argc, const char* const* argv) {
     kprintf("[ELF] Loading process '%s' (file size: %zu bytes)...\n", name, elf_size);
 
     /*=========================================================================
@@ -684,7 +831,8 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
 
     // Create process FIRST so we have a user page directory to map into
     kprintf("[ELF] Creating process with entry point 0x%08x\n", ehdr->e_entry);
-    int pid = task_create_user((uint32_t)ehdr->e_entry, name);
+    int pid = task_create_user_argv((uint32_t)ehdr->e_entry, name,
+                                    USER_STACK_LARGE, argc, argv);
     if (pid < 0) {
         kprintf("[ELF] ERROR: Failed to create process\n");
         return -1;
