@@ -14,6 +14,7 @@
 #include "wait_queue.h" /* For wait_queue_remove_task() on external kill */
 #include "syscall.h"    /* For waitpid_notify_death() on external kill */
 #include "vfs.h"     /* For capability flags (CAP_ALL, etc.) - EDR Phase 1 */
+#include "errno.h"   /* For -EBADF/-EMFILE from the fd table helpers */
 #include "edr_behavioral.h"  /* EDR Phase 2: Behavioral detection */
 #include "edr_advanced.h"    /* EDR Phase 3: Advanced detection */
 #include "ramfs.h"   /* For ramfs_mkdir() - per-process private /tmp */
@@ -711,6 +712,9 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     // Initialize per-process stream context (stdin/stdout/stderr)
     streams_init(&task->streams);
 
+    // Initialize the per-process file descriptor table (fds 3+)
+    task_fdtable_init(task);
+
     // Initialize FD tracking (v1.11)
     task->open_fd_count = 0;
 
@@ -1220,6 +1224,9 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     // Initialize per-process stream context (stdin/stdout/stderr)
     streams_init(&task->streams);
 
+    // Initialize the per-process file descriptor table (fds 3+)
+    task_fdtable_init(task);
+
     // Initialize FD tracking (v1.11)
     task->open_fd_count = 0;
 
@@ -1544,6 +1551,11 @@ void task_terminate(uint32_t pid) {
         // Clean up streams (close any open file descriptors)
         streams_cleanup(&task->streams);
 
+        // Release any files the task opened via SYS_OPEN. Safe on the self-exit
+        // path too: this only returns entries to the global VFS fd pool and
+        // never touches the kernel stack the dying task is still running on.
+        task_fdtable_cleanup(task);
+
         // A task terminated while not running never reaches the scheduler
         // cleanup queue (it is reaped off the ready queue without freeing its
         // slot), so free its resources and release its slot here. A
@@ -1788,4 +1800,78 @@ const char* task_get_state_string(task_state_t state) {
         case TASK_STATE_TERMINATED: return "TERMINATED";
         default:                    return "UNKNOWN";
     }
+}
+
+/*=============================================================================
+ * PER-PROCESS FILE DESCRIPTOR TABLE
+ *
+ * Userspace fds 3..(TASK_FDTABLE_SIZE+2) map onto the global VFS fd pool.
+ * fds 0/1/2 are handled by task->streams and never appear here.
+ *
+ * No locking: a task's table is only ever touched by that task (from its own
+ * syscalls) or by task_terminate() after the task is off the run queue.
+ *===========================================================================*/
+
+void task_fdtable_init(task_t* task) {
+    if (!task) {
+        return;
+    }
+    for (int i = 0; i < TASK_FDTABLE_SIZE; i++) {
+        task->fdtable[i] = -1;
+    }
+}
+
+void task_fdtable_cleanup(task_t* task) {
+    if (!task) {
+        return;
+    }
+    for (int i = 0; i < TASK_FDTABLE_SIZE; i++) {
+        if (task->fdtable[i] >= 0) {
+            vfs_close(task->fdtable[i]);
+            task->fdtable[i] = -1;
+        }
+    }
+}
+
+int task_fd_install(task_t* task, int vfs_fd) {
+    if (!task || vfs_fd < 0) {
+        return -EBADF;
+    }
+    for (int i = 0; i < TASK_FDTABLE_SIZE; i++) {
+        if (task->fdtable[i] < 0) {
+            task->fdtable[i] = vfs_fd;
+            return i + TASK_FD_BASE;
+        }
+    }
+    return -EMFILE;
+}
+
+int task_fd_lookup(task_t* task, int user_fd) {
+    if (!task) {
+        return -EBADF;
+    }
+    int slot = user_fd - TASK_FD_BASE;
+    if (slot < 0 || slot >= TASK_FDTABLE_SIZE) {
+        return -EBADF;
+    }
+    if (task->fdtable[slot] < 0) {
+        return -EBADF;
+    }
+    return task->fdtable[slot];
+}
+
+int task_fd_remove(task_t* task, int user_fd) {
+    if (!task) {
+        return -EBADF;
+    }
+    int slot = user_fd - TASK_FD_BASE;
+    if (slot < 0 || slot >= TASK_FDTABLE_SIZE) {
+        return -EBADF;
+    }
+    int vfs_fd = task->fdtable[slot];
+    if (vfs_fd < 0) {
+        return -EBADF;
+    }
+    task->fdtable[slot] = -1;
+    return vfs_fd;
 }

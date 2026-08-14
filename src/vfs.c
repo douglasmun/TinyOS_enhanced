@@ -52,6 +52,75 @@ static vfs_mount_t vfs_mounts[VFS_MAX_DRIVES];
 static bool vfs_initialized = false;
 
 /*=============================================================================
+ * DEFAULT DRIVE (for paths with no drive letter, e.g. "/hello.elf")
+ *
+ * This used to fall back to "the first registered driver", which is NOT the
+ * same thing as a stable default: fat32_vfs_init() registers before
+ * ramfs_vfs_init(), so on a disk where C: actually mounts, every pathless
+ * path silently resolved to FAT32 instead of RAMFS. That made `exec
+ * /hello.elf` fail with "File not found" on a real FAT32 volume while working
+ * on a blank one — the embedded binaries live in RAMFS.
+ *
+ * Naming the default drive makes the resolution independent of init order.
+ *===========================================================================*/
+#define VFS_DEFAULT_DRIVE 'D'   /* RAMFS: holds the embedded system binaries */
+
+/*=============================================================================
+ * FUNCTION: vfs_resolve_drive
+ * PURPOSE: Map a possibly drive-qualified path to its driver + stripped path
+ *
+ * vfs_open/mkdir/rmdir each carry their own inline copy of this logic. This
+ * helper exists so new entry points do not add a fifth divergent copy; the
+ * existing three are left alone deliberately, since rewriting live security
+ * checks is a bigger change than the one being made here.
+ *
+ * @param path      Caller's path (may start with "C:", "d:", or neither)
+ * @param ops_out   Receives the driver ops for the resolved drive
+ * @param rest_out  Receives the path with any drive prefix stripped
+ * @return 0 on success, negative VFS error otherwise
+ *===========================================================================*/
+static int vfs_resolve_drive(const char* path,
+                             const file_operations_t** ops_out,
+                             const char** rest_out) {
+    size_t path_len = strlen(path);
+
+    if (path_len >= 2 && path[1] == ':' &&
+        ((path[0] >= 'A' && path[0] <= 'Z') ||
+         (path[0] >= 'a' && path[0] <= 'z'))) {
+
+        char drive = path[0];
+        if (drive >= 'a' && drive <= 'z') {
+            drive = drive - 'a' + 'A';
+        }
+
+        int mount_idx = drive - 'A';
+        if (!vfs_mounts[mount_idx].mounted) {
+            return VFS_ENOENT;
+        }
+        *ops_out = vfs_mounts[mount_idx].ops;
+        *rest_out = path + 2;
+        return 0;
+    }
+
+    /* No drive letter - use the default drive (see VFS_DEFAULT_DRIVE). */
+    int default_idx = VFS_DEFAULT_DRIVE - 'A';
+    if (vfs_mounts[default_idx].mounted) {
+        *ops_out = vfs_mounts[default_idx].ops;
+        *rest_out = path;
+        return 0;
+    }
+
+    for (int i = 0; i < VFS_MAX_DRIVERS; i++) {
+        if (vfs_drivers[i].registered) {
+            *ops_out = vfs_drivers[i].ops;
+            *rest_out = path;
+            return 0;
+        }
+    }
+    return VFS_ENOENT;
+}
+
+/*=============================================================================
  * VFS INITIALIZATION
  *=============================================================================*/
 
@@ -523,11 +592,18 @@ int vfs_open(const char* path, int flags) {
             return VFS_ENOENT;
         }
     } else {
-        /* No drive letter - use first registered driver (legacy behavior) */
-        for (int i = 0; i < VFS_MAX_DRIVERS; i++) {
-            if (vfs_drivers[i].registered) {
-                driver_ops = vfs_drivers[i].ops;
-                break;
+        /* No drive letter - use the default drive (see VFS_DEFAULT_DRIVE). */
+        int default_idx = VFS_DEFAULT_DRIVE - 'A';
+        if (vfs_mounts[default_idx].mounted) {
+            driver_ops = vfs_mounts[default_idx].ops;
+        } else {
+            /* Default drive not mounted: fall back to the first registered
+             * driver so early-boot paths still resolve to something. */
+            for (int i = 0; i < VFS_MAX_DRIVERS; i++) {
+                if (vfs_drivers[i].registered) {
+                    driver_ops = vfs_drivers[i].ops;
+                    break;
+                }
             }
         }
     }
@@ -856,11 +932,16 @@ int vfs_mkdir(const char* path) {
             return VFS_ENOENT;
         }
     } else {
-        /* No drive letter - use first registered driver */
-        for (int i = 0; i < VFS_MAX_DRIVERS; i++) {
-            if (vfs_drivers[i].registered) {
-                driver_ops = vfs_drivers[i].ops;
-                break;
+        /* No drive letter - use the default drive, same as vfs_open(). */
+        int default_idx = VFS_DEFAULT_DRIVE - 'A';
+        if (vfs_mounts[default_idx].mounted) {
+            driver_ops = vfs_mounts[default_idx].ops;
+        } else {
+            for (int i = 0; i < VFS_MAX_DRIVERS; i++) {
+                if (vfs_drivers[i].registered) {
+                    driver_ops = vfs_drivers[i].ops;
+                    break;
+                }
             }
         }
     }
@@ -976,11 +1057,16 @@ int vfs_rmdir(const char* path) {
             return VFS_ENOENT;
         }
     } else {
-        /* No drive letter - use first registered driver */
-        for (int i = 0; i < VFS_MAX_DRIVERS; i++) {
-            if (vfs_drivers[i].registered) {
-                driver_ops = vfs_drivers[i].ops;
-                break;
+        /* No drive letter - use the default drive, same as vfs_open(). */
+        int default_idx = VFS_DEFAULT_DRIVE - 'A';
+        if (vfs_mounts[default_idx].mounted) {
+            driver_ops = vfs_mounts[default_idx].ops;
+        } else {
+            for (int i = 0; i < VFS_MAX_DRIVERS; i++) {
+                if (vfs_drivers[i].registered) {
+                    driver_ops = vfs_drivers[i].ops;
+                    break;
+                }
             }
         }
     }
@@ -1130,4 +1216,48 @@ void vfs_stats(void) {
     kprintf("  FDs in use: %d/%d\n", used_fds, VFS_MAX_FDS);
     kprintf("  Drivers registered: %d/%d\n", drivers_registered, VFS_MAX_DRIVERS);
     kprintf("  Initialized: %s\n", vfs_initialized ? "yes" : "no");
+}
+
+/*=============================================================================
+ * FUNCTION: vfs_stat
+ * PURPOSE: Look up a path's metadata without opening it
+ *===========================================================================*/
+int vfs_stat(const char* path, vfs_dirent_t* out) {
+    if (!vfs_initialized) {
+        return VFS_EINVAL;
+    }
+    if (!path || !out) {
+        return VFS_EFAULT;
+    }
+
+    size_t path_len = strlen(path);
+    if (path_len == 0 || path_len >= VFS_MAX_PATH) {
+        return VFS_EINVAL;
+    }
+
+    const file_operations_t* driver_ops = NULL;
+    const char* actual_path = NULL;
+    int rc = vfs_resolve_drive(path, &driver_ops, &actual_path);
+    if (rc < 0) {
+        return rc;
+    }
+
+    if (!driver_ops || !driver_ops->stat) {
+        return VFS_EINVAL;
+    }
+
+    /* Canonicalize before handing the path to the driver, for the same reason
+     * vfs_open does: "/etc/../etc/passwd" must not slip past a prefix check by
+     * arriving in a form the check does not recognize. */
+    char canonical_path[VFS_MAX_PATH];
+    int canon_ret = vfs_canonicalize_path(actual_path, canonical_path, VFS_MAX_PATH);
+    if (canon_ret < 0) {
+        return canon_ret;
+    }
+
+    /* Zero first so a driver that fills only some fields cannot leak whatever
+     * the caller's buffer happened to contain back to userspace. */
+    memset(out, 0, sizeof(*out));
+
+    return driver_ops->stat(canonical_path, out);
 }

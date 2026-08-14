@@ -30,6 +30,7 @@
 #include "hello_elf_data.h"
 #include "sleeper_elf_data.h"
 #include "spawner_elf_data.h"
+#include "fileio_elf_data.h"
 #include "shell_elf_data.h"
 #include "shell.h"
 #include "keyboard.h"
@@ -795,6 +796,42 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
              * shell's own `exec` is unaffected (it runs as root), which is why
              * only the spawn path exposed this. */
             ramfs_chmod("/spawner.elf", 0755);
+        }
+    }
+
+    /* fileio.elf exercises SYS_OPEN/SYS_CLOSE/SYS_READDIR from ring 3. It needs
+     * a file it is allowed to write, but RAMFS's root directory is 0755 and
+     * root-owned, so a uid-1000 process cannot create one. Seed it empty here
+     * and make it 0666 — the demo opens it O_WRONLY|O_TRUNC. */
+    {
+        int fileio_fd = ramfs_open("/fileio.elf", RAMFS_FLAG_WRITE);
+        if (fileio_fd >= 0) {
+            ramfs_write(fileio_fd, fileio_elf_data, fileio_elf_data_len);
+            ramfs_close(fileio_fd);
+            ramfs_chmod("/fileio.elf", 0755);
+        }
+
+        /* The demo works inside /fio rather than the RAMFS root, because the
+         * root is 0700 (RAMFS_DEFAULT_DIR_MODE) and a uid-1000 process cannot
+         * list or write it. Deliberate hardening — give the test its own
+         * world-readable directory instead of loosening the root. */
+        if (ramfs_mkdir("/fio") >= 0) {
+            ramfs_chmod("/fio", 0755);
+        }
+
+        int data_fd = ramfs_open("/fio/fileio-test.txt", RAMFS_FLAG_WRITE);
+        if (data_fd >= 0) {
+            ramfs_close(data_fd);
+            ramfs_chmod("/fio/fileio-test.txt", 0666);
+        }
+
+        /* A second entry, so readdir has to return more than one name and the
+         * demo's search cannot pass by finding whatever happens to be first. */
+        int marker_fd = ramfs_open("/fio/marker.txt", RAMFS_FLAG_WRITE);
+        if (marker_fd >= 0) {
+            ramfs_write(marker_fd, "marker", 6);
+            ramfs_close(marker_fd);
+            ramfs_chmod("/fio/marker.txt", 0644);
         }
     }
 

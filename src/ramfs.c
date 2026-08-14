@@ -81,12 +81,12 @@ static mutex_t ramfs_mutex;
  *    consistent credential snapshot, even if the task's credentials change
  *    mid-function due to setuid/setgid syscalls.
  *
- * CRITICAL: Callers MUST use get_current_credentials() at function entry to
+ * CRITICAL: Callers MUST use ramfs_get_current_credentials() at function entry to
  * cache credentials locally. Do NOT call scheduler_get_current_task() multiple
  * times within a security-sensitive function - credentials could change between
  * calls if a setuid syscall is executed concurrently.
  */
-static void get_current_credentials(uint16_t* uid_out, uint16_t* gid_out) {
+void ramfs_get_current_credentials(uint16_t* uid_out, uint16_t* gid_out) {
     task_t* current = scheduler_get_current_task();
     if (current) {
         /* Use effective UID/GID for permission checks (supports setuid programs) */
@@ -413,7 +413,7 @@ int ramfs_mkdir(const char* path) {
 
     /* Get current process credentials (v1.10) */
     uint16_t uid, gid;
-    get_current_credentials(&uid, &gid);
+    ramfs_get_current_credentials(&uid, &gid);
 
     // Check if already exists
     if (ramfs_find_locked(path)) {
@@ -510,7 +510,7 @@ int ramfs_open(const char* path, uint8_t flags) {
 
     /* Get current process credentials (v1.10) */
     uint16_t uid, gid;
-    get_current_credentials(&uid, &gid);
+    ramfs_get_current_credentials(&uid, &gid);
 
     /*=========================================================================
      * SECURITY FIX (v1.11): Per-Process FD Limit Enforcement
@@ -877,7 +877,7 @@ int ramfs_unlink(const char* path) {
 
     /* Get current process credentials (v1.10) */
     uint16_t uid, gid;
-    get_current_credentials(&uid, &gid);
+    ramfs_get_current_credentials(&uid, &gid);
 
     ramfs_node_t* node = ramfs_find_locked(path);
     if (!node || node == root) {
@@ -944,7 +944,7 @@ int ramfs_rename(const char* old_path, const char* new_path) {
 
     /* Get current process credentials (v1.10) */
     uint16_t uid, gid;
-    get_current_credentials(&uid, &gid);
+    ramfs_get_current_credentials(&uid, &gid);
 
     /* Validate inputs */
     if (!old_path || !new_path) {
@@ -1024,7 +1024,7 @@ int ramfs_rmdir(const char* path) {
 
     /* Get current process credentials (v1.10) */
     uint16_t uid, gid;
-    get_current_credentials(&uid, &gid);
+    ramfs_get_current_credentials(&uid, &gid);
 
     ramfs_node_t* node = ramfs_find_locked(path);
     if (!node || node == root) {

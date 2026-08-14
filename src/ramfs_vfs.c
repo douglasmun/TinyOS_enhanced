@@ -45,8 +45,21 @@
 #define RAMFS_VFS_MAX_HANDLES 64  // Must be >= VFS_MAX_FDS
 
 typedef struct {
-    int ramfs_fd;     // RAMFS file descriptor
+    int ramfs_fd;     // RAMFS file descriptor (-1 for directory handles)
     bool in_use;      // true if this handle is allocated
+
+    /* Directory iteration state (VFS_O_DIRECTORY opens).
+     *
+     * `dir_node` is the directory being walked and `dir_pos` is how many
+     * entries have already been returned. The cursor is an INDEX, not a
+     * `ramfs_node_t*` into the sibling list, deliberately: a stashed child
+     * pointer would dangle if that child were deleted between two readdir
+     * calls. Re-walking from the head each call is O(n^2) over a full
+     * listing, which is irrelevant at RAMFS_MAX_CHILDREN_PER_DIR and cannot
+     * fault. */
+    bool is_dir;
+    ramfs_node_t* dir_node;
+    uint32_t dir_pos;
 } ramfs_fd_handle_t;
 
 // Static pool of handles (avoids malloc/free complexity)
@@ -61,6 +74,9 @@ static ramfs_fd_handle_t* ramfs_alloc_handle(int ramfs_fd) {
         if (!handle_pool[i].in_use) {
             handle_pool[i].ramfs_fd = ramfs_fd;
             handle_pool[i].in_use = true;
+            handle_pool[i].is_dir = false;
+            handle_pool[i].dir_node = NULL;
+            handle_pool[i].dir_pos = 0;
             return &handle_pool[i];
         }
     }
@@ -94,6 +110,40 @@ static void ramfs_free_handle(ramfs_fd_handle_t* handle) {
 static int ramfs_vfs_open(const char* path, int flags, void** private_data) {
     /* Convert VFS flags to RAMFS flags */
     uint8_t ramfs_flags = 0;
+
+    /* Directory open: ramfs_open() only accepts regular files (it rejects
+     * RAMFS_TYPE_DIR), so a directory handle bypasses it entirely and just
+     * pins the node for readdir to walk. */
+    if (flags & VFS_O_DIRECTORY) {
+        ramfs_node_t* dir = ramfs_find(path);
+        if (!dir) {
+            return VFS_ENOENT;
+        }
+        if (dir->type != RAMFS_TYPE_DIR) {
+            return VFS_EINVAL;
+        }
+
+        /* Bypassing ramfs_open() also bypasses ITS permission check, so do it
+         * here: listing a directory is a read of that directory. Without this
+         * a ring-3 caller could enumerate a mode-0700 directory it cannot
+         * open any file in. */
+        uint16_t uid, gid;
+        ramfs_get_current_credentials(&uid, &gid);
+        if (!ramfs_check_permission(dir, uid, gid, RAMFS_FLAG_READ)) {
+            return VFS_EACCES;
+        }
+
+        ramfs_fd_handle_t* dir_handle = ramfs_alloc_handle(-1);
+        if (!dir_handle) {
+            return VFS_ENOMEM;
+        }
+        dir_handle->is_dir = true;
+        dir_handle->dir_node = dir;
+        dir_handle->dir_pos = 0;
+
+        *private_data = (void*)dir_handle;
+        return 0;
+    }
 
     /*
      * CRITICAL FIX: VFS_O_RDONLY is 0x0000, so "flags & VFS_O_RDONLY" is always false!
@@ -150,8 +200,11 @@ static int ramfs_vfs_close(void* private_data) {
         return VFS_EINVAL;
     }
 
-    /* Close the RAMFS file */
-    ramfs_close(handle->ramfs_fd);
+    /* Directory handles never went through ramfs_open, so there is no RAMFS
+     * fd to release — closing one would pass -1 to ramfs_close(). */
+    if (!handle->is_dir) {
+        ramfs_close(handle->ramfs_fd);
+    }
 
     /* Free the handle back to the pool */
     ramfs_free_handle(handle);
@@ -244,21 +297,95 @@ static int ramfs_vfs_rmdir(const char* path) {
 }
 
 /*=============================================================================
- * NOTE: readdir is not implemented in VFS layer for RAMFS
+ * FUNCTION: ramfs_vfs_readdir
+ * PURPOSE: Serialize directory entries into a caller-supplied buffer
  *
- * REASON: RAMFS ramfs_readdir() uses a different interface:
- * - RAMFS: ramfs_node_t* ramfs_readdir(const char* path)
- * - VFS:   ssize_t readdir(void* private_data, void* buf, size_t size)
+ * This is the third piece the old "incompatible interfaces" note called for:
+ * the entry format is vfs_dirent_t (vfs.h, a fixed ABI shared with ring 3),
+ * and iteration state lives in the handle as an index (see ramfs_fd_handle_t).
  *
- * These interfaces are incompatible. RAMFS returns a node pointer, while VFS
- * expects a buffer-based interface. To implement VFS readdir, we would need to:
- * 1. Define a directory entry format
- * 2. Serialize ramfs_node_t data into the buffer
- * 3. Implement stateful iteration (remembering position between calls)
+ * Fills as many whole vfs_dirent_t records as fit and returns the BYTE count,
+ * 0 at end-of-directory. A buffer too small for even one entry is EINVAL
+ * rather than a silent 0, which would be indistinguishable from EOF.
  *
- * For now, applications can use ramfs_readdir() directly if needed.
- * The essential operations (mkdir, rmdir) are available through VFS.
+ * The buffer is kernel memory: sys_readdir copies it out to userspace.
  *===========================================================================*/
+static ssize_t ramfs_vfs_readdir(void* private_data, void* buf, size_t size) {
+    ramfs_fd_handle_t* handle = (ramfs_fd_handle_t*)private_data;
+    if (!handle || !buf) {
+        return VFS_EINVAL;
+    }
+    if (!handle->is_dir || !handle->dir_node) {
+        return VFS_EBADF;   /* Opened as a file, not with VFS_O_DIRECTORY */
+    }
+    if (size < sizeof(vfs_dirent_t)) {
+        return VFS_EINVAL;
+    }
+
+    size_t max_entries = size / sizeof(vfs_dirent_t);
+    vfs_dirent_t* out = (vfs_dirent_t*)buf;
+    size_t produced = 0;
+
+    /* Re-walk from the head and skip dir_pos entries; see the cursor comment
+     * on ramfs_fd_handle_t for why this is an index rather than a pointer. */
+    ramfs_node_t* child = handle->dir_node->children;
+    for (uint32_t skip = 0; skip < handle->dir_pos && child; skip++) {
+        child = child->next;
+    }
+
+    while (child && produced < max_entries) {
+        vfs_dirent_t* de = &out[produced];
+        memset(de, 0, sizeof(*de));
+
+        de->size = (child->type == RAMFS_TYPE_DIR) ? 0 : child->size;
+        de->mode = child->mode;
+        de->type = (child->type == RAMFS_TYPE_DIR) ? VFS_DT_DIR : VFS_DT_REG;
+        de->reserved = 0;
+
+        /* Truncate rather than reject: RAMFS_MAX_NAME and VFS_NAME_MAX are
+         * independent limits, and a long name must not desync the cursor. */
+        safe_strcpy(de->name, child->name, sizeof(de->name));
+
+        produced++;
+        handle->dir_pos++;
+        child = child->next;
+    }
+
+    return (ssize_t)(produced * sizeof(vfs_dirent_t));
+}
+
+/**
+ * @brief Look up a RAMFS path's metadata without opening it
+ * @param path Path (drive letter already stripped by the VFS)
+ * @param out Filled in on success
+ * @return 0 on success, negative error code on failure
+ */
+static int ramfs_vfs_stat(const char* path, vfs_dirent_t* out) {
+    if (!path || !out) {
+        return VFS_EINVAL;
+    }
+
+    ramfs_node_t* node = ramfs_find(path);
+    if (!node) {
+        return VFS_ENOENT;
+    }
+
+    /* Reading metadata is a read of the containing directory, which the
+     * caller already had to traverse; what ramfs_find does not check is
+     * whether THIS node is readable. Require it, so stat cannot be used to
+     * probe sizes inside a directory the caller cannot open. */
+    uint16_t uid, gid;
+    ramfs_get_current_credentials(&uid, &gid);
+    if (!ramfs_check_permission(node, uid, gid, RAMFS_FLAG_READ)) {
+        return VFS_EACCES;
+    }
+
+    out->size = (node->type == RAMFS_TYPE_DIR) ? 0 : node->size;
+    out->mode = node->mode;
+    out->type = (node->type == RAMFS_TYPE_DIR) ? VFS_DT_DIR : VFS_DT_REG;
+    out->reserved = 0;
+    return 0;
+}
 
 /*=============================================================================
  * RAMFS FILE OPERATIONS TABLE
@@ -271,7 +398,8 @@ static const file_operations_t ramfs_file_ops = {
     .ioctl   = NULL,  /* Not implemented */
     .mkdir   = ramfs_vfs_mkdir,
     .rmdir   = ramfs_vfs_rmdir,
-    .readdir = NULL  /* Incompatible with RAMFS interface - use ramfs_readdir() directly */
+    .readdir = ramfs_vfs_readdir,
+    .stat    = ramfs_vfs_stat
 };
 
 /*=============================================================================

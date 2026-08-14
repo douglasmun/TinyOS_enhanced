@@ -61,6 +61,24 @@ int read(int fd, void* buf, size_t len) {
                     (uint32_t)len);
 }
 
+int open(const char* path, int flags) {
+    return syscall3(SYS_OPEN, (uint32_t)(uintptr_t)path, (uint32_t)flags, 0);
+}
+
+int close(int fd) {
+    return syscall1(SYS_CLOSE, (uint32_t)fd);
+}
+
+int readdir(int fd, void* buf, size_t size) {
+    return syscall3(SYS_READDIR, (uint32_t)fd, (uint32_t)(uintptr_t)buf,
+                    (uint32_t)size);
+}
+
+int stat(const char* path, void* buf, size_t size) {
+    return syscall3(SYS_STAT, (uint32_t)(uintptr_t)path,
+                    (uint32_t)(uintptr_t)buf, (uint32_t)size);
+}
+
 int putchar(int c) {
     char ch = (char)c;
     write(1, &ch, 1);

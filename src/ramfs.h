@@ -304,4 +304,9 @@ ramfs_node_t* ramfs_get_root(void);
 /* Permission operations */
 int ramfs_chmod(const char* path, uint16_t mode);
 bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint8_t access);
+
+/* Effective uid/gid of the calling task, as a consistent snapshot. Exposed for
+ * ramfs_vfs.c's directory open, which does not go through ramfs_open() and so
+ * must run the permission check itself. */
+void ramfs_get_current_credentials(uint16_t* uid_out, uint16_t* gid_out);
 void ramfs_format_permissions(uint16_t mode, char* buf);

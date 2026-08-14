@@ -24,6 +24,7 @@
 #include "audit.h"     // For audit_log() in mandatory EDR hook
 #include <stddef.h>    // For offsetof() macro used in static assertions
 #include "elf.h"       // SYS_SPAWN: elf_exec_from_path
+#include "vfs.h"       // SYS_OPEN/CLOSE/READDIR: vfs_* and vfs_dirent_t
 #include "util.h"      // MAX_PATH
 
 /*-----------------------------------------------------------------------------
@@ -320,7 +321,11 @@ int sys_write(int fd, const char* buf, size_t len) {
     /* Reject unknown descriptors up front. stdin (0) is not writable. Note the
      * check happens before the len == 0 early-out so that a bad fd is reported
      * as such rather than silently succeeding on a zero-length write. */
-    if (fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+    /* fd >= TASK_FD_BASE is a file opened with SYS_OPEN; it is resolved
+     * per-task below. Everything else must be stdout/stderr — stdin is not
+     * writable. */
+    bool to_file = (fd >= TASK_FD_BASE);
+    if (!to_file && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
         return -EBADF;
     }
 
@@ -404,9 +409,30 @@ int sys_write(int fd, const char* buf, size_t len) {
      * NULL if there is no current task at all — a syscall from a kernel thread
      * context that isn't a task, which shouldn't happen but is cheap to guard. */
     task_t* writer = scheduler_get_current_task();
-    stream_context_t* streams = writer ? &writer->streams : get_current_streams();
-    if (!streams) {
-        return -EFAULT;
+
+    /* File descriptors resolve through the per-task table; console fds resolve
+     * through the stream context. Resolve whichever applies once, before the
+     * copy loop, so a bad fd costs nothing. */
+    int vfs_fd = -1;
+    stream_context_t* streams = NULL;
+
+    if (to_file) {
+        if (!writer) {
+            return -ESRCH;
+        }
+        vfs_fd = task_fd_lookup(writer, fd);
+        if (vfs_fd < 0) {
+            return vfs_fd;   /* -EBADF */
+        }
+    } else {
+        /* A task always has an embedded stream_context_t (streams_init'd at
+         * creation), so this is only NULL if there is no current task at all —
+         * a syscall from a kernel thread context that isn't a task, which
+         * shouldn't happen but is cheap to guard. */
+        streams = writer ? &writer->streams : get_current_streams();
+        if (!streams) {
+            return -EFAULT;
+        }
     }
 
     while (total_written < len) {
@@ -437,10 +463,15 @@ int sys_write(int fd, const char* buf, size_t len) {
             return (total_written > 0) ? (int)total_written : ret;
         }
 
-        /* Now safe to access kernel_buf - hand it to the bound stream. */
-        int wrote = (fd == STDERR_FILENO)
+        /* Now safe to access kernel_buf - hand it to the file or the stream. */
+        int wrote;
+        if (to_file) {
+            wrote = (int)vfs_write(vfs_fd, kernel_buf, chunk_size);
+        } else {
+            wrote = (fd == STDERR_FILENO)
                         ? stderr_write(streams, kernel_buf, chunk_size)
                         : stdout_write(streams, kernel_buf, chunk_size);
+        }
 
         /* A short write means the sink filled up or the stream is closed; a
          * negative one means it failed outright. Either way stop here and
@@ -474,8 +505,10 @@ int sys_write(int fd, const char* buf, size_t len) {
  * where user unmaps buffer between validation and write.
  *-----------------------------------------------------------------------------*/
 int sys_read(int fd, char* buf, size_t len) {
-    /* Only stdin is readable. stdout/stderr are write-only here. */
-    if (fd != STDIN_FILENO) {
+    /* fd >= TASK_FD_BASE is a file opened with SYS_OPEN. Otherwise only stdin
+     * is readable — stdout/stderr are write-only here. */
+    bool from_file = (fd >= TASK_FD_BASE);
+    if (!from_file && fd != STDIN_FILENO) {
         return -EBADF;
     }
 
@@ -562,16 +595,30 @@ int sys_read(int fd, char* buf, size_t len) {
 
     size_t read_size = (len > READ_MAX_SIZE) ? READ_MAX_SIZE : len;
 
-    /* Same resolution as sys_write: prefer the calling task's own streams. */
+    /* Same resolution as sys_write: files through the per-task fd table,
+     * console through the calling task's own streams. */
     task_t* reader = scheduler_get_current_task();
-    stream_context_t* streams = reader ? &reader->streams : get_current_streams();
-    if (!streams) {
-        return -EFAULT;
+    int n;
+
+    if (from_file) {
+        if (!reader) {
+            return -ESRCH;
+        }
+        int vfs_fd = task_fd_lookup(reader, fd);
+        if (vfs_fd < 0) {
+            return vfs_fd;   /* -EBADF */
+        }
+        n = (int)vfs_read(vfs_fd, kernel_buf, read_size);
+    } else {
+        stream_context_t* streams = reader ? &reader->streams : get_current_streams();
+        if (!streams) {
+            return -EFAULT;
+        }
+        /* Fill the kernel buffer from whatever stdin is bound to (keyboard by
+         * default, a file if redirected, a pipe once those are wired up). */
+        n = stdin_read(streams, kernel_buf, read_size);
     }
 
-    /* Fill the kernel buffer from whatever stdin is bound to (keyboard by
-     * default, a file if redirected, a pipe once those are wired up). */
-    int n = stdin_read(streams, kernel_buf, read_size);
     if (n < 0) {
         return -EIO;
     }
@@ -790,6 +837,169 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
 
     scheduler_add_task(child);
     return pid;
+}
+
+/*=============================================================================
+ * FILE I/O SYSCALLS (v2.4)
+ *
+ * Before these, a ring-3 process could not open a file at all: sys_read and
+ * sys_write only ever accepted fds 0/1/2. They are the foundation the ring-3
+ * shell needs (roadmap item 4).
+ *
+ * Descriptors returned to userspace are PER-PROCESS indices into
+ * task->fdtable, never global VFS fd numbers — see the fdtable comment in
+ * process.h for why that indirection is a security property and not just
+ * bookkeeping.
+ *
+ * SECURITY: paths are copied in with copy_string_from_user before use and no
+ * user pointer is ever dereferenced in the kernel, matching sys_spawn.
+ *===========================================================================*/
+
+int sys_open(const char* user_path, int flags) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    /* Copy the path in first: a bad pointer is the cheap rejection, and after
+     * this the kernel holds its own copy, so the caller cannot swap the string
+     * out between validation and use (TOCTOU). */
+    char path[VFS_MAX_PATH];
+    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    if (rc < 0) {
+        return rc;   /* -EFAULT / -ENAMETOOLONG */
+    }
+    if (rc == 0) {
+        return -EINVAL;  /* Empty path */
+    }
+
+    /* Reject unknown flag bits rather than passing them through: it keeps the
+     * ABI closed so a future VFS_O_* cannot be silently requested by an old
+     * binary that happened to set the bit. */
+    const int allowed = VFS_O_RDONLY | VFS_O_WRONLY | VFS_O_RDWR |
+                        VFS_O_CREAT  | VFS_O_TRUNC  | VFS_O_APPEND |
+                        VFS_O_DIRECTORY;
+    if (flags & ~allowed) {
+        return -EINVAL;
+    }
+
+    /* A directory is only ever readable — opening one for write would reach a
+     * driver write path that has no meaning for a directory node. */
+    if ((flags & VFS_O_DIRECTORY) && (flags & 0x3) != VFS_O_RDONLY) {
+        return -EINVAL;
+    }
+
+    /* vfs_open enforces the uid/permission checks; this runs with the calling
+     * task's credentials because syscalls execute on the caller's behalf. */
+    int vfs_fd = vfs_open(path, flags);
+    if (vfs_fd < 0) {
+        return vfs_fd;
+    }
+
+    int user_fd = task_fd_install(self, vfs_fd);
+    if (user_fd < 0) {
+        vfs_close(vfs_fd);   /* Table full — don't leak the global descriptor */
+        return user_fd;
+    }
+
+    return user_fd;
+}
+
+int sys_close(int fd) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    /* Remove first, then close: the slot is freed even if the driver's close
+     * reports an error, so a failing flush cannot strand a descriptor. */
+    int vfs_fd = task_fd_remove(self, fd);
+    if (vfs_fd < 0) {
+        return vfs_fd;   /* -EBADF */
+    }
+
+    return (vfs_close(vfs_fd) == 0) ? 0 : -EIO;
+}
+
+int sys_readdir(int fd, void* user_buf, uint32_t size) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (!user_buf || size == 0) {
+        return -EINVAL;
+    }
+    if (size > MAX_IO_SIZE) {
+        return -EINVAL;
+    }
+
+    int vfs_fd = task_fd_lookup(self, fd);
+    if (vfs_fd < 0) {
+        return vfs_fd;   /* -EBADF */
+    }
+
+    /* Read into kernel memory, then copy out. The driver must never write
+     * straight into a user pointer: it would fault in the kernel on a bad
+     * address instead of returning -EFAULT, and could be unmapped mid-write.
+     * One entry at a time keeps this off the 512 KB task stack. */
+    vfs_dirent_t entry;
+    uint32_t written = 0;
+
+    while (written + sizeof(entry) <= size) {
+        ssize_t got = vfs_readdir(vfs_fd, &entry, sizeof(entry));
+        if (got < 0) {
+            /* Report the error only if nothing was produced; otherwise return
+             * the good entries and let the next call surface it. */
+            return (written > 0) ? (int)written : (int)got;
+        }
+        if (got == 0) {
+            break;       /* End of directory */
+        }
+        if ((size_t)got != sizeof(entry)) {
+            return (written > 0) ? (int)written : -EIO;
+        }
+
+        if (copy_to_user((uint8_t*)user_buf + written, &entry, sizeof(entry)) < 0) {
+            return -EFAULT;
+        }
+        written += sizeof(entry);
+    }
+
+    return (int)written;
+}
+
+int sys_stat(const char* user_path, void* user_buf, uint32_t size) {
+    if (!user_buf) {
+        return -EINVAL;
+    }
+    /* One entry exactly: a short buffer would leave the caller reading past
+     * what was filled, and there is nothing useful to write into a partial
+     * dirent. */
+    if (size < sizeof(vfs_dirent_t)) {
+        return -EINVAL;
+    }
+
+    char path[VFS_MAX_PATH];
+    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    if (rc < 0) {
+        return rc;
+    }
+    if (rc == 0) {
+        return -EINVAL;
+    }
+
+    /* Same rule as sys_readdir: fill kernel memory, then copy out. */
+    vfs_dirent_t entry;
+    int err = vfs_stat(path, &entry);
+    if (err < 0) {
+        return err;
+    }
+
+    if (copy_to_user(user_buf, &entry, sizeof(entry)) < 0) {
+        return -EFAULT;
+    }
+
+    return 0;
 }
 
 int sys_waitpid(int pid) {
@@ -1721,6 +1931,25 @@ static void syscall_dispatch(struct cpu_state* state) {
 
         case SYS_SPAWN:
             ret = sys_spawn((const char*)arg1, (char* const*)arg2);
+            break;
+
+        case SYS_OPEN:
+            /* arg1 = user path pointer, arg2 = VFS_O_* flags */
+            ret = sys_open((const char*)arg1, (int)arg2);
+            break;
+
+        case SYS_CLOSE:
+            ret = sys_close((int)arg1);
+            break;
+
+        case SYS_READDIR:
+            /* arg1 = fd, arg2 = user buffer, arg3 = buffer size */
+            ret = sys_readdir((int)arg1, (void*)arg2, arg3);
+            break;
+
+        case SYS_STAT:
+            /* arg1 = user path pointer, arg2 = user buffer, arg3 = buffer size */
+            ret = sys_stat((const char*)arg1, (void*)arg2, arg3);
             break;
 
         default:

@@ -125,6 +125,30 @@ typedef int32_t ssize_t;                /* Signed size type for I/O operations *
 #define VFS_O_CREAT         0x0100  /* Create if not exists */
 #define VFS_O_TRUNC         0x0200  /* Truncate to zero length */
 #define VFS_O_APPEND        0x0400  /* Append mode */
+#define VFS_O_DIRECTORY     0x0800  /* Open a directory for readdir, not a file */
+
+/*=============================================================================
+ * Directory entry (SYS_READDIR ABI)
+ *
+ * This crosses the ring 0/3 boundary, so the layout is FIXED: userspace
+ * (userspace/libc.h) declares a byte-identical struct. It is deliberately
+ * flat and fixed-size — no trailing variable-length name, no pointers — so a
+ * ring-3 caller can walk an array of them without the kernel ever handing out
+ * an address. Changing any field is an ABI break: update libc.h in lockstep.
+ *===========================================================================*/
+#define VFS_NAME_MAX        63      /* Longest entry name (excl. NUL) */
+
+#define VFS_DT_UNKNOWN      0
+#define VFS_DT_REG          1       /* Regular file */
+#define VFS_DT_DIR          2       /* Directory */
+
+typedef struct {
+    uint32_t size;                  /* File size in bytes (0 for directories) */
+    uint16_t mode;                  /* Unix-style permission bits */
+    uint8_t  type;                  /* VFS_DT_* */
+    uint8_t  reserved;              /* Pad to a 4-byte boundary; must be 0 */
+    char     name[VFS_NAME_MAX + 1];
+} vfs_dirent_t;
 
 /* Error codes (negative values) */
 #define VFS_EBADF           -9      /* Bad file descriptor */
@@ -267,6 +291,18 @@ typedef struct file_operations {
      * @return Number of bytes read on success, negative error code on failure
      */
     ssize_t (*readdir)(void* private_data, void* buf, size_t size);
+
+    /**
+     * @brief Look up a single path's metadata without opening it
+     * @param path Path to inspect (drive letter already stripped)
+     * @param out Filled in on success; `name` is left untouched
+     * @return 0 on success, negative error code on failure
+     *
+     * Path-based, not fd-based: the point is to size a file BEFORE deciding to
+     * open it, and opening for metadata alone burns a descriptor from a pool
+     * that is only VFS_MAX_FDS deep.
+     */
+    int (*stat)(const char* path, vfs_dirent_t* out);
 
 } file_operations_t;
 
@@ -435,6 +471,19 @@ int vfs_rmdir(const char* path);
  * - Delegates to driver's readdir function
  */
 ssize_t vfs_readdir(int fd, void* buf, size_t size);
+
+/**
+ * @brief Look up a path's metadata without opening it
+ * @param path Path, optionally drive-qualified ("C:/file"); pathless goes to
+ *             the default drive, same as vfs_open()
+ * @param out Filled in on success. `name` is NOT set — the caller already
+ *            knows the path it asked about.
+ * @return 0 on success, negative error code on failure
+ *
+ * Path-based rather than fd-based so that sizing a file does not consume one
+ * of the VFS_MAX_FDS descriptors.
+ */
+int vfs_stat(const char* path, vfs_dirent_t* out);
 
 /**
  * @brief Iterate through mounted drives

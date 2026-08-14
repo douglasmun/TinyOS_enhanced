@@ -301,6 +301,24 @@ typedef struct task {
     stream_context_t streams;        // Per-process stream context (embedded)
 
     /*=========================================================================
+     * Per-process file descriptor table (fds 3 .. TASK_FDTABLE_SIZE+2)
+     *
+     * fds 0/1/2 are NOT here: they stay in `streams` above, which already
+     * models console/file/pipe redirection and inheritance. This table only
+     * covers descriptors handed out by SYS_OPEN, so a ring-3 program can hold
+     * open files without the kernel exposing global VFS fd numbers to it.
+     *
+     * Each slot holds a GLOBAL VFS fd (vfs_open's return) or -1 when free.
+     * The indirection matters: VFS fds are a single 64-entry system-wide pool
+     * (VFS_MAX_FDS), so leaking raw VFS numbers to userspace would let one
+     * process guess and operate on another's descriptor. A task-local index
+     * can only ever name something this task opened.
+     *=======================================================================*/
+    #define TASK_FDTABLE_SIZE  16    // Per-process open files (fds 3..18)
+    #define TASK_FD_BASE       3     // First userspace fd this table backs
+    int fdtable[TASK_FDTABLE_SIZE];  // Global VFS fd per slot, -1 = free
+
+    /*=========================================================================
      * SECURITY (EDR Phase 2): Behavioral Detection State
      *
      * Per-process syscall pattern tracking and anomaly detection for
@@ -687,6 +705,56 @@ void task_set_priority(task_t* task, priority_t priority);
  * @return String representation of state
  */
 const char* task_get_state_string(task_state_t state);
+
+/*=============================================================================
+ * Per-process file descriptor table
+ *
+ * Translates between task-local userspace fds (3..TASK_FDTABLE_SIZE+2) and the
+ * global VFS fd pool. See the fdtable field in task_t for why the indirection
+ * exists rather than handing raw VFS fds to ring 3.
+ *===========================================================================*/
+
+/**
+ * @brief Mark every slot free. Call before a task can run.
+ * @param task Task to initialize
+ */
+void task_fdtable_init(task_t* task);
+
+/**
+ * @brief Close every open descriptor the task still holds.
+ *
+ * Called from task_terminate alongside streams_cleanup. Unlike the stream
+ * fds there is no "borrowed" case: spawn does NOT inherit this table, so a
+ * slot is only ever owned by the task that opened it and closing it here
+ * cannot yank a descriptor out from under a parent.
+ *
+ * @param task Task whose descriptors should be released
+ */
+void task_fdtable_cleanup(task_t* task);
+
+/**
+ * @brief Install a global VFS fd in the first free slot.
+ * @param task Task to install into
+ * @param vfs_fd Global VFS descriptor (from vfs_open)
+ * @return Userspace fd (>= TASK_FD_BASE), or -EMFILE when the table is full
+ */
+int task_fd_install(task_t* task, int vfs_fd);
+
+/**
+ * @brief Resolve a userspace fd to its global VFS fd.
+ * @param task Task owning the descriptor
+ * @param user_fd Userspace fd as passed by ring 3
+ * @return Global VFS fd, or -EBADF when out of range or not open
+ */
+int task_fd_lookup(task_t* task, int user_fd);
+
+/**
+ * @brief Release a userspace fd, freeing its slot.
+ * @param task Task owning the descriptor
+ * @param user_fd Userspace fd as passed by ring 3
+ * @return Global VFS fd that was released, or -EBADF when not open
+ */
+int task_fd_remove(task_t* task, int user_fd);
 
 /*=============================================================================
  * PHASE 12: NO CORE DUMPS (Security-by-Design)

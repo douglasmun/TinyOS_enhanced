@@ -356,7 +356,8 @@ int elf_exec_from_path(const char* path, const char* name,
     elf_exec_lock();
 
     /* Open via the VFS so drive-letter paths (C: FAT32, D: RAMFS) work;
-     * pathless "/file" goes to the legacy default driver (RAMFS). */
+     * pathless "/file" goes to the default drive (D:, RAMFS), where the
+     * embedded system binaries live. */
     int fd = vfs_open(path, VFS_O_RDONLY);
     if (fd < 0) {
         reason = "cannot open file";
