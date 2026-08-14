@@ -337,17 +337,22 @@ static void run_pipeline(const char* cmd_line) {
     /* Carries stage N's output into stage N+1. Empty for the first stage. */
     size_t carry_len = 0;
 
+    /* Which of the two static pipes currently hold an allocated wait-queue
+     * page, so the cleanup exit frees exactly those and never double-frees. */
+    bool stage_pipe_live = false;
+    bool out_pipe_live = false;
+
     for (int stage = 0; stage < pipeline.cmd_count; stage++) {
         bool is_last = (stage == pipeline.cmd_count - 1);
 
         /* --- stdin: feed in whatever the previous stage produced. --- */
         if (stage > 0) {
             pipe_init(&stage_pipe);
+            stage_pipe_live = true;
             if (carry_len > 0 &&
                 pipe_write(&stage_pipe, stage_out, carry_len) < 0) {
                 kprintf("shell: pipe write failed\n");
-                pipe_destroy(&stage_pipe);
-                return;
+                goto cleanup;
             }
             /* Close the write end BEFORE the stage runs: with no concurrent
              * writer, the data is already complete, and this is what lets the
@@ -365,6 +370,7 @@ static void run_pipeline(const char* cmd_line) {
          *     which writes to wherever the shell's stdout already points. --- */
         if (!is_last) {
             pipe_init(&out_pipe);
+            out_pipe_live = true;
             streams->stdout_stream.type = STREAM_TYPE_PIPE;
             streams->stdout_stream.data = &out_pipe;
             streams->stdout_stream.fd = -1;
@@ -424,6 +430,7 @@ static void run_pipeline(const char* cmd_line) {
              * stage that overran cannot block on a pipe nobody will drain. */
             pipe_close_read(&out_pipe);
             pipe_destroy(&out_pipe);
+            out_pipe_live = false;
 
             if (g_pipeline_dropped > 0) {
                 kprintf("shell: stage %d output truncated at %u bytes "
@@ -437,7 +444,25 @@ static void run_pipeline(const char* cmd_line) {
         if (stage > 0) {
             stdin_reset(streams);
             pipe_destroy(&stage_pipe);
+            stage_pipe_live = false;
         }
+    }
+
+cleanup:
+    /* Single exit for the mid-loop failure paths. pipe_init() allocates a page
+     * per call, so returning straight out of the loop leaked one 4KB wait-queue
+     * page per failure -- repeatable on demand, hence a real exhaustion vector.
+     * The stream resets matter just as much: stdin/stdout still point at these
+     * statics, and leaving them bound to a destroyed pipe would let the next
+     * command read or write a torn-down buffer. */
+    if (out_pipe_live) {
+        stdout_reset(streams);
+        pipe_close_read(&out_pipe);
+        pipe_destroy(&out_pipe);
+    }
+    if (stage_pipe_live) {
+        stdin_reset(streams);
+        pipe_destroy(&stage_pipe);
     }
 }
 

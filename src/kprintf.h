@@ -22,10 +22,13 @@ typedef void (*kprintf_capture_fn)(void* ctx, char c);
  * less error-prone than rewriting every call site.
  *
  * SCOPE: install it around the smallest possible region and restore it
- * immediately, saving/restoring both the function and the context.  While a
- * hook is installed EVERY kprintf in the system is captured, including kernel
- * logging from interrupt handlers and the EDR daemon, so a hook left installed
- * silently swallows kernel diagnostics into unrelated buffers.
+ * immediately, saving/restoring both the function and the context.
+ *
+ * The hook is bound to the task that installs it and is consulted ONLY while
+ * that task is running, so a stage that blocks (e.g. `exec`, which waits on its
+ * child) cannot divert other tasks' kernel logging -- including panic output --
+ * into the installer's buffer.  Output produced by the owning task itself is
+ * still captured wholesale, so keep the region tight regardless.
  *
  * Declared outside the NO_DEBUG_LOGGING guard below: that guard compiles
  * kprintf itself away, but the capture plumbing is a real function in
