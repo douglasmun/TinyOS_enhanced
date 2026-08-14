@@ -111,6 +111,15 @@ typedef struct {
     uint8_t  attributes;
     char     filename[12];          // 8.3 + null
     bool     is_directory;
+
+    /* Where this file's 8.3 directory entry lives, so writes can be made
+     * durable. Without it a write updates file_size/first_cluster only in
+     * this in-RAM descriptor: the data reaches the disk but the directory
+     * still says "size 0, no cluster", so the file reads back empty after a
+     * remount. dirent_cluster == 0 means "no dirent" (an open root dir). */
+    uint32_t dirent_cluster;        // Directory cluster holding the entry
+    uint32_t dirent_index;          // Entry index within that cluster
+    bool     dirty;                 // Size/first_cluster changed since flush
 } fat32_file_t;
 
 /*=============================================================================
@@ -126,6 +135,10 @@ int fat32_close(int fd);
 int fat32_read(int fd, void* buffer, uint32_t size);
 int fat32_write(int fd, const void* buffer, uint32_t size);
 int fat32_seek(int fd, uint32_t offset);
+
+/* Drop an open file's contents (O_TRUNC): frees the cluster chain, zeroes the
+ * size, and flushes the directory entry. Returns 0 on success, -1 on error. */
+int fat32_truncate(int fd);
 
 // Directory operations
 int fat32_opendir(const char* path);

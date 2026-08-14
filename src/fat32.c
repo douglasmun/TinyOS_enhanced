@@ -236,6 +236,57 @@ static int write_cluster(uint32_t cluster, const void* buffer) {
 }
 
 /*-----------------------------------------------------------------------------
+ * FUNCTION: flush_dirent
+ * PURPOSE: Push a file's size and first cluster back into its on-disk 8.3
+ *          directory entry, making a write durable across a remount.
+ *
+ * WHY THIS EXISTS: fat32_write updates file_size/first_cluster in the in-RAM
+ * fat32_file_t only. The file DATA and the FAT chain both reach the disk, but
+ * the directory entry still reports the pre-write size (0 for a new file), so
+ * after a reboot fat32_open reports size 0 and fat32_read returns EOF
+ * immediately — the bytes are on the platter but unreachable. This is the
+ * "cluster alloc + dirent update" half of roadmap item 3.
+ *
+ * PRECONDITION: caller holds fat32_mutex (uses cluster_buffer).
+ * RETURNS: 0 on success (or nothing to do), -1 on I/O error.
+ *---------------------------------------------------------------------------*/
+static int flush_dirent(fat32_file_t* file) {
+    if (!file->dirty || file->dirent_cluster == 0) {
+        return 0;  /* clean, or no dirent to update (root directory) */
+    }
+
+    if (read_cluster(file->dirent_cluster, cluster_buffer) != 0) {
+        kprintf("[FAT32] ERROR: flush_dirent: failed to read dir cluster %u\n",
+                file->dirent_cluster);
+        return -1;
+    }
+
+    uint32_t entries_per_cluster = bytes_per_cluster / FAT32_DIR_ENTRY_SIZE;
+    if (file->dirent_index >= entries_per_cluster) {
+        kprintf("[FAT32] ERROR: flush_dirent: dirent index %u out of range\n",
+                file->dirent_index);
+        return -1;
+    }
+
+    fat32_dir_entry_t* entries = (fat32_dir_entry_t*)cluster_buffer;
+    fat32_dir_entry_t* de = &entries[file->dirent_index];
+
+    de->file_size = file->file_size;
+    de->first_cluster_high = (uint16_t)(file->first_cluster >> 16);
+    de->first_cluster_low  = (uint16_t)(file->first_cluster & 0xFFFF);
+    de->attributes |= FAT32_ATTR_ARCHIVE;  /* file has been modified */
+
+    if (write_cluster(file->dirent_cluster, cluster_buffer) != 0) {
+        kprintf("[FAT32] ERROR: flush_dirent: failed to write dir cluster %u\n",
+                file->dirent_cluster);
+        return -1;
+    }
+
+    file->dirty = false;
+    return 0;
+}
+
+/*-----------------------------------------------------------------------------
  * FUNCTION: parse_path
  * PURPOSE: Parse path into directory components
  *---------------------------------------------------------------------------*/
@@ -331,7 +382,8 @@ static bool is_last_lfn_entry(const fat32_dir_entry_t* entry) {
  * FUNCTION: find_dir_entry
  * PURPOSE: Find a directory entry in a directory cluster
  *---------------------------------------------------------------------------*/
-static int find_dir_entry(uint32_t dir_cluster, const char* name, fat32_dir_entry_t* entry) {
+static int find_dir_entry(uint32_t dir_cluster, const char* name, fat32_dir_entry_t* entry,
+                          uint32_t* out_dirent_cluster, uint32_t* out_dirent_index) {
     char name83[12];
     filename_to_83(name, name83);
 
@@ -388,6 +440,8 @@ static int find_dir_entry(uint32_t dir_cluster, const char* name, fat32_dir_entr
 
             if (memcmp(entries[i].name, name83, 11) == 0) {
                 memcpy(entry, &entries[i], sizeof(fat32_dir_entry_t));
+                if (out_dirent_cluster) *out_dirent_cluster = cluster;
+                if (out_dirent_index)   *out_dirent_index = i;
                 return 0;
             }
         }
@@ -554,16 +608,23 @@ int fat32_open(const char* path) {
         open_files[fd].file_size = 0;
         open_files[fd].position = 0;
         open_files[fd].is_directory = true;
+        open_files[fd].dirent_cluster = 0;   /* root dir has no dirent of its own */
+        open_files[fd].dirent_index = 0;
+        open_files[fd].dirty = false;
         mutex_unlock(&fat32_mutex);
         return fd;
     }
 
     // Navigate to file
     uint32_t current_cluster = root_dir_cluster;
+    uint32_t dirent_cluster = 0;
+    uint32_t dirent_index = 0;
     fat32_dir_entry_t entry;
 
     for (int i = 0; i < depth; i++) {
-        if (find_dir_entry(current_cluster, components[i], &entry) != 0) {
+        uint32_t parent_cluster = current_cluster;
+        if (find_dir_entry(parent_cluster, components[i], &entry,
+                           &dirent_cluster, &dirent_index) != 0) {
             kprintf("[FAT32] ERROR: File not found: %s\n", components[i]);
             mutex_unlock(&fat32_mutex);
             return -1;
@@ -589,6 +650,9 @@ int fat32_open(const char* path) {
     open_files[fd].position = 0;
     open_files[fd].attributes = entry.attributes;
     open_files[fd].is_directory = (entry.attributes & FAT32_ATTR_DIRECTORY) != 0;
+    open_files[fd].dirent_cluster = dirent_cluster;
+    open_files[fd].dirent_index = dirent_index;
+    open_files[fd].dirty = false;
 
     mutex_unlock(&fat32_mutex);
     return fd;
@@ -605,10 +669,15 @@ int fat32_close(int fd) {
 
     mutex_lock(&fat32_mutex);
 
+    /* Flush any pending size/first-cluster change before dropping the
+     * descriptor — otherwise a write that never crossed a flush point would
+     * leave the directory entry stale and the data unreachable. */
+    int rc = flush_dirent(&open_files[fd]);
+
     open_files[fd].in_use = false;
 
     mutex_unlock(&fat32_mutex);
-    return 0;
+    return rc;
 }
 
 /*-----------------------------------------------------------------------------
@@ -709,32 +778,52 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
         return -1;
     }
 
+    if (size == 0) {
+        return 0;
+    }
+
     mutex_lock(&fat32_mutex);
 
     const uint8_t* buf = (const uint8_t*)buffer;
     uint32_t bytes_written = 0;
 
+    /*=========================================================================
+     * An empty file (just created) has no cluster chain at all:
+     * first_cluster == current_cluster == 0. The old loop's allocation test
+     * ("current_cluster >= EOC || at a cluster boundary") was false for
+     * cluster 0 at position 0, so it fell through and wrote to
+     * cluster_to_sector(0) — which computes (0-2)*spc and underflows into the
+     * FAT/boot-sector region. Allocate the first cluster up front instead.
+     *=======================================================================*/
+    if (file->first_cluster == 0) {
+        uint32_t first = allocate_cluster(0);
+        if (first == 0) {
+            mutex_unlock(&fat32_mutex);
+            return -1;  /* disk full; nothing written yet */
+        }
+        file->first_cluster = first;
+        file->current_cluster = first;
+        file->dirty = true;
+    }
+
+    /* A seek past the end of the current chain (or a stale EOC in
+     * current_cluster) must not be written through. */
+    if (file->current_cluster < 2 || file->current_cluster >= FAT32_EOC) {
+        mutex_unlock(&fat32_mutex);
+        return -1;
+    }
+
+    uint32_t iteration_count = 0;
+
     while (bytes_written < size) {
-        // If we're at a cluster boundary or beyond current cluster chain, allocate new cluster
-        if (file->current_cluster >= FAT32_EOC ||
-            (file->position > 0 && (file->position % bytes_per_cluster) == 0)) {
-
-            uint32_t new_cluster = allocate_cluster(file->current_cluster);
-            if (new_cluster == 0) {
-                mutex_unlock(&fat32_mutex);
-                return bytes_written > 0 ? (int)bytes_written : -1;  // Disk full
-            }
-
-            if (file->first_cluster == 0) {
-                file->first_cluster = new_cluster;
-            }
-            file->current_cluster = new_cluster;
+        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+            kprintf("[FAT32] ERROR: Cluster chain cycle detected in write operation\n");
+            break;
         }
 
-        // Read current cluster (for partial writes)
+        // Read current cluster (preserves bytes we're not overwriting)
         if (read_cluster(file->current_cluster, cluster_buffer) != 0) {
-            mutex_unlock(&fat32_mutex);
-            return bytes_written > 0 ? (int)bytes_written : -1;
+            break;
         }
 
         // Calculate how much to write in this cluster
@@ -744,13 +833,10 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
             bytes_to_write = size - bytes_written;
         }
 
-        // Update cluster buffer
         memcpy(cluster_buffer + cluster_offset, buf + bytes_written, bytes_to_write);
 
-        // Write cluster back to disk
         if (write_cluster(file->current_cluster, cluster_buffer) != 0) {
-            mutex_unlock(&fat32_mutex);
-            return bytes_written > 0 ? (int)bytes_written : -1;
+            break;
         }
 
         bytes_written += bytes_to_write;
@@ -759,21 +845,97 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
         // Update file size if we extended it
         if (file->position > file->file_size) {
             file->file_size = file->position;
+            file->dirty = true;
         }
 
-        // Move to next cluster if needed
-        if ((file->position % bytes_per_cluster) == 0 && bytes_written < size) {
+        /*=====================================================================
+         * Advance to the next cluster only when this one is exactly full AND
+         * there is more to write. Follow the existing chain if it continues;
+         * otherwise extend it. The old code `continue`d here and relied on the
+         * top-of-loop test to allocate, which re-read the boundary condition
+         * and could allocate twice or spin.
+         *===================================================================*/
+        if (bytes_written < size && (file->position % bytes_per_cluster) == 0) {
             uint32_t next = read_fat_entry(file->current_cluster);
-            if (next >= FAT32_EOC) {
-                // Need to allocate another cluster
-                continue;
+
+            if (next == FAT32_BAD_CLUSTER) {
+                break;  /* FAT read failure */
             }
+
+            if (next >= FAT32_EOC) {
+                next = allocate_cluster(file->current_cluster);
+                if (next == 0) {
+                    break;  /* disk full — return the partial write below */
+                }
+            }
+
             file->current_cluster = next;
         }
     }
 
+    /* Make the write durable: the data and FAT chain are on disk, but the
+     * directory entry still holds the old size/first cluster until flushed. */
+    if (flush_dirent(file) != 0 && bytes_written > 0) {
+        kprintf("[FAT32] WARNING: data written but directory entry not updated\n");
+    }
+
     mutex_unlock(&fat32_mutex);
-    return bytes_written;
+
+    if (bytes_written == 0) {
+        return -1;
+    }
+    return (int)bytes_written;
+}
+
+/*-----------------------------------------------------------------------------
+ * FUNCTION: fat32_truncate
+ * PURPOSE: Drop an open file's contents (O_TRUNC): free its cluster chain and
+ *          reset size/first cluster, then flush the directory entry.
+ * WHY: Rewriting an existing file with fewer bytes than it already held would
+ *      otherwise leave the previous tail in place, since fat32_write only
+ *      grows file_size and never shrinks it.
+ *---------------------------------------------------------------------------*/
+int fat32_truncate(int fd) {
+    if (fd < 0 || fd >= FAT32_MAX_OPEN_FILES || !open_files[fd].in_use) {
+        return -1;
+    }
+
+    fat32_file_t* file = &open_files[fd];
+
+    if (file->is_directory) {
+        return -1;
+    }
+
+    mutex_lock(&fat32_mutex);
+
+    uint32_t cluster = file->first_cluster;
+    uint32_t iteration_count = 0;
+
+    while (cluster >= 2 && cluster < FAT32_EOC) {
+        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+            kprintf("[FAT32] ERROR: Cluster chain cycle detected in truncate\n");
+            mutex_unlock(&fat32_mutex);
+            return -1;
+        }
+
+        uint32_t next = read_fat_entry(cluster);
+        if (next == FAT32_BAD_CLUSTER) {
+            break;
+        }
+        write_fat_entry(cluster, FAT32_FREE);
+        cluster = next;
+    }
+
+    file->first_cluster = 0;
+    file->current_cluster = 0;
+    file->file_size = 0;
+    file->position = 0;
+    file->dirty = true;
+
+    int rc = flush_dirent(file);
+
+    mutex_unlock(&fat32_mutex);
+    return rc;
 }
 
 /*-----------------------------------------------------------------------------
@@ -797,8 +959,29 @@ int fat32_seek(int fd, uint32_t offset) {
     file->position = 0;
     file->current_cluster = file->first_cluster;
 
-    // Seek forward
+    /* An empty file has no chain to walk; position 0 is the only valid target
+     * and fat32_write allocates the first cluster on demand. */
+    if (file->first_cluster == 0) {
+        file->position = 0;
+        mutex_unlock(&fat32_mutex);
+        return (offset == 0) ? 0 : -1;
+    }
+
+    /*=========================================================================
+     * Seek forward.
+     *
+     * When `offset` lands exactly on a cluster boundary (e.g. seeking to EOF
+     * of a file that is an exact multiple of the cluster size, which is what
+     * append does), the byte at `offset` lives in the NEXT cluster — which,
+     * at EOF, does not exist yet. Skipping that far would walk off the end of
+     * the chain and fail. Stop on the last existing cluster instead and let
+     * fat32_write's boundary handling allocate the successor when it actually
+     * needs to write there.
+     *=======================================================================*/
     uint32_t clusters_to_skip = offset / bytes_per_cluster;
+    if (clusters_to_skip > 0 && (offset % bytes_per_cluster) == 0) {
+        clusters_to_skip--;
+    }
 
     /*=========================================================================
      * SECURITY FIX (Issue 5.2): Infinite Loop DoS Protection
@@ -874,10 +1057,38 @@ int fat32_create(const char* path) {
     fat32_dir_entry_t* entries = (fat32_dir_entry_t*)cluster_buffer;
     uint32_t entries_per_cluster = bytes_per_cluster / FAT32_DIR_ENTRY_SIZE;
 
+    /*=========================================================================
+     * Refuse to create a name that already exists.
+     *
+     * Without this, `write C:/NOTES.TXT ...` on an existing file appends a
+     * SECOND directory entry with the same 8.3 name. find_dir_entry returns
+     * the first match, so subsequent opens keep using the original entry while
+     * the duplicate lingers — the directory ends up self-inconsistent and the
+     * duplicate's clusters are unreachable. Callers that want to overwrite
+     * open the existing file (optionally with O_TRUNC) instead.
+     *=======================================================================*/
+    for (uint32_t i = 0; i < entries_per_cluster; i++) {
+        if (entries[i].name[0] == 0x00) {
+            break;  /* end of directory */
+        }
+        if (entries[i].name[0] == 0xE5 || is_lfn_entry(&entries[i])) {
+            continue;
+        }
+        if (memcmp(entries[i].name, name_83, 11) == 0) {
+            mutex_unlock(&fat32_mutex);
+            return -1;  /* already exists */
+        }
+    }
+
     // Find free entry
     for (uint32_t i = 0; i < entries_per_cluster; i++) {
         if (entries[i].name[0] == 0x00 || entries[i].name[0] == 0xE5) {
-            // Found free slot
+            /* Zero the slot first: a recycled (0xE5) entry still carries the
+             * deleted file's timestamps and cluster fields, and leaving them
+             * behind produces a dirent that disagrees with the new empty
+             * file (notably a stale first_cluster). */
+            memset(&entries[i], 0, sizeof(fat32_dir_entry_t));
+
             memcpy(entries[i].name, name_83, 11);
             entries[i].attributes = FAT32_ATTR_ARCHIVE;
             entries[i].first_cluster_high = 0;

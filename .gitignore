@@ -153,3 +153,7 @@ pipes.log
 pipes-trace.log
 pipes-exec.log
 pipes-exec-trace.log
+fat32w-boot1.log
+fat32w-boot1-trace.log
+fat32w-boot2.log
+fat32w-boot2-trace.log

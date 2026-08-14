@@ -134,6 +134,7 @@ typedef int32_t ssize_t;                /* Signed size type for I/O operations *
 #define VFS_ENOENT          -2      /* No such file or directory */
 #define VFS_EACCES          -13     /* Permission denied */
 #define VFS_EEXIST          -17     /* File exists */
+#define VFS_EIO             -5      /* I/O error (media write / metadata flush failed) */
 #define VFS_EOVERFLOW       -75     /* Value too large for defined data type (POSIX) */
 
 /*=============================================================================
