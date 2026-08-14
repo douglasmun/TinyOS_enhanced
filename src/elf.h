@@ -168,6 +168,26 @@ bool elf_verify_signature(const void* elf_data, size_t elf_size);
 int elf_load_process(const void* elf_data, size_t elf_size, const char* name);
 
 /**
+ * @brief Load an ELF executable and create a process with an argv vector
+ *
+ * Identical to elf_load_process() except that the new process's main() gets
+ * the given arguments. By convention argv[0] is the program name, but this
+ * function does not enforce that — it passes through whatever it is handed.
+ *
+ * argv is copied onto the child's user stack during creation; the caller keeps
+ * ownership and neither the array nor the strings need to outlive this call.
+ *
+ * @param elf_data Pointer to ELF file data in memory
+ * @param elf_size Actual size of ELF file buffer
+ * @param name     Name for the process
+ * @param argc     Number of argv entries (0 to USER_ARGV_MAX)
+ * @param argv     Array of argc NUL-terminated strings, or NULL when argc==0
+ * @return Process ID (PID) on success, -1 on failure
+ */
+int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
+                          int argc, const char* const* argv);
+
+/**
  * @brief Get entry point address from ELF
  * @param elf_data Pointer to ELF file data in memory
  * @return Entry point virtual address, or 0 on error

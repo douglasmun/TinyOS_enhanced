@@ -508,6 +508,46 @@ int task_create_user(uint32_t entry, const char* name);
 int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages);
 
 /**
+ * @brief Maximum argv entries a user task may be created with
+ *
+ * Bounds both the kernel-side pointer array and the space the argv block can
+ * consume out of the child's top stack page. argv[argc] == NULL is stored in
+ * addition to these, matching the C ABI.
+ */
+#define USER_ARGV_MAX        32
+
+/**
+ * @brief Maximum total bytes of argv string data (including NUL terminators)
+ *
+ * The whole argv block — strings, the pointer array and argc — must fit in the
+ * slack between the ASLR'd initial ESP and the top of the mapped stack page, so
+ * it is deliberately far smaller than a page.
+ */
+#define USER_ARGV_MAX_BYTES  1024
+
+/**
+ * @brief Create a user task (Ring 3) with an argv vector on its stack
+ *
+ * Identical to task_create_user_ex(), plus it writes an argc/argv block onto
+ * the new task's user stack so its main() receives real arguments. The strings
+ * are copied while CR3 is the child's PDPT (the same window in which the stack
+ * pages are mapped and zeroed), because the stack is mapped only in that
+ * address space.
+ *
+ * argv is copied by value; the caller keeps ownership of both the array and
+ * the strings, and neither needs to outlive this call.
+ *
+ * @param entry       Entry point address
+ * @param name        Task name
+ * @param stack_pages Number of stack pages (USER_STACK_MIN to USER_STACK_MAX)
+ * @param argc        Number of argv entries (0 to USER_ARGV_MAX)
+ * @param argv        Array of argc NUL-terminated strings, or NULL when argc==0
+ * @return PID of new task, or -1 on error
+ */
+int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages,
+                          int argc, const char* const* argv);
+
+/**
  * @brief Set currently running task (used by scheduler)
  * @param task Pointer to task structure
  */

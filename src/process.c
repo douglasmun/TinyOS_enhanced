@@ -756,8 +756,48 @@ int task_create_user(uint32_t entry, const char* name) {
 /*=============================================================================
  * FUNCTION: task_create_user_ex
  * PURPOSE: Create a new user-mode task (Ring 3) with configurable stack size
+ *
+ * Thin wrapper over task_create_user_argv() with an empty argument vector, so
+ * a task created this way sees argc == 0 and argv[0] == NULL. Kept as its own
+ * entry point because most callers have no arguments to pass.
  *=============================================================================*/
 int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) {
+    return task_create_user_argv(entry, name, stack_pages, 0, NULL);
+}
+
+/*=============================================================================
+ * FUNCTION: task_create_user_argv
+ * PURPOSE: Create a new user-mode task (Ring 3) with configurable stack size
+ *          and an argc/argv block written onto its user stack
+ *=============================================================================*/
+int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages,
+                          int argc, const char* const* argv) {
+    /* Validate the argument vector before anything is allocated, so a bad
+     * request fails cheaply rather than half-way through building a task. */
+    if (argc < 0 || argc > USER_ARGV_MAX) {
+        kprintf("[PROCESS] ERROR: argc %d out of range (max %d)\n", argc, USER_ARGV_MAX);
+        return -1;
+    }
+    if (argc > 0 && !argv) {
+        kprintf("[PROCESS] ERROR: argc %d with NULL argv\n", argc);
+        return -1;
+    }
+
+    /* Total string bytes, NUL terminators included. Computed up front so the
+     * whole block is known to fit before the child's stack is touched. */
+    size_t argv_bytes = 0;
+    for (int i = 0; i < argc; i++) {
+        if (!argv[i]) {
+            kprintf("[PROCESS] ERROR: argv[%d] is NULL\n", i);
+            return -1;
+        }
+        argv_bytes += strlen(argv[i]) + 1;
+        if (argv_bytes > USER_ARGV_MAX_BYTES) {
+            kprintf("[PROCESS] ERROR: argv too large (>%d bytes)\n", USER_ARGV_MAX_BYTES);
+            return -1;
+        }
+    }
+
     // Validate and clamp stack_pages to allowed range
     if (stack_pages < USER_STACK_MIN) {
         kprintf("[PROCESS] WARNING: Stack size %d pages too small, using minimum %d pages\n",
@@ -1057,6 +1097,83 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
     for (int i = 0; i < stack_pages; i++) {
         uint32_t virt_addr = stack_base - ((i + 1) * 0x1000);
         memset((void*)virt_addr, 0, 4096);
+    }
+
+    /*=========================================================================
+     * Write the argc/argv block onto the child's user stack.
+     *
+     * This MUST happen here, while CR3 is still the child's PDPT: the stack is
+     * mapped only in that address space, so the same virtual addresses are
+     * unmapped (or belong to something else entirely) once we switch back.
+     *
+     * Layout, built downward from the ASLR'd initial ESP:
+     *
+     *      user_stack ->  [ argv string data      ]  (argv_bytes, then aligned)
+     *                     [ argv[argc] == NULL    ]
+     *                     [ argv[argc-1] ... argv[0] ]
+     *                     [ argv (char**)         ]
+     *      new esp    ->  [ argc (int)            ]
+     *
+     * crt0 pops argc and argv straight into main()'s arguments. With argc == 0
+     * this still writes {argc=0, argv=&NULL-terminator}, so a program declaring
+     * main(int, char**) sees a valid empty vector rather than garbage.
+     *
+     * The block lives in the slack below user_stack inside the already-mapped
+     * top stack page; USER_ARGV_MAX/USER_ARGV_MAX_BYTES keep it far below a
+     * page, and the bounds check below refuses the load rather than writing
+     * past the mapping if that ever stops holding.
+     *=======================================================================*/
+    {
+        /* Bytes needed: strings + (argc + 1) pointers + argc itself + slack
+         * for 4-byte alignment of the pointer array. */
+        size_t block_bytes = argv_bytes + ((size_t)argc + 1) * sizeof(uint32_t)
+                             + sizeof(uint32_t) + sizeof(uint32_t);
+        uint32_t stack_low = stack_base - ((uint32_t)stack_pages * 0x1000);
+
+        if (task->user_stack < stack_low ||
+            (size_t)(task->user_stack - stack_low) < block_bytes) {
+            /* Cannot happen with the current limits, but writing outside the
+             * mapping would corrupt whatever else lives there, so fail loudly
+             * instead. Restore CR3 first — we are still on the child's PDPT. */
+            __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+            kprintf("[PROCESS] ERROR: argv block (%u bytes) does not fit on user stack\n",
+                    (unsigned)block_bytes);
+            task->pid = 0;
+            task_free_slot(slot);
+            return -1;
+        }
+
+        /* 1. Copy the strings, recording where each one landed. */
+        uint32_t sp = task->user_stack;
+        uint32_t user_argv_ptrs[USER_ARGV_MAX];
+        for (int i = 0; i < argc; i++) {
+            size_t len = strlen(argv[i]) + 1;
+            sp -= len;
+            memcpy((void*)sp, argv[i], len);
+            user_argv_ptrs[i] = sp;
+        }
+
+        /* 2. Align down so the pointer array is 4-byte aligned. */
+        sp &= ~0x3u;
+
+        /* 3. NULL terminator, then the pointers in reverse so argv[0] ends up
+         *    lowest — i.e. the array reads forwards from the final address. */
+        sp -= sizeof(uint32_t);
+        *(uint32_t*)sp = 0;
+        for (int i = argc - 1; i >= 0; i--) {
+            sp -= sizeof(uint32_t);
+            *(uint32_t*)sp = user_argv_ptrs[i];
+        }
+        uint32_t user_argv = sp;
+
+        /* 4. argv then argc, so crt0 pops argc first. */
+        sp -= sizeof(uint32_t);
+        *(uint32_t*)sp = user_argv;
+        sp -= sizeof(uint32_t);
+        *(uint32_t*)sp = (uint32_t)argc;
+
+        /* ESP starts at the block instead of at the raw ASLR base. */
+        task->user_stack = sp;
     }
 
     // Switch back to kernel page directory

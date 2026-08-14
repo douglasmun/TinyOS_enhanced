@@ -1458,8 +1458,37 @@ void cmd_exec(int argc, char* argv[]) {
     }
 
     kprintf("[EXEC] File loaded successfully\n");
+
+    /* Build the child's argv from the rest of the command line.
+     *
+     * `exec prog a b c` gives the child argv == {"prog", "a", "b", "c"}: by
+     * convention argv[0] is the program name, and the shell's own argv[0]
+     * ("exec") and argv[1] (the path) are not part of it. A trailing "&" is a
+     * shell directive, not an argument, so it is dropped — `background` was
+     * computed from it above.
+     *
+     * The strings point into the shell's tokenizer buffer, which is fine: they
+     * are copied onto the child's stack during creation and are not referenced
+     * afterwards. Over-long vectors are rejected by task_create_user_argv
+     * rather than silently truncated, so the child never sees a partial
+     * command line. */
+    int last_arg = background ? argc - 1 : argc;   /* exclude a trailing "&" */
+    if (last_arg - 2 > USER_ARGV_MAX - 1) {        /* -1: argv[0] is the name */
+        stream_printf(get_current_streams(),
+                      "exec: too many arguments (max %d)\n", USER_ARGV_MAX - 1);
+        return;
+    }
+
+    const char* child_argv[USER_ARGV_MAX];
+    int child_argc = 0;
+    child_argv[child_argc++] = proc_name;
+    for (int i = 2; i < last_arg; i++) {
+        child_argv[child_argc++] = argv[i];
+    }
+
     // Load ELF and create process
-    int pid = elf_load_process(exec_buffer, file_size, proc_name);
+    int pid = elf_load_process_argv(exec_buffer, file_size, proc_name,
+                                    child_argc, child_argv);
 
     if (pid < 0) {
         /* elf_load_process owns its own teardown: every failure path after

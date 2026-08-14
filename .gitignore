@@ -145,3 +145,5 @@ bgjobs-trace.log
 redirect.log
 redirect-trace.log
 scratchpad/
+argv.log
+argv-trace.log

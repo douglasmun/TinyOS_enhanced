@@ -303,6 +303,15 @@ static void elf_abort_load(int pid, uint32_t kernel_cr3) {
  * PURPOSE: Load ELF executable and create a process
  *=============================================================================*/
 int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
+    return elf_load_process_argv(elf_data, elf_size, name, 0, NULL);
+}
+
+/*=============================================================================
+ * FUNCTION: elf_load_process_argv
+ * PURPOSE: Load ELF executable and create a process, passing it an argv vector
+ *=============================================================================*/
+int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
+                          int argc, const char* const* argv) {
     kprintf("[ELF] Loading process '%s' (file size: %zu bytes)...\n", name, elf_size);
 
     /*=========================================================================
@@ -684,7 +693,8 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
 
     // Create process FIRST so we have a user page directory to map into
     kprintf("[ELF] Creating process with entry point 0x%08x\n", ehdr->e_entry);
-    int pid = task_create_user((uint32_t)ehdr->e_entry, name);
+    int pid = task_create_user_argv((uint32_t)ehdr->e_entry, name,
+                                    USER_STACK_LARGE, argc, argv);
     if (pid < 0) {
         kprintf("[ELF] ERROR: Failed to create process\n");
         return -1;
