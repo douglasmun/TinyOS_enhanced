@@ -56,7 +56,7 @@ The release-signing public key is published **here in the README** (and in the r
 RWSjOIBH4PaSwMQGL52OOQP7tyEu2p3Z83If58oyBxuatlkOnuBo2qOF
 ```
 
-A plain SHA-256 is also given in the [release notes](../../releases/tag/v2.2) for a quick integrity check. Either way, this is an educational OS — only run it in a throwaway VM.
+A plain SHA-256 is also given in the [release notes](../../releases/latest) for a quick integrity check. Either way, this is an educational OS — only run it in a throwaway VM.
 
 **Recommended — with a virtual NIC (DHCP completes immediately):**
 
