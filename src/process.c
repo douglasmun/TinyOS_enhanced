@@ -12,6 +12,7 @@
 #include "aslr.h"    /* For stack randomization */
 #include "critical.h" /* For CRITICAL_SECTION macros (Issue 5.1) */
 #include "wait_queue.h" /* For wait_queue_remove_task() on external kill */
+#include "syscall.h"    /* For waitpid_notify_death() on external kill */
 #include "vfs.h"     /* For capability flags (CAP_ALL, etc.) - EDR Phase 1 */
 #include "edr_behavioral.h"  /* EDR Phase 2: Behavioral detection */
 #include "edr_advanced.h"    /* EDR Phase 3: Advanced detection */
@@ -1412,6 +1413,16 @@ void task_terminate(uint32_t pid) {
         // or the stale entry consumes a later wakeup / spuriously wakes the
         // slot's next occupant. No-op unless blocked_on_wq is set.
         wait_queue_remove_task(task);
+
+        // An externally killed task never runs sys_exit, so nothing else would
+        // record its status or wake anyone blocked in waitpid() on it. Waiters
+        // block on a wait queue rather than polling, so skipping this hangs
+        // them permanently instead of just delaying them a tick. 0x7F follows
+        // the shell convention for "died abnormally"; it is indistinguishable
+        // from a deliberate exit(127) until waitpid grows real WIFSIGNALED
+        // encoding, which is fine for now — the point is that the waiter is
+        // released at all.
+        waitpid_notify_death(task->pid, task->generation, 0x7F);
 
         // Clean up streams (close any open file descriptors)
         streams_cleanup(&task->streams);

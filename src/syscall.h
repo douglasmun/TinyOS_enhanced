@@ -176,6 +176,19 @@ void sys_yield(void);
 int sys_sleep(uint32_t ms);
 int sys_waitpid(int pid);
 
+/*-----------------------------------------------------------------------------
+ * Record a process death and wake every sys_waitpid() waiter.
+ *
+ * sys_exit calls this on the clean-exit path. task_terminate MUST call it too:
+ * a process killed externally (kill, #PF, guard-page hit) never runs sys_exit,
+ * and since waiters now BLOCK on a wait queue instead of polling every tick,
+ * an unwoken waiter would hang forever rather than merely noticing late.
+ *
+ * Takes its own critical section (they nest), so callers already inside one —
+ * such as sys_exit's cleanup window — can call it directly.
+ *---------------------------------------------------------------------------*/
+void waitpid_notify_death(uint32_t pid, uint32_t generation, int status);
+
 /* User/Group Management Syscalls (v1.10) */
 uint16_t sys_getuid(void);
 uint16_t sys_getgid(void);

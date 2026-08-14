@@ -9,6 +9,7 @@
 #include "memory.h"    // For USER_SPACE_END
 #include "errno.h"     // For POSIX-style error codes
 #include "scheduler.h"
+#include "wait_queue.h"
 #include "serial.h"
 #include "keyboard.h"
 #include "copy_user.h" // SECURITY: TOCTOU fix - safe user memory access
@@ -124,11 +125,15 @@ void syscall_handler_c(struct cpu_state* state);
  * EXIT RECORDS
  *
  * The ZOMBIE window lasts less than a tick (the timer-IRQ cleanup drain
- * recycles the slot before any sleeping waiter runs), so waitpid can almost
+ * recycles the slot before any woken waiter runs), so waitpid can almost
  * never read exit_status out of the task slot. sys_exit therefore also logs
  * {pid, generation, status} into this small ring; sys_waitpid consults it
  * when the slot is already gone. Old entries are overwritten FIFO — a waiter
- * that polls every tick cannot fall 16 exits behind on this system.
+ * woken on the exiting child's own tick cannot fall 16 exits behind here.
+ *
+ * The ring remains the STATUS STORE even now that waiters block on a wait
+ * queue rather than polling: the wakeup only tells a waiter to re-check, and
+ * by the time it runs the slot is typically already recycled.
  *===========================================================================*/
 #define EXIT_RECORDS 16
 static struct {
@@ -144,6 +149,32 @@ static void exit_record_store(uint32_t pid, uint32_t generation, int status) {
     exit_records[exit_record_next].generation = generation;
     exit_records[exit_record_next].status = status;
     exit_record_next = (exit_record_next + 1) % EXIT_RECORDS;
+}
+
+/*=============================================================================
+ * WAITPID WAIT QUEUE
+ *
+ * ONE global queue for all waiters rather than one per task: waiters are woken
+ * as a BROADCAST and each re-checks its own {pid, generation}. A per-child
+ * queue would have to live in the task slot, which the reaper frees and
+ * recycles inside the same tick the child exits — the queue would be gone
+ * before the wakeup could be delivered.
+ *
+ * Broadcast (not wakeup-one) is required for correctness: waiters block on
+ * DIFFERENT pids, so waking a single arbitrary waiter can wake one whose child
+ * is still alive. It sleeps again and the event is lost forever, leaving the
+ * real waiter blocked permanently.
+ *
+ * No init call is needed: wait_queue_init() only zeroes the struct, and a
+ * static already lands zeroed in .bss.
+ *===========================================================================*/
+static wait_queue_t waitpid_wq;
+
+void waitpid_notify_death(uint32_t pid, uint32_t generation, int status) {
+    uint32_t eflags = disable_interrupts();
+    exit_record_store(pid, generation, status);
+    wait_queue_wakeup_all(&waitpid_wq);
+    restore_interrupts(eflags);
 }
 
 static bool exit_record_find(uint32_t pid, uint32_t generation, int* status) {
@@ -228,7 +259,15 @@ void sys_exit(int status) {
         /* The post-switch reaper zeroes pid and recycles the slot within a
          * tick — before a task_sleep(1)-polling waiter ever runs again — so
          * the status must be preserved outside the slot to be observable. */
-        exit_record_store(current->pid, current->generation, status);
+        /* Record the status and wake every waitpid() waiter so each can
+         * re-check its own child.
+         *
+         * This MUST stay inside the same interrupts-disabled window as the
+         * ZOMBIE transition above. A waiter runs "check condition, then sleep"
+         * under a critical section; if the wakeup landed between its check and
+         * its sleep, it would block after the event had already been signalled
+         * and never be woken again. */
+        waitpid_notify_death(current->pid, current->generation, status);
 
         /* Step 4: Remove from ready queue NOW to avoid race condition */
         // where timer interrupt tries to schedule/remove the same task
@@ -561,9 +600,11 @@ int sys_sleep(uint32_t ms) {
 /*-----------------------------------------------------------------------------
  * System Call: Waitpid
  * Block until the process `pid` has exited; returns its exit status, or
- * -ECHILD if no such live process exists. Uses tick-sleep polling (the
- * process table has no parent/child waiter lists); each poll costs one
- * 10 ms tick of latency, which is fine for an educational OS.
+ * -ECHILD if no such live process exists.
+ *
+ * The waiter BLOCKS on a shared wait queue woken by waitpid_notify_death()
+ * (from both sys_exit and task_terminate) — it no longer wakes every 10 ms
+ * tick to poll a condition that is almost always still false.
  *
  * SECURITY: only root or the owner of the target process may wait on it —
  * prevents an unprivileged process from siphoning another user's exit codes.
@@ -599,15 +640,26 @@ int sys_waitpid(int pid) {
     }
     CRITICAL_SECTION_EXIT();
 
-    /* The status is truncated POSIX-style to 0..255 so a child's negative
+    /* Block on the waitpid wait queue until the child dies, re-checking the
+     * condition on every wakeup: the queue is shared by all waiters and woken
+     * as a broadcast, so most wakeups belong to somebody else's child.
+     *
+     * The check and the sleep both happen inside ONE critical section, and
+     * wait_queue_sleep releases it as it yields. That is what closes the lost-
+     * wakeup race: waitpid_notify_death records the status and wakes the queue
+     * with interrupts disabled, so it cannot slip in between this task's check
+     * and its sleep.
+     *
+     * The status is truncated POSIX-style to 0..255 so a child's negative
      * exit code can never collide with this syscall's own -Exxx errors. */
     while (1) {
         CRITICAL_SECTION_ENTER();
         task_t* child = task_get_validated(pid, generation);
         if (!child) {
             /* Slot already reaped/recycled — recover the status from the
-             * exit-record ring (the common path: the reaper wins the race
-             * against a tick-sleeping waiter every time). */
+             * exit-record ring. This is the COMMON path, not an edge case:
+             * the post-switch reaper recycles the slot within the same tick
+             * the child exits, so a woken waiter almost never sees the slot. */
             int status = 0;
             exit_record_find(pid, generation, &status);
             CRITICAL_SECTION_EXIT();
@@ -618,8 +670,7 @@ int sys_waitpid(int pid) {
             CRITICAL_SECTION_EXIT();
             return status & 0xFF;
         }
-        CRITICAL_SECTION_EXIT();
-        task_sleep(1);
+        wait_queue_sleep(&waitpid_wq);  /* releases the critical section */
     }
 }
 

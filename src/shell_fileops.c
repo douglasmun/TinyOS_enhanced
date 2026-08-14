@@ -14,6 +14,7 @@
 #include "editor.h"
 #include "stdio.h"
 #include "critical.h"
+#include "syscall.h"   /* For sys_waitpid() — foreground exec blocks on it */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -1490,19 +1491,15 @@ void cmd_exec(int argc, char* argv[]) {
             return;
         }
 
-        // Wait for child process to terminate. Poll with generation
-        // validation, same as sys_waitpid: PIDs are random 16-bit values and
-        // the allocator can hand a just-reaped child's PID to a new task, so
-        // a bare task_get(pid) loop could latch onto an unrelated process.
+        // Wait for the child to terminate via the same wait-queue path
+        // userspace waitpid() uses, rather than a second hand-rolled poll
+        // loop: one blocking implementation to get right, and every
+        // foreground `exec` exercises it. sys_waitpid does its own generation
+        // validation (PIDs are random 16-bit values and the allocator can hand
+        // a just-reaped child's PID to a new task) and returns as soon as the
+        // child is recorded dead, so no tick-granular polling is involved.
         kprintf("[EXEC] Waiting for process to complete...\n");
-        uint32_t child_generation = task->generation;
-        while (1) {
-            task_t* child = task_get_validated(pid, child_generation);
-            if (!child || child->state == TASK_STATE_TERMINATED) {
-                break;  // Child has finished
-            }
-            task_sleep(1);  // Block a tick (10 ms) instead of yield-spinning
-        }
+        sys_waitpid(pid);
 
         /*
          * CRITICAL: Reap the zombie process
