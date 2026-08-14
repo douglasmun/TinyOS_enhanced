@@ -188,6 +188,62 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
                           int argc, const char* const* argv);
 
 /**
+ * @brief Serialize the whole exec path (loader + caller's load buffer)
+ *
+ * The exec chain leans on two big STATIC buffers — elf.c's allocated_frames[]
+ * page-tracking array and cmd_exec's exec_buffer[] file buffer. They are static
+ * rather than stack-local on purpose: at 16KB and 64KB they would overflow the
+ * 128KB kernel task stack that the deep cmd_exec -> elf_load_process ->
+ * sha256 -> ecdsa_verify chain already runs on. Do NOT "fix" that by moving
+ * them back to the stack.
+ *
+ * That made them safe only under the invariant that one load is ever in flight,
+ * which held while the single-threaded shell was the only caller. SYS_SPAWN
+ * breaks it: any process can now start a load, so two could interleave and
+ * scribble over each other's buffer — corrupting the tracked frame list (double
+ * free / leak) or the bytes being hashed and signature-checked.
+ *
+ * These take a blocking mutex, so a second loader sleeps until the first is
+ * done rather than spinning. Callers that own a load buffer must hold this
+ * across BOTH filling the buffer and the elf_load_process*() call — locking
+ * only the loader would still let a second caller overwrite the first's file
+ * bytes mid-verify.
+ *
+ * elf_load_process*() does NOT take the lock itself, precisely so the caller
+ * can extend it over its own buffer; every entry point into the exec path is
+ * responsible for wrapping the whole sequence.
+ */
+void elf_exec_lock(void);
+void elf_exec_unlock(void);
+
+/**
+ * @brief Read an executable from the VFS and start it as a process
+ *
+ * The whole exec sequence in one place: take the exec lock, read the file into
+ * the shared 64KB load buffer, load and create the process, release the lock.
+ * Callers get a PID (or a negative errno) and never touch the static buffers.
+ *
+ * Factored out of cmd_exec so SYS_SPAWN can reuse it. The alternative — giving
+ * the syscall its own file buffer — would mean a second 64KB static array, and
+ * two independently-locked copies of a sequence whose locking discipline is the
+ * whole point.
+ *
+ * The new process is NOT added to the scheduler; the caller decides that, since
+ * it also decides whether to hand over its streams first (a child must inherit
+ * before it can be scheduled, or it may run with the wrong stdout).
+ *
+ * @param path  VFS path to the executable (drive-letter paths supported)
+ * @param name  Process name
+ * @param argc  Number of argv entries (0 to USER_ARGV_MAX)
+ * @param argv  Array of argc NUL-terminated strings, or NULL when argc==0
+ * @param err   Optional; receives a human-readable reason on failure
+ * @return PID on success, negative errno on failure
+ */
+int elf_exec_from_path(const char* path, const char* name,
+                       int argc, const char* const* argv,
+                       const char** err);
+
+/**
  * @brief Get entry point address from ELF
  * @param elf_data Pointer to ELF file data in memory
  * @return Entry point virtual address, or 0 on error

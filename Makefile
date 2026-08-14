@@ -101,6 +101,7 @@ SRC := \
   src/elf.c \
   src/hello_elf_data.c \
   src/sleeper_elf_data.c \
+  src/spawner_elf_data.c \
   src/shell_elf_data.c \
   src/ramfs.c \
   src/ramfs_vfs.c \

@@ -147,3 +147,5 @@ redirect-trace.log
 scratchpad/
 argv.log
 argv-trace.log
+spawn.log
+spawn-trace.log

@@ -65,6 +65,39 @@ int copy_from_user(void* kernel_dst, const void* user_src, size_t len);
 int copy_to_user(void* user_dst, const void* kernel_src, size_t len);
 
 /*=============================================================================
+ * FUNCTION: copy_string_from_user
+ *============================================================================*/
+/**
+ * Safely copies a NUL-terminated string from user space into a kernel buffer.
+ *
+ * copy_from_user() cannot express this: the length is not known until the
+ * terminator is found, and guessing a length would either read past the end of
+ * a short string (faulting on the next, possibly unmapped, page even though the
+ * string itself was entirely valid) or truncate a long one.
+ *
+ * Bytes are therefore fetched one at a time through copy_from_user(), which
+ * keeps every per-byte user-space and page-fault check in exactly one place.
+ *
+ * SECURITY:
+ * - Never reads past the terminator, so a string ending just before an
+ *   unmapped page still copies successfully
+ * - Always NUL-terminates on success, so callers can treat the result as a
+ *   C string without re-checking
+ * - Refuses rather than truncates when the string does not fit, so a caller
+ *   cannot be handed a silently shortened path or argument
+ *
+ * @param kernel_dst  Destination buffer in kernel space
+ * @param user_src    Source string in user space (may be invalid/unmapped)
+ * @param max_len     Size of kernel_dst, terminator included
+ *
+ * @return Length of the copied string (excluding the terminator) on success,
+ *         -EFAULT if the user address is invalid or faults,
+ *         -EINVAL on a bad argument,
+ *         -ENAMETOOLONG if the string does not fit in max_len
+ */
+int copy_string_from_user(char* kernel_dst, const char* user_src, size_t max_len);
+
+/*=============================================================================
  * INTERNAL FUNCTIONS (called from page fault handler)
  *============================================================================*/
 

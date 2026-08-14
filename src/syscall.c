@@ -23,6 +23,8 @@
 #include "edr_behavioral.h" // EDR Phase 2: Behavioral detection
 #include "audit.h"     // For audit_log() in mandatory EDR hook
 #include <stddef.h>    // For offsetof() macro used in static assertions
+#include "elf.h"       // SYS_SPAWN: elf_exec_from_path
+#include "util.h"      // MAX_PATH
 
 /*-----------------------------------------------------------------------------
  * CPU State Structure (matches syscall stub stack frame)
@@ -648,6 +650,148 @@ int sys_sleep(uint32_t ms) {
  * SECURITY: only root or the owner of the target process may wait on it —
  * prevents an unprivileged process from siphoning another user's exit codes.
  *-----------------------------------------------------------------------------*/
+/*=============================================================================
+ * FUNCTION: sys_spawn
+ * PURPOSE: Load an ELF from the filesystem and start it as a child process
+ *
+ * PARAMETERS:
+ *   user_path - user pointer to a NUL-terminated path ("/prog.elf", "C:/x.elf")
+ *   user_argv - user pointer to a NULL-terminated char* array, or NULL
+ *
+ * RETURNS: child PID (> 0) on success, negative errno on failure
+ *
+ * The child inherits the caller's streams (so a spawned process writes where
+ * its parent's stdout points) and is recorded as the caller's child, which is
+ * what makes waitpid() and `jobs` work on it. It does NOT block: the caller
+ * waits explicitly with waitpid() if it wants to.
+ *
+ * SECURITY: every byte of the path and the argument vector is copied into
+ * kernel memory with copy_*_from_user BEFORE use. Nothing below dereferences
+ * a user pointer, so a hostile caller cannot swap the string out between the
+ * validation and the load (TOCTOU), and a bad pointer returns -EFAULT rather
+ * than faulting in the kernel.
+ *===========================================================================*/
+int sys_spawn(const char* user_path, char* const* user_argv) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    /* Path first: a bad path is the cheap rejection. */
+    char path[MAX_PATH];
+    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    if (rc < 0) {
+        return rc;   /* -EFAULT / -ENAMETOOLONG */
+    }
+    if (rc == 0) {
+        return -EINVAL;  /* Empty path */
+    }
+
+    /* Copy the whole vector into kernel storage. Both the pointer array and
+     * the strings it points at live in user memory and must be copied; the
+     * strings are packed into one flat buffer bounded by USER_ARGV_MAX_BYTES,
+     * the same budget task_create_user_argv enforces for the child's stack. */
+    char argv_storage[USER_ARGV_MAX_BYTES];
+    const char* kargv[USER_ARGV_MAX];
+    int kargc = 0;
+
+    if (user_argv) {
+        size_t used = 0;
+
+        while (kargc < USER_ARGV_MAX) {
+            /* One pointer at a time: the array length is unknown until the
+             * NULL terminator is read, and reading past it would fault. */
+            uint32_t uptr = 0;
+            rc = copy_from_user(&uptr, (const uint8_t*)user_argv + (size_t)kargc * sizeof(uint32_t),
+                                sizeof(uptr));
+            if (rc < 0) {
+                return rc;
+            }
+            if (uptr == 0) {
+                break;   /* End of vector */
+            }
+
+            char* dst = argv_storage + used;
+            size_t room = sizeof(argv_storage) - used;
+            if (room == 0) {
+                return -E2BIG;
+            }
+
+            rc = copy_string_from_user(dst, (const char*)uptr, room);
+            if (rc < 0) {
+                /* -ENAMETOOLONG here means the vector overflowed the budget,
+                 * which is E2BIG from the caller's point of view. */
+                return (rc == -ENAMETOOLONG) ? -E2BIG : rc;
+            }
+
+            kargv[kargc++] = dst;
+            used += (size_t)rc + 1;   /* +1 for the NUL */
+        }
+
+        /* Loop ended without seeing NULL => more entries than we accept. */
+        if (kargc == USER_ARGV_MAX) {
+            uint32_t uptr = 0;
+            rc = copy_from_user(&uptr, (const uint8_t*)user_argv + (size_t)kargc * sizeof(uint32_t),
+                                sizeof(uptr));
+            if (rc < 0) {
+                return rc;
+            }
+            if (uptr != 0) {
+                return -E2BIG;
+            }
+        }
+    }
+
+    /* argv[0] conventionally names the program; supply the basename when the
+     * caller passed no vector at all, so the child never sees argc == 0 with
+     * a name it cannot recover. */
+    const char* name = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/' && p[1] != '\0') {
+            name = p + 1;
+        }
+    }
+    if (path[0] != '\0' && path[1] == ':' && name == path) {
+        name = path + 2;
+    }
+    if (kargc == 0) {
+        kargv[kargc++] = name;
+    }
+
+    /* Read + verify signature + build the address space. Takes the exec lock
+     * internally, so a spawn racing the shell's own `exec` serializes on the
+     * shared load buffers instead of corrupting them. */
+    const char* err = NULL;
+    int pid = elf_exec_from_path(path, name, kargc, kargv, &err);
+    if (pid < 0) {
+        kprintf("[SPAWN] '%s': %s (rc=%d)\n", path, err ? err : "failed", pid);
+        return pid;
+    }
+
+    task_t* child = task_get(pid);
+    if (!child) {
+        /* Built, then vanished before we could schedule it (e.g. terminated
+         * mid-load). Reap rather than leak a fully-constructed process. */
+        task_terminate((uint32_t)pid);
+        return -ESRCH;
+    }
+
+    /* Parentage before scheduling: `jobs`/waitpid match on both fields, and
+     * the child could exit on the very next tick once it is runnable. */
+    child->parent_pid = self->pid;
+    child->parent_generation = self->generation;
+
+    /* Streams before scheduling too — a child made runnable with the default
+     * console context would ignore the caller's redirection on its first
+     * write. See streams_inherit's ownership caveat in stdio.h: the copy is
+     * shallow, so the caller must outlive the child (or wait for it) before
+     * closing any redirected fd. */
+    streams_inherit(&child->streams, &self->streams);
+
+    scheduler_add_task(child);
+    return pid;
+}
+
 int sys_waitpid(int pid) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -1573,6 +1717,10 @@ static void syscall_dispatch(struct cpu_state* state) {
 
         case SYS_WAITPID:
             ret = sys_waitpid((int)arg1);
+            break;
+
+        case SYS_SPAWN:
+            ret = sys_spawn((const char*)arg1, (char* const*)arg2);
             break;
 
         default:

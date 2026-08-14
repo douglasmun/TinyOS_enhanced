@@ -14,7 +14,7 @@ CFLAGS  := -m32 -ffreestanding -fno-pic -fno-builtin -fno-stack-protector \
 LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
 # User programs to build
-PROGRAMS := hello.elf shell.elf info.elf sleeper.elf
+PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -49,6 +49,14 @@ sleeper.elf: sleeper.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c sleeper.c -o sleeper.o
 	$(LD) $(LDFLAGS) -o sleeper.elf crt0.o sleeper.o libc.o -lgcc
 	@echo "Built sleeper.elf"
+
+# spawner.elf is the SYS_SPAWN test fixture (see verify-spawn.sh): a USER
+# process that starts another process, which the shell's own `exec` cannot
+# demonstrate because that path runs in the kernel.
+spawner.elf: spawner.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c spawner.c -o spawner.o
+	$(LD) $(LDFLAGS) -o spawner.elf crt0.o spawner.o libc.o -lgcc
+	@echo "Built spawner.elf"
 
 # shell.elf provides its own _start and syscall wrappers
 shell.elf: shell.c user.ld

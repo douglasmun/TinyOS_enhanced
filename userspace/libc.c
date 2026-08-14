@@ -41,6 +41,13 @@ void yield(void)  { syscall0(SYS_YIELD); }
 int sleep_ms(uint32_t ms) { return syscall1(SYS_SLEEP, ms); }
 int waitpid(int pid) { return syscall1(SYS_WAITPID, (uint32_t)pid); }
 
+int spawn(const char* path, char* const* argv) {
+    /* syscall3 with an unused third argument: the kernel only extracts the
+     * three arg registers and SYS_SPAWN reads two of them. */
+    return syscall3(SYS_SPAWN, (uint32_t)(uintptr_t)path,
+                    (uint32_t)(uintptr_t)argv, 0);
+}
+
 /*-----------------------------------------------------------------------------
  * I/O
  *---------------------------------------------------------------------------*/

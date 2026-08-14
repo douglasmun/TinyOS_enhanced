@@ -33,6 +33,9 @@
 #define SYS_SLEEP      17   // Sleep for N milliseconds (blocks, timer wake)
 #define SYS_WAITPID    18   // Wait for a child process to exit
 
+/* Process creation (v2.3) */
+#define SYS_SPAWN      19   // Load an ELF and start it as a child process
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -103,7 +106,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  18  // Highest valid syscall number (SYS_WAITPID)
+#define MAX_SYSCALL_NUM  19  // Highest valid syscall number (SYS_SPAWN)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -177,6 +180,19 @@ int sys_getpid(void);
 void sys_yield(void);
 int sys_sleep(uint32_t ms);
 int sys_waitpid(int pid);
+
+/**
+ * @brief Load an ELF from the filesystem and start it as a child process
+ *
+ * @param user_path User pointer to a NUL-terminated path
+ * @param user_argv User pointer to a NULL-terminated char* array, or NULL
+ * @return Child PID (> 0) on success, negative errno on failure
+ *
+ * Does not block. The child inherits the caller's streams and is recorded as
+ * its child, so waitpid() on the returned PID works. All user memory is copied
+ * in before use.
+ */
+int sys_spawn(const char* user_path, char* const* user_argv);
 
 /*-----------------------------------------------------------------------------
  * Record a process death and wake every sys_waitpid() waiter.
