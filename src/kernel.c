@@ -281,7 +281,7 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     kprintf("   /^|^\\  Heart <3\n");
     kprintf("\n");
     kprintf("~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~\n");
-    kprintf("   TinyOS v2.0 (Build 20251123)\n");
+    kprintf("   %s\n", TINYOS_VERSION_NAME);
     kprintf("~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~\n");
     kprintf("\n");
 

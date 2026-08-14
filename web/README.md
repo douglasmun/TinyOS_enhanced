@@ -56,10 +56,11 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO carries the same content as the signed `v2.2` release asset
-(SHA-256 `7d562bcc66b1e9d0227a36b03125d8be5e421d8a5061cdbc7f9452f2cef0a1e8` as of
-2026-08-06 — includes the framebuffer console, userspace libc + FAT32 exec,
-and blocking syscalls from PR #26). Note `i686-elf-grub-mkrescue` is
+The committed ISO carries the same content as the signed `v2.3` release asset
+(SHA-256 `632a5825b6329a6bebc5256b113531ee7dbafab902800499f9beda6c22336077` as of
+2026-08-14 — adds background jobs, fd-aware I/O, `SYS_SPAWN` + argv, and shell
+pipelines from PRs #30–#33, on top of the v2.2 framebuffer console, userspace
+libc + FAT32 exec, and blocking syscalls). Note `i686-elf-grub-mkrescue` is
 non-deterministic, so a fresh rebuild will hash differently even with
 identical inputs.
 

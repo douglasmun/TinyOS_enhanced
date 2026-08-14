@@ -22,6 +22,7 @@ The cryptography is implemented from scratch for educational purposes and has no
 - **Boot → shell → login** — Multiboot2 boot, first-boot root password setup, PBKDF2-HMAC-SHA256 (100k iterations) password hashing.
 - **Ring-3 user processes** — from-scratch ELF32 loader, `int 0x80` syscall interface; `exec /hello.elf` loads a signed binary, runs it in user mode, services its syscalls, and reaps it on exit.
 - **Signed-ELF secure boot** — every user binary is verified against a pinned **ECDSA P-256** key; unsigned/tampered binaries are **rejected (fail-closed) by default**.
+- **Shell job control & pipelines** — background jobs (`exec foo.elf &`, `jobs`, `ps`, `kill`) with a blocking `waitpid`; I/O redirection (`>`, `<`) and **pipelines** (`echo hi | cat -n`, `exec /hello.elf | cat -n`). Processes can start processes via `SYS_SPAWN` with full `argv` (no `fork()` — PAE, no COW pages).
 - **Memory protection** — PAE paging, **NX / W^X** enforcement, **ASLR**, kernel-stack guard pages.
 - **Networking** — TCP/IP stack with **DHCP, DNS, ICMP** over a real **Intel e1000** NIC driver, plus a firewall and intrusion-detection (IDS) layer.
 - **Filesystems** — a VFS layer with **FAT32** (`C:`) and **RAMFS** (`D:`) drives; `ls`, file read/write, directories.
@@ -133,6 +134,7 @@ Deeper documentation lives in [`doc/`](doc/) — start with [`doc/USER_GUIDE.md`
 ## Known limitations
 
 - Single-core, 32-bit, console-only; targets QEMU (256 MB).
+- Pipeline stages run **sequentially, not concurrently** — the shell is a single kernel task and builtins are direct calls, so a stage is fully drained before the next runs. A stage producing more than the 4 KB pipe buffer is truncated (reported, with `-EPIPE`) rather than blocking forever. True concurrent pipelines need the planned userspace shell.
 - No long-soak / multi-day stability testing yet.
 - A formerly-present SSH server was **removed from the build** (it never completed a reliable handshake); its sources are retained on disk but are not compiled or linked.
 
