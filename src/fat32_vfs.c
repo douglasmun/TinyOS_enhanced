@@ -47,8 +47,10 @@
 #define FAT32_VFS_MAX_HANDLES 64  // Must be >= VFS_MAX_FDS
 
 typedef struct {
-    int fat32_fd;     // FAT32 file descriptor
+    int fat32_fd;     // FAT32 file descriptor (-1 for directory handles)
     bool in_use;      // true if this handle is allocated
+    bool is_dir;      // true if opened with VFS_O_DIRECTORY (readdir only)
+    uint32_t dir_pos; // Directory cursor: entries already returned
 } fat32_fd_handle_t;
 
 // Static pool of handles (avoids malloc/free complexity)
@@ -63,6 +65,8 @@ static fat32_fd_handle_t* fat32_alloc_handle(int fat32_fd) {
         if (!handle_pool[i].in_use) {
             handle_pool[i].fat32_fd = fat32_fd;
             handle_pool[i].in_use = true;
+            handle_pool[i].is_dir = false;
+            handle_pool[i].dir_pos = 0;
             return &handle_pool[i];
         }
     }
@@ -94,6 +98,31 @@ static void fat32_free_handle(fat32_fd_handle_t* handle) {
  * SECURITY FIX (Issue 8.2): Now uses type-safe fat32_fd_handle_t* instead of integer cast
  */
 static int fat32_vfs_open(const char* path, int flags, void** private_data) {
+    /*=========================================================================
+     * Directory open: the FAT32 driver is root-directory-only, and its
+     * enumerator (fat32_list_root_cb) takes no path. Accept just the root and
+     * reject any other directory explicitly — silently listing the root for
+     * "C:/sub" would report the wrong directory's contents as if they were
+     * real.
+     *=======================================================================*/
+    if (flags & VFS_O_DIRECTORY) {
+        /* vfs_open has already stripped "C:" and canonicalized, so the root
+         * arrives as "/" (or "" if the caller passed a bare "C:"). */
+        if (!(path[0] == '\0' || (path[0] == '/' && path[1] == '\0'))) {
+            return VFS_EINVAL;
+        }
+
+        fat32_fd_handle_t* dir_handle = fat32_alloc_handle(-1);
+        if (!dir_handle) {
+            return VFS_ENOMEM;
+        }
+        dir_handle->is_dir = true;
+        dir_handle->dir_pos = 0;
+
+        *private_data = (void*)dir_handle;
+        return 0;
+    }
+
     /* Open file using FAT32 */
     int fat32_fd = fat32_open(path);
 
@@ -150,6 +179,13 @@ static int fat32_vfs_close(void* private_data) {
         return VFS_EINVAL;
     }
 
+    /* Directory handles never went through fat32_open, so there is no FAT32
+     * fd to release — closing one would pass -1 to fat32_close(). */
+    if (handle->is_dir) {
+        fat32_free_handle(handle);
+        return 0;
+    }
+
     /* Close the FAT32 file. The return value matters now that close flushes
      * the directory entry: a failure there means the data is on disk but the
      * dirent still reports the old size, so the file reads back empty. Report
@@ -181,6 +217,10 @@ static ssize_t fat32_vfs_read(void* private_data, void* buf, size_t size) {
         return VFS_EINVAL;
     }
 
+    if (handle->is_dir) {
+        return VFS_EINVAL;  /* Use readdir, not read, on a directory */
+    }
+
     int bytes_read = fat32_read(handle->fat32_fd, buf, (uint32_t)size);
 
     if (bytes_read < 0) {
@@ -206,6 +246,10 @@ static ssize_t fat32_vfs_write(void* private_data, const void* buf, size_t size)
         return VFS_EINVAL;
     }
 
+    if (handle->is_dir) {
+        return VFS_EINVAL;  /* Directories are not writable through this path */
+    }
+
     int bytes_written = fat32_write(handle->fat32_fd, buf, (uint32_t)size);
 
     if (bytes_written < 0) {
@@ -216,6 +260,167 @@ static ssize_t fat32_vfs_write(void* private_data, const void* buf, size_t size)
 }
 
 /*=============================================================================
+ * DIRECTORY ENUMERATION
+ *
+ * fat32_list_root_cb() is a PUSH enumerator (it walks the whole root and calls
+ * back per entry) while readdir is a PULL cursor. Bridging them here — rather
+ * than reimplementing the walk — keeps the LFN-chain, deleted-entry and
+ * volume-label handling in one place; duplicating that parsing is where the
+ * bugs would come from.
+ *
+ * Cost: each call re-walks the root from the start and skips `dir_pos`
+ * entries, so listing N entries is O(N^2) in directory reads. The root
+ * directory is small and this is not on any hot path; correctness and a single
+ * copy of the parser are worth more here than the constant factor.
+ *===========================================================================*/
+typedef struct {
+    vfs_dirent_t* out;      /* Caller's buffer */
+    uint32_t capacity;      /* Entries it can hold */
+    uint32_t filled;        /* Entries written so far */
+    uint32_t skip;          /* Entries to skip (the cursor) */
+    uint32_t seen;          /* Entries walked past so far */
+} fat32_readdir_ctx_t;
+
+static void fat32_readdir_emit(void* ctx, const char* name, uint32_t size, bool is_dir) {
+    fat32_readdir_ctx_t* rc = (fat32_readdir_ctx_t*)ctx;
+
+    /* The enumerator has no early exit, so it keeps calling after the buffer
+     * is full. Count every entry regardless (the cursor must stay accurate),
+     * but only store the ones in this window. */
+    uint32_t index = rc->seen++;
+    if (index < rc->skip || rc->filled >= rc->capacity) {
+        return;
+    }
+
+    vfs_dirent_t* de = &rc->out[rc->filled++];
+    de->size = is_dir ? 0 : size;
+    de->mode = is_dir ? 0755 : 0644;   /* FAT32 has no Unix permissions */
+    de->type = is_dir ? VFS_DT_DIR : VFS_DT_REG;
+    de->reserved = 0;
+    safe_strcpy(de->name, name, sizeof(de->name));
+}
+
+/**
+ * @brief Read directory entries from a FAT32 directory handle
+ * @param private_data Type-safe handle pointer (must be a directory handle)
+ * @param buf Output buffer, filled with whole vfs_dirent_t records
+ * @param size Buffer size in bytes; must hold at least one entry
+ * @return Bytes written, 0 at end of directory, negative error code on failure
+ */
+static ssize_t fat32_vfs_readdir(void* private_data, void* buf, size_t size) {
+    fat32_fd_handle_t* handle = (fat32_fd_handle_t*)private_data;
+    if (!handle || !buf) {
+        return VFS_EINVAL;
+    }
+    if (!handle->is_dir) {
+        return VFS_EINVAL;  /* Not opened with VFS_O_DIRECTORY */
+    }
+    if (size < sizeof(vfs_dirent_t)) {
+        return VFS_EINVAL;  /* Cannot report a partial entry */
+    }
+
+    fat32_readdir_ctx_t ctx;
+    ctx.out = (vfs_dirent_t*)buf;
+    ctx.capacity = (uint32_t)(size / sizeof(vfs_dirent_t));
+    ctx.filled = 0;
+    ctx.skip = handle->dir_pos;
+    ctx.seen = 0;
+
+    if (fat32_list_root_cb(fat32_readdir_emit, &ctx) != 0) {
+        return VFS_EIO;
+    }
+
+    handle->dir_pos += ctx.filled;
+    return (ssize_t)(ctx.filled * sizeof(vfs_dirent_t));
+}
+
+/*=============================================================================
+ * STAT
+ *
+ * fat32.h declares fat32_stat(), but nothing ever implemented it — it is a
+ * dead prototype. Rather than add a second directory walk, reuse the same
+ * enumerator readdir uses and match on the 8.3 name it produces, so stat and
+ * readdir can never disagree about what a file is called or how big it is.
+ *
+ * Root-directory-only, matching this driver's readdir.
+ *===========================================================================*/
+typedef struct {
+    const char* want;       /* Name being looked for */
+    vfs_dirent_t* out;      /* Filled in on match */
+    bool found;
+} fat32_stat_ctx_t;
+
+/* FAT32 8.3 names are case-insensitive, and fat32_open() upper-cases what it
+ * is given. Comparing case-sensitively here would make stat("persist.txt")
+ * fail on a file that open("persist.txt") happily returns. */
+static bool fat32_name_eq(const char* a, const char* b) {
+    while (*a && *b) {
+        char ca = (*a >= 'a' && *a <= 'z') ? (char)(*a - 32) : *a;
+        char cb = (*b >= 'a' && *b <= 'z') ? (char)(*b - 32) : *b;
+        if (ca != cb) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static void fat32_stat_emit(void* ctx, const char* name, uint32_t size, bool is_dir) {
+    fat32_stat_ctx_t* sc = (fat32_stat_ctx_t*)ctx;
+
+    /* The enumerator has no early exit; ignore everything after the match. */
+    if (sc->found || !fat32_name_eq(name, sc->want)) {
+        return;
+    }
+
+    sc->out->size = is_dir ? 0 : size;
+    sc->out->mode = is_dir ? 0755 : 0644;   /* FAT32 has no Unix permissions */
+    sc->out->type = is_dir ? VFS_DT_DIR : VFS_DT_REG;
+    sc->out->reserved = 0;
+    sc->found = true;
+}
+
+/**
+ * @brief Look up a FAT32 path's metadata without opening it
+ * @param path Path (drive letter already stripped by the VFS)
+ * @param out Filled in on success
+ * @return 0 on success, negative error code on failure
+ */
+static int fat32_vfs_stat(const char* path, vfs_dirent_t* out) {
+    if (!path || !out) {
+        return VFS_EINVAL;
+    }
+
+    /* The root itself: a directory with no entry of its own to look up. */
+    if (path[0] == '\0' || (path[0] == '/' && path[1] == '\0')) {
+        out->size = 0;
+        out->mode = 0755;
+        out->type = VFS_DT_DIR;
+        out->reserved = 0;
+        return 0;
+    }
+
+    /* Strip the leading slash; the enumerator reports bare 8.3 names. Any
+     * further slash means a subdirectory, which this driver cannot reach. */
+    const char* name = (path[0] == '/') ? path + 1 : path;
+    if (strchr(name, '/') != NULL) {
+        return VFS_EINVAL;
+    }
+
+    fat32_stat_ctx_t ctx;
+    ctx.want = name;
+    ctx.out = out;
+    ctx.found = false;
+
+    if (fat32_list_root_cb(fat32_stat_emit, &ctx) != 0) {
+        return VFS_EIO;
+    }
+
+    return ctx.found ? 0 : VFS_ENOENT;
+}
+
+/*=============================================================================
  * FAT32 FILE OPERATIONS TABLE
  *=============================================================================*/
 static const file_operations_t fat32_file_ops = {
@@ -223,6 +428,8 @@ static const file_operations_t fat32_file_ops = {
     .close = fat32_vfs_close,
     .read  = fat32_vfs_read,
     .write = fat32_vfs_write,
+    .readdir = fat32_vfs_readdir,
+    .stat = fat32_vfs_stat,
     .ioctl = NULL  /* Not implemented */
 };
 

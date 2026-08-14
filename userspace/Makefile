@@ -14,7 +14,7 @@ CFLAGS  := -m32 -ffreestanding -fno-pic -fno-builtin -fno-stack-protector \
 LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
 # User programs to build
-PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf
+PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -57,6 +57,14 @@ spawner.elf: spawner.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c spawner.c -o spawner.o
 	$(LD) $(LDFLAGS) -o spawner.elf crt0.o spawner.o libc.o -lgcc
 	@echo "Built spawner.elf"
+
+# fileio.elf is the file-syscall test fixture (see verify-fsyscalls.sh): a USER
+# process doing open/write/read/readdir. The shell's own cat/ls cannot prove
+# these syscalls work, since they run in the kernel and touch ramfs directly.
+fileio.elf: fileio.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c fileio.c -o fileio.o
+	$(LD) $(LDFLAGS) -o fileio.elf crt0.o fileio.o libc.o -lgcc
+	@echo "Built fileio.elf"
 
 # shell.elf provides its own _start and syscall wrappers
 shell.elf: shell.c user.ld

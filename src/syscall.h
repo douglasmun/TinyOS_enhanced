@@ -36,6 +36,21 @@
 /* Process creation (v2.3) */
 #define SYS_SPAWN      19   // Load an ELF and start it as a child process
 
+/* File I/O (v2.4) — the foundation for a ring-3 shell. Until these existed a
+ * user process could not open a file at all: sys_read/sys_write only accepted
+ * fds 0/1/2. Descriptors returned here are PER-PROCESS indices (3+) into
+ * task->fdtable, not global VFS fds. */
+#define SYS_OPEN       20   // Open a file, returns a per-process fd (3+)
+#define SYS_CLOSE      21   // Close a per-process fd
+#define SYS_READDIR    22   // Read directory entries from a fd opened on a dir
+#define SYS_STAT       23   // Metadata for a path, without opening it
+
+/* No SYS_LSEEK yet: the VFS has no seek operation (file_operations_t has no
+ * .seek and vfs_file_t's `offset` is unused). Only FAT32 has fat32_seek();
+ * RAMFS has none, so a seek syscall would work on C: and fail on D:. Adding
+ * one means a VFS seek op plus a RAMFS implementation — deliberately left to
+ * the change that needs it rather than shipped half-working here. */
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -106,7 +121,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  19  // Highest valid syscall number (SYS_SPAWN)
+#define MAX_SYSCALL_NUM  23  // Highest valid syscall number (SYS_STAT)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -193,6 +208,45 @@ int sys_waitpid(int pid);
  * in before use.
  */
 int sys_spawn(const char* user_path, char* const* user_argv);
+
+/**
+ * @brief Open a file or directory, returning a per-process fd
+ *
+ * @param user_path User pointer to a NUL-terminated path ("/f.txt", "C:/F.TXT")
+ * @param flags VFS_O_* flags; VFS_O_DIRECTORY opens a directory for readdir
+ * @return Per-process fd (>= TASK_FD_BASE) on success, negative errno on failure
+ *
+ * The returned descriptor indexes task->fdtable, NOT the global VFS fd pool —
+ * ring 3 never learns a global fd number. The path is copied in before use.
+ */
+int sys_open(const char* user_path, int flags);
+
+/**
+ * @brief Close a per-process fd
+ * @param fd Per-process fd from sys_open
+ * @return 0 on success, negative errno on failure
+ */
+int sys_close(int fd);
+
+/**
+ * @brief Read directory entries into a user buffer
+ *
+ * @param fd Per-process fd opened with VFS_O_DIRECTORY
+ * @param user_buf User pointer receiving an array of vfs_dirent_t
+ * @param size Size of user_buf in bytes
+ * @return Bytes written (a multiple of sizeof(vfs_dirent_t)), 0 at end of
+ *         directory, or negative errno
+ */
+int sys_readdir(int fd, void* user_buf, uint32_t size);
+
+/**
+ * @brief Metadata for a path, without opening it
+ * @param user_path User-space path pointer (drive-qualified or not)
+ * @param user_buf User-space buffer receiving one vfs_dirent_t
+ * @param size Buffer size; must be at least sizeof(vfs_dirent_t)
+ * @return 0 on success, negative errno on failure
+ */
+int sys_stat(const char* user_path, void* user_buf, uint32_t size);
 
 /*-----------------------------------------------------------------------------
  * Record a process death and wake every sys_waitpid() waiter.
