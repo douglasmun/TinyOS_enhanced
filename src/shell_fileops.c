@@ -692,8 +692,18 @@ void cmd_ls(int argc, char* argv[]) {
         int count = 0;
         for (int v = 0; v < visible_count; v++) {
             ramfs_node_t* entry = visible[v];
+            /* The directory marker has to be padded together with the name,
+             * not after it: printing "%-18s/" pushed the slash to the far end
+             * of the column, where it read as a prefix on the next entry
+             * ("hello" + "/hello.elf" instead of "hello/" + "hello.elf"). */
             if (entry->type == RAMFS_TYPE_DIR) {
-                stream_printf(ctx, "%-18s/", entry->name);
+                char marked[RAMFS_MAX_NAME + 1];
+                size_t n = strlen(entry->name);
+                if (n > RAMFS_MAX_NAME - 1) n = RAMFS_MAX_NAME - 1;
+                memcpy(marked, entry->name, n);
+                marked[n] = '/';
+                marked[n + 1] = '\0';
+                stream_printf(ctx, "%-19s", marked);
             } else {
                 stream_printf(ctx, "%-19s", entry->name);
             }
