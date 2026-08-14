@@ -1331,11 +1331,19 @@ void cmd_exec(int argc, char* argv[]) {
     char abs_path[MAX_PATH];
 
     /*
-     * Static (not stack) buffer: cmd_exec runs on the shell's 64KB task
-     * kernel stack, and the ELF verify path (SHA-256 + ECDSA) is deep. A
+     * Static (not stack) buffer: cmd_exec runs on the shell's kernel task
+     * stack (KERNEL_TASK_STACK_PAGES = 32 pages = 128KB; it was 64KB when
+     * this comment was first written, which the full signed-exec chain
+     * overflowed), and the ELF verify path (SHA-256 + ECDSA) is deep. A
      * 16KB stack buffer here previously overflowed the task stack and
-     * silently corrupted the signature hash computation. cmd_exec is only
-     * invoked from the single-threaded shell, so a static buffer is safe.
+     * silently corrupted the signature hash computation.
+     *
+     * INVARIANT: cmd_exec is invoked only from the single-threaded shell, so
+     * one load is ever in flight and a static buffer is safe. Background jobs
+     * preserve this — `exec foo.elf &` still returns through this one caller
+     * before the next command is read. A future SYS_SPAWN (roadmap item 2)
+     * would let a *process* trigger a load concurrently and BREAK it; that
+     * change must give the buffer a lock or a per-caller allocation.
      */
     static uint8_t exec_buffer[EXEC_BUFFER_SIZE];
 
@@ -1445,7 +1453,14 @@ void cmd_exec(int argc, char* argv[]) {
     int pid = elf_load_process(exec_buffer, file_size, proc_name);
 
     if (pid < 0) {
-        kprintf("[EXEC] ERROR: Failed to load ELF executable\n");
+        /* elf_load_process owns its own teardown: every failure path after
+         * task_create_user goes through elf_abort_load(), which restores
+         * kernel CR3 and task_terminate()s the partial process (freeing the
+         * PDPT, page tables, stacks and slot). Nothing to reap here — a
+         * second task_terminate() on the freed slot would risk hitting a
+         * recycled task. */
+        stream_printf(get_current_streams(),
+                      "exec: failed to load '%s'\n", path);
         return;
     }
 
@@ -1492,7 +1507,13 @@ void cmd_exec(int argc, char* argv[]) {
 
         kprintf("[EXEC] Process completed\n");
     } else {
+        /* Loaded successfully but the slot vanished before we could schedule
+         * it (terminated mid-load, e.g. an EDR false positive). The image and
+         * its address space are still allocated, so reap them rather than
+         * leaking a fully-built process. task_terminate is a no-op if the
+         * slot is already gone. */
         kprintf("[EXEC] WARNING: Could not find task to add to scheduler\n");
+        task_terminate((uint32_t)pid);
     }
 }
 

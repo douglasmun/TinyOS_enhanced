@@ -570,12 +570,26 @@ void unmap_page_range(uint32_t vaddr_start, uint32_t vaddr_end) {
     }
 
     /*=========================================================================
-     * PAE MODE: Would need separate implementation for 3-level paging
-     * For now, only support standard 32-bit mode
+     * LEGACY 32-BIT PAGING ONLY — NOT a gap under PAE.
+     *
+     * This walker reaches page tables through the recursive mapping at
+     * 0xFFC00000, which only exists in 2-level paging, and it takes no PDPT
+     * argument, so it can only ever act on the CURRENT address space. Neither
+     * property fits PAE, where a process image is built in a separate user
+     * PDPT while CR3 still belongs to the loader.
+     *
+     * The ELF loader used to call this on its failure paths (AUDIT-10E) and
+     * silently got this no-op. That is fixed at the source: elf_abort_load()
+     * in elf.c now tears the failed process down with task_terminate(), whose
+     * task_free_resources -> free_page_directory -> pae_free_user_pdpt path
+     * frees user page tables, all four page directories and the PDPT while
+     * skipping tables still shared with the kernel (COW invariant, 1596a04).
+     * Do not "complete" this function for PAE by duplicating that walk — the
+     * shared-page-table skip is subtle and belongs in exactly one place.
      *=======================================================================*/
     if (pae_is_active()) {
-        /* TODO: Implement PAE version with 3-level page table cleanup */
-        kprintf("[PAGING] WARNING: unmap_page_range not yet implemented for PAE mode\n");
+        kprintf("[PAGING] WARNING: unmap_page_range called under PAE (no-op; "
+                "use task_terminate/pae_free_user_pdpt for user address spaces)\n");
         return;
     }
 

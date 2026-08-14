@@ -565,6 +565,7 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     task->kernel_stack_phys = stack_pages[0];  // First stack page (for compatibility)
     // No user stack for kernel tasks
     task->user_guard_page_phys = 0;
+    task->user_guard_page_virt = 0;
     task->user_stack_pages = 0;  // Kernel tasks have no user stack
     for (int i = 0; i < 256; i++) {  // Max 256 pages (1MB)
         task->user_stack_pages_phys[i] = 0;
@@ -1008,6 +1009,13 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
              (user_stack_flags & ~PAGE_PRESENT));  // Present=0
     flush_tlb_single(user_guard_virt);
 
+    /* Record the VIRTUAL address, not just the frame: a ring-3 fault reports
+     * CR2 as a user virtual address, and ASLR moves stack_base every exec, so
+     * the handler cannot recompute this. Storing only user_guard_page_phys
+     * (as before) left the handler with nothing to compare against, which is
+     * why user-stack overflow fell through to the generic page-fault path. */
+    task->user_guard_page_virt = user_guard_virt;
+
     /* Map user stack pages into USER page directory (virtual -> physical) */
     for (int i = 0; i < stack_pages; i++) {
         uint32_t virt_addr = stack_base - ((i + 1) * 0x1000);  /* Top-down from stack_base */
@@ -1346,6 +1354,7 @@ void task_free_resources(task_t* task) {
             pmm_free(task->user_guard_page_phys);
             task->user_guard_page_phys = 0;
         }
+        task->user_guard_page_virt = 0;
         // Free all user stack pages (using actual allocated count)
         for (int i = 0; i < task->user_stack_pages; i++) {
             if (task->user_stack_pages_phys[i] != 0) {
