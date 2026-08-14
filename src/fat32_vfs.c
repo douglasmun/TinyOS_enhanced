@@ -478,6 +478,58 @@ static ssize_t fat32_vfs_seek(void* private_data, ssize_t offset, int whence) {
 }
 
 /*=============================================================================
+ * DIRECTORY / FILE MANAGEMENT OPS
+ *
+ * These three were unreachable before: the driver implemented them but the ops
+ * table below exposed neither mkdir nor rmdir nor unlink, so nothing outside
+ * fat32.c ever called them. Wiring them up is what makes SYS_MKDIR/SYS_RMDIR/
+ * SYS_UNLINK work on C:.
+ *
+ * FAT32 has no ownership or permission bits, so unlike RAMFS there is no
+ * per-user check here — the protection is vfs_unlink/vfs_rmdir's protected
+ * path list plus the driver's own refusals (root dir, non-empty dir, open
+ * file).
+ *===========================================================================*/
+static int fat32_vfs_mkdir(const char* path) {
+    int ret = fat32_mkdir(path);
+    if (ret < 0) {
+        switch (ret) {
+            case -2: return VFS_EEXIST;
+            /* The driver collapses "disk full", "root directory full" and a
+             * failed sector access into -1. Out-of-space dominates the three
+             * in practice, and the root of a FAT32 volume genuinely does have
+             * a fixed entry budget. */
+            default: return VFS_ENOSPC;
+        }
+    }
+    return 0;
+}
+
+static int fat32_vfs_rmdir(const char* path) {
+    int ret = fat32_rmdir(path);
+    if (ret < 0) {
+        switch (ret) {
+            case -2: return VFS_ENOTDIR;
+            case -3: return VFS_ENOTEMPTY;
+            default: return VFS_ENOENT;
+        }
+    }
+    return 0;
+}
+
+static int fat32_vfs_unlink(const char* path) {
+    int ret = fat32_unlink(path);
+    if (ret < 0) {
+        switch (ret) {
+            case -2: return VFS_EISDIR;
+            case -3: return VFS_EBUSY;
+            default: return VFS_ENOENT;
+        }
+    }
+    return 0;
+}
+
+/*=============================================================================
  * FAT32 FILE OPERATIONS TABLE
  *=============================================================================*/
 static const file_operations_t fat32_file_ops = {
@@ -488,6 +540,9 @@ static const file_operations_t fat32_file_ops = {
     .readdir = fat32_vfs_readdir,
     .stat = fat32_vfs_stat,
     .seek = fat32_vfs_seek,
+    .mkdir = fat32_vfs_mkdir,
+    .rmdir = fat32_vfs_rmdir,
+    .unlink = fat32_vfs_unlink,
     .ioctl = NULL  /* Not implemented */
 };
 

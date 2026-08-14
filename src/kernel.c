@@ -833,6 +833,14 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_close(marker_fd);
             ramfs_chmod("/fio/marker.txt", 0644);
         }
+
+        /* A separate 0777 scratch directory for the mkdir/rmdir/unlink demo.
+         * It cannot share /fio: that one is 0755 root-owned, so a uid-1000
+         * process cannot create entries in it, and loosening it would break
+         * the readdir test's "exactly two entries" expectation. */
+        if (ramfs_mkdir("/scratch") >= 0) {
+            ramfs_chmod("/scratch", 0777);
+        }
     }
 
     // Temporary removed the PHASE 8 to 10 Networking Tests to fasten testing of 11.

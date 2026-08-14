@@ -9,7 +9,8 @@
  *
  * NOTE: the output strings are load-bearing — verify-fsyscalls.sh greps for
  * "fileio: read back:", "fileio: found both entries", "fileio: fat32
- * entries=", "fileio: stat ok", "fileio: seek ok" and "fileio: done".
+ * entries=", "fileio: stat ok", "fileio: seek ok", "fileio: fat32 namespace
+ * ok", "fileio: namespace ok" and "fileio: done".
  * Keep them byte-identical.
  *===========================================================================*/
 #include "libc.h"
@@ -350,6 +351,195 @@ static int do_seek(void) {
     return 0;
 }
 
+/*=============================================================================
+ * mkdir / rmdir / unlink
+ *
+ * Works in /scratch (0777) rather than /fio (0755 root-owned): a ring-3
+ * process is uid 1000 and cannot create entries in a directory it does not
+ * have write permission on. That restriction is itself worth asserting, so
+ * the negative half of this test tries /fio on purpose.
+ *===========================================================================*/
+#define SCRATCH_DIR  "D:/scratch"
+#define NEW_DIR      SCRATCH_DIR "/newdir"
+/* Deliberately INSIDE the new directory: the non-empty-rmdir check is only
+ * meaningful if the file is actually a child of NEW_DIR. */
+#define NEW_FILE     NEW_DIR "/newfile.txt"
+
+static int do_namespace(void) {
+    /* Clean up anything a previous run left behind, so the test is
+     * repeatable across reboots of a persistent image. Failures are ignored:
+     * on a first run there is nothing to remove. */
+    unlink(NEW_FILE);
+    rmdir(NEW_DIR);
+
+    int rc = mkdir(NEW_DIR);
+    if (rc < 0) {
+        printf("fileio: mkdir failed %d\n", rc);
+        return -1;
+    }
+
+    /* Creating the same name twice must fail rather than silently succeed or
+     * produce a duplicate entry. */
+    if (mkdir(NEW_DIR) >= 0) {
+        print("fileio: duplicate mkdir accepted\n");
+        return -1;
+    }
+
+    /* The directory must really exist: open it and confirm it is a
+     * directory, not just trust mkdir's return value. */
+    int dfd = open(NEW_DIR, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        printf("fileio: new dir not openable %d\n", dfd);
+        return -1;
+    }
+    close(dfd);
+
+    /* A file inside the new directory: proves mkdir produced a usable
+     * directory rather than a stray entry. */
+    int fd = open(NEW_FILE, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        printf("fileio: create in new dir failed %d\n", fd);
+        return -1;
+    }
+    write(fd, "gone soon", 9);
+    close(fd);
+
+    /* A non-empty directory must not be removable — otherwise its children
+     * become unreachable garbage. */
+    if (rmdir(NEW_DIR) >= 0) {
+        print("fileio: rmdir of non-empty dir accepted\n");
+        return -1;
+    }
+
+    /* unlink must refuse a directory, and rmdir must refuse a file: each
+     * would corrupt bookkeeping that assumes the other type. */
+    if (unlink(NEW_DIR) >= 0) {
+        print("fileio: unlink of directory accepted\n");
+        return -1;
+    }
+    if (rmdir(NEW_FILE) >= 0) {
+        print("fileio: rmdir of file accepted\n");
+        return -1;
+    }
+
+    rc = unlink(NEW_FILE);
+    if (rc < 0) {
+        printf("fileio: unlink failed %d\n", rc);
+        return -1;
+    }
+
+    /* Gone means gone: the name must no longer open. */
+    fd = open(NEW_FILE, O_RDONLY);
+    if (fd >= 0) {
+        print("fileio: unlinked file still opens\n");
+        close(fd);
+        return -1;
+    }
+
+    /* Now that it is empty, the directory goes too. */
+    rc = rmdir(NEW_DIR);
+    if (rc < 0) {
+        printf("fileio: rmdir failed %d\n", rc);
+        return -1;
+    }
+    if (open(NEW_DIR, O_RDONLY | O_DIRECTORY) >= 0) {
+        print("fileio: removed dir still opens\n");
+        return -1;
+    }
+
+    /* Permission is enforced on the PARENT directory: /fio is 0755 and owned
+     * by root, so uid 1000 must not be able to create inside it. Without this
+     * check the syscalls would be a filesystem-wide write primitive. */
+    if (mkdir("D:/fio/nope") >= 0) {
+        print("fileio: mkdir in root-owned dir accepted\n");
+        return -1;
+    }
+    if (unlink("D:/fio/marker.txt") >= 0) {
+        print("fileio: unlink in root-owned dir accepted\n");
+        return -1;
+    }
+
+    /* Removing a non-existent name is an error, not a silent success. */
+    if (unlink(SCRATCH_DIR "/never-existed") >= 0) {
+        print("fileio: unlink of missing file accepted\n");
+        return -1;
+    }
+
+    /*=====================================================================
+     * The SAME syscalls against FAT32. This half matters more than the D:
+     * half: the FAT32 mkdir/rmdir/unlink were dead code before this change
+     * (nothing outside the driver called them) and carried the bugs that
+     * would have become ring-3 corruption primitives — rmdir was literally
+     * unlink, which freed a directory's cluster chain without checking that
+     * it was empty.
+     *===================================================================*/
+    unlink("C:/NSFILE.TXT");
+    rmdir("C:/NSDIR");
+
+    rc = mkdir("C:/NSDIR");
+    if (rc < 0) {
+        printf("fileio: fat32 mkdir failed %d\n", rc);
+        return -1;
+    }
+
+    /* Duplicate mkdir previously appended a SECOND dirent with the same 8.3
+     * name, stranding the original's clusters. */
+    if (mkdir("C:/NSDIR") >= 0) {
+        print("fileio: fat32 duplicate mkdir accepted\n");
+        return -1;
+    }
+
+    /* unlink() must refuse a directory: doing it the old way freed the
+     * cluster chain while the entries inside still referenced it. */
+    if (unlink("C:/NSDIR") >= 0) {
+        print("fileio: fat32 unlink of directory accepted\n");
+        return -1;
+    }
+
+    /* A file to delete, and to prove rmdir refuses a non-directory. */
+    fd = open("C:/NSFILE.TXT", O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        printf("fileio: fat32 create failed %d\n", fd);
+        return -1;
+    }
+    write(fd, "fat32-ns", 8);
+
+    /* Unlinking a file that is still OPEN would free clusters out from under
+     * the descriptor, so the next writer aliases them. */
+    if (unlink("C:/NSFILE.TXT") >= 0) {
+        print("fileio: fat32 unlink of open file accepted\n");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (rmdir("C:/NSFILE.TXT") >= 0) {
+        print("fileio: fat32 rmdir of file accepted\n");
+        return -1;
+    }
+
+    rc = unlink("C:/NSFILE.TXT");
+    if (rc < 0) {
+        printf("fileio: fat32 unlink failed %d\n", rc);
+        return -1;
+    }
+    if (open("C:/NSFILE.TXT", O_RDONLY) >= 0) {
+        print("fileio: fat32 unlinked file still opens\n");
+        return -1;
+    }
+
+    rc = rmdir("C:/NSDIR");
+    if (rc < 0) {
+        printf("fileio: fat32 rmdir failed %d\n", rc);
+        return -1;
+    }
+
+    print("fileio: fat32 namespace ok\n");
+
+    print("fileio: namespace ok\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
 
@@ -361,6 +551,7 @@ int main(int argc, char** argv) {
     if (do_readdir_fat32() < 0) return 1;
     if (do_stat() < 0) return 1;
     if (do_seek() < 0) return 1;
+    if (do_namespace() < 0) return 1;
 
     /* A never-opened fd must not resolve to anything. The VFS fd pool is
      * system-wide, so if the table leaked raw VFS numbers this could name

@@ -28,6 +28,9 @@
 #define SYS_READDIR 22
 #define SYS_STAT    23
 #define SYS_LSEEK   24
+#define SYS_MKDIR   25
+#define SYS_RMDIR   26
+#define SYS_UNLINK  27
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -105,6 +108,13 @@ int  stat(const char* path, void* buf, size_t size);
  * drives — neither filesystem can represent a sparse hole, so use write() to
  * grow a file. */
 int  lseek(int fd, int offset, int whence);
+
+/* Namespace mutation. All three take a path (drive-qualified or not) and
+ * return 0 on success, a negative errno otherwise. rmdir only removes an
+ * EMPTY directory; unlink refuses directories and, on C:, open files. */
+int  mkdir(const char* path);
+int  rmdir(const char* path);
+int  unlink(const char* path);
 int  putchar(int c);
 int  puts(const char* s);            /* appends newline */
 void print(const char* s);           /* no newline */

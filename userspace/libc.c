@@ -84,6 +84,18 @@ int lseek(int fd, int offset, int whence) {
                     (uint32_t)whence);
 }
 
+int mkdir(const char* path) {
+    return syscall1(SYS_MKDIR, (uint32_t)(uintptr_t)path);
+}
+
+int rmdir(const char* path) {
+    return syscall1(SYS_RMDIR, (uint32_t)(uintptr_t)path);
+}
+
+int unlink(const char* path) {
+    return syscall1(SYS_UNLINK, (uint32_t)(uintptr_t)path);
+}
+
 int putchar(int c) {
     char ch = (char)c;
     write(1, &ch, 1);

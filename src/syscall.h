@@ -51,6 +51,16 @@
  * only the driver holds the live position — see the .seek op in vfs.h. */
 #define SYS_LSEEK      24   // Reposition an open fd's cursor
 
+/* Namespace mutation. The drivers already had mkdir/rmdir/unlink, but the VFS
+ * ops tables exposed none of them on FAT32 and no .unlink op existed at all,
+ * so they were dead code reachable from nowhere. Exposing them to ring 3 also
+ * required hardening fat32_unlink (it happily deleted directories and open
+ * files) and rewriting fat32_rmdir (it was `return fat32_unlink(path)`, which
+ * removed a directory's entry while leaking its whole cluster chain). */
+#define SYS_MKDIR      25   // Create a directory
+#define SYS_RMDIR      26   // Remove an empty directory
+#define SYS_UNLINK     27   // Remove a file
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -121,7 +131,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  24  // Highest valid syscall number (SYS_LSEEK)
+#define MAX_SYSCALL_NUM  27  // Highest valid syscall number (SYS_UNLINK)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -259,6 +269,13 @@ int sys_stat(const char* user_path, void* user_buf, uint32_t size);
  * creating a sparse region — neither driver can represent a hole.
  */
 int sys_lseek(int fd, int32_t offset, int whence);
+
+/* Path-based namespace mutation. Each copies the path into kernel memory
+ * first (copy_string_from_user) and then delegates to the VFS, which applies
+ * the protected-path capability check before reaching a driver. */
+int sys_mkdir(const char* user_path);
+int sys_rmdir(const char* user_path);
+int sys_unlink(const char* user_path);
 
 /*-----------------------------------------------------------------------------
  * Record a process death and wake every sys_waitpid() waiter.

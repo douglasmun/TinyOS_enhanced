@@ -276,7 +276,19 @@ static int ramfs_vfs_mkdir(const char* path) {
     int ret = ramfs_mkdir(path);
     if (ret < 0) {
         kprintf("[RAMFS VFS] mkdir failed for '%s': %d\n", path, ret);
-        return VFS_ENOENT;  /* Map RAMFS errors to VFS errors */
+        /* RAMFS returns per-function ad-hoc codes; flattening them all to
+         * ENOENT made "permission denied" and "already exists" both read as
+         * "no such file", which is actively misleading now that ring 3 sees
+         * these errnos. */
+        switch (ret) {
+            case -2: return VFS_EEXIST;
+            case -3: return VFS_ENOTDIR;  /* a path component is a file */
+            case -5: return VFS_EACCES;
+            case -6:
+            case -9: return VFS_ENOSPC;
+            case -7: return VFS_EINVAL;   /* path traversal blocked */
+            default: return VFS_ENOENT;
+        }
     }
     return 0;
 }
@@ -291,7 +303,33 @@ static int ramfs_vfs_rmdir(const char* path) {
     int ret = ramfs_rmdir(path);
     if (ret < 0) {
         kprintf("[RAMFS VFS] rmdir failed for '%s': %d\n", path, ret);
-        return VFS_ENOENT;  /* Map RAMFS errors to VFS errors */
+        switch (ret) {
+            case -2: return VFS_ENOTDIR;
+            case -3: return VFS_ENOTEMPTY;
+            case -5: return VFS_EACCES;
+            default: return VFS_ENOENT;
+        }
+    }
+    return 0;
+}
+
+/*=============================================================================
+ * FUNCTION: ramfs_vfs_unlink
+ * PURPOSE: Remove a file (VFS .unlink op)
+ *
+ * ramfs_unlink already refuses directories and checks write permission on the
+ * PARENT directory against the caller's uid/gid, which is what keeps a ring-3
+ * task from deleting another user's files.
+ *===========================================================================*/
+static int ramfs_vfs_unlink(const char* path) {
+    int ret = ramfs_unlink(path);
+    if (ret < 0) {
+        kprintf("[RAMFS VFS] unlink failed for '%s': %d\n", path, ret);
+        switch (ret) {
+            case -2: return VFS_EISDIR;
+            case -4: return VFS_EACCES;
+            default: return VFS_ENOENT;
+        }
     }
     return 0;
 }
@@ -452,6 +490,7 @@ static const file_operations_t ramfs_file_ops = {
     .ioctl   = NULL,  /* Not implemented */
     .mkdir   = ramfs_vfs_mkdir,
     .rmdir   = ramfs_vfs_rmdir,
+    .unlink  = ramfs_vfs_unlink,
     .readdir = ramfs_vfs_readdir,
     .stat    = ramfs_vfs_stat,
     .seek    = ramfs_vfs_seek
