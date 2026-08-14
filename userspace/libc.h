@@ -27,6 +27,7 @@
 #define SYS_CLOSE   21
 #define SYS_READDIR 22
 #define SYS_STAT    23
+#define SYS_LSEEK   24
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -92,6 +93,18 @@ int  readdir(int fd, void* buf, size_t size);
  * size before deciding to read it. `size` must be at least sizeof(dirent_t).
  * Returns 0 on success or a negative errno. */
 int  stat(const char* path, void* buf, size_t size);
+
+/* Seek origins — same values as VFS_SEEK_* in src/vfs.h, passed straight
+ * through without translation so the two cannot drift apart. */
+#define SEEK_SET    0
+#define SEEK_CUR    1
+#define SEEK_END    2
+
+/* Reposition an open fd's cursor. Returns the resulting absolute position or
+ * a negative errno. Seeking past the end clamps to the file size on both
+ * drives — neither filesystem can represent a sparse hole, so use write() to
+ * grow a file. */
+int  lseek(int fd, int offset, int whence);
 int  putchar(int c);
 int  puts(const char* s);            /* appends newline */
 void print(const char* s);           /* no newline */

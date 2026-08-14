@@ -387,6 +387,60 @@ static int ramfs_vfs_stat(const char* path, vfs_dirent_t* out) {
     return 0;
 }
 
+/**
+ * @brief Reposition a RAMFS file cursor
+ * @param private_data Type-safe handle pointer
+ * @param offset Signed displacement, interpreted per `whence`
+ * @param whence VFS_SEEK_SET / VFS_SEEK_CUR / VFS_SEEK_END
+ * @return Resulting absolute position, or negative error code
+ *
+ * The whence arithmetic is done here rather than in the VFS layer because
+ * only the driver holds the live position and size (see the .seek op in
+ * vfs.h). Computed in ssize_t so an offset that would take the result
+ * negative is caught before it becomes a huge unsigned position.
+ */
+static ssize_t ramfs_vfs_seek(void* private_data, ssize_t offset, int whence) {
+    ramfs_fd_handle_t* handle = (ramfs_fd_handle_t*)private_data;
+    if (!handle) {
+        return VFS_EINVAL;
+    }
+    /* A directory has no read/write cursor; its iteration state is dir_pos,
+     * which belongs to readdir alone. Seeking it would desynchronise the
+     * walk without any way to express a valid target. */
+    if (handle->is_dir) {
+        return VFS_EBADF;
+    }
+
+    ssize_t base;
+    switch (whence) {
+        case VFS_SEEK_SET:
+            base = 0;
+            break;
+        case VFS_SEEK_CUR:
+            base = (ssize_t)ramfs_tell(handle->ramfs_fd);
+            break;
+        case VFS_SEEK_END:
+            base = (ssize_t)ramfs_fd_size(handle->ramfs_fd);
+            break;
+        default:
+            return VFS_EINVAL;
+    }
+    if (base < 0) {
+        return VFS_EBADF;   /* Stale or never-opened underlying fd */
+    }
+
+    ssize_t target = base + offset;
+    if (target < 0) {
+        return VFS_EINVAL;  /* Before the start of the file */
+    }
+
+    int pos = ramfs_seek(handle->ramfs_fd, (uint32_t)target);
+    if (pos < 0) {
+        return VFS_EBADF;
+    }
+    return (ssize_t)pos;
+}
+
 /*=============================================================================
  * RAMFS FILE OPERATIONS TABLE
  *=============================================================================*/
@@ -399,7 +453,8 @@ static const file_operations_t ramfs_file_ops = {
     .mkdir   = ramfs_vfs_mkdir,
     .rmdir   = ramfs_vfs_rmdir,
     .readdir = ramfs_vfs_readdir,
-    .stat    = ramfs_vfs_stat
+    .stat    = ramfs_vfs_stat,
+    .seek    = ramfs_vfs_seek
 };
 
 /*=============================================================================

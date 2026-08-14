@@ -123,14 +123,18 @@ l_fat=$(grep -n "fileio: fat32 entries=" "$SERIAL" 2>/dev/null | head -1 | cut -
 # stat() on both drives: size/type agree with what was written, a directory
 # reports as one, a missing path and a short buffer are both refused.
 l_stat=$(grep -n "fileio: stat ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+# lseek on both drives: SEEK_SET/CUR/END, negative displacement, past-EOF
+# clamp, and the rejected cases (before-start, bad whence, directory fd).
+# RAMFS had no seek at all before this, so the D: half could not have passed.
+l_seek=$(grep -n "fileio: seek ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 l_done=$(grep -n "fileio: done" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$l_wfd" ] || [ -z "$l_back" ] || [ -z "$l_dir" ] || [ -z "$l_fat" ] \
-   || [ -z "$l_stat" ] || [ -z "$l_done" ]; then
+   || [ -z "$l_stat" ] || [ -z "$l_seek" ] || [ -z "$l_done" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC)"
     echo "  write fd=${l_wfd:-none} readback=${l_back:-none}" \
          "readdir=${l_dir:-none} fat32=${l_fat:-none} stat=${l_stat:-none}" \
-         "done=${l_done:-none}"
+         "seek=${l_seek:-none} done=${l_done:-none}"
     echo "--- tail of $SERIAL ---"
     grep -v "Suspicious" "$SERIAL" | tail -30
     exit 2
@@ -154,15 +158,24 @@ if [ "${statsize:-0}" -ne 16 ]; then
     exit 1
 fi
 
+# SEEK_END on C:/HELLO.ELF must report that file's real size. A driver that
+# answered 0 (or echoed the requested offset) would still print "seek ok".
+seekend=$(grep -o "fileio: fat32 seek end=[0-9]*" "$SERIAL" | head -1 | cut -d= -f2)
+if [ "${seekend:-0}" -ne 14144 ]; then
+    echo "RESULT: FAIL — fat32 SEEK_END reported $seekend, expected 14144"
+    exit 1
+fi
+
 if [ "$TYPIST_RC" -eq 0 ] && [ "$l_back" -gt "$l_wfd" ] && [ "$l_fat" -gt "$l_dir" ] \
-   && [ "$l_stat" -gt "$l_fat" ] && [ "$l_done" -gt "$l_stat" ]; then
-    echo "RESULT: PASS — ring-3 open/write/read/readdir/stat work on both D: and C: (fd=$wfd)"
+   && [ "$l_stat" -gt "$l_fat" ] && [ "$l_seek" -gt "$l_stat" ] \
+   && [ "$l_done" -gt "$l_seek" ]; then
+    echo "RESULT: PASS — ring-3 open/write/read/readdir/stat/lseek work on both D: and C: (fd=$wfd)"
     grep "fileio:" "$SERIAL" | head -20
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; out of order:" \
          "wfd=$l_wfd back=$l_back dir=$l_dir fat32=$l_fat stat=$l_stat" \
-         "done=$l_done)"
+         "seek=$l_seek done=$l_done)"
     grep -v "Suspicious" "$SERIAL" | tail -30
     exit 2
 fi

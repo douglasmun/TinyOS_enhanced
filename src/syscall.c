@@ -1002,6 +1002,25 @@ int sys_stat(const char* user_path, void* user_buf, uint32_t size) {
     return 0;
 }
 
+int sys_lseek(int fd, int32_t offset, int whence) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    int vfs_fd = task_fd_lookup(self, fd);
+    if (vfs_fd < 0) {
+        return vfs_fd;   /* -EBADF */
+    }
+
+    /* No user pointers here, so nothing to copy — the whole call is scalar.
+     * vfs_lseek validates `whence` and returns -ENOSYS for a driver without
+     * a seek op, which the caller must be able to distinguish from a
+     * successful seek to position 0. */
+    ssize_t pos = vfs_lseek(vfs_fd, (ssize_t)offset, whence);
+    return (int)pos;
+}
+
 int sys_waitpid(int pid) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -1950,6 +1969,14 @@ static void syscall_dispatch(struct cpu_state* state) {
         case SYS_STAT:
             /* arg1 = user path pointer, arg2 = user buffer, arg3 = buffer size */
             ret = sys_stat((const char*)arg1, (void*)arg2, arg3);
+            break;
+
+        case SYS_LSEEK:
+            /* arg1 = fd, arg2 = signed offset, arg3 = whence.
+             * arg2 is reinterpreted as int32_t, not cast numerically: a
+             * negative offset (SEEK_END/SEEK_CUR backwards) arrives as a
+             * large unsigned value in the register. */
+            ret = sys_lseek((int)arg1, (int32_t)arg2, (int)arg3);
             break;
 
         default:

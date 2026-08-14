@@ -822,6 +822,69 @@ int ramfs_write(int fd, const void* buf, size_t count) {
 }
 
 /**
+ * Reposition the read/write cursor
+ *
+ * The `pos` field has been in ramfs_fd_t since the beginning, advanced by
+ * read/write; there was simply no way to set it. Without this, RAMFS could
+ * not back SYS_LSEEK and the syscall would have worked on C: and failed on
+ * D: — the same per-drive asymmetry the readdir work removed.
+ *
+ * Clamps past-EOF to the file size to match fat32_seek, which has always
+ * clamped: one syscall must not mean two different things depending on which
+ * drive letter the caller opened. Growing a file is write()'s job, and RAMFS
+ * cannot represent a sparse hole anyway (a NULL page within node->size is
+ * treated as corruption by ramfs_read, deliberately).
+ */
+int ramfs_seek(int fd, uint32_t offset) {
+    if (fd < 0 || fd >= RAMFS_MAX_FDS || !file_descriptors[fd].in_use) {
+        return -1;
+    }
+
+    ramfs_node_t* node = file_descriptors[fd].node;
+    if (!node) {
+        return -3;
+    }
+
+    if (offset > node->size) {
+        offset = node->size;
+    }
+
+    file_descriptors[fd].pos = offset;
+    return (int)offset;
+}
+
+/**
+ * Get the current cursor position
+ *
+ * Needed because SEEK_CUR is resolved inside the driver (see the .seek op in
+ * vfs.h): the VFS layer has never maintained a usable copy of the position.
+ */
+int ramfs_tell(int fd) {
+    if (fd < 0 || fd >= RAMFS_MAX_FDS || !file_descriptors[fd].in_use) {
+        return -1;
+    }
+    return (int)file_descriptors[fd].pos;
+}
+
+/**
+ * Get the size of the file an fd refers to
+ *
+ * SEEK_END needs this, and resolving it here rather than via ramfs_stat()
+ * keeps it correct for a file still being written: the fd's node is the live
+ * one, whereas a path lookup could race a rename.
+ */
+int ramfs_fd_size(int fd) {
+    if (fd < 0 || fd >= RAMFS_MAX_FDS || !file_descriptors[fd].in_use) {
+        return -1;
+    }
+    ramfs_node_t* node = file_descriptors[fd].node;
+    if (!node) {
+        return -3;
+    }
+    return (int)node->size;
+}
+
+/**
  * Close file
  */
 void ramfs_close(int fd) {
