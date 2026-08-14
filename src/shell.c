@@ -64,7 +64,7 @@ static const shell_command_t command_table[] = {
     { "chmod",   CAT_FILE, "chmod <mode> <file>","Change file permissions" },
     { "grep",    CAT_FILE, "grep <pattern> [files]", "Search for pattern in files" },
     { "find",    CAT_FILE, "find [pattern]",     "Find files by name pattern" },
-    { "exec",    CAT_FILE, "exec <file>",        "Execute ELF binary" },
+    { "exec",    CAT_FILE, "exec <file> [&]",    "Execute ELF binary (& = background)" },
 
     /* Drive Management */
     { "mount",   CAT_DRIVE, "mount",             "Show mounted drives (C:=FAT32, D:=RAMFS)" },
@@ -81,6 +81,7 @@ static const shell_command_t command_table[] = {
     { "clear",   CAT_SYS, "clear",               "Clear the screen" },
     { "echo",    CAT_SYS, "echo [text]",         "Echo arguments back" },
     { "ps",      CAT_SYS, "ps [-a] [-l]",        "Show task information" },
+    { "jobs",    CAT_SYS, "jobs",                "List background jobs of this shell" },
     { "top",     CAT_SYS, "top",                 "Real-time system monitor (press 'q' to quit)" },
     { "mem",     CAT_SYS, "mem",                 "Show memory usage" },
     { "kill",    CAT_SYS, "kill <pid>",          "Terminate a task" },
@@ -522,6 +523,8 @@ static void parse_and_execute(char* cmd_line) {
     /* System Monitoring Commands */
     else if (strcmp(argv[0], "ps") == 0) {
         cmd_ps_extended(argc, argv);
+    } else if (strcmp(argv[0], "jobs") == 0) {
+        cmd_jobs(argc, argv);
     } else if (strcmp(argv[0], "top") == 0) {
         cmd_top(argc, argv);
     }

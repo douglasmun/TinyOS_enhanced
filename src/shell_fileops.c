@@ -1323,9 +1323,17 @@ void cmd_rm(int argc, char* argv[]) {
 
 void cmd_exec(int argc, char* argv[]) {
     if (argc < 2) {
-        kprintf("Usage: exec <file>\n");
+        kprintf("Usage: exec <file> [&]\n");
         return;
     }
+
+    /* A trailing "&" runs the process in the background: load it, add it to
+     * the scheduler and return to the prompt immediately instead of blocking
+     * until it exits. The shell tokenizer splits on spaces, so "&" arrives as
+     * its own argv entry ("exec foo.elf&" without a space is NOT treated as
+     * background — it would name a file "foo.elf&", which is what the user
+     * literally typed). */
+    bool background = (argc >= 3 && strcmp(argv[argc - 1], "&") == 0);
 
     const char* path = argv[1];
     char abs_path[MAX_PATH];
@@ -1471,6 +1479,16 @@ void cmd_exec(int argc, char* argv[]) {
     if (task) {
         scheduler_add_task(task);
         kprintf("[EXEC] Process added to scheduler\n");
+
+        if (background) {
+            /* Background: hand the process to the scheduler and return to the
+             * prompt. No wait, and no reap here — the scheduler's post-switch
+             * cleanup queue enqueues any ZOMBIE/TERMINATED task unconditionally
+             * (scheduler.c), so an unwaited background child is still reaped.
+             * Use `ps` to watch it and `jobs` to list this shell's children. */
+            stream_printf(get_current_streams(), "[%d] %s\n", pid, proc_name);
+            return;
+        }
 
         // Wait for child process to terminate. Poll with generation
         // validation, same as sys_waitpid: PIDs are random 16-bit values and

@@ -802,6 +802,17 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
     /* SECURITY (v1.11): Use safe_strcpy with full buffer size */
     safe_strcpy(task->name, name, TASK_NAME_LEN);
 
+    /* Record the creator as parent: whoever is running when a user task is
+     * created is the process that started it (the shell, for `exec`). Stored
+     * as {pid, generation} so a recycled parent slot can never be mistaken for
+     * the real parent. memset above already left these zero (= no parent) for
+     * the case where there is no current task (early boot). */
+    task_t* creator = scheduler_get_current_task();
+    if (creator) {
+        task->parent_pid = creator->pid;
+        task->parent_generation = creator->generation;
+    }
+
     // Allocate guard page and kernel stack (for syscalls) - same as kernel tasks
     uint32_t guard_page_phys = pmm_alloc();
     if (guard_page_phys == 0) {

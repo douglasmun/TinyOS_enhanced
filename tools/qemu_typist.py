@@ -36,7 +36,7 @@ for c in "abcdefghijklmnopqrstuvwxyz0123456789":
 for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
     KEYMAP[c] = "shift-" + c.lower()
 # digits shifted -> symbols if ever needed
-SHIFT_DIGITS = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5"}
+SHIFT_DIGITS = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "&": "7"}
 for sym, d in SHIFT_DIGITS.items():
     KEYMAP[sym] = "shift-" + d
 
@@ -110,11 +110,19 @@ def type_str(sock, s):
 
 
 def type_verified(sock, s, timeout=40):
-    """Type a visible string and echo-verify it landed in the serial log."""
-    start = len(read_serial())
+    """Type a visible string and echo-verify it landed in the serial log.
+
+    Verifies char-by-char IN ORDER rather than as one contiguous match: a live
+    background process writes to the same serial console, so its output
+    interleaves into the echo ("jo[SYSCALL]...bs") and a contiguous search for
+    "jobs" would spuriously fail on a run that actually worked."""
+    start = max(0, len(read_serial()) - len(s) - 4)
     type_str(sock, s)
-    # the chars should echo back (login/username/command all echo)
-    wait_for(s, timeout=timeout, since=max(0, start - len(s) - 4))
+    cursor = start
+    for ch in s:
+        if ch == "\n":
+            continue
+        cursor = wait_for(ch, timeout=timeout, since=cursor)
 
 
 def main():
@@ -166,6 +174,33 @@ def main():
         # surface whatever we got; the bash verdict will classify
         print(str(e), file=sys.stderr)
         return 2
+
+    # 6) Optional follow-up commands, ';'-separated, sent after the first
+    #    command's expect has been observed. Used by the background-jobs
+    #    harness to run `jobs`/`ps` while a backgrounded child is still alive.
+    #    Each may carry its own expect via "cmd=>expected text".
+    followups = os.environ.get("TINYOS_FOLLOWUP_CMDS", "")
+    if followups.strip():
+        for item in followups.split(";"):
+            item = item.strip()
+            if not item:
+                continue
+            if "=>" in item:
+                cmd, want = item.split("=>", 1)
+                cmd, want = cmd.strip(), want.strip()
+            else:
+                cmd, want = item, None
+            time.sleep(1)
+            print(f"typist: sending '{cmd}'")
+            mark = len(read_serial())
+            type_verified(sock, cmd + "\n", timeout=60)
+            if want:
+                try:
+                    wait_for(want, timeout=120, since=mark)
+                    print(f"typist: '{want}' observed")
+                except SystemExit as e:
+                    print(str(e), file=sys.stderr)
+                    return 3
     return 0
 
 

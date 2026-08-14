@@ -28,6 +28,7 @@
 #include "test_tasks.h"
 #include "elf.h"
 #include "hello_elf_data.h"
+#include "sleeper_elf_data.h"
 #include "shell_elf_data.h"
 #include "shell.h"
 #include "keyboard.h"
@@ -749,6 +750,18 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         if (elf_fd >= 0) {
             ramfs_write(elf_fd, hello_elf_data, hello_elf_data_len);
             ramfs_close(elf_fd);
+        }
+    }
+
+    /* sleeper.elf runs for ~6 seconds, unlike hello.elf which exits in
+     * milliseconds. It exists so 'exec /sleeper.elf &' leaves a child that is
+     * still ALIVE when the next shell command runs — without it, `jobs` and
+     * `ps` can never observe a background job. */
+    {
+        int sleeper_fd = ramfs_open("/sleeper.elf", RAMFS_FLAG_WRITE);
+        if (sleeper_fd >= 0) {
+            ramfs_write(sleeper_fd, sleeper_elf_data, sleeper_elf_data_len);
+            ramfs_close(sleeper_fd);
         }
     }
 
