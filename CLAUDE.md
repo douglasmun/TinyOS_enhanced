@@ -8,19 +8,26 @@ No kernel libc — only the kernel's own helpers (`util.c` memcpy/memset/strlen,
 ## To-do next (post-v2.2 roadmap)
 
 Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
-1. **Background jobs** — `exec foo.elf &`, `ps`/`kill` for user processes
-   (`cmd_exec` currently blocks, so only one user process ever runs); make
-   `sys_waitpid` block on a wait queue instead of tick-polling (exit-record
-   ring stays as the status store).
+1. ~~**Background jobs**~~ **DONE** — `exec foo.elf &` + `{parent_pid,
+   parent_generation}` tracking + `jobs` builtin; `sys_waitpid` now blocks on a
+   shared wait queue woken by `waitpid_notify_death()` (exit-record ring stays
+   as the status store). `ps`/`kill` and zombie reaping already worked.
+   Harness: `verify-bgjobs.sh` + `userspace/sleeper.c`.
 2. **SYS_SPAWN + pipes** — processes starting processes, shell pipelines.
-   Skip `fork()` (PAE, no COW pages).
+   Skip `fork()` (PAE, no COW pages). **NEXT.**
 3. **FAT32 write support** — cluster alloc + dirent update + `vfs_write`.
 4. **Userspace shell** (capstone, depends on 1–3).
 
-Fold into whichever PR comes first (low-severity, known): `unmap_page_range`
-is a PAE no-op (failed ELF loads leak PT frames); `cmd_exec` doesn't reap
-task/PDPT on `task_create_user` failure; user guard page not wired into the
-#PF handler; AUDIT-8E IDS-not-wired gap.
+Hygiene: the three exec-path items are **done** (failure paths now restore CR3
+then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard
+page armed via a new `user_guard_page_virt` field — CR2 is virtual for user
+faults). **AUDIT-8E IDS-not-wired gap is still open.**
+
+**`MAX_SYSCALL_NUM` must cover the highest syscall number**, not the highest in
+its own comment block. It sat at 16 while `SYS_SLEEP` (17) and `SYS_WAITPID`
+(18) had working dispatcher cases, so the range check rejected both and PR
+#26's blocking syscalls were unreachable from userspace. Bump it when adding
+syscalls.
 
 ## Build & run
 
