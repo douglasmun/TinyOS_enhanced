@@ -56,21 +56,21 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is built from `main` at **PR #40** (`2a93213`), which fixes
-`ls` running a directory's `/` marker into the next column. Relative to the
-signed `v2.3` release asset it is **ahead** by that fix; relative to current
-`main` it is **behind**, and deliberately so — it is a pinned demo image, not a
-rolling build of `main`, and it is only refreshed when someone runs the steps
-above.
+The committed ISO is built from `main` at **PR #56** (`d712cad`), and matches the
+signed `v2.4` release asset. It is a pinned image, not a rolling build of `main`:
+it only moves when someone runs the steps above, so expect it to fall behind
+again as work lands.
 
-That gap is not small, so do not read the demo as showing current behaviour.
-Most visibly, the demo still boots into the **kernel** shell: PR #51 made the
-ring-3 shell the default login shell, and PRs #42–#55 also landed FAT32
-subdirectories, ring-3 redirection and pipelines, the ring-3 credential
-commands, and credential-syscall hardening. None of that is in this image.
+**Login now drops straight into the ring-3 shell** (PR #51), which is what the
+demo shows. That shell has ~16 builtins against the kernel shell's ~70 — type
+`kshell` to hand over to the kernel shell for the privileged and introspection
+commands (`pae`, `mem`, `wxaudit`, `auditlog`, `top`, networking), and `exit` to
+log out. This image also carries FAT32 subdirectories, ring-3 redirection and
+pipelines, the ring-3 credential commands, and the credential-syscall hardening
+from PRs #42–#55.
 
-SHA-256 `d6ef1079914c7273405b05996017c3835f5b9818212d4a71f568c17f14e35627` as of
-2026-08-14. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
+SHA-256 `d106bd2ea5c9dc96f0f78c904043c14349e5922a917e49cc75fb15cb5a415859` as of
+2026-08-16. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs — this hash identifies
 the committed artifact, it is not reproducible from source.
 
