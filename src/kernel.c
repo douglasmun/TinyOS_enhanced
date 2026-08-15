@@ -33,6 +33,7 @@
 #include "fileio_elf_data.h"
 #include "producer_elf_data.h"
 #include "counter_elf_data.h"
+#include "credprobe_elf_data.h"
 #include "shell_elf_data.h"
 #include "shell.h"
 #include "keyboard.h"
@@ -832,6 +833,21 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(counter_fd, counter_elf_data, counter_elf_data_len);
             ramfs_close(counter_fd);
             ramfs_chmod("/counter.elf", 0755);
+        }
+    }
+
+    /* credprobe.elf calls the DEPRECATED credential syscalls (SYS_SWITCH_USER,
+     * SYS_CHANGE_PASSWORD) directly through int 0x80. No shell offers those
+     * calls, so a probe that bypasses the shell entirely is the only way to
+     * assert the ring-3 gate holds at the SYSCALL BOUNDARY rather than merely
+     * that nothing happens to invoke them. 0755 for the same uid-1000 reason as
+     * spawner.elf above. */
+    {
+        int credprobe_fd = ramfs_open("/credprobe.elf", RAMFS_FLAG_WRITE);
+        if (credprobe_fd >= 0) {
+            ramfs_write(credprobe_fd, credprobe_elf_data, credprobe_elf_data_len);
+            ramfs_close(credprobe_fd);
+            ramfs_chmod("/credprobe.elf", 0755);
         }
     }
 

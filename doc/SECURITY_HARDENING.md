@@ -1248,6 +1248,82 @@ legacy design, documented in the source itself.
   rationale comments.
 - `src/user.h` — `user_account_t` with the `password_hash[]` field.
 
+### Passwords do not cross the ring boundary
+
+The credential *interface* is hardened on the same principle as the store. There
+have been two generations of it:
+
+- **`SYS_CRED` (32) — current.** Ring 3 names an **operation and a username, and
+  nothing else**. The kernel prints the prompts, reads the keystrokes into its
+  own buffer (`read_password` calls `keyboard_getchar()` directly, bypassing
+  `task->streams`), applies the euid checks, and zeroes the buffer before
+  returning. A plaintext password never enters a user address space, an argv, or
+  a syscall argument register — a ring-3 shell **cannot leak or log what it never
+  holds**.
+
+- **`SYS_CHANGE_PASSWORD` (14) and `SYS_SWITCH_USER` (15) — deprecated from ring
+  3.** These predate `SYS_CRED` and take the **plaintext password as a syscall
+  argument**. A caller must hold the plaintext to make the call at all, so the
+  exposure is inherent to the interface: it cannot be hardened away, only
+  removed. Ring-3 dispatch returns **`-ENOSYS`**. Build
+  `-DTINYOS_LEGACY_CRED_SYSCALLS` to re-enable it (an explicitly named opt-out,
+  never a default). The underlying C functions remain available to **kernel**
+  callers — the kernel shell's `su` calls `sys_switch_user()` directly rather
+  than through `int 0x80`, so gating the dispatch does not remove the command.
+
+Both surviving entry points authenticate through the **`user_authenticate()`
+family** (`user_authenticate_for()`, see below), not the bare
+`user_verify_password()` hash comparison. This matters: the counter,
+`USER_MAX_LOGIN_ATTEMPTS` lockout, `USER_LOCKOUT_DURATION` expiry and the
+locked/inactive checks all live in `user_authenticate()`. Using the bare
+comparison made a credential syscall an **un-counted password oracle** that the
+account-lockout policy never saw. A shared `switch_user_commit()` additionally
+re-checks `USER_FLAG_LOCKED`/`USER_FLAG_ACTIVE` before committing a credential
+change on **every** path, including root's (root skips the *password*, never the
+*account state* — otherwise an administrative lock is silently defeated).
+
+### An audit record must name the operation that actually happened
+
+Sharing `user_authenticate()` across login, `su` and password-change is right for
+*policy* — one definition of the lockout rules — but it originally hardcoded
+`AUDIT_AUTH_LOGIN_SUCCESS`/`_FAILURE` for every outcome, which was only correct
+while login was its sole caller. An `su` consequently wrote *"User 'root' (UID 0)
+logged in successfully"* into the audit log.
+
+A false entry is worse than a missing one **here specifically**, because this log
+is append-only and HMAC-chained: an investigator trusts it *because* it cannot be
+edited, and a forged record is indistinguishable from a true one. An `su` from a
+compromised unprivileged shell appeared as a clean root login.
+
+`user_authenticate_for(username, password, op)` applies identical policy and lets
+the caller name the operation (`LOGIN`, `SU`, `PASSWD`), selecting the matching
+failure event. `user_authenticate()` remains as the login wrapper. The **success**
+record is deliberately left to the caller, which alone knows whether the operation
+went on to **commit** — a verified password is not a completed switch, and only
+the failure is final at verification time.
+
+Related, and pre-existing: five declared event types had no case in
+`audit_event_type_str()` and rendered as `UNKNOWN` — `AUDIT_USER_SWITCH`,
+`AUDIT_AUTH_SU_FAILURE`, `AUDIT_AUTH_PASSWORD_CHANGE_FAILURE`,
+`AUDIT_USER_PASSWORD_CHANGE`, and `AUDIT_MEMORY_SEAL`. Typing the record
+correctly achieves nothing if it then prints as `UNKNOWN`; all 49 declared types
+now map.
+
+**Verification:** `verify-cred-deprecation.sh` runs `/credprobe.elf`, a ring-3
+program that issues both deprecated syscalls **directly through `int 0x80`**, and
+asserts the exact errno. The probe is a separate program by necessity, not
+convenience: no shell offers these calls, and the kernel shell's `su` calls
+`user_authenticate()` itself before reaching the syscall — so a shell-driven test
+exercises the shell's throttling and passes identically against a vulnerable
+kernel. Only a caller that bypasses the shell tests the boundary.
+
+`verify-audit-optype.sh` covers the audit-record half and must dodge the same
+trap from the other side: root's `su` skips the password entirely, so it reaches
+none of the shared code. The harness becomes unprivileged first, then `su`s back
+to root **with a password**, and asserts the **count** of `AUTH_LOGIN_SUCCESS`
+records is exactly one — the real login. Zero would mean the genuine record had
+been suppressed as well, which a presence test would not catch.
+
 ---
 
 ## ELF Code Signing — ECDSA P-256, key pinning, fail-closed

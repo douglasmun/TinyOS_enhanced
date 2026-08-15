@@ -1881,13 +1881,30 @@ int sys_change_password(const char* old_password, const char* new_password) {
             RETURN_ERROR(ESRCH);
         }
 
-        bool verified = user_verify_password(user->username, kernel_old_password);
+        /* Authenticate, do not merely compare: the bare hash comparison keeps no
+         * failed_attempts counter, so this was a second unthrottled password
+         * oracle against the caller's own account (and the only check standing
+         * between a hijacked ring-3 process and a permanent credential change).
+         * Same delegation as sys_switch_user above.
+         *
+         * Audited as a PASSWORD CHANGE, not a login — this verifies a password
+         * but establishes no session.
+         *
+         * NOTE: the family returns the UID on success, which is 0 for root — so
+         * the success test is `>= 0`, never `== 0`. Testing for zero would
+         * reject a correct password for every NON-root account while appearing
+         * to work for root: exactly the sort of bug that survives a root-only
+         * test run. */
+        int auth = user_authenticate_for(user->username, kernel_old_password,
+                                         USER_AUTH_OP_PASSWD);
+        bool verified = (auth >= 0);
 
         /* Zero old password immediately after verification */
         memset(kernel_old_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
         if (!verified) {
-            kprintf("[SYSCALL] sys_change_password: Old password verification failed\n");
+            kprintf("[SYSCALL] sys_change_password: Old password verification failed (%d)\n",
+                    auth);
             memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
             audit_log(AUDIT_AUTH_PASSWORD_CHANGE_FAILURE, AUDIT_WARN, current->uid,
                       "Failed password change attempt (wrong old password)");
@@ -1932,6 +1949,53 @@ int sys_change_password(const char* old_password, const char* new_password) {
  * - -EINVAL if user not found
  * - -EPERM if authentication fails
  *-----------------------------------------------------------------------------*/
+/*-----------------------------------------------------------------------------
+ * Shared tail of both switch_user entry points: re-check the account state and
+ * commit the credential change.
+ *
+ * The lock/active re-check is NOT redundant with user_authenticate(). A caller
+ * may have authenticated microseconds ago, and an administrator can lock the
+ * account in between; committing a switch to an account that is locked RIGHT
+ * NOW is the failure this guards. It is also the only check on the preauth
+ * path once the password step is skipped.
+ *---------------------------------------------------------------------------*/
+static int switch_user_commit(task_t* current, user_account_t* target,
+                              const char* username) {
+    if (target->flags & USER_FLAG_LOCKED) {
+        audit_log(AUDIT_AUTH_SU_FAILURE, AUDIT_WARN, current->uid,
+                  "su to '%s' refused: account locked", username);
+        RETURN_ERROR(EPERM);
+    }
+    if (!(target->flags & USER_FLAG_ACTIVE)) {
+        audit_log(AUDIT_AUTH_SU_FAILURE, AUDIT_WARN, current->uid,
+                  "su to '%s' refused: account inactive", username);
+        RETURN_ERROR(EPERM);
+    }
+
+    current->uid  = target->uid;
+    current->euid = target->uid;
+    current->gid  = target->gid;
+    current->egid = target->gid;
+    return 0;
+}
+
+int sys_switch_user_preauth(const char* username) {
+    if (!username) RETURN_ERROR(EFAULT);
+
+    task_t* current = scheduler_get_current_task();
+    if (!current) RETURN_ERROR(ESRCH);
+
+    user_account_t* target_user = user_find_by_username(username);
+    if (!target_user) RETURN_ERROR(EINVAL);
+
+    int rc = switch_user_commit(current, target_user, username);
+    if (rc == 0) {
+        audit_log(AUDIT_USER_SWITCH, AUDIT_INFO, target_user->uid,
+                  "User switched to '%s' (uid=%d)", username, target_user->uid);
+    }
+    return rc;
+}
+
 int sys_switch_user(const char* username, const char* password) {
     /*=========================================================================
      * SECURITY: Validate user-space pointers
@@ -1997,11 +2061,11 @@ int sys_switch_user(const char* username, const char* password) {
         kprintf("[SYSCALL] Root switching to user '%s' (uid=%d)\n",
                 kernel_username, target_user->uid);
 
-        /* Switch UID/GID */
-        current->uid = target_user->uid;
-        current->euid = target_user->uid;
-        current->gid = target_user->gid;
-        current->egid = target_user->gid;
+        /* Root skips the PASSWORD, not the account state: switching into a
+         * locked or inactive account would resurrect it as a usable identity
+         * and silently defeat an administrative lock. */
+        int rc = switch_user_commit(current, target_user, kernel_username);
+        if (rc < 0) return rc;
 
         audit_log(AUDIT_USER_SWITCH, AUDIT_INFO, target_user->uid,
                   "Root switched to user '%s' (uid=%d)", kernel_username, target_user->uid);
@@ -2030,18 +2094,35 @@ int sys_switch_user(const char* username, const char* password) {
         kernel_password[SYSCALL_MAX_PASSWORD_LEN - 1] = '\0';
 
         /*=====================================================================
-         * SECURITY: Verify password before switching
+         * SECURITY: Authenticate through user_authenticate(), NOT through the
+         * raw user_verify_password().
+         *
+         * user_verify_password() is only the hash comparison. Every policy that
+         * makes a password meaningful lives in user_authenticate(): the
+         * failed_attempts counter, USER_MAX_LOGIN_ATTEMPTS lockout,
+         * USER_LOCKOUT_DURATION expiry, and the locked/inactive/no-password
+         * checks. Calling the bare comparison here meant an unlimited,
+         * un-counted password oracle at syscall rate against ANY account,
+         * including one an administrator had explicitly locked — the login
+         * prompt was throttled while this path was not.
+         *
+         * Delegating to the user_authenticate() family means one definition of
+         * the policy, the same one the login prompt and the kernel shell's `su`
+         * apply. Audited as an SU, not a login: this verifies a password but
+         * establishes no session, and a forged login record in a
+         * tamper-evident log is worse than no record at all.
          *===================================================================*/
-        bool verified = user_verify_password(kernel_username, kernel_password);
+        int auth = user_authenticate_for(kernel_username, kernel_password,
+                                         USER_AUTH_OP_SU);
 
         /* Zero password immediately after verification */
         memset(kernel_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
-        if (!verified) {
-            kprintf("[SYSCALL] sys_switch_user: Password verification failed for '%s'\n",
-                    kernel_username);
+        if (auth < 0) {
+            kprintf("[SYSCALL] sys_switch_user: Authentication failed for '%s' (%d)\n",
+                    kernel_username, auth);
             audit_log(AUDIT_AUTH_SU_FAILURE, AUDIT_WARN, current->uid,
-                      "Failed su attempt to user '%s'", kernel_username);
+                      "Failed su attempt to user '%s' (auth=%d)", kernel_username, auth);
             RETURN_ERROR(EPERM);
         }
 
@@ -2049,10 +2130,8 @@ int sys_switch_user(const char* username, const char* password) {
         kprintf("[SYSCALL] User uid=%d switching to user '%s' (uid=%d)\n",
                 current->uid, kernel_username, target_user->uid);
 
-        current->uid = target_user->uid;
-        current->euid = target_user->uid;
-        current->gid = target_user->gid;
-        current->egid = target_user->gid;
+        int rc = switch_user_commit(current, target_user, kernel_username);
+        if (rc < 0) return rc;
 
         audit_log(AUDIT_USER_SWITCH, AUDIT_INFO, target_user->uid,
                   "User switched to '%s' (uid=%d)", kernel_username, target_user->uid);
@@ -2412,6 +2491,18 @@ static void syscall_dispatch(struct cpu_state* state) {
          * These syscalls REPLACE setuid binaries with kernel-level operations
          *===================================================================*/
 
+        /*=====================================================================
+         * DEPRECATED FROM RING 3 (see syscall.h): both of these take a
+         * PLAINTEXT PASSWORD in a syscall argument register. SYS_CRED (32)
+         * supersedes them precisely by never letting a password reach
+         * userspace — the kernel prompts and reads it itself. A ring-3 caller
+         * of these two must hold the plaintext to make the call at all, so the
+         * exposure is inherent to the interface and cannot be hardened away.
+         *
+         * The C functions stay available to KERNEL callers (the kernel shell's
+         * `su`), which is why only the dispatch is gated, not the code.
+         *===================================================================*/
+#ifdef TINYOS_LEGACY_CRED_SYSCALLS
         case SYS_CHANGE_PASSWORD:
             /*=================================================================
              * Replace /bin/passwd (setuid root)
@@ -2420,7 +2511,16 @@ static void syscall_dispatch(struct cpu_state* state) {
              *===============================================================*/
             ret = sys_change_password((const char*)arg1, (const char*)arg2);
             break;
+#else
+        case SYS_CHANGE_PASSWORD:
+            audit_log(AUDIT_AUTH_PASSWORD_CHANGE_FAILURE, AUDIT_WARN,
+                      current_task ? current_task->uid : 0,
+                      "Deprecated SYS_CHANGE_PASSWORD refused; use SYS_CRED");
+            ret = -ENOSYS;
+            break;
+#endif
 
+#ifdef TINYOS_LEGACY_CRED_SYSCALLS
         case SYS_SWITCH_USER:
             /*=================================================================
              * Replace /bin/su (setuid root)
@@ -2429,6 +2529,14 @@ static void syscall_dispatch(struct cpu_state* state) {
              *===============================================================*/
             ret = sys_switch_user((const char*)arg1, (const char*)arg2);
             break;
+#else
+        case SYS_SWITCH_USER:
+            audit_log(AUDIT_AUTH_SU_FAILURE, AUDIT_WARN,
+                      current_task ? current_task->uid : 0,
+                      "Deprecated SYS_SWITCH_USER refused from ring 3");
+            ret = -ENOSYS;
+            break;
+#endif
 
         case SYS_MSEAL:
             /*=================================================================

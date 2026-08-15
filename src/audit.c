@@ -390,12 +390,17 @@ const char* audit_event_type_str(audit_event_type_t type) {
         case AUDIT_AUTH_PASSWORD_CHANGE:    return "AUTH_PASSWORD_CHANGE";
         case AUDIT_AUTH_ACCOUNT_LOCKED:     return "AUTH_ACCOUNT_LOCKED";
         case AUDIT_AUTH_ACCOUNT_UNLOCKED:   return "AUTH_ACCOUNT_UNLOCKED";
+        case AUDIT_AUTH_PASSWORD_CHANGE_FAILURE:
+                                            return "AUTH_PASSWORD_CHANGE_FAILURE";
+        case AUDIT_AUTH_SU_FAILURE:         return "AUTH_SU_FAILURE";
 
         /* Privilege */
         case AUDIT_PRIV_SETUID:             return "PRIV_SETUID";
         case AUDIT_PRIV_SETGID:             return "PRIV_SETGID";
         case AUDIT_PRIV_ESCALATION:         return "PRIV_ESCALATION";
         case AUDIT_PRIV_DEESCALATION:       return "PRIV_DEESCALATION";
+        case AUDIT_USER_SWITCH:             return "USER_SWITCH";
+        case AUDIT_USER_PASSWORD_CHANGE:    return "USER_PASSWORD_CHANGE";
 
         /* File Operations */
         case AUDIT_FILE_OPEN:               return "FILE_OPEN";
@@ -423,6 +428,7 @@ const char* audit_event_type_str(audit_event_type_t type) {
         case AUDIT_SEC_MEMORY_VIOLATION:    return "SEC_MEMORY_VIOLATION";
         case AUDIT_SEC_SYSCALL_VIOLATION:   return "SEC_SYSCALL_VIOLATION";
         case AUDIT_SEC_EXPLOIT_ATTEMPT:     return "SEC_EXPLOIT_ATTEMPT";
+        case AUDIT_MEMORY_SEAL:             return "MEMORY_SEAL";
 
         /* System */
         case AUDIT_SYS_BOOT:                return "SYS_BOOT";

@@ -167,3 +167,7 @@ usershell.log
 usershell-trace.log
 ring3-cred.log
 ring3-cred-trace.log
+cred-deprecation.log
+cred-deprecation-trace.log
+audit-optype.log
+audit-optype-trace.log

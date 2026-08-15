@@ -91,8 +91,32 @@ bool user_verify_password(const char* username, const char* password);
 void user_hash_password(const char* password, char* hash_out);
 bool user_has_password(uint16_t uid);
 
-/* Authentication */
+/* Authentication.
+ *
+ * user_authenticate() is the LOGIN entry point: it records its outcome as
+ * AUDIT_AUTH_LOGIN_SUCCESS / AUDIT_AUTH_LOGIN_FAILURE.
+ *
+ * Not every password check is a login. `su` and a password change also verify a
+ * password, and must get the same policy (failed_attempts counter, lockout
+ * expiry, locked/inactive checks) — but recording them as logins puts events in
+ * the tamper-evident audit log that never happened, which is worse than no
+ * record at all: the log is the thing an investigator trusts. Those callers use
+ * user_authenticate_for(), which applies identical policy and lets the caller
+ * name the operation being audited.
+ *
+ * The op selects the FAILURE event. Only USER_AUTH_OP_LOGIN also writes a
+ * success record here: an su or a password change is not complete when the
+ * password checks out, so its success is audited by the caller once the
+ * operation actually commits (AUDIT_USER_SWITCH / AUDIT_USER_PASSWORD_CHANGE). */
+typedef enum {
+    USER_AUTH_OP_LOGIN = 0,   /* fail: AUDIT_AUTH_LOGIN_FAILURE  (also logs success) */
+    USER_AUTH_OP_SU,          /* fail: AUDIT_AUTH_SU_FAILURE */
+    USER_AUTH_OP_PASSWD       /* fail: AUDIT_AUTH_PASSWORD_CHANGE_FAILURE */
+} user_auth_op_t;
+
 int user_authenticate(const char* username, const char* password);
+int user_authenticate_for(const char* username, const char* password,
+                          user_auth_op_t op);
 void user_lock_account(const char* username);
 void user_unlock_account(const char* username);
 

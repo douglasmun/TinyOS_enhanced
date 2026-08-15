@@ -169,6 +169,21 @@ void shell_cmd_su(const char* args) {
 
     /* Root can switch to any user without password */
     if (current->euid == 0) {
+        /* Root skips the PASSWORD, not the account state. This path goes
+         * straight to sys_setgid/sys_setuid, which enforce privilege rules but
+         * know nothing about the user database, so without this check a locked
+         * or deactivated account could still be entered as a live identity —
+         * silently defeating an administrative lock. sys_switch_user() applies
+         * the same check for every other caller. */
+        if (target_user->flags & USER_FLAG_LOCKED) {
+            kprintf("su: account '%s' is locked\n", target_username);
+            return;
+        }
+        if (!(target_user->flags & USER_FLAG_ACTIVE)) {
+            kprintf("su: account '%s' is inactive\n", target_username);
+            return;
+        }
+
         kprintf("Switching to %s (no password required for root)\n", target_username);
 
         /* Switch user via syscalls - CHECK RETURN VALUES for security.
@@ -214,8 +229,10 @@ void shell_cmd_su(const char* args) {
     }
     password[pos] = '\0';
 
-    /* Authenticate (also maintains the per-account lockout counter) */
-    int auth_result = user_authenticate(target_username, password);
+    /* Authenticate (also maintains the per-account lockout counter). Audited as
+     * an su, not a login — this verifies a password but establishes no session. */
+    int auth_result = user_authenticate_for(target_username, password,
+                                            USER_AUTH_OP_SU);
 
     if (auth_result < 0) {
         /* Clear password from memory */
@@ -250,10 +267,12 @@ void shell_cmd_su(const char* args) {
         return;
     }
 
-    /* Switch user via the password-gated syscall. sys_setuid()/sys_setgid()
-     * only permit privilege drops for non-root callers, so they cannot be
-     * used to elevate even after a successful authentication. */
-    int switch_result = sys_switch_user(target_username, password);
+    /* Commit the switch. user_authenticate() above already verified the
+     * password AND maintained the lockout counter, so use the preauth entry
+     * point rather than sys_switch_user(), which would re-run the full PBKDF2
+     * derivation (100k iterations, seconds under TCG) for the same password.
+     * It still re-checks that the account is not locked or inactive. */
+    int switch_result = sys_switch_user_preauth(target_username);
 
     /* Clear password from memory */
     SECURE_ZERO_PASSWORD(password);

@@ -856,16 +856,47 @@ bool user_verify_password(const char* username, const char* password) {
  * AUTHENTICATION
  *=============================================================================*/
 
+/* Audit event for a FAILED verification, by operation. Keeping this in one
+ * place is the point: a caller that picked its own event type could drift from
+ * the policy it is reporting on. */
+static audit_event_type_t auth_failure_event(user_auth_op_t op) {
+    switch (op) {
+        case USER_AUTH_OP_SU:     return AUDIT_AUTH_SU_FAILURE;
+        case USER_AUTH_OP_PASSWD: return AUDIT_AUTH_PASSWORD_CHANGE_FAILURE;
+        case USER_AUTH_OP_LOGIN:
+        default:                  return AUDIT_AUTH_LOGIN_FAILURE;
+    }
+}
+
+/* Human-readable verb for the audit message, so a reader of the log sees what
+ * was actually attempted rather than a generic "Login failed". */
+static const char* auth_op_verb(user_auth_op_t op) {
+    switch (op) {
+        case USER_AUTH_OP_SU:     return "su";
+        case USER_AUTH_OP_PASSWD: return "password change";
+        case USER_AUTH_OP_LOGIN:
+        default:                  return "Login";
+    }
+}
+
 int user_authenticate(const char* username, const char* password) {
+    return user_authenticate_for(username, password, USER_AUTH_OP_LOGIN);
+}
+
+int user_authenticate_for(const char* username, const char* password,
+                          user_auth_op_t op) {
+    const audit_event_type_t fail_event = auth_failure_event(op);
+    const char* verb = auth_op_verb(op);
+
     if (!username || !password) {
         return -1;  /* Invalid parameters */
     }
 
     user_account_t* user = user_find_by_username(username);
     if (!user || !user->in_use) {
-        /* Audit: Login failure - user not found */
-        audit_log(AUDIT_AUTH_LOGIN_FAILURE, AUDIT_WARN, 0,
-                  "Login failed: user '%s' not found", username);
+        /* Audit: failure - user not found */
+        audit_log(fail_event, AUDIT_WARN, 0,
+                  "%s failed: user '%s' not found", verb, username);
         return -2;  /* User not found */
     }
 
@@ -883,8 +914,8 @@ int user_authenticate(const char* username, const char* password) {
      *=======================================================================*/
     if (user->password_hash[0] == '\0') {
         /* Account has no password set yet */
-        audit_log(AUDIT_AUTH_LOGIN_FAILURE, AUDIT_INFO, user->uid,
-                  "Login failed: account '%s' has no password set", username);
+        audit_log(fail_event, AUDIT_INFO, user->uid,
+                  "%s failed: account '%s' has no password set", verb, username);
         return -6;  /* No password set */
     }
 
@@ -897,8 +928,9 @@ int user_authenticate(const char* username, const char* password) {
         if (user->failed_attempts < USER_MAX_LOGIN_ATTEMPTS ||
             current_time - user->last_failed_time < USER_LOCKOUT_DURATION) {
             /* Audit: Login attempt on locked account */
-            audit_log(AUDIT_AUTH_LOGIN_FAILURE, AUDIT_WARN, user->uid,
-                      "Login failed: account '%s' is locked due to failed attempts", username);
+            audit_log(fail_event, AUDIT_WARN, user->uid,
+                      "%s failed: account '%s' is locked due to failed attempts",
+                      verb, username);
             return -3;  /* Account locked */
         } else {
             /* Unlock account */
@@ -916,8 +948,8 @@ int user_authenticate(const char* username, const char* password) {
     /* Check if account is active */
     if (!(user->flags & USER_FLAG_ACTIVE)) {
         /* Audit: Login attempt on inactive account */
-        audit_log(AUDIT_AUTH_LOGIN_FAILURE, AUDIT_WARN, user->uid,
-                  "Login failed: account '%s' is inactive", username);
+        audit_log(fail_event, AUDIT_WARN, user->uid,
+                  "%s failed: account '%s' is inactive", verb, username);
         return -4;  /* Account inactive */
     }
 
@@ -954,9 +986,17 @@ int user_authenticate(const char* username, const char* password) {
     user->failed_attempts = 0;
     mutex_unlock(&user_db_mutex);
 
-    /* Audit: Successful login */
-    audit_log(AUDIT_AUTH_LOGIN_SUCCESS, AUDIT_INFO, user->uid,
-              "User '%s' (UID %d) logged in successfully", username, user->uid);
+    /* Audit the success AS THE OPERATION IT WAS. Only a login may be recorded
+     * as a login: an su or a password change that verified a password did not
+     * establish a session, and a log that says otherwise misleads exactly the
+     * reader who most needs it. The su/passwd SUCCESS record is written by the
+     * caller, which alone knows whether the operation went on to complete —
+     * verification passing is not the same as the switch or the change being
+     * committed, and only the failure is final at this point. */
+    if (op == USER_AUTH_OP_LOGIN) {
+        audit_log(AUDIT_AUTH_LOGIN_SUCCESS, AUDIT_INFO, user->uid,
+                  "User '%s' (UID %d) logged in successfully", username, user->uid);
+    }
 
     return user->uid;  /* Return uid on success */
 }
