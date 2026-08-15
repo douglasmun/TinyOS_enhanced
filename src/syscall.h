@@ -298,8 +298,7 @@ int sys_getcwd(char* user_buf, uint32_t size);
  * @brief Change the caller's cwd.
  *
  * @param user_path Absolute or relative path, optionally drive-qualified
- * @return 0 on success, -ENOENT/-ENOTDIR/-EACCES, or -ENOSYS for a FAT32
- *         subdirectory (the driver is root-directory-only)
+ * @return 0 on success, -ENOENT/-ENOTDIR/-EACCES on failure
  */
 int sys_chdir(const char* user_path);
 

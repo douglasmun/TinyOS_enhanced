@@ -1919,14 +1919,6 @@ int task_chdir(task_t* task, const char* path) {
     resolved[1] = ':';
     safe_strcpy(resolved + 2, canonical, sizeof(resolved) - 2);
 
-    /* FAT32 is root-directory-only (see fat32.c), so C: has exactly one valid
-     * cwd. Reported as -ENOSYS rather than -ENOENT to distinguish "this driver
-     * cannot do subdirectories" from "that directory is missing" — the
-     * subdirectory may well exist on disk. */
-    if (drive == 'C' && strcmp(canonical, "/") != 0) {
-        return -ENOSYS;
-    }
-
     /* Existence, directory-ness and permission in one call. Deliberately not
      * vfs_stat: stat demands read permission, and chdir must only demand
      * search (x) — a process may stand in a directory it cannot list. */
