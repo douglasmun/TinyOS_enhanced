@@ -171,3 +171,5 @@ cred-deprecation.log
 cred-deprecation-trace.log
 audit-optype.log
 audit-optype-trace.log
+privcmd-guard.log
+privcmd-guard-trace.log
