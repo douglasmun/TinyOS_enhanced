@@ -15,7 +15,7 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
 # User programs to build
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
-            producer.elf counter.elf
+            producer.elf counter.elf credprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -81,6 +81,14 @@ counter.elf: counter.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c counter.c -o counter.o
 	$(LD) $(LDFLAGS) -o counter.elf crt0.o counter.o libc.o -lgcc
 	@echo "Built counter.elf"
+
+# credprobe.elf calls the DEPRECATED credential syscalls straight through
+# int 0x80. No shell can make those calls, so this is the only way to prove the
+# ring-3 gate holds at the syscall boundary itself.
+credprobe.elf: credprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c credprobe.c -o credprobe.o
+	$(LD) $(LDFLAGS) -o credprobe.elf crt0.o credprobe.o libc.o -lgcc
+	@echo "Built credprobe.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld

@@ -365,6 +365,98 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      without the echo check, since a password prompt echoes `*` per keystroke and
      verifying the characters back would always fail.
 
+   - PR #55 — **the LEGACY credential syscalls are closed off from ring 3**, and
+     the ones that remain now enforce the account-lockout policy themselves.
+     Not a new feature: `SYS_CHANGE_PASSWORD` (14) and `SYS_SWITCH_USER` (15)
+     predate `SYS_CRED` and take a **plaintext password in a syscall argument
+     register** — the exposure SYS_CRED exists to remove. A ring-3 caller must
+     *hold* the plaintext to make the call at all, so it cannot be hardened
+     away, only removed: the dispatcher cases now return **`-ENOSYS`** unless
+     built `-DTINYOS_LEGACY_CRED_SYSCALLS` (an explicitly named opt-out, like
+     every other flag here). The **C functions stay** — the kernel shell's `su`
+     calls `sys_switch_user()` directly, not through `int 0x80`, so gating only
+     the dispatch leaves it working.
+
+     Underneath that, three real bugs, all the same class as the FAT32 dead-code
+     bugs in PR #45 — latent while only trusted kernel code reached them,
+     dangerous the moment ring 3 could:
+     - **`sys_switch_user` authenticated with `user_verify_password()`**, which
+       is only the **hash comparison**. Every policy that makes a password
+       meaningful lives in `user_authenticate()`: the `failed_attempts` counter,
+       `USER_MAX_LOGIN_ATTEMPTS` lockout, `USER_LOCKOUT_DURATION` expiry, and
+       the locked/inactive checks. So the login prompt was throttled while this
+       path was an **unlimited, un-counted password oracle** against any
+       account, including one an administrator had explicitly locked. Now
+       delegates to `user_authenticate()` — one definition of the policy.
+       `sys_change_password`'s non-root branch had the identical bug.
+     - **the root branches skipped the account STATE, not just the password.**
+       Root `su` into a **locked or deactivated** account silently defeated an
+       administrative lock. Fixed with a shared `switch_user_commit()` that
+       re-checks `USER_FLAG_LOCKED`/`ACTIVE` on **every** path — including the
+       kernel shell's own root fast path (`shell_user.c`), which bypasses
+       `sys_switch_user` entirely by calling `sys_setgid`/`sys_setuid` and so
+       needed the check added separately.
+
+     - **`user_authenticate()` forged LOGIN records for things that were not
+       logins.** Delegating `su` and password-change to it (above) was the right
+       call for *policy*, but it hardcoded `AUDIT_AUTH_LOGIN_SUCCESS` /
+       `AUDIT_AUTH_LOGIN_FAILURE` for every outcome — correct only while login
+       was its sole caller. An `su` therefore wrote *"User 'root' (UID 0) logged
+       in successfully"* into the **tamper-evident** audit log. That is worse
+       than no record: the log is trusted *because* it is append-only and
+       HMAC-chained, so a false entry is indistinguishable from a true one, and
+       an `su` from a compromised unprivileged shell read as a clean root login.
+       Fixed with **`user_authenticate_for(username, password, op)`** —
+       identical policy, caller names the operation. `user_authenticate()`
+       remains as the `USER_AUTH_OP_LOGIN` wrapper, so the login path and the
+       ABI are untouched. The **success** record is left to the caller, which
+       alone knows whether the operation went on to *commit*: verification
+       passing is not the same as the switch or the change succeeding, and only
+       the failure is final at that point. Both callers already had correctly
+       typed success records (`AUDIT_USER_SWITCH`, `AUDIT_USER_PASSWORD_CHANGE`),
+       so nothing was left unaudited.
+     - **five audit event types had no string mapping** and printed as
+       `UNKNOWN`: `AUDIT_USER_SWITCH`, `AUDIT_AUTH_SU_FAILURE`,
+       `AUDIT_AUTH_PASSWORD_CHANGE_FAILURE`, `AUDIT_USER_PASSWORD_CHANGE`, and
+       `AUDIT_MEMORY_SEAL` (emitted by `sys_mseal`). Pre-existing, and it
+       directly undercuts the fix above — distinguishing an su from a login in
+       the log is pointless if the su then renders as `UNKNOWN`. All 49 declared
+       types now map; check with a `comm` of the enum against the `case` labels
+       if you add one.
+
+     `sys_switch_user_preauth()` exists so the kernel shell's `su` does not pay
+     **PBKDF2 twice** (100k iterations, seconds under TCG): it already calls
+     `user_authenticate_for()` itself, so the commit path skips the second
+     password verification while still re-checking lock/active state. Nothing
+     reachable from ring 3 calls it.
+
+     **The harness had to be thrown away and rewritten, and that is the useful
+     part.** The first version drove `su` from the kernel shell and asserted the
+     lockout engaged. It **passed against a deliberately reverted, vulnerable
+     kernel** — because the kernel shell calls `user_authenticate()` *itself*
+     before ever reaching the syscall, so a shell-driven attack exercises the
+     SHELL's throttling and proves nothing about the syscall. The gate lives at
+     the **syscall boundary**, so only a caller that goes straight to `int 0x80`
+     can test it: `userspace/credprobe.c` (seeded at `/credprobe.elf`, 0755)
+     issues both deprecated calls directly with a real username and password
+     string. `verify-cred-deprecation.sh` asserts the **exact** errno `-38`, not
+     merely "non-zero" — `-EPERM` would mean the call was *dispatched and then
+     declined*, a weaker property than never being dispatched. Validated both
+     ways: PASS on the fixed kernel, FAIL on one with the gate removed.
+
+     `verify-audit-optype.sh` covers the audit-record half, and has the **same
+     trap** in a different place: `shell_cmd_su`'s root fast path skips the
+     password entirely, so a root `su` reaches **none** of the changed code and
+     would pass against a fully unfixed kernel. The harness therefore creates a
+     user, `su`s **down** to it (root fast path — just how we become
+     unprivileged), then `su`s **back to root with a password**, which is the
+     only step that reaches `user_authenticate_for()`. It asserts the **count**
+     of `AUTH_LOGIN_SUCCESS` records is exactly 1, not their absence: zero would
+     mean the genuine login record had been suppressed too, and a
+     presence/absence test catches neither failure. Counts are anchored on the
+     record shape (`| TYPE |`), since the typed `auditlog` command echoes into
+     the same serial stream.
+
    Remaining: the introspection and machine-state commands in ring 3. Note they
    are NOT one group. `ps`/`kill`/`top` live in `shell_monitor.c`, which is
    already **stream-routed** (16 `stream_printf` vs 10 `kprintf`), so exposing
@@ -422,7 +514,10 @@ syscalls.
 Build flags are all **explicitly named opt-outs, never defaults**:
 `-DELF_PERMISSIVE_SIGNATURES` (warn-and-load unsigned binaries),
 `-DTINYOS_FAST_KDF` (lower PBKDF2 iterations), `-DTINYOS_TRACE_SYSCALLS` (per-syscall
-trace).
+trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
+`SYS_CHANGE_PASSWORD`/`SYS_SWITCH_USER`, which take a plaintext password in an
+argument register — see PR #55; the opt-in restores *reachability*, not the
+vulnerabilities, since both calls are policy-enforcing now).
 
 ## Stack budgets (important)
 

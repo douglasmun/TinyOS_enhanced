@@ -158,6 +158,27 @@
 #define SYS_SWITCH_USER      15  // Switch to another user (replaces /bin/su)
 
 /*=============================================================================
+ * DEPRECATED FROM RING 3: SYS_CHANGE_PASSWORD (14) and SYS_SWITCH_USER (15)
+ *
+ * Both take a PLAINTEXT PASSWORD through a syscall argument register, which is
+ * exactly the exposure SYS_CRED (32) was built to remove: there the kernel
+ * prompts and reads the keystrokes itself, so a password never enters a user
+ * address space, an argv, or a register at all. A ring-3 caller of these two
+ * must hold the plaintext to make the call, so the class cannot be fixed
+ * without changing the interface.
+ *
+ * The DISPATCHER CASES are therefore refused with -ENOSYS by default. The
+ * C functions remain and stay fully supported for KERNEL callers — the kernel
+ * shell's `su` (shell_user.c) calls sys_switch_user() directly, not through
+ * int 0x80, so it is unaffected.
+ *
+ * Build -DTINYOS_LEGACY_CRED_SYSCALLS to re-enable ring-3 dispatch. Like every
+ * other build flag in this tree it is an explicitly named opt-out, never a
+ * default. Even then the calls are now policy-enforcing (see below), so the
+ * opt-in restores reachability, NOT the vulnerabilities.
+ *===========================================================================*/
+
+/*=============================================================================
  * PHASE 14: Memory Sealing Syscall (Modern Linux 2024 Feature)
  *
  * TRADITIONAL ATTACK VECTOR:
@@ -506,9 +527,24 @@ int sys_setegid(uint16_t egid);
 /* Cryptographic Syscalls (v1.13) */
 int sys_crypto(int op, void* arg1, void* arg2, void* arg3, void* arg4);
 
-/* Capability-Based Privilege Syscalls (v1.14) */
+/* Capability-Based Privilege Syscalls (v1.14).
+ *
+ * Ring-3 dispatch is DEPRECATED (see the SYS_CHANGE_PASSWORD block above); both
+ * remain first-class entry points for kernel callers such as the kernel shell's
+ * `su`. Both enforce the account-lockout and locked/inactive policy themselves
+ * rather than assuming a caller checked first. */
 int sys_change_password(const char* old_password, const char* new_password);
 int sys_switch_user(const char* username, const char* password);
+
+/* Variant of sys_switch_user for a caller that has ALREADY authenticated the
+ * target through the user_authenticate() family this instant — it performs the same
+ * lock/active re-checks and the switch, but skips the second password
+ * verification. Exists so the kernel shell's `su` does not pay PBKDF2 twice
+ * (100k iterations, and slow under TCG) for one interactive login. The password
+ * is still required and still verified by the caller; this is a cost
+ * optimisation, not an authentication bypass, and nothing reachable from ring 3
+ * calls it. */
+int sys_switch_user_preauth(const char* username);
 
 /* Memory Sealing Syscall (Phase 14) */
 int sys_mseal(uint32_t addr, uint32_t size);
