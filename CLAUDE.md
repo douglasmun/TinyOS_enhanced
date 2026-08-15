@@ -151,10 +151,25 @@ syscalls.
   `grep -v Suspicious`.
 - First boot asks to set a root password, then login. Scripted keystrokes drop under
   TCG load — echo-verify each char before advancing.
+- `-DTINYOS_TRACE_SYSCALLS` logs every syscall dispatch. **Off by default and it must
+  stay that way**: with the shell at ring 3 the kernel console and the user's own
+  output are the same serial stream, and `readline()` costs one syscall per keystroke,
+  so a single typed command buries itself in trace lines. Useful when bringing up a
+  new syscall. Same for the routine-FS-error `kprintf`s that used to live in
+  `ramfs_vfs` mkdir/rmdir/unlink — a failed `rmdir` is a userspace error the caller
+  already reports on its own stream, so printing it kernel-side double-reports it.
+  Don't add per-operation `kprintf` to a path ring 3 can reach.
+
+Build flags are all **explicitly named opt-outs, never defaults**:
+`-DELF_PERMISSIVE_SIGNATURES` (warn-and-load unsigned binaries),
+`-DTINYOS_FAST_KDF` (lower PBKDF2 iterations), `-DTINYOS_TRACE_SYSCALLS` (per-syscall
+trace).
 
 ## Stack budgets (important)
 
-The shell runs as a **kernel task** (not on the 256 KB boot stack), and the entire
+The **default** shell runs as a kernel task (the ring-3 shell from PR #48 is opt-in via
+`exec /shell.elf` and has its own user stack; this section is about the kernel one).
+It is not on the 256 KB boot stack, and the entire
 `exec` chain — `cmd_exec → elf_load_process → ecdsa_verify → task_create_user → PAE
 page-table setup` — runs on that one kernel stack. The stack is now **128 KB**
 (`KERNEL_TASK_STACK_PAGES = 32` in `process.h`); it was 64 KB, which the full
