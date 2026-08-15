@@ -34,8 +34,8 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
 4. **Userspace shell** (capstone, depends on 1–3 — now all done). **IN PROGRESS
    — the ring-3 shell is now the DEFAULT LOGIN SHELL (PR #51), with the kernel
    shell as a fallback.** It is not yet a replacement: ~13 builtins against the
-   kernel shell's ~70, and nothing privileged (redirection landed in PR #52 and
-   pipelines in PR #53; a pipeline's stages must both be programs). The syscall
+   kernel shell's ~70, and nothing privileged (redirection and pipelines both
+   landed in PR #52; a pipeline's stages must both be programs). The syscall
    foundation landed first, one group per PR:
    - PR #43 — per-process **fd table** + `SYS_OPEN`/`SYS_CLOSE`/`SYS_READDIR`/
      `SYS_STAT` (19–22).
@@ -149,7 +149,11 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      keystrokes sent in that window are dropped because nothing is in `read()`
      yet.
 
-   - PR #52 — **ring-3 redirection** (`>`, `>>`, `<`), via a new
+   Redirection and pipelines are written up separately below because they are
+   two distinct designs, but they shipped as ONE commit in PR #52 — "part 1"
+   and "part 2" are sections of that single merge, not two of them.
+
+   - PR #52, part 1 — **ring-3 redirection** (`>`, `>>`, `<`), via a new
      **`SYS_REDIRECT` (30)**. Deliberately **NOT `dup2`**: fds 0/1/2 are not in
      `task->fdtable` at all — they live in `task->streams`, which is what
      already models console/file/pipe backing and what `sys_spawn` inherits
@@ -222,7 +226,8 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      **barrier, not a check**. Same failure as the `[EXEC] Process completed`
      note in `verify-redirect.sh`, reached from the other side.
 
-   - PR #53 — **ring-3 pipelines** (`a | b`), via a new **`SYS_PIPE` (31)**.
+   - PR #52, part 2 — **ring-3 pipelines** (`a | b`), via a new
+     **`SYS_PIPE` (31)**.
      Deliberately **NOT POSIX `pipe(int fd[2])`**, for the same reason
      `SYS_REDIRECT` is not `dup2`: the ends a shell has to connect are stdin and
      stdout, which are **not in `task->fdtable` at all** — they live in
