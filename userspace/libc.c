@@ -115,6 +115,10 @@ int pipe_op(int op, int id) {
     return syscall3(SYS_PIPE, (uint32_t)op, (uint32_t)id, 0);
 }
 
+int cred(int op, const char* user) {
+    return syscall3(SYS_CRED, (uint32_t)op, (uint32_t)user, 0);
+}
+
 int putchar(int c) {
     char ch = (char)c;
     write(1, &ch, 1);

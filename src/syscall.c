@@ -29,6 +29,7 @@
 #include "shell_redir.h" // SYS_PIPE: pipe_buffer_t and pipe_init/destroy
 #include "pmm.h"       // SYS_PIPE: frames for the pipe buffer
 #include "paging.h"    // SYS_PIPE: map those frames before touching them
+#include "shell_user.h" // SYS_CRED: the passwd/useradd/userdel implementations
 
 /*-----------------------------------------------------------------------------
  * CPU State Structure (matches syscall stub stack frame)
@@ -1464,6 +1465,52 @@ int sys_pipe(int op, int id) {
     }
 }
 
+int sys_cred(int op, const char* user_name) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    /* Validate the op BEFORE touching user memory: an unknown op has no
+     * business faulting in a username, and this keeps the error a caller gets
+     * for a bad op independent of whether its pointer happened to be valid. */
+    if (op != CRED_OP_PASSWD && op != CRED_OP_USERADD && op != CRED_OP_USERDEL) {
+        return -EINVAL;
+    }
+
+    /* Only passwd has a meaningful "no name" case — it means "my own account".
+     * useradd and userdel would otherwise have to invent a target. */
+    if (!user_name) {
+        if (op != CRED_OP_PASSWD) {
+            return -EINVAL;
+        }
+        return shell_cmd_passwd(NULL);
+    }
+
+    /* Bounded copy out of user memory. The buffer is sized to the database's
+     * own limit, so a longer name is rejected here rather than silently
+     * truncated into a match against a DIFFERENT existing account. */
+    char name[USER_MAX_USERNAME];
+    int rc = copy_string_from_user(name, user_name, sizeof(name));
+    if (rc < 0) {
+        return rc;
+    }
+
+    /* An empty string is not the same as NULL: passwd(NULL) means "my own",
+     * but passwd("") is a caller that meant to name someone and did not. Each
+     * command already prints its own usage for this, so let it through. */
+    switch (op) {
+        case CRED_OP_PASSWD:
+            return shell_cmd_passwd(name);
+        case CRED_OP_USERADD:
+            return shell_cmd_useradd(name);
+        case CRED_OP_USERDEL:
+            return shell_cmd_userdel(name);
+        default:
+            return -EINVAL;
+    }
+}
+
 int sys_waitpid(int pid) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -2462,6 +2509,11 @@ static void syscall_dispatch(struct cpu_state* state) {
         case SYS_PIPE:
             /* arg1 = PIPE_OP_*, arg2 = pipe id (ignored by CREATE) */
             ret = sys_pipe((int)arg1, (int)arg2);
+            break;
+
+        case SYS_CRED:
+            /* arg1 = CRED_OP_*, arg2 = username (NULL = my own, passwd only) */
+            ret = sys_cred((int)arg1, (const char*)arg2);
             break;
 
         default:

@@ -35,6 +35,7 @@
 #define SYS_CHDIR   29
 #define SYS_REDIRECT 30
 #define SYS_PIPE     31
+#define SYS_CRED     32
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -186,6 +187,27 @@ int  redirect(int fd, const char* path, int mode);
  *
  * PIPE_CREATE returns a positive ID; the rest return 0. Negative is an errno. */
 int  pipe_op(int op, int id);
+
+/* Credential operations (must match CRED_OP_* in src/syscall.h) */
+#define CRED_PASSWD   0    /* change a password: own, or another's as root */
+#define CRED_USERADD  1    /* create a user  (root only)                   */
+#define CRED_USERDEL  2    /* delete a user  (root only, never root)       */
+
+/* Administer user credentials. `user` names the account; pass NULL with
+ * CRED_PASSWD to mean the calling user.
+ *
+ * There is deliberately NO password parameter. The KERNEL prints the prompts
+ * and reads the keystrokes into its own buffer, so a plaintext password never
+ * enters a user address space, an argv, or a syscall register — a ring-3 shell
+ * cannot leak or log what it never holds. The call blocks while the kernel
+ * prompts, and the command prints its own diagnostics to this process's stdout.
+ *
+ * Authorization is the same euid check the kernel shell has always applied, not
+ * a second implementation: non-root gets -EPERM for useradd/userdel and for
+ * changing someone else's password.
+ *
+ * Returns 0 on success or a negative errno. */
+int  cred(int op, const char* user);
 
 /* Console I/O */
 int  putchar(int c);

@@ -22,12 +22,45 @@
 #include "crypto.h"  /* For crypto_constant_time_compare() */
 #include "pit.h"     /* For pit_get_ticks() - used in authentication delay */
 #include "serial.h"  /* For serial debug output */
+#include "stdio.h"   /* For stream_printf() - see cred_printf below */
+#include "errno.h"   /* Credential commands return negative errnos to SYS_CRED */
+
+/*=============================================================================
+ * HELPER: Output for the credential commands
+ *=============================================================================
+ * passwd/useradd/userdel are reachable from BOTH shells: the kernel shell calls
+ * them directly, and the ring-3 shell reaches them through SYS_CRED. So their
+ * output cannot use kprintf, which writes to the kernel console and would leave
+ * a ring-3 caller's own stream silent (the same routing bug already fixed once
+ * for `ls C:`, see the FAT32 note in CLAUDE.md).
+ *
+ * stream_printf falls back to kprintf when there is no current stream context,
+ * so kernel-shell and early-boot callers are unaffected.
+ *
+ * Only these three commands are converted. The rest of this file still uses
+ * kprintf deliberately: they are not reachable from ring 3, and rewriting the
+ * ~106 remaining call sites would be a large untested diff for no behaviour
+ * change.
+ *=============================================================================*/
+#define cred_printf(...) stream_printf(get_current_streams(), __VA_ARGS__)
 
 /*=============================================================================
  * HELPER: Get password input (hidden)
  *=============================================================================
  * NOTE: This function does NOT print a prompt. Callers must print their own
  * custom prompt before calling this function (e.g., "Enter new password: ")
+ *
+ * The keystrokes are taken straight from keyboard_getchar(), NOT from the
+ * caller's stdin. That is deliberate and is what lets SYS_CRED keep a plaintext
+ * password out of every user address space: the bytes go from the keyboard
+ * driver into this kernel buffer and are hashed and wiped without ever being
+ * copied out to ring 3. It also means a redirected or piped stdin cannot feed a
+ * password in, which is the correct refusal for an interactive credential
+ * change (and matches how real getpass() reads the terminal, not stdin).
+ *
+ * The echo uses the stream helper so a ring-3 caller sees its own asterisks;
+ * with no stream context it falls back to kprintf, so login and su are
+ * unchanged.
  *=============================================================================*/
 static int read_password(char* buffer, size_t max_len) {
     size_t pos = 0;
@@ -38,18 +71,18 @@ static int read_password(char* buffer, size_t max_len) {
 
         if (c == '\n') {
             buffer[pos] = '\0';
-            kprintf("\n");
+            cred_printf("\n");
             return pos;
         } else if (c == '\b' || c == 0x7F) {  /* Backspace */
             if (pos > 0) {
                 pos--;
                 /* Erase the asterisk (v1.13: kbd driver no longer echoes) */
-                kprintf("\b \b");
+                cred_printf("\b \b");
             }
         } else if (c >= 32 && c < 127) {  /* Printable characters */
             if (pos < max_len - 1) {  /* Only write if space available */
                 buffer[pos++] = c;
-                kprintf("*");  /* Echo asterisk instead of actual character */
+                cred_printf("*");  /* Echo asterisk instead of actual character */
             }
             /* Silently ignore characters that would overflow */
         }
@@ -237,11 +270,11 @@ void shell_cmd_su(const char* args) {
  * COMMAND: passwd [username]
  * Change password
  *=============================================================================*/
-void shell_cmd_passwd(const char* args) {
+int shell_cmd_passwd(const char* args) {
     task_t* current = scheduler_get_current_task();
     if (!current) {
-        kprintf("Error: No current task\n");
-        return;
+        cred_printf("Error: No current task\n");
+        return -ESRCH;
     }
 
     /* Determine which user's password to change */
@@ -252,22 +285,22 @@ void shell_cmd_passwd(const char* args) {
         /* Change own password */
         user_account_t* user = user_find_by_uid(current->uid);
         if (!user) {
-            kprintf("passwd: cannot find current user\n");
-            return;
+            cred_printf("passwd: cannot find current user\n");
+            return -ESRCH;
         }
         target_username = user->username;
         target_uid = current->uid;
     } else {
         /* Changing another user's password (requires root) */
         if (current->euid != 0) {
-            kprintf("passwd: only root can change other users' passwords\n");
-            return;
+            cred_printf("passwd: only root can change other users' passwords\n");
+            return -EPERM;
         }
 
         user_account_t* user = user_find_by_username(target_username);
         if (!user) {
-            kprintf("passwd: user '%s' does not exist\n", target_username);
-            return;
+            cred_printf("passwd: user '%s' does not exist\n", target_username);
+            return -ESRCH;
         }
         target_uid = user->uid;
     }
@@ -275,14 +308,14 @@ void shell_cmd_passwd(const char* args) {
     /* If changing own password, verify old password first */
     if (target_uid == current->uid && current->euid != 0) {
         char old_password[USER_MAX_PASSWORD];
-        kprintf("Changing password for %s\n", target_username);
-        kprintf("(current) ");
+        cred_printf("Changing password for %s\n", target_username);
+        cred_printf("(current) ");
         read_password(old_password, sizeof(old_password));
 
         if (!user_verify_password(target_username, old_password)) {
             SECURE_ZERO_PASSWORD(old_password);
-            kprintf("passwd: authentication token manipulation error\n");
-            return;
+            cred_printf("passwd: authentication token manipulation error\n");
+            return -EACCES;
         }
         SECURE_ZERO_PASSWORD(old_password);
     }
@@ -291,10 +324,10 @@ void shell_cmd_passwd(const char* args) {
     char new_password[USER_MAX_PASSWORD];
     char confirm_password[USER_MAX_PASSWORD];
 
-    kprintf("Enter new password: ");
+    cred_printf("Enter new password: ");
     read_password(new_password, sizeof(new_password));
 
-    kprintf("Retype new password: ");
+    cred_printf("Retype new password: ");
     read_password(confirm_password, sizeof(confirm_password));
 
     /* Verify passwords match (constant-time comparison to prevent timing attacks) */
@@ -304,48 +337,51 @@ void shell_cmd_passwd(const char* args) {
     if (pw1_len != pw2_len || !crypto_constant_time_compare(new_password, confirm_password, pw1_len)) {
         SECURE_ZERO_PASSWORD(new_password);
         SECURE_ZERO_PASSWORD(confirm_password);
-        kprintf("passwd: passwords do not match\n");
-        return;
+        cred_printf("passwd: passwords do not match\n");
+        return -EINVAL;
     }
 
     /* Set new password */
-    if (user_set_password(target_uid, new_password) == 0) {
-        kprintf("passwd: password updated successfully\n");
+    int rc = user_set_password(target_uid, new_password);
+    if (rc == 0) {
+        cred_printf("passwd: password updated successfully\n");
     } else {
-        kprintf("passwd: error updating password\n");
+        cred_printf("passwd: error updating password\n");
+        rc = -EIO;
     }
 
     /* Clear passwords from memory */
     SECURE_ZERO_PASSWORD(new_password);
     SECURE_ZERO_PASSWORD(confirm_password);
+    return rc;
 }
 
 /*=============================================================================
  * COMMAND: useradd <username>
  * Create new user (root only)
  *=============================================================================*/
-void shell_cmd_useradd(const char* args) {
+int shell_cmd_useradd(const char* args) {
     task_t* current = scheduler_get_current_task();
     if (!current) {
-        kprintf("Error: No current task\n");
-        return;
+        cred_printf("Error: No current task\n");
+        return -ESRCH;
     }
 
     /* Check root permission */
     if (current->euid != 0) {
-        kprintf("useradd: permission denied (must be root)\n");
-        return;
+        cred_printf("useradd: permission denied (must be root)\n");
+        return -EPERM;
     }
 
     if (!args || args[0] == '\0') {
-        kprintf("Usage: useradd <username>\n");
-        return;
+        cred_printf("Usage: useradd <username>\n");
+        return -EINVAL;
     }
 
     /* Check if user already exists */
     if (user_find_by_username(args)) {
-        kprintf("useradd: user '%s' already exists\n", args);
-        return;
+        cred_printf("useradd: user '%s' already exists\n", args);
+        return -EEXIST;
     }
 
     /* Find next available UID (start from 1002) */
@@ -355,13 +391,13 @@ void shell_cmd_useradd(const char* args) {
     }
 
     if (new_uid >= 60000) {
-        kprintf("useradd: no available UID\n");
-        return;
+        cred_printf("useradd: no available UID\n");
+        return -ENOSPC;
     }
 
     /* Get password */
     char password[USER_MAX_PASSWORD];
-    kprintf("Enter password for new user: ");
+    cred_printf("Enter password for new user: ");
     read_password(password, sizeof(password));
 
     /* Create user */
@@ -370,53 +406,69 @@ void shell_cmd_useradd(const char* args) {
     SECURE_ZERO_PASSWORD(password);
 
     if (result == 0) {
-        kprintf("useradd: user '%s' created (uid=%d, gid=100)\n", args, new_uid);
-    } else {
-        kprintf("useradd: failed to create user (error %d)\n", result);
+        cred_printf("useradd: user '%s' created (uid=%d, gid=100)\n", args, new_uid);
+        return 0;
     }
+
+    cred_printf("useradd: failed to create user (error %d)\n", result);
+    return -EIO;
 }
 
 /*=============================================================================
  * COMMAND: userdel <username>
  * Delete user (root only)
  *=============================================================================*/
-void shell_cmd_userdel(const char* args) {
+int shell_cmd_userdel(const char* args) {
     task_t* current = scheduler_get_current_task();
     if (!current) {
-        kprintf("Error: No current task\n");
-        return;
+        cred_printf("Error: No current task\n");
+        return -ESRCH;
     }
 
     /* Check root permission */
     if (current->euid != 0) {
-        kprintf("userdel: permission denied (must be root)\n");
-        return;
+        cred_printf("userdel: permission denied (must be root)\n");
+        return -EPERM;
     }
 
     if (!args || args[0] == '\0') {
-        kprintf("Usage: userdel <username>\n");
-        return;
-    }
-
-    /* Cannot delete root */
-    if (strcmp(args, "root") == 0) {
-        kprintf("userdel: cannot delete root user\n");
-        return;
+        cred_printf("Usage: userdel <username>\n");
+        return -EINVAL;
     }
 
     /* Find user */
     user_account_t* user = user_find_by_username(args);
     if (!user) {
-        kprintf("userdel: user '%s' does not exist\n", args);
-        return;
+        cred_printf("userdel: user '%s' does not exist\n", args);
+        return -ESRCH;
+    }
+
+    /* Refuse by UID, not by name: "root" is the name of uid 0 by convention
+     * only, and an account created with uid 0 is root in every way that
+     * matters. The old check compared the argument to the string "root", so
+     * any other name for uid 0 deleted the system's only privileged account. */
+    if (user->uid == 0) {
+        cred_printf("userdel: cannot delete root user\n");
+        return -EPERM;
+    }
+
+    /* Deleting the account you are logged in as leaves the session running with
+     * credentials no user database entry backs any more — every later lookup on
+     * that uid fails, and the uid is free to be handed to a new account that
+     * then inherits this session. */
+    if (user->uid == current->uid || user->uid == current->euid) {
+        cred_printf("userdel: cannot delete the current user\n");
+        return -EPERM;
     }
 
     /* Delete user */
     if (user_delete(user->uid) == 0) {
-        kprintf("userdel: user '%s' deleted\n", args);
-    } else {
-        kprintf("userdel: failed to delete user\n");
+        cred_printf("userdel: user '%s' deleted\n", args);
+        return 0;
     }
+
+    cred_printf("userdel: failed to delete user\n");
+    return -EIO;
 }
 
 /*=============================================================================

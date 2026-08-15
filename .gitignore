@@ -165,3 +165,5 @@ fsyscalls.log
 fsyscalls-trace.log
 usershell.log
 usershell-trace.log
+ring3-cred.log
+ring3-cred-trace.log

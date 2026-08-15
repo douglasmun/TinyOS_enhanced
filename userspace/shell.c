@@ -73,6 +73,9 @@ static void cmd_help(void) {
           "  write <f> <text>  write text to a file (truncates)\n"
           "  getpid            print this shell's pid\n"
           "  id                print uid and gid\n"
+          "  passwd [user]     change a password (no arg: your own)\n"
+          "  useradd <user>    create a user  (root only)\n"
+          "  userdel <user>    delete a user  (root only)\n"
           "  kshell            switch to the kernel shell (see below)\n"
           "  exit / logout     log out and return to the login prompt\n"
           "\n"
@@ -91,11 +94,14 @@ static void cmd_help(void) {
           "itself, which cannot be both stages at once. `kshell` has\n"
           "pipelines that work with builtins.\n"
           "\n"
+          "passwd/useradd/userdel prompt for the password in the KERNEL, not\n"
+          "here: this shell never holds one, and cannot leak what it never\n"
+          "sees. Permission is the same root check the kernel shell applies.\n"
+          "\n"
           "This shell runs at ring 3 and reaches the system only through\n"
-          "syscalls. It does not yet cover everything: user management,\n"
-          "shutdown/reboot, ps/top/kill, the security tooling and\n"
-          "networking still live in the kernel shell. Type `kshell` to get\n"
-          "there.\n");
+          "syscalls. It does not yet cover everything: shutdown/reboot,\n"
+          "ps/top/kill, the security tooling and networking still live in\n"
+          "the kernel shell. Type `kshell` to get there.\n");
 }
 
 static void cmd_echo(int argc, char** argv) {
@@ -263,6 +269,46 @@ static void cmd_write(int argc, char** argv) {
 
 static void cmd_id(void) {
     printf("uid=%d gid=%d\n", getuid(), getgid());
+}
+
+/*-----------------------------------------------------------------------------
+ * Credential commands
+ *
+ * These are thin on purpose. The shell contributes only the operand: the
+ * KERNEL prints the prompts, reads the password, applies the euid checks and
+ * prints the result, so there is nothing here to get wrong and no window in
+ * which this process holds a plaintext password.
+ *
+ * `passwd` with no operand means the calling user, which is the one case where
+ * a missing argument is not an error. useradd and userdel require a name — the
+ * kernel rejects a NULL for them, but catching it here gives a usage line
+ * instead of a bare errno.
+ *---------------------------------------------------------------------------*/
+static int is_cred_cmd(const char* cmd) {
+    return strcmp(cmd, "passwd") == 0 ||
+           strcmp(cmd, "useradd") == 0 ||
+           strcmp(cmd, "userdel") == 0;
+}
+
+static void cmd_cred(int argc, char** argv, int op, const char* name) {
+    if (argc > 2) {
+        printf("usage: %s %s\n", name,
+               (op == CRED_PASSWD) ? "[user]" : "<user>");
+        return;
+    }
+
+    const char* who = (argc > 1) ? argv[1] : 0;
+    if (!who && op != CRED_PASSWD) {
+        printf("usage: %s <user>\n", name);
+        return;
+    }
+
+    int rc = cred(op, who);
+    if (rc < 0) {
+        /* The command already printed why on its own stream; add the errno only
+         * so a caller reading a transcript can tell a refusal from a failure. */
+        fail(name, who, rc);
+    }
 }
 
 /*-----------------------------------------------------------------------------
@@ -668,8 +714,8 @@ static int dispatch(int argc, char** argv, int background, int* status) {
         return 1;
     }
 
-    /* Hand this session over to the kernel shell, which still owns everything
-     * privileged (users, shutdown, ps/kill, security tooling, networking) plus
+    /* Hand this session over to the kernel shell, which still owns the rest of
+     * what is privileged (shutdown, ps/kill, security tooling, networking) plus
      * pipelines through builtins. We cannot set a flag in the kernel from here, so
      * the request travels as the exit status: the parent recognises 70 and
      * runs its own command loop instead of returning to the login prompt.
@@ -689,6 +735,10 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "stat") == 0)   { cmd_stat(argc, argv);     return 0; }
     if (strcmp(cmd, "write") == 0)  { cmd_write(argc, argv);    return 0; }
     if (strcmp(cmd, "id") == 0)     { cmd_id();                 return 0; }
+
+    if (strcmp(cmd, "passwd") == 0)  { cmd_cred(argc, argv, CRED_PASSWD,  "passwd");  return 0; }
+    if (strcmp(cmd, "useradd") == 0) { cmd_cred(argc, argv, CRED_USERADD, "useradd"); return 0; }
+    if (strcmp(cmd, "userdel") == 0) { cmd_cred(argc, argv, CRED_USERDEL, "userdel"); return 0; }
 
     if (strcmp(cmd, "mkdir") == 0) { cmd_path_op(argc, argv, mkdir,  "mkdir"); return 0; }
     if (strcmp(cmd, "rmdir") == 0) { cmd_path_op(argc, argv, rmdir,  "rmdir"); return 0; }
@@ -809,6 +859,20 @@ int main(int argc, char** argv) {
             continue;
         }
         if (nargs == 0) continue;
+
+        /* A credential command with a redirection is refused rather than run.
+         * Its prompts are printed by the KERNEL into this process's stdout, so
+         * `passwd > f` would put "Enter new password:" in the file while the
+         * kernel blocked on the keyboard — the user would face a shell that
+         * looks hung and would be typing a password blind. `< f` cannot work
+         * either: read_password reads the keyboard directly, never stdin, so a
+         * redirected stdin is silently ignored rather than supplying anything.
+         * Neither is expressible, so say so instead of misbehaving. */
+        if (is_cred_cmd(args[0]) && (redir.in_path || redir.out_path)) {
+            printf("%s: cannot be redirected; it prompts on the console\n",
+                   args[0]);
+            continue;
+        }
 
         /* Redirect only around the command itself: the prompt, the echoed line
          * and any error the shell prints about the redirection all belong on
