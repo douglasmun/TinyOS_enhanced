@@ -62,13 +62,18 @@ trap cleanup EXIT
 
 echo "==> Driving the boot flow (slow under TCG; be patient)..."
 # The redirected exec prints nothing to the console, so there is no output to
-# wait on; "[EXEC] Process exited" is the kernel-side marker that it finished.
+# wait on; a kernel-side marker has to stand in for it. It must be the marker
+# that means the SHELL IS READY AGAIN, not merely that the child died:
+# "Process exited" is printed from the exit syscall, with the whole teardown
+# (task reap, page-directory and PDPT free) still to come, and keystrokes sent
+# in that window are dropped because nothing is in read() yet. "[EXEC] Process
+# completed" is the last line cmd_exec prints before it returns to the prompt.
 # `cat` then has to produce the text from the file.
 TINYOS_PASSWORD="$PASSWORD" \
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_EXEC_CMD="exec /hello.elf > /out.txt" \
-TINYOS_EXPECT="Process exited" \
+TINYOS_EXPECT="[EXEC] Process completed" \
 TINYOS_FOLLOWUP_CMDS="cat /out.txt=>Hello from ELF" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?

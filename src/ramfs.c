@@ -5,6 +5,7 @@
 #include "kprintf.h"
 #include "util.h"
 #include "pmm.h"
+#include "paging.h"     /* pae_map_page() - map pmm frames before touching them */
 #include "critical.h"
 #include "mutex.h"
 #include "process.h"    /* For task_t, PROCESS_MAX_FDS */
@@ -120,6 +121,24 @@ static ramfs_node_t* alloc_node(const char* name, uint8_t type,
     }
 
     // kprintf("[RAMFS_DEBUG] Allocated node '%s' at %p\n", name, (void*)node);
+
+    /* Identity-map the frame before the memset below writes through it.
+     * pmm_alloc() hands back a PHYSICAL address that is only safe to
+     * dereference while the boot identity map happens to cover it — an
+     * accident of which frames the allocator has handed out, not a guarantee.
+     * This is the long-standing intermittent "boot-time memset kernel page
+     * fault"; it became reproducible once the ring-3 login shell built and
+     * tore down an address space before the first file was created, moving
+     * the free list past the identity-mapped range.
+     *
+     * The mapping must go into the KERNEL address space explicitly, not
+     * whatever CR3 happens to hold: nodes are created from exec paths that run
+     * with a user PDPT loaded, and pae_map_page would then write the entry
+     * into the user's tables (copy-on-writing a kernel-shared page table on
+     * the way) while leaving the kernel's own mapping absent. */
+    pae_map_page_into(pae_get_kernel_pdpt(),
+                      (uint32_t)(uintptr_t)node, (uint64_t)(uintptr_t)node,
+                      PAE_PRESENT | PAE_READWRITE | PAE_NX);
 
     memset(node, 0, sizeof(ramfs_node_t));
 
@@ -820,6 +839,12 @@ int ramfs_write(int fd, const void* buf, size_t count) {
                 count = i;  // out of memory: commit what was written
                 break;
             }
+            /* Same identity-map-before-touch requirement as alloc_node, and
+             * the same reason for targeting the kernel PDPT explicitly. */
+            pae_map_page_into(pae_get_kernel_pdpt(),
+                              (uint32_t)(uintptr_t)node->data_pages[page],
+                              (uint64_t)(uintptr_t)node->data_pages[page],
+                              PAE_PRESENT | PAE_READWRITE | PAE_NX);
             memset(node->data_pages[page], 0, RAMFS_PAGE_SIZE);
             if (page == 0) {
                 node->data = node->data_pages[0];  // back-compat alias
