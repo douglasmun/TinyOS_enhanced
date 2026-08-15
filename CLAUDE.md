@@ -32,9 +32,10 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
    boot 2 must re-read the file and see a non-zero `fatls` size).
    Subdirectories landed later — see PR #47 under item 4.
 4. **Userspace shell** (capstone, depends on 1–3 — now all done). **IN PROGRESS
-   — syscall foundation only.** The kernel shell is untouched and stays the
-   default; nothing has migrated to ring 3 yet. What a userspace shell needs
-   from the kernel is landing first, one syscall group per PR:
+   — the ring-3 shell is now the DEFAULT LOGIN SHELL (PR #51), with the kernel
+   shell as a fallback.** It is not yet a replacement: ~13 builtins against the
+   kernel shell's ~70, no pipes or redirection, nothing privileged. The syscall
+   foundation landed first, one group per PR:
    - PR #43 — per-process **fd table** + `SYS_OPEN`/`SYS_CLOSE`/`SYS_READDIR`/
      `SYS_STAT` (19–22).
    - PR #44 — `SYS_LSEEK` (24).
@@ -81,7 +82,8 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      is more dangerous than a leaked chain. `fat32_list_root_cb` is now a
      wrapper over `fat32_list_dir_cb(path, ...)`; `cmd_fatls` takes a path.
    - PR #48 — **the ring-3 shell itself**, first migration step. The kernel
-     shell is still the default and is untouched; `userspace/shell.c` (was a
+     shell was still the default at this point (PR #51 below changed that);
+     `userspace/shell.c` (was a
      183-line vestigial stub with 4 hardcoded commands and a hand-rolled
      `_start`) is now a libc-based `main(argc, argv)` reached with
      `exec /shell.elf`. Builtins: `help echo pwd cd ls cat stat write mkdir
@@ -113,8 +115,40 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
    alignment bias away — pre-existing kernel bug, only reachable once a ring-3
    parent passed a variable-length vector.
 
-   Remaining: pipes/redirection and the privileged commands, then making the
-   ring-3 shell the default login shell.
+   - PR #51 — **the ring-3 shell becomes the DEFAULT LOGIN SHELL.** Login now
+     runs `launch_login_shell()` (`src/shell.c`) instead of dropping straight
+     into the kernel command loop. It is a launcher **with a fallback**, not a
+     swap: if `/shell.elf` is missing, unsigned, or fails to load, it returns
+     non-zero and the kernel command loop runs, because a broken shell.elf must
+     never cost the user their login.
+
+     Three things make this work:
+     - **`exit` = logout.** The ring-3 shell cannot return to a login prompt by
+       itself; its parent can. The process exits, `launch_login_shell` returns,
+       and `shell_task`'s session loop falls back around to the login prompt.
+     - **`kshell` = hand over to the kernel shell**, via the child's **exit
+       status** (`SHELL_EXIT_WANT_KERNEL_SHELL`, 70). A first attempt used a
+       kernel-side `static bool`, which cannot work — the ring-3 shell is a
+       separate process and cannot set a kernel variable. The status is the
+       only channel a dying child already has.
+     - **Credentials are inherited from the session.** `task_create_user`
+       hardcodes uid 1000 for every user task, so a root login would otherwise
+       be silently demoted. Set before `scheduler_add_task`, for the same
+       reason `sys_spawn` sets parentage first: after that call the child can
+       run on the very next tick.
+
+     `tools/qemu_typist.py` now types `kshell` right after login by default, so
+     the eight harnesses that drive the *kernel* shell keep working unchanged;
+     `TINYOS_STAY_IN_RING3=1` skips it (only `verify-usershell.sh` sets it).
+     Two harnesses had to change for real reasons, not cosmetics: see the
+     `memset`/`wait_queue_init` fix under "Security work" for the page-fault
+     class this made deterministic, and note `verify-redirect.sh` now waits on
+     `[EXEC] Process completed` rather than `Process exited` — the latter is
+     printed from the exit syscall with the whole teardown still to come, and
+     keystrokes sent in that window are dropped because nothing is in `read()`
+     yet.
+
+   Remaining: pipes/redirection and the privileged commands in ring 3.
 
 Hygiene: the three exec-path items are **done** (failure paths now restore CR3
 then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard
@@ -286,13 +320,23 @@ security-mechanism reference is `doc/SECURITY_HARDENING.md`.
   sha256/the crypto layer. (The earlier-dropped attempt was rejected for the WRONG reason —
   "exec_buffer has no .bss neighbor"; the corruption was never in exec_buffer.)
 
-- **OPEN: rare boot-time `memset` kernel page fault.** Intermittent KERNEL PANIC during
-  EARLY boot (pre-shell), EIP=`memset`, CR2 a low frame, "PD present, PT walk ends
-  not-present". RAMFS/PMM `alloc_node`-style code `memset`s a `pmm_alloc`'d frame via its
-  physical address before that frame's PAE PTE is reliably present. Distinct from the
-  sha256 bug (boot never reaches exec). Fix approach: map-before-touch in the alloc paths,
-  or guarantee the identity map covers every pmm_alloc frame. See memory note
-  `ramfs-identity-map-bug.md`.
+- **FIXED: `memset`/`wait_queue_init` kernel page fault on a `pmm_alloc`'d frame.**
+  Was logged here as a *rare boot-time* fault (EIP=`memset`, CR2 a low frame, "PD
+  present, PT walk ends not-present"). Making the ring-3 shell the default login
+  shell turned it **deterministic**: that shell builds and tears down a full
+  address space before the first file is created, which moves the PMM free list
+  past the range the boot identity map happens to cover. `pmm_alloc()` returns a
+  **physical** address, and three call sites dereferenced it directly —
+  `ramfs.c` `alloc_node` (the documented one), `ramfs_write`'s `data_pages`
+  allocation, and `shell_redir.c` `pipe_init`'s wait-queue page. Fixed by
+  map-before-touch at all three, following the `pae.c:215-255` pattern.
+  **Map into the KERNEL address space explicitly** —
+  `pae_map_page_into(pae_get_kernel_pdpt(), ...)`, not `pae_map_page()`: nodes are
+  created from exec paths that run with a **user PDPT loaded**, so `pae_map_page`
+  would write the entry into the user's tables (copy-on-writing a kernel-shared
+  page table on the way, see "User address space" below) and leave the kernel's
+  own mapping absent. Harnesses: `verify-pipes.sh` and `verify-redirect.sh` both
+  panicked before the fix and pass after.
 
 - **Password hashing**: PBKDF2 is always **100,000 iterations** (OWASP), decoupled from
   `-DTINYOS_DEV` (a build-speed flag) — pass `-DTINYOS_FAST_KDF` to lower it explicitly.

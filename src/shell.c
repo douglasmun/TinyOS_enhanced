@@ -17,6 +17,10 @@
 #include "shell_user.h"  /* User management commands (v1.10) */
 #include "ramfs.h"
 #include "stdio.h"
+#include "elf.h"       /* elf_exec_from_path() — launching the ring-3 login shell */
+#include "process.h"
+#include "syscall.h"   /* sys_waitpid() — the login shell blocks on it */
+#include "critical.h"
 
 #define SHELL_BUFFER_SIZE 256
 #define MAX_ARGS 10
@@ -136,6 +140,13 @@ static int buffer_pos = 0;
 
 /* Logout flag - set by logout command to exit shell loop */
 static volatile bool should_logout = false;
+
+/* Exit status by which the ring-3 login shell asks to hand control to the
+ * kernel command loop (its `kshell` builtin) rather than log out. It cannot
+ * set a kernel flag directly — it is a separate process — so the exit status
+ * is the channel. 70 is outside the 0..63 a shell would plausibly return on
+ * its own, and sys_waitpid truncates to 0..255, so it round-trips intact. */
+#define SHELL_EXIT_WANT_KERNEL_SHELL 70
 
 /* Function prototype */
 void shell_task(void);
@@ -953,6 +964,93 @@ static void parse_and_execute(char* cmd_line) {
  *       Re-enabling stack protection to catch overflow
  *---------------------------------------------------------------------------*/
 
+/*-----------------------------------------------------------------------------
+ * FUNCTION: launch_login_shell
+ * PURPOSE: Run /shell.elf as the ring-3 login shell, blocking until it exits
+ *
+ * Roadmap item 4. The ring-3 shell is the default face of the system, but it
+ * is NOT yet a replacement for this one: it has ~13 builtins against this
+ * shell's ~70, and everything privileged (users, shutdown, ps/kill, security
+ * tooling, networking) plus pipes and redirection still live only here. So
+ * this is a launcher with a fallback, not a swap — if /shell.elf is missing,
+ * unsigned, or fails to load, we return non-zero and the caller runs the
+ * kernel command loop instead. A broken or unsigned shell.elf must never cost
+ * the user their login.
+ *
+ * `exit` in the ring-3 shell therefore means LOGOUT: the process exits, this
+ * function returns, and the session loop in shell_task falls back around to
+ * the login prompt. That is the whole reason logout works at all without a
+ * session syscall — the ring-3 shell cannot return to a login prompt by
+ * itself, but its parent can.
+ *
+ * CREDENTIALS: task_create_user hardcodes uid 1000 for every user task, so a
+ * root login would otherwise be silently demoted to a regular user. The child
+ * inherits this session's credentials instead, set before it is made runnable
+ * for the same reason sys_spawn sets parentage first — after
+ * scheduler_add_task the child can run on the very next tick.
+ *
+ * @return 0 on logout (ring-3 shell ran and exited), 1 if it asked to hand
+ *         over to the kernel command loop, negative if it could not be run
+ *---------------------------------------------------------------------------*/
+static int launch_login_shell(void) {
+    const char* path = "/shell.elf";
+    const char* name = "shell.elf";
+    const char* child_argv[1] = { name };
+
+    const char* err = NULL;
+    int pid = elf_exec_from_path(path, name, 1, child_argv, &err);
+    if (pid < 0) {
+        kprintf("[SHELL] ring-3 shell unavailable (%s); using the kernel shell\n",
+                err ? err : "failed to load");
+        return -1;
+    }
+
+    task_t* task = task_get((uint32_t)pid);
+    if (!task) {
+        /* Built, then the slot vanished before we could schedule it. Reap
+         * rather than leak a fully-constructed process, and fall back. */
+        kprintf("[SHELL] ring-3 shell vanished during load; using the kernel shell\n");
+        task_terminate((uint32_t)pid);
+        return -1;
+    }
+
+    /* Run as whoever just logged in, not as the hardcoded uid 1000. */
+    task_t* self = scheduler_get_current_task();
+    if (self) {
+        task->uid  = self->uid;
+        task->gid  = self->gid;
+        task->euid = self->euid;
+        task->egid = self->egid;
+
+        /* Parentage so the child's own waitpid/jobs bookkeeping matches, and
+         * streams so its output reaches this session's console. */
+        task->parent_pid = self->pid;
+        task->parent_generation = self->generation;
+        streams_inherit(&task->streams, get_current_streams());
+    }
+
+    scheduler_add_task(task);
+
+    /* Block on the same wait-queue path userspace waitpid() uses. The return
+     * value is the child's exit status (0..255), which is how the ring-3
+     * shell's `kshell` asks for the kernel loop. */
+    int status = sys_waitpid(pid);
+
+    task_t* child = task_get((uint32_t)pid);
+    if (child && child->state == TASK_STATE_TERMINATED) {
+        CRITICAL_SECTION_ENTER();
+        scheduler_remove_task(child);
+        CRITICAL_SECTION_EXIT();
+    }
+
+    /* A negative return is a waitpid error, not a status; treat it as a plain
+     * exit rather than letting -Exxx be mistaken for a request. */
+    if (status == SHELL_EXIT_WANT_KERNEL_SHELL) {
+        return 1;
+    }
+    return 0;
+}
+
 void shell_task(void) {
     kprintf("[SHELL] Shell task started! (ESP check)\n");
 
@@ -1010,6 +1108,26 @@ void shell_task(void) {
         kprintf("|  Welcome Home!       |\n");
         kprintf("------------------------\n");
         kprintf("\n");
+
+        /* The ring-3 shell is the default login shell. It blocks until the
+         * user exits it, which IS the logout — control lands back here and the
+         * session loop restarts at the login prompt.
+         *
+         * On failure (missing/unsigned/unloadable shell.elf) we fall through
+         * to the kernel command loop below, so the system stays usable. The
+         * kernel shell is also still reachable on purpose: the ring-3 shell
+         * has none of the privileged commands yet, so a user who needs
+         * `shutdown` or `useradd` types `kshell` to drop into this loop. */
+        if (launch_login_shell() == 0) {
+            /* Ring-3 shell exited => logout. Skip the kernel command loop and
+             * go straight back to the login prompt. */
+            console_clear();
+            kprintf("\n");
+            continue;
+        }
+        /* Either the ring-3 shell could not run, or the user typed `kshell`.
+         * Both land in the kernel command loop below. */
+
         kprintf("$ ");
 
         buffer_pos = 0;

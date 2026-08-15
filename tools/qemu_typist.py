@@ -159,7 +159,26 @@ def main():
     end = wait_for("create a regular user now? (y/n):", timeout=180, since=end)
     type_str(sock, "n\n")
 
-    # 4) At the shell, run the signed exec as the FIRST command
+    # 4) Login now lands in the RING-3 shell, which has ~13 builtins and knows
+    #    nothing of `exec`, pipes or redirection. Every harness except
+    #    verify-usershell.sh drives the kernel shell, so by default we type
+    #    `kshell` first to get there. Set TINYOS_STAY_IN_RING3=1 to skip it and
+    #    drive the ring-3 shell directly.
+    #
+    #    Doing this here rather than in each harness keeps the eight existing
+    #    harnesses working unchanged: the shell they target did not move, only
+    #    what login hands you first.
+    if os.environ.get("TINYOS_STAY_IN_RING3", "") != "1":
+        time.sleep(2)
+        print("typist: sending 'kshell' (switch to the kernel shell)")
+        mark = len(read_serial())
+        type_verified(sock, "kshell\n", timeout=60)
+        # Wait for the ring-3 shell to actually exit before typing at the
+        # kernel shell; "$" alone is no good as a marker, it is already all
+        # over the boot log.
+        wait_for("shell: exiting", timeout=120, since=mark)
+
+    # 5) At the shell, run the signed exec as the FIRST command
     #    (give the shell a beat to draw its prompt).
     #    Overridable so harnesses can exercise other binaries/paths
     #    (e.g. TINYOS_EXEC_CMD="exec C:/info.elf").

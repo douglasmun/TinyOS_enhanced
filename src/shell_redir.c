@@ -8,6 +8,7 @@
 #include "critical.h"
 #include "wait_queue.h"  /* NEW: For proper blocking pipe operations */
 #include "pmm.h"         /* NEW: For wait queue allocation */
+#include "paging.h"      /* pae_map_page() — identity-map the wq frame */
 #include "errno.h"       /* NEW: For EPIPE error code */
 #include <stddef.h>
 
@@ -303,6 +304,23 @@ void pipe_init(pipe_buffer_t* pipe) {
         pipe->writers = NULL;
         return;
     }
+
+    /*=========================================================================
+     * Identity-map the frame BEFORE writing through it.
+     *
+     * pmm_alloc() returns a PHYSICAL address, and the code below dereferences
+     * it directly. That only works while the boot identity map happens to
+     * cover the frame the allocator handed out — which is not an invariant.
+     * Once the ring-3 login shell runs before the first pipe, its address
+     * space is built and torn down first, so the allocator's free list has
+     * moved and a pipe can land on a frame whose PTE is not present. The
+     * write below then page-faults in KERNEL mode with no handler: panic.
+     *
+     * Same class as the boot-time RAMFS memset fault and the pae.c page-table
+     * allocator above; same fix, and it must stay ahead of the first write.
+     *=======================================================================*/
+    pae_map_page_into(pae_get_kernel_pdpt(), wq_page, (uint64_t)wq_page,
+                      PAE_PRESENT | PAE_READWRITE | PAE_NX);
 
     /* Readers wait queue at start of page */
     pipe->readers = (void*)(uintptr_t)wq_page;

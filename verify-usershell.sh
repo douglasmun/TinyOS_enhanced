@@ -2,15 +2,19 @@
 #
 # verify-usershell.sh — FULLY AUTOMATED check of the RING-3 shell (roadmap 4).
 #
-# Boots, logs in, and runs
+# Boots, logs in, and drives the ring-3 shell interactively through the QEMU
+# monitor. The shell under test is a USER process at ring 3, and every builtin
+# it runs reaches the filesystem only through the syscalls added in PRs
+# #43-#47.
 #
-#     exec /shell.elf
+# The ring-3 shell is now the DEFAULT LOGIN SHELL, so no `exec` is typed to
+# reach it: logging in must land straight in it. The first command below is an
+# ordinary ring-3 builtin (`pwd`), and the fact that it works at all is the
+# proof — under the old arrangement the kernel shell would have answered, and
+# the marker assertions below would not match its output.
 #
-# then drives the ring-3 shell interactively through the QEMU monitor. This is
-# the first migration step: the shell under test is a USER process at ring 3,
-# and every builtin it runs reaches the filesystem only through the syscalls
-# added in PRs #43-#47. The kernel shell is untouched and still the default —
-# it is what launches this one.
+# The kernel shell remains reachable as a fallback (`kshell`) because the
+# ring-3 shell does not yet cover the privileged commands.
 #
 # What makes this different from verify-fsyscalls.sh: fileio.elf is a fixed
 # program running a scripted sequence. Here the commands arrive as KEYSTROKES
@@ -28,6 +32,11 @@
 #   - `/hello.elf`         — spawn + waitpid: a ring-3 shell starting a ring-3
 #                            child and being woken when it exits.
 #   - `exit`               — the loop terminates and the process is reaped.
+#   - `kshell` + `whoami`  — the fallback works. This is the safety property
+#                            of making a 13-builtin shell the default: the
+#                            ~70-command kernel shell must stay reachable.
+#                            `whoami` exists ONLY there, so its output proves
+#                            the handover landed in the kernel shell.
 #
 # Exit 0 = PASS, non-zero = FAIL/INCONCLUSIVE.  Logs: usershell.log (serial),
 # usershell-trace.log (int/cpu_reset trace).
@@ -82,8 +91,9 @@ echo "==> Driving the boot flow (slow under TCG; be patient)..."
 TINYOS_PASSWORD="$PASSWORD" \
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
-TINYOS_EXEC_CMD="exec /shell.elf" \
-TINYOS_EXPECT="type 'help'" \
+TINYOS_STAY_IN_RING3=1 \
+TINYOS_EXEC_CMD="pwd" \
+TINYOS_EXPECT="D:/" \
 TINYOS_FOLLOWUP_CMDS="\
 cd /scratch=>D:/scratch;\
 mkdir usdir;\
@@ -96,7 +106,9 @@ rmdir usdir=>directory not empty;\
 rm usdir/f.txt;\
 rmdir usdir;\
 /hello.elf shellarg=>argv[1]=shellarg;\
-exit=>shell: exiting" \
+kshell=>Switching to the kernel shell;\
+whoami=>root;\
+logout=>login" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
@@ -148,15 +160,30 @@ l_busy=$(grep -n "directory not empty" "$SERIAL" 2>/dev/null | head -1 | cut -d:
 # spawn + waitpid from ring 3, with argv reaching the child's main().
 l_spawn=$(grep -n "argv\[1\]=shellarg" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 l_exit=$(grep -n "shell: exiting" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+# The kernel shell answered after `kshell`. `whoami` is a KERNEL-shell command
+# the ring-3 shell does not have, so its output proves the handover really
+# landed there rather than the ring-3 shell continuing to run.
+# Anchored at the start only: serial lines carry a trailing CR, so "^root$"
+# would never match.
+l_kshell=$(grep -n "^root[[:space:]]*$" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+
+# The ring-3 shell must have appeared with NO `exec` typed. The typist's first
+# command is an ordinary builtin, so if the banner shows up before any exec of
+# shell.elf, login went straight into it. A stray "exec /shell.elf" in the log
+# would mean the harness, not the kernel, put us there.
+if grep -q "exec /shell.elf" "$SERIAL" 2>/dev/null; then
+    echo "RESULT: FAIL — shell.elf was exec'd explicitly; this harness must prove it is the DEFAULT login shell"
+    exit 1
+fi
 
 if [ -z "$l_start" ] || [ -z "$l_cd" ] || [ -z "$l_cat" ] || [ -z "$l_ls" ] \
    || [ -z "$l_lsdir" ] || [ -z "$l_stat" ] || [ -z "$l_busy" ] \
-   || [ -z "$l_spawn" ] || [ -z "$l_exit" ]; then
+   || [ -z "$l_spawn" ] || [ -z "$l_exit" ] || [ -z "$l_kshell" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC)"
     echo "  start=${l_start:-none} cd=${l_cd:-none} cat=${l_cat:-none}" \
          "ls=${l_ls:-none} lsdir=${l_lsdir:-none} stat=${l_stat:-none}" \
          "rmdir-refused=${l_busy:-none} spawn=${l_spawn:-none}" \
-         "exit=${l_exit:-none}"
+         "exit=${l_exit:-none} kshell=${l_kshell:-none}"
     echo "--- tail of $SERIAL ---"
     grep -v "Suspicious" "$SERIAL" | tail -30
     exit 2
@@ -164,14 +191,14 @@ fi
 
 if [ "$TYPIST_RC" -eq 0 ] && [ "$l_cd" -gt "$l_start" ] \
    && [ "$l_busy" -gt "$l_cat" ] && [ "$l_spawn" -gt "$l_busy" ] \
-   && [ "$l_exit" -gt "$l_spawn" ]; then
-    echo "RESULT: PASS — the ring-3 shell ran builtins, refused rmdir on a non-empty dir, spawned a child with argv, and exited"
-    grep -E "TinyOS shell \(ring 3\)|D:/scratch|rs-ok|usdir|argv\[1\]=|shell: exiting" "$SERIAL" | head -25
+   && [ "$l_exit" -gt "$l_spawn" ] && [ "$l_kshell" -gt "$l_exit" ]; then
+    echo "RESULT: PASS — login landed directly in the ring-3 shell, which ran builtins, refused rmdir on a non-empty dir, spawned a child with argv, and handed over to the kernel shell on 'kshell'"
+    grep -E "TinyOS shell \(ring 3\)|D:/scratch|rs-ok|usdir|argv\[1\]=|shell: exiting|Switching to the kernel shell" "$SERIAL" | head -25
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; out of order:" \
          "start=$l_start cd=$l_cd cat=$l_cat busy=$l_busy" \
-         "spawn=$l_spawn exit=$l_exit)"
+         "spawn=$l_spawn exit=$l_exit kshell=$l_kshell)"
     grep -v "Suspicious" "$SERIAL" | tail -30
     exit 2
 fi

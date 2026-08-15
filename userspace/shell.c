@@ -70,10 +70,17 @@ static void cmd_help(void) {
           "  write <f> <text>  write text to a file (truncates)\n"
           "  getpid            print this shell's pid\n"
           "  id                print uid and gid\n"
-          "  exit [status]     leave the shell\n"
+          "  kshell            switch to the kernel shell (see below)\n"
+          "  exit / logout     log out and return to the login prompt\n"
           "\n"
           "Anything else is run as a program: a name containing '/' or ending\n"
-          "in .elf is spawned, and the shell waits for it unless it ends '&'.\n");
+          "in .elf is spawned, and the shell waits for it unless it ends '&'.\n"
+          "\n"
+          "This shell runs at ring 3 and reaches the system only through\n"
+          "syscalls. It does not yet cover everything: user management,\n"
+          "shutdown/reboot, ps/top/kill, the security tooling, networking,\n"
+          "pipes and redirection still live in the kernel shell. Type\n"
+          "`kshell` to get there.\n");
 }
 
 static void cmd_echo(int argc, char** argv) {
@@ -337,6 +344,18 @@ static int dispatch(int argc, char** argv, int background, int* status) {
         return 1;
     }
 
+    /* Hand this session over to the kernel shell, which still owns everything
+     * privileged (users, shutdown, ps/kill, security tooling, networking) plus
+     * pipes and redirection. We cannot set a flag in the kernel from here, so
+     * the request travels as the exit status: the parent recognises 70 and
+     * runs its own command loop instead of returning to the login prompt.
+     * Keep in sync with SHELL_EXIT_WANT_KERNEL_SHELL in src/shell.c. */
+    if (strcmp(cmd, "kshell") == 0) {
+        print("Switching to the kernel shell; `logout` there returns to login.\n");
+        *status = 70;
+        return 1;
+    }
+
     if (strcmp(cmd, "help") == 0)   { cmd_help();               return 0; }
     if (strcmp(cmd, "echo") == 0)   { cmd_echo(argc, argv);     return 0; }
     if (strcmp(cmd, "pwd") == 0)    { cmd_pwd();                return 0; }
@@ -372,7 +391,8 @@ int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    print("\nTinyOS shell (ring 3) - type 'help' for builtins, 'exit' to leave\n");
+    print("\nTinyOS shell (ring 3) - 'help' for builtins, 'kshell' for the "
+          "kernel shell, 'exit' to log out\n");
 
     char line[MAX_LINE];
     char* args[MAX_ARGS];
@@ -413,6 +433,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* "shell: exiting" is load-bearing — verify-usershell.sh greps for it.
+     * Keep it byte-identical. */
     print("shell: exiting\n");
     return status;
 }
