@@ -30,13 +30,51 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
    from the shell) and `cmd_write` routes an explicit `X:` prefix through the
    VFS. Harness: `verify-fat32-write.sh` (boots twice against ONE disk image;
    boot 2 must re-read the file and see a non-zero `fatls` size).
-   Still root-directory-only. **NEXT: item 4.**
-4. **Userspace shell** (capstone, depends on 1–3 — now all done).
+   Still root-directory-only.
+4. **Userspace shell** (capstone, depends on 1–3 — now all done). **IN PROGRESS
+   — syscall foundation only.** The kernel shell is untouched and stays the
+   default; nothing has migrated to ring 3 yet. What a userspace shell needs
+   from the kernel is landing first, one syscall group per PR:
+   - PR #43 — per-process **fd table** + `SYS_OPEN`/`SYS_CLOSE`/`SYS_READDIR`/
+     `SYS_STAT` (19–22).
+   - PR #44 — `SYS_LSEEK` (24).
+   - PR #45 — `SYS_MKDIR`/`SYS_RMDIR`/`SYS_UNLINK` (25–27), plus a `.unlink` op
+     in `file_operations_t` and `vfs_unlink`. Wiring was the small half: both
+     drivers already had mkdir/rmdir/unlink but **nothing outside the driver
+     files ever called them** — FAT32's ops table exposed none of the three —
+     so they were dead code carrying serious bugs that ring-3 reachability
+     would have turned into corruption primitives. `fat32_rmdir` was literally
+     `return fat32_unlink(path);` (no is-directory check, no emptiness check —
+     it freed a directory's cluster chain while entries inside still pointed at
+     those clusters); `fat32_unlink` matched on name alone so it deleted
+     directories and **open** files; `fat32_mkdir` appended a duplicate dirent
+     for an existing name, leaked the just-allocated cluster on every failure
+     path after `allocate_cluster` (which marks it EOC **on disk**), and
+     ignored the dirent-writeback return so it reported *success* for a
+     directory that never reached the disk. All fixed in the same PR as the
+     syscalls, deliberately — see "RAMFS node ownership" below for the other
+     half. Harness: `verify-fsyscalls.sh` (covers **both** D: and C:; the
+     refusal cases run on C: because that is where the dangerous bugs lived).
+   Remaining before the shell itself: `SYS_GETCWD`/`SYS_CHDIR` (per-process cwd
+   — everything above is absolute-path only), and FAT32 subdirectories (still
+   root-directory-only, so `mkdir C:/a/b` cannot work).
 
 Hygiene: the three exec-path items are **done** (failure paths now restore CR3
 then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard
 page armed via a new `user_guard_page_virt` field — CR2 is virtual for user
 faults). **AUDIT-8E IDS-not-wired gap is still open.**
+
+**RAMFS node ownership (PR #45)**: `alloc_node` used to hardcode `uid = gid = 0`.
+That was invisible while only the kernel created nodes, but the default modes are
+**0700 dirs / 0600 files** (owner-only, deliberate hardening — and there is **no
+sticky bit**, by design), so once ring 3 could `mkdir`, a uid-1000 process got a
+root-owned directory back and then `EACCES` opening its own directory. `alloc_node`
+now takes the creator's credentials. The root node stays explicitly root-owned, and
+boot-time setup still yields root-owned system binaries because it runs with no
+current task (`ramfs_get_current_credentials` falls back to uid/gid 0). This
+affected file creation too, not just mkdir. Corollary: a 0777 RAMFS directory
+(e.g. the `/scratch` created at boot for the harness) permits cross-user deletion —
+a real property of the model, not an oversight.
 
 **`MAX_SYSCALL_NUM` must cover the highest syscall number**, not the highest in
 its own comment block. It sat at 16 while `SYS_SLEEP` (17) and `SYS_WAITPID`
