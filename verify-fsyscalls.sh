@@ -97,7 +97,7 @@ fi
 
 # Any of the program's own failure lines is a hard FAIL — it got far enough to
 # report, so this is a real defect, not an inconclusive run.
-if grep -qE "fileio: (open for write failed|open for read failed|opendir failed|read failed|readdir failed|short write|content MISMATCH|stale fd accepted|marker\.txt NOT|fileio-test\.txt NOT|fat32 opendir failed|fat32 readdir failed|fat32 partial record|fat32 subdir wrongly accepted|getcwd failed|getcwd accepted a short buffer|chdir failed|relative create failed|relative create did not land in the cwd|absolute path broken by cwd|chdir \.\. failed|relative chdir failed|relative unlink failed|chdir to missing dir accepted|failed chdir moved cwd|chdir to a file accepted|chdir to a FAT32 subdirectory accepted|chdir to C:/ failed|chdir back to D:/ failed)" "$SERIAL" 2>/dev/null; then
+if grep -qE "fileio: (open for write failed|open for read failed|opendir failed|read failed|readdir failed|short write|content MISMATCH|stale fd accepted|marker\.txt NOT|fileio-test\.txt NOT|fat32 opendir failed|fat32 readdir failed|fat32 partial record|fat32 subdir wrongly accepted|getcwd failed|getcwd accepted a short buffer|chdir failed|relative create failed|relative create did not land in the cwd|absolute path broken by cwd|chdir \.\. failed|relative chdir failed|relative unlink failed|chdir to missing dir accepted|failed chdir moved cwd|chdir to a file accepted|chdir to a missing FAT32 directory accepted|chdir to C:/ failed|chdir back to D:/ failed|fat32 mkdir SUBA failed|fat32 nested mkdir failed|fat32 mkdir under missing parent accepted|fat32 create SUBFILE failed|fat32 mkdir under a file accepted|fat32 nested create failed|fat32 nested write short|fat32 nested reopen failed|fat32 nested read got|fat32 nested content|fat32 nested stat failed|fat32 nested stat size|fat32 nested file also visible in root|fat32 subdir open failed|fat32 subdir listing missing|fat32 O_DIRECTORY on a file accepted|fat32 chdir into subdir failed|fat32 cwd is|fat32 relative open in subdir failed|fat32 chdir back to D:/ failed|fat32 rmdir of non-empty parent accepted|fat32 rmdir of non-empty subdir accepted|fat32 nested unlink failed|fat32 nested rmdir failed|fat32 parent rmdir failed)" "$SERIAL" 2>/dev/null; then
     echo "RESULT: FAIL — fileio.elf reported an error"
     grep "fileio:" "$SERIAL" | tail -10
     exit 1
@@ -139,20 +139,26 @@ l_ns=$(grep -n "fileio: namespace ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: 
 # getcwd/chdir, and — the actual point of a cwd — relative paths resolving
 # through it: a file created as "cwdfile.txt" must land in the cwd, an absolute
 # path must ignore the cwd, ".." must clamp at the drive root, a failed chdir
-# must leave the cwd untouched, and a FAT32 subdirectory must be refused
-# (root-directory-only driver) rather than silently accepted.
+# must leave the cwd untouched, and a MISSING FAT32 directory must be refused
+# rather than silently accepted.
 l_cwd=$(grep -n "fileio: cwd ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+# FAT32 subdirectories: nested mkdir, I/O through a nested path, that the
+# nested file is NOT also visible in the root (the exact failure mode of the
+# old path-as-one-filename behaviour), subdirectory listing, chdir into a
+# subdir with relative resolution, and the refusals (missing parent, parent
+# that is a file, O_DIRECTORY on a file, rmdir of a non-empty directory).
+l_sub=$(grep -n "fileio: fat32 subdirs ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 l_done=$(grep -n "fileio: done" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$l_wfd" ] || [ -z "$l_back" ] || [ -z "$l_dir" ] || [ -z "$l_fat" ] \
    || [ -z "$l_stat" ] || [ -z "$l_seek" ] || [ -z "$l_ns" ] \
-   || [ -z "$l_cwd" ] || [ -z "$l_done" ]; then
+   || [ -z "$l_cwd" ] || [ -z "$l_sub" ] || [ -z "$l_done" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC)"
     echo "  write fd=${l_wfd:-none} readback=${l_back:-none}" \
          "readdir=${l_dir:-none} fat32=${l_fat:-none} stat=${l_stat:-none}" \
          "seek=${l_seek:-none} fat32ns=${l_fatns:-none}" \
          "namespace=${l_ns:-none}" "cwd=${l_cwd:-none}" \
-         "done=${l_done:-none}"
+         "subdirs=${l_sub:-none}" "done=${l_done:-none}"
     echo "--- tail of $SERIAL ---"
     grep -v "Suspicious" "$SERIAL" | tail -30
     exit 2
@@ -187,14 +193,16 @@ fi
 if [ "$TYPIST_RC" -eq 0 ] && [ "$l_back" -gt "$l_wfd" ] && [ "$l_fat" -gt "$l_dir" ] \
    && [ "$l_stat" -gt "$l_fat" ] && [ "$l_seek" -gt "$l_stat" ] \
    && [ "$l_fatns" -gt "$l_seek" ] && [ "$l_ns" -gt "$l_fatns" ] \
-   && [ "$l_cwd" -gt "$l_ns" ] && [ "$l_done" -gt "$l_cwd" ]; then
-    echo "RESULT: PASS — ring-3 open/write/read/readdir/stat/lseek/mkdir/rmdir/unlink/getcwd/chdir work on both D: and C: (fd=$wfd)"
-    grep "fileio:" "$SERIAL" | head -25
+   && [ "$l_cwd" -gt "$l_ns" ] && [ "$l_sub" -gt "$l_cwd" ] \
+   && [ "$l_done" -gt "$l_sub" ]; then
+    echo "RESULT: PASS — ring-3 open/write/read/readdir/stat/lseek/mkdir/rmdir/unlink/getcwd/chdir work on both D: and C:, including nested FAT32 subdirectories (fd=$wfd)"
+    grep "fileio:" "$SERIAL" | head -40
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; out of order:" \
          "wfd=$l_wfd back=$l_back dir=$l_dir fat32=$l_fat stat=$l_stat" \
-         "seek=$l_seek fat32ns=$l_fatns namespace=$l_ns done=$l_done)"
+         "seek=$l_seek fat32ns=$l_fatns namespace=$l_ns cwd=$l_cwd" \
+         "subdirs=$l_sub done=$l_done)"
     grep -v "Suspicious" "$SERIAL" | tail -30
     exit 2
 fi

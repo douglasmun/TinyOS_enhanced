@@ -651,8 +651,9 @@ static int do_cwd(void) {
         return -1;
     }
 
-    /* C: root is reachable; a FAT32 SUBdirectory is not (root-directory-only
-     * driver), and must be refused rather than silently accepted. */
+    /* C: root is reachable. A nonexistent FAT32 directory must still be
+     * refused — subdirectories work now, so this checks existence rather than
+     * the old blanket "no subdirectories" rule. */
     if (chdir("C:/") < 0) {
         print("fileio: chdir to C:/ failed\n");
         return -1;
@@ -662,7 +663,7 @@ static int do_cwd(void) {
         return -1;
     }
     if (chdir("C:/NOPE") >= 0) {
-        print("fileio: chdir to a FAT32 subdirectory accepted\n");
+        print("fileio: chdir to a missing FAT32 directory accepted\n");
         return -1;
     }
 
@@ -673,6 +674,197 @@ static int do_cwd(void) {
     }
 
     print("fileio: cwd ok\n");
+    return 0;
+}
+
+/*=============================================================================
+ * FAT32 subdirectories.
+ *
+ * Everything above operates on C:'s root, which is all the driver could reach:
+ * create/mkdir/rmdir/unlink each took the whole path as one filename and acted
+ * on the root cluster unconditionally, so "C:/A/B" meant a root entry named
+ * "A/B" truncated to 8 characters. This stage exercises the nesting itself —
+ * creation at depth, I/O through a nested path, listing, and the refusals that
+ * must survive.
+ *===========================================================================*/
+static int do_fat32_subdirs(void) {
+    int rc;
+    char buf[64];
+
+    /* Clean up anything a previous run left behind. Deepest first: a
+     * non-empty directory cannot be removed. */
+    unlink("C:/SUBA/SUBB/DEEP.TXT");
+    rmdir("C:/SUBA/SUBB");
+    rmdir("C:/SUBA");
+
+    rc = mkdir("C:/SUBA");
+    if (rc < 0) {
+        printf("fileio: fat32 mkdir SUBA failed %d\n", rc);
+        return -1;
+    }
+
+    /* The nested mkdir: previously impossible. */
+    rc = mkdir("C:/SUBA/SUBB");
+    if (rc < 0) {
+        printf("fileio: fat32 nested mkdir failed %d\n", rc);
+        return -1;
+    }
+
+    /* mkdir under a MISSING parent must fail rather than silently landing in
+     * the root, which is what the old path-as-one-name behaviour did. */
+    if (mkdir("C:/NOSUCH/CHILD") >= 0) {
+        print("fileio: fat32 mkdir under missing parent accepted\n");
+        return -1;
+    }
+
+    /* A parent that is a FILE, not a directory, must also be refused. */
+    int probe = open("C:/SUBFILE.TXT", O_WRONLY | O_CREAT | O_TRUNC);
+    if (probe < 0) {
+        printf("fileio: fat32 create SUBFILE failed %d\n", probe);
+        return -1;
+    }
+    close(probe);
+    if (mkdir("C:/SUBFILE.TXT/CHILD") >= 0) {
+        print("fileio: fat32 mkdir under a file accepted\n");
+        return -1;
+    }
+
+    /* Write through a nested path, then read it back after a close — this is
+     * what proves the dirent was written into the SUBdirectory's cluster and
+     * not the root's. */
+    int fd = open("C:/SUBA/SUBB/DEEP.TXT", O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        printf("fileio: fat32 nested create failed %d\n", fd);
+        return -1;
+    }
+    if (write(fd, "deep-ok", 7) != 7) {
+        print("fileio: fat32 nested write short\n");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    fd = open("C:/SUBA/SUBB/DEEP.TXT", O_RDONLY);
+    if (fd < 0) {
+        printf("fileio: fat32 nested reopen failed %d\n", fd);
+        return -1;
+    }
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n != 7) {
+        printf("fileio: fat32 nested read got %d\n", n);
+        return -1;
+    }
+    buf[n] = '\0';
+    if (strcmp(buf, "deep-ok") != 0) {
+        printf("fileio: fat32 nested content '%s'\n", buf);
+        return -1;
+    }
+
+    /* stat must resolve the nested path and report the real size. A stat that
+     * silently searched the root would report ENOENT here. */
+    dirent_t st;
+    rc = stat("C:/SUBA/SUBB/DEEP.TXT", &st, sizeof(st));
+    if (rc < 0) {
+        printf("fileio: fat32 nested stat failed %d\n", rc);
+        return -1;
+    }
+    if (st.size != 7) {
+        printf("fileio: fat32 nested stat size=%u\n", st.size);
+        return -1;
+    }
+
+    /* The nested file must NOT appear in the root — the whole failure mode
+     * this stage exists to catch. */
+    if (stat("C:/DEEP.TXT", &st, sizeof(st)) >= 0) {
+        print("fileio: fat32 nested file also visible in root\n");
+        return -1;
+    }
+
+    /* Enumerate the subdirectory: DEEP.TXT plus "." and "..". */
+    int dfd = open("C:/SUBA/SUBB", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        printf("fileio: fat32 subdir open failed %d\n", dfd);
+        return -1;
+    }
+    dirent_t ents[8];
+    int found_deep = 0;
+    for (;;) {
+        int got = readdir(dfd, ents, sizeof(ents));
+        if (got <= 0) {
+            break;
+        }
+        int count = got / (int)sizeof(dirent_t);
+        for (int i = 0; i < count; i++) {
+            if (strcmp(ents[i].name, "DEEP.TXT") == 0) {
+                found_deep = 1;
+            }
+        }
+    }
+    close(dfd);
+    if (!found_deep) {
+        print("fileio: fat32 subdir listing missing DEEP.TXT\n");
+        return -1;
+    }
+
+    /* Opening a FILE with O_DIRECTORY must fail rather than enumerate. */
+    if (open("C:/SUBA/SUBB/DEEP.TXT", O_RDONLY | O_DIRECTORY) >= 0) {
+        print("fileio: fat32 O_DIRECTORY on a file accepted\n");
+        return -1;
+    }
+
+    /* chdir into a FAT32 subdirectory now works, and relative paths resolve
+     * against it. This is what the old -ENOSYS gate refused outright. */
+    if (chdir("C:/SUBA/SUBB") < 0) {
+        print("fileio: fat32 chdir into subdir failed\n");
+        return -1;
+    }
+    if (getcwd(buf, sizeof(buf)) < 0 || strcmp(buf, "C:/SUBA/SUBB") != 0) {
+        printf("fileio: fat32 cwd is '%s'\n", buf);
+        return -1;
+    }
+    fd = open("DEEP.TXT", O_RDONLY);
+    if (fd < 0) {
+        printf("fileio: fat32 relative open in subdir failed %d\n", fd);
+        return -1;
+    }
+    close(fd);
+
+    if (chdir("D:/") < 0) {
+        print("fileio: fat32 chdir back to D:/ failed\n");
+        return -1;
+    }
+
+    /* A non-empty directory must still be refused — the check that rmdir
+     * exists for, now that there is real nesting to get it wrong. */
+    if (rmdir("C:/SUBA") >= 0) {
+        print("fileio: fat32 rmdir of non-empty parent accepted\n");
+        return -1;
+    }
+    if (rmdir("C:/SUBA/SUBB") >= 0) {
+        print("fileio: fat32 rmdir of non-empty subdir accepted\n");
+        return -1;
+    }
+
+    /* Tear down deepest-first; each step must succeed. */
+    rc = unlink("C:/SUBA/SUBB/DEEP.TXT");
+    if (rc < 0) {
+        printf("fileio: fat32 nested unlink failed %d\n", rc);
+        return -1;
+    }
+    rc = rmdir("C:/SUBA/SUBB");
+    if (rc < 0) {
+        printf("fileio: fat32 nested rmdir failed %d\n", rc);
+        return -1;
+    }
+    rc = rmdir("C:/SUBA");
+    if (rc < 0) {
+        printf("fileio: fat32 parent rmdir failed %d\n", rc);
+        return -1;
+    }
+    unlink("C:/SUBFILE.TXT");
+
+    print("fileio: fat32 subdirs ok\n");
     return 0;
 }
 
@@ -689,6 +881,7 @@ int main(int argc, char** argv) {
     if (do_seek() < 0) return 1;
     if (do_namespace() < 0) return 1;
     if (do_cwd() < 0) return 1;
+    if (do_fat32_subdirs() < 0) return 1;
 
     /* A never-opened fd must not resolve to anything. The VFS fd pool is
      * system-wide, so if the table leaked raw VFS numbers this could name

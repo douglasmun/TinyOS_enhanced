@@ -30,7 +30,7 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
    from the shell) and `cmd_write` routes an explicit `X:` prefix through the
    VFS. Harness: `verify-fat32-write.sh` (boots twice against ONE disk image;
    boot 2 must re-read the file and see a non-zero `fatls` size).
-   Still root-directory-only.
+   Subdirectories landed later — see PR #47 under item 4.
 4. **Userspace shell** (capstone, depends on 1–3 — now all done). **IN PROGRESS
    — syscall foundation only.** The kernel shell is untouched and stays the
    default; nothing has migrated to ring 3 yet. What a userspace shell needs
@@ -55,9 +55,33 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      syscalls, deliberately — see "RAMFS node ownership" below for the other
      half. Harness: `verify-fsyscalls.sh` (covers **both** D: and C:; the
      refusal cases run on C: because that is where the dangerous bugs lived).
-   Remaining before the shell itself: `SYS_GETCWD`/`SYS_CHDIR` (per-process cwd
-   — everything above is absolute-path only), and FAT32 subdirectories (still
-   root-directory-only, so `mkdir C:/a/b` cannot work).
+   - PR #46 — `SYS_GETCWD`/`SYS_CHDIR` (28–29) + per-process cwd, so relative
+     paths resolve. The blocker was POSIX **r vs x**: RAMFS's hardened 0700
+     root made a process's own default cwd (`D:/`) unreachable to uid 1000 —
+     `chdir` needs only *search*, not *read*. Fixed with a new `.access_dir`
+     VFS op (deliberately **not** `vfs_stat`, which demands r), a new
+     `RAMFS_FLAG_EXEC`, and `/` at **0711** (searchable, still unlistable to
+     non-root). Note a NULL `.access_dir` means *permitted* — fine for a driver
+     with no ownership model, but FAT32 still needs its own op so `chdir` to a
+     missing path is refused.
+   - PR #47 — **FAT32 subdirectories**, which lifts the `-ENOSYS` `chdir` gate
+     on non-root C: paths. Reads were already nested-capable (`fat32_open` and
+     `find_dir_entry` walk components and full cluster chains); the whole gap
+     was that every *mutating* op and the listing took the entire path as one
+     filename and acted on `root_dir_cluster` unconditionally — so `C:/A/B`
+     meant a root entry named `A/B` truncated to 8 chars. One shared
+     `resolve_parent_dir()` closed it. Directories now also **grow past one
+     cluster** (`dir_find_free_slot` allocates and rolls back on write
+     failure), and three latent bugs that subdirectory reachability would have
+     turned live were fixed in the same change: one-cluster-only duplicate
+     scans (the same duplicate-dirent corruption class already fixed twice in
+     this file), `fat32_mkdir` skipping the 8.3 extension split and hardcoding
+     `..` to the root, and `fat32_unlink` not skipping LFN entries. Unlink and
+     rmdir now clear the dirent **before** freeing the chain — a dangling name
+     is more dangerous than a leaked chain. `fat32_list_root_cb` is now a
+     wrapper over `fat32_list_dir_cb(path, ...)`; `cmd_fatls` takes a path.
+   Remaining before the shell itself: nothing in the kernel — the syscall
+   foundation is complete. Next is migrating the shell itself to ring 3.
 
 Hygiene: the three exec-path items are **done** (failure paths now restore CR3
 then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard

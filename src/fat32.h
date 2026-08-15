@@ -173,4 +173,10 @@ typedef void (*fat32_dir_emit_t)(void* ctx, const char* name, uint32_t size, boo
  * Returns 0 on success, -1 if not mounted / on read error. */
 int fat32_list_root_cb(fat32_dir_emit_t emit, void* ctx);
 
+/* Walk any directory by path ("" or "/" means the root), delivering each
+ * visible entry to `emit`. Returns 0 on success, -1 if not mounted / not
+ * found / on read error, -2 if the path names a file rather than a
+ * directory. */
+int fat32_list_dir_cb(const char* path, fat32_dir_emit_t emit, void* ctx);
+
 #endif // FAT32_H

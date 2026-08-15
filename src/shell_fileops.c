@@ -1648,12 +1648,28 @@ static void fatls_stream_emit(void* ctx, const char* name, uint32_t size, bool i
 }
 
 void cmd_fatls(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-
     stream_context_t* ctx = get_current_streams();
-    stream_printf(ctx, "Contents of C: drive (FAT32):\n");
-    if (fat32_list_root_cb(fatls_stream_emit, ctx) != 0) {
-        stream_printf(ctx, "ls: cannot read C: (FAT32 not mounted or read error)\n");
+
+    /* An optional path argument selects a subdirectory; with no argument the
+     * root is listed, as before. "C:" is accepted and stripped so both
+     * `fatls C:/SUB` and `fatls /SUB` work. */
+    const char* path = "/";
+    if (argc > 1 && argv[1]) {
+        path = argv[1];
+        if ((path[0] == 'C' || path[0] == 'c') && path[1] == ':') {
+            path += 2;
+        }
+        if (path[0] == '\0') {
+            path = "/";
+        }
+    }
+
+    stream_printf(ctx, "Contents of C:%s (FAT32):\n", path);
+
+    int rc = fat32_list_dir_cb(path, fatls_stream_emit, ctx);
+    if (rc == -2) {
+        stream_printf(ctx, "ls: %s is not a directory\n", path);
+    } else if (rc != 0) {
+        stream_printf(ctx, "ls: cannot read C:%s (not mounted, or no such directory)\n", path);
     }
 }
