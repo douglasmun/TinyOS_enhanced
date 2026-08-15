@@ -159,3 +159,5 @@ fat32w-boot2.log
 fat32w-boot2-trace.log
 fsyscalls.log
 fsyscalls-trace.log
+usershell.log
+usershell-trace.log

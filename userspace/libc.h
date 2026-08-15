@@ -122,8 +122,8 @@ int  unlink(const char* path);
  * against it, so chdir("D:/scratch") then open("f.txt") opens
  * D:/scratch/f.txt. getcwd returns the length written (excluding the NUL) or
  * -ERANGE if the path does not fit — it never truncates, since a truncated
- * path names a different directory. chdir returns -ENOSYS for a FAT32
- * subdirectory: that driver only supports its root. */
+ * path names a different directory. chdir works at any depth on both drives;
+ * it needs only search (x) permission, not read. */
 int  getcwd(char* buf, unsigned int size);
 int  chdir(const char* path);
 int  putchar(int c);

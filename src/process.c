@@ -1132,10 +1132,10 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
      * past the mapping if that ever stops holding.
      *=======================================================================*/
     {
-        /* Bytes needed: strings + (argc + 1) pointers + argc itself + slack
-         * for 4-byte alignment of the pointer array. */
+        /* Bytes needed: strings + (argc + 1) pointers + argv + argc + slack
+         * for the 16-byte alignment of the final esp (see step 2). */
         size_t block_bytes = argv_bytes + ((size_t)argc + 1) * sizeof(uint32_t)
-                             + sizeof(uint32_t) + sizeof(uint32_t);
+                             + sizeof(uint32_t) + sizeof(uint32_t) + 15u;
         uint32_t stack_low = stack_base - ((uint32_t)stack_pages * 0x1000);
 
         if (task->user_stack < stack_low ||
@@ -1161,8 +1161,23 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
             user_argv_ptrs[i] = sp;
         }
 
-        /* 2. Align down so the pointer array is 4-byte aligned. */
-        sp &= ~0x3u;
+        /* 2. Align the block so the FINAL esp lands on a 16-byte boundary.
+         *
+         * This is load-bearing, not cosmetic: switch_to_user_mode in
+         * context_switch.S does `and eax, 0xFFFFFFF0` on the user ESP before
+         * building the iret frame (SSE wants a 16-aligned stack). That mask
+         * silently moves ESP DOWN by up to 15 bytes, so a block whose base is
+         * not already 16-aligned is skipped past — crt0 then reads argc from
+         * zeroed stack below the block and main() sees argc == 0 with a
+         * garbage argv. It looked intermittent because whether sp happened to
+         * land on 16 depends on the total length of the argument strings.
+         *
+         * Steps 3 and 4 push (argc + 1) pointers plus argv plus argc below
+         * this point, so bias the alignment by exactly that many bytes. */
+        {
+            uint32_t below = ((uint32_t)argc + 3u) * sizeof(uint32_t);
+            sp = ((sp - below) & ~0xFu) + below;
+        }
 
         /* 3. NULL terminator, then the pointers in reverse so argv[0] ends up
          *    lowest — i.e. the array reads forwards from the final address. */

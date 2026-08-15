@@ -67,9 +67,9 @@ fileio.elf: fileio.c libc.h $(LIBC_OBJS) user.ld
 	@echo "Built fileio.elf"
 
 # shell.elf provides its own _start and syscall wrappers
-shell.elf: shell.c user.ld
+shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c shell.c -o shell.o
-	$(LD) $(LDFLAGS) -o shell.elf shell.o -lgcc
+	$(LD) $(LDFLAGS) -o shell.elf crt0.o shell.o libc.o -lgcc
 	@echo "Built shell.elf"
 
 # ---------------------------------------------------------------------------
