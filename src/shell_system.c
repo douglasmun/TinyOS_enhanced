@@ -95,6 +95,12 @@ static bool safe_parse_int(const char* str, int* result) {
  * COMMAND: mem - Display memory usage
  *=============================================================================*/
 void cmd_mem(int argc, char* argv[]) {
+    /* Root only: the layout it prints (heap/stack bases, region addresses) is
+     * exactly what an attacker needs to defeat the ASLR this kernel implements. */
+    if (!require_root("mem")) {
+        return;
+    }
+
     /*=========================================================================
      * SECURITY FIX (v1.18): Enforce strict argument count
      *
@@ -133,6 +139,12 @@ void cmd_mem(int argc, char* argv[]) {
  * COMMAND: aslr - Display ASLR statistics
  *=============================================================================*/
 void cmd_aslr(int argc, char* argv[]) {
+    /* Root only: reporting the entropy and the randomized bases of the running
+     * system tells a local attacker how much guessing ASLR actually costs them. */
+    if (!require_root("aslr")) {
+        return;
+    }
+
     if (argc != 1) {
         kprintf("aslr: command takes no arguments\n");
         kprintf("Usage: aslr\n");
@@ -195,6 +207,12 @@ void cmd_aslr(int argc, char* argv[]) {
 void cmd_pae(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
+
+    /* Root only: this dumps page-directory and page-table PHYSICAL addresses,
+     * which hands a local attacker the kernel's memory map directly. */
+    if (!require_root("pae")) {
+        return;
+    }
 
     kprintf("\n=== PAE (Physical Address Extension) Status ===\n");
     kprintf("\nCPU Support:\n");
@@ -289,6 +307,12 @@ void cmd_pae(int argc, char* argv[]) {
 void cmd_wxaudit(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
+
+    /* Root only: a W^X violation report is a list of pages that are both
+     * writable and executable — i.e. where to put shellcode, ranked. */
+    if (!require_root("wxaudit")) {
+        return;
+    }
 
     /* Run PAE W^X audit */
     uint32_t violations = pae_wx_audit();
@@ -938,6 +962,19 @@ void cmd_auditlog(int argc, char* argv[]) {
         }
     }
 
+    /* Root only, and checked HERE rather than at function entry so that
+     * `auditlog --help` still works for anyone: usage text discloses nothing.
+     *
+     * Everything below this point does. The audit log records who logged in and
+     * when, which accounts exist, and which are locked -- and PR #55 exists
+     * precisely so an `su` cannot forge a clean root login in it. A log an
+     * unprivileged user can READ still leaks the account inventory and the
+     * administrator's activity pattern; -v additionally reports whether the
+     * HMAC chain is intact, which tells a tamperer whether they were caught. */
+    if (!require_root("auditlog")) {
+        return;
+    }
+
     /* Show statistics if requested */
     if (show_stats) {
         audit_stats_t stats;
@@ -1121,6 +1158,12 @@ void cmd_sectest(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
+    /* Root only: the suite exercises kernel internals and reports what it
+     * found, so its output doubles as a probe of the running system. */
+    if (!require_root("sectest")) {
+        return;
+    }
+
     kprintf("Starting security test suite...\n");
     run_security_tests();
 }
@@ -1187,6 +1230,6 @@ void cmd_secstatus(int argc, char* argv[]) {
             edr_scans, edr_threats, edr_responses);
 
     kprintf("\n");
-    kprintf("  Details: aslr | pae | wxaudit | auditlog | sectest\n");
+    kprintf("  Details (root): aslr | pae | wxaudit | auditlog | sectest\n");
     kprintf("\n");
 }
