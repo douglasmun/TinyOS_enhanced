@@ -44,6 +44,12 @@ static mutex_t fat32_mutex;
 // Cache for FAT and cluster data (MUST be protected by fat32_mutex)
 static uint8_t* sector_buffer = NULL;  // 512-byte sector buffer
 static uint8_t* cluster_buffer = NULL;  // Full cluster buffer
+/* Second cluster-sized buffer, used only by fat32_rmdir's emptiness check:
+ * it must read the directory's own cluster while cluster_buffer still holds
+ * the parent entry it is about to modify. Allocated on first use so a volume
+ * that never removes a directory does not pay for it. Guarded by
+ * fat32_mutex, like the other shared buffers. */
+static uint8_t* rmdir_buffer = NULL;
 
 /*=============================================================================
  * HELPER FUNCTIONS
@@ -1194,8 +1200,43 @@ int fat32_unlink(const char* path) {
         if (entries[i].name[0] == 0xE5) continue;
 
         if (memcmp(entries[i].name, name_83, 11) == 0) {
+            /*=================================================================
+             * Refuse to unlink a directory.
+             *
+             * This matched on NAME ALONE. Deleting a directory this way frees
+             * its cluster chain while the child entries living in those
+             * clusters still point at them, so the next allocation hands the
+             * same clusters to a new file and the old children alias it —
+             * silent cross-file corruption. rmdir() is the operation for
+             * directories, and it checks emptiness first.
+             *===============================================================*/
+            if (entries[i].attributes & FAT32_ATTR_DIRECTORY) {
+                mutex_unlock(&fat32_mutex);
+                return -2;  // Is a directory
+            }
+
+            /*=================================================================
+             * Refuse to unlink a file that is currently open.
+             *
+             * Freeing the chain out from under an open descriptor leaves its
+             * cached current_cluster pointing at storage the allocator is
+             * free to hand to someone else, so a later read or write through
+             * that fd would touch another file's data. Without a real
+             * unlink-on-last-close this is the only safe answer.
+             *===============================================================*/
+            uint32_t ent_cluster = ((uint32_t)entries[i].first_cluster_high << 16) |
+                                   entries[i].first_cluster_low;
+            for (int f = 0; f < FAT32_MAX_OPEN_FILES; f++) {
+                if (open_files[f].in_use &&
+                    open_files[f].first_cluster == ent_cluster &&
+                    ent_cluster != 0) {
+                    mutex_unlock(&fat32_mutex);
+                    return -3;  // Busy: file is open
+                }
+            }
+
             // Found the file - free its clusters
-            uint32_t cluster = ((uint32_t)entries[i].first_cluster_high << 16) | entries[i].first_cluster_low;
+            uint32_t cluster = ent_cluster;
 
             /*=================================================================
              * SECURITY FIX (Issue 5.2): Infinite Loop DoS Protection
@@ -1255,6 +1296,32 @@ int fat32_mkdir(const char* path) {
         name_83[i] = dirname[i] >= 'a' && dirname[i] <= 'z' ? dirname[i] - 32 : dirname[i];
     }
 
+    /*=========================================================================
+     * Reject a name that already exists, before allocating anything.
+     *
+     * This check was missing: mkdir of an existing name appended a SECOND
+     * entry with the same 8.3 name, and lookups stop at the first match, so
+     * the original's clusters became unreachable while still marked in use.
+     * The same class of duplicate-dirent bug was already fixed once in
+     * fat32_create.
+     *=======================================================================*/
+    if (read_cluster(root_dir_cluster, cluster_buffer) != 0) {
+        mutex_unlock(&fat32_mutex);
+        return -1;
+    }
+    {
+        fat32_dir_entry_t* existing = (fat32_dir_entry_t*)cluster_buffer;
+        uint32_t per_cluster = bytes_per_cluster / FAT32_DIR_ENTRY_SIZE;
+        for (uint32_t i = 0; i < per_cluster; i++) {
+            if (existing[i].name[0] == 0x00) break;
+            if (existing[i].name[0] == 0xE5) continue;
+            if (memcmp(existing[i].name, name_83, 11) == 0) {
+                mutex_unlock(&fat32_mutex);
+                return -2;  // Already exists
+            }
+        }
+    }
+
     // Allocate cluster for new directory
     uint32_t new_cluster = allocate_cluster(0);
     if (new_cluster == 0) {
@@ -1282,10 +1349,17 @@ int fat32_mkdir(const char* path) {
     entries[1].first_cluster_high = root_dir_cluster >> 16;
     entries[1].first_cluster_low = root_dir_cluster & 0xFFFF;
 
-    write_cluster(new_cluster, cluster_buffer);
+    if (write_cluster(new_cluster, cluster_buffer) != 0) {
+        write_fat_entry(new_cluster, FAT32_FREE);
+        mutex_unlock(&fat32_mutex);
+        return -1;
+    }
 
     // Add to parent (root) directory
     if (read_cluster(root_dir_cluster, cluster_buffer) != 0) {
+        /* Same leak as the full-root path below: the cluster is already
+         * marked EOC on disk, so returning without freeing it strands it. */
+        write_fat_entry(new_cluster, FAT32_FREE);
         mutex_unlock(&fat32_mutex);
         return -1;
     }
@@ -1301,11 +1375,23 @@ int fat32_mkdir(const char* path) {
             entries[i].first_cluster_low = new_cluster & 0xFFFF;
             entries[i].file_size = 0;
 
-            write_cluster(root_dir_cluster, cluster_buffer);
+            /* Returning success on a failed writeback would report a
+             * directory that does not exist on disk, while its cluster stays
+             * allocated. */
+            if (write_cluster(root_dir_cluster, cluster_buffer) != 0) {
+                write_fat_entry(new_cluster, FAT32_FREE);
+                mutex_unlock(&fat32_mutex);
+                return -1;
+            }
             mutex_unlock(&fat32_mutex);
             return 0;
         }
     }
+
+    /* No free slot in the root directory. The cluster allocated above would
+     * otherwise stay marked in use with nothing referencing it — a permanent
+     * leak on every failed mkdir against a full root. */
+    write_fat_entry(new_cluster, FAT32_FREE);
 
     mutex_unlock(&fat32_mutex);
     return -1;
@@ -1316,9 +1402,151 @@ int fat32_mkdir(const char* path) {
  * PURPOSE: Remove a directory (Phase 2 - simplified)
  *---------------------------------------------------------------------------*/
 int fat32_rmdir(const char* path) {
-    // For now, use same logic as unlink but check it's a directory
-    // Note: fat32_unlink already has its own mutex protection
-    return fat32_unlink(path);
+    /*=========================================================================
+     * This used to be `return fat32_unlink(path)`, which checked neither of
+     * the two things rmdir exists to check: that the target IS a directory,
+     * and that it is EMPTY. Removing a populated directory that way freed its
+     * cluster chain while the entries inside still referenced those clusters,
+     * so the next allocation aliased them — silent corruption. Harmless while
+     * nothing called it; not harmless once SYS_RMDIR exposes it to ring 3.
+     *=======================================================================*/
+    if (!fat32_mounted) {
+        return -1;
+    }
+
+    mutex_lock(&fat32_mutex);
+
+    const char* dirname = path;
+    if (*dirname == '/') dirname++;
+
+    /* Refuse to remove the root itself: it has no parent entry to clear and
+     * freeing its chain would take the whole volume with it. */
+    if (*dirname == '\0') {
+        mutex_unlock(&fat32_mutex);
+        return -1;
+    }
+
+    char name_83[11];
+    memset(name_83, ' ', 11);
+    int name_len = (int)strlen(dirname);
+    if (name_len > 8) name_len = 8;
+    for (int i = 0; i < name_len; i++) {
+        name_83[i] = dirname[i] >= 'a' && dirname[i] <= 'z'
+                         ? dirname[i] - 32 : dirname[i];
+    }
+
+    if (read_cluster(root_dir_cluster, cluster_buffer) != 0) {
+        mutex_unlock(&fat32_mutex);
+        return -1;
+    }
+
+    fat32_dir_entry_t* entries = (fat32_dir_entry_t*)cluster_buffer;
+    uint32_t entries_per_cluster = bytes_per_cluster / FAT32_DIR_ENTRY_SIZE;
+
+    for (uint32_t i = 0; i < entries_per_cluster; i++) {
+        if (entries[i].name[0] == 0x00) break;
+        if (entries[i].name[0] == 0xE5) continue;
+        if (memcmp(entries[i].name, name_83, 11) != 0) continue;
+
+        if (!(entries[i].attributes & FAT32_ATTR_DIRECTORY)) {
+            mutex_unlock(&fat32_mutex);
+            return -2;  // Not a directory
+        }
+
+        uint32_t dir_cluster = ((uint32_t)entries[i].first_cluster_high << 16) |
+                               entries[i].first_cluster_low;
+
+        /*=====================================================================
+         * Emptiness check. Read the directory's own cluster and reject
+         * anything other than "." and ".." — a live entry there means files
+         * would be orphaned by freeing the chain.
+         *
+         * Uses a separate buffer because cluster_buffer currently holds the
+         * root directory we are about to modify; re-reading it here would
+         * discard the entry we located.
+         *===================================================================*/
+        if (dir_cluster != 0) {
+            /* One page, allocated the same way and at the same size as
+             * cluster_buffer, kept for the life of the mount. A stack array
+             * is not an option: bytes_per_cluster is a runtime value, and a
+             * multi-KB local would overflow the kernel task stack that the
+             * whole shell command chain already shares. */
+            if (!rmdir_buffer) {
+                rmdir_buffer = (uint8_t*)pmm_alloc();
+                if (!rmdir_buffer) {
+                    mutex_unlock(&fat32_mutex);
+                    return -1;
+                }
+            }
+
+            /* Walk the WHOLE chain, not just the first cluster. A directory
+             * large enough to spill into a second cluster would otherwise
+             * scan as empty and be removed with live children still in it —
+             * the exact corruption this check exists to prevent. The free
+             * loop below already walks the full chain, so a first-cluster-
+             * only scan is also inconsistent with it. */
+            uint32_t scan = dir_cluster;
+            uint32_t scan_iters = 0;
+            while (scan > 0 && scan < FAT32_EOC) {
+                if (++scan_iters > FAT32_MAX_CLUSTER_CHAIN) {
+                    kprintf("[FAT32] ERROR: Cluster chain cycle detected in rmdir scan\n");
+                    mutex_unlock(&fat32_mutex);
+                    return -1;
+                }
+
+                if (read_cluster(scan, rmdir_buffer) != 0) {
+                    mutex_unlock(&fat32_mutex);
+                    return -1;
+                }
+
+                fat32_dir_entry_t* kids = (fat32_dir_entry_t*)rmdir_buffer;
+                for (uint32_t k = 0; k < entries_per_cluster; k++) {
+                    if (kids[k].name[0] == 0x00) break;
+                    if (kids[k].name[0] == 0xE5) continue;
+
+                    /* Skip the "." and ".." self/parent links. */
+                    if (kids[k].name[0] == '.' &&
+                        (kids[k].name[1] == ' ' ||
+                         (kids[k].name[1] == '.' && kids[k].name[2] == ' '))) {
+                        continue;
+                    }
+
+                    mutex_unlock(&fat32_mutex);
+                    return -3;  // Directory not empty
+                }
+
+                scan = read_fat_entry(scan);
+            }
+        }
+
+        /* Free the directory's cluster chain, bounded against a cyclic FAT
+         * the same way fat32_unlink is. */
+        uint32_t cluster = dir_cluster;
+        uint32_t iteration_count = 0;
+        while (cluster > 0 && cluster < FAT32_EOC) {
+            if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+                kprintf("[FAT32] ERROR: Cluster chain cycle detected in rmdir\n");
+                mutex_unlock(&fat32_mutex);
+                return -1;
+            }
+            uint32_t next = read_fat_entry(cluster);
+            write_fat_entry(cluster, FAT32_FREE);
+            cluster = next;
+        }
+
+        entries[i].name[0] = 0xE5;
+
+        if (write_cluster(root_dir_cluster, cluster_buffer) != 0) {
+            mutex_unlock(&fat32_mutex);
+            return -1;
+        }
+
+        mutex_unlock(&fat32_mutex);
+        return 0;
+    }
+
+    mutex_unlock(&fat32_mutex);
+    return -1;  // Not found
 }
 
 /*-----------------------------------------------------------------------------

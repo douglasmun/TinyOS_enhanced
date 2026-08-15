@@ -1021,6 +1021,39 @@ int sys_lseek(int fd, int32_t offset, int whence) {
     return (int)pos;
 }
 
+/*=============================================================================
+ * FUNCTION: syscall_path_op
+ * PURPOSE: Shared body for the path-only namespace syscalls
+ *
+ * mkdir/rmdir/unlink differ only in which VFS entry point they call: each one
+ * copies a user path into kernel memory and delegates. Sharing the copy-in
+ * means the "never dereference a user pointer" rule is enforced in one place
+ * rather than three near-identical ones.
+ *===========================================================================*/
+static int syscall_path_op(const char* user_path, int (*op)(const char*)) {
+    char path[VFS_MAX_PATH];
+    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    if (rc < 0) {
+        return rc;
+    }
+    if (rc == 0) {
+        return -EINVAL;   /* Empty path */
+    }
+    return op(path);
+}
+
+int sys_mkdir(const char* user_path) {
+    return syscall_path_op(user_path, vfs_mkdir);
+}
+
+int sys_rmdir(const char* user_path) {
+    return syscall_path_op(user_path, vfs_rmdir);
+}
+
+int sys_unlink(const char* user_path) {
+    return syscall_path_op(user_path, vfs_unlink);
+}
+
 int sys_waitpid(int pid) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -1977,6 +2010,19 @@ static void syscall_dispatch(struct cpu_state* state) {
              * negative offset (SEEK_END/SEEK_CUR backwards) arrives as a
              * large unsigned value in the register. */
             ret = sys_lseek((int)arg1, (int32_t)arg2, (int)arg3);
+            break;
+
+        case SYS_MKDIR:
+            /* arg1 = user path pointer */
+            ret = sys_mkdir((const char*)arg1);
+            break;
+
+        case SYS_RMDIR:
+            ret = sys_rmdir((const char*)arg1);
+            break;
+
+        case SYS_UNLINK:
+            ret = sys_unlink((const char*)arg1);
             break;
 
         default:

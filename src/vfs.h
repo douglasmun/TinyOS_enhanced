@@ -171,6 +171,11 @@ typedef struct {
 #define VFS_EIO             -5      /* I/O error (media write / metadata flush failed) */
 #define VFS_EOVERFLOW       -75     /* Value too large for defined data type (POSIX) */
 #define VFS_ENOSYS          -38     /* Operation not implemented by this driver */
+#define VFS_EISDIR          -21     /* Is a directory (unlink on a directory) */
+#define VFS_ENOTDIR         -20     /* Not a directory (rmdir on a file) */
+#define VFS_ENOSPC          -28     /* No space left on device */
+#define VFS_ENOTEMPTY       -39     /* Directory not empty */
+#define VFS_EBUSY           -16     /* Resource busy (unlink of an open file) */
 
 /*=============================================================================
  * PHASE 9: No /dev/mem or /dev/kmem (Security-by-Omission)
@@ -340,6 +345,17 @@ typedef struct file_operations {
      */
     ssize_t (*seek)(void* private_data, ssize_t offset, int whence);
 
+    /**
+     * @brief Remove a file (not a directory — that is rmdir)
+     * @param path Path to unlink (drive letter already stripped)
+     * @return 0 on success, negative error code on failure
+     *
+     * Both drivers already had an unlink; neither was reachable through the
+     * VFS, so there was no way to delete a file except from kernel code that
+     * called the driver directly.
+     */
+    int (*unlink)(const char* path);
+
 } file_operations_t;
 
 /*=============================================================================
@@ -493,6 +509,18 @@ int vfs_mkdir(const char* path);
  * - Delegates to driver's rmdir function
  */
 int vfs_rmdir(const char* path);
+
+/**
+ * @brief Remove a file
+ * @param path Path to file to remove
+ * @return 0 on success, negative error code on failure
+ *
+ * SECURITY:
+ * - Validates path pointer and length
+ * - Checks for protected paths
+ * - Delegates to driver's unlink function
+ */
+int vfs_unlink(const char* path);
 
 /**
  * @brief Read directory entries

@@ -1130,6 +1130,75 @@ int vfs_rmdir(const char* path) {
 }
 
 /**
+ * @brief Remove a file through the VFS layer
+ *
+ * Same validation shape as vfs_rmdir: resolve the drive, canonicalize, refuse
+ * protected prefixes without CAP_SYS_ADMIN, then delegate. Unlike mkdir/rmdir
+ * this one uses vfs_resolve_drive rather than an inline fourth copy of the
+ * drive-letter logic.
+ */
+int vfs_unlink(const char* path) {
+    if (!vfs_initialized) {
+        return VFS_EINVAL;
+    }
+    if (!path) {
+        return VFS_EFAULT;
+    }
+
+    size_t path_len = strlen(path);
+    if (path_len == 0 || path_len >= VFS_MAX_PATH) {
+        return VFS_EINVAL;
+    }
+
+    const file_operations_t* driver_ops = NULL;
+    const char* actual_path = NULL;
+    int rc = vfs_resolve_drive(path, &driver_ops, &actual_path);
+    if (rc < 0) {
+        return rc;
+    }
+    if (!driver_ops || !driver_ops->unlink) {
+        return VFS_ENOSYS;
+    }
+
+    char canonical_path[VFS_MAX_PATH];
+    int canon_ret = vfs_canonicalize_path(actual_path, canonical_path, VFS_MAX_PATH);
+    if (canon_ret < 0) {
+        return canon_ret;
+    }
+    actual_path = canonical_path;
+
+    /* Protected paths: removing /bin/sh is as damaging as rmdir'ing /bin. */
+    task_t* current_task = scheduler_get_current_task();
+    const char* protected_paths[] = {
+        "/bin/",
+        "/sbin/",
+        "/etc/",
+        "/boot/",
+        "/kernel",
+        NULL
+    };
+
+    bool is_protected = false;
+    for (int i = 0; protected_paths[i] != NULL; i++) {
+        size_t prefix_len = strlen(protected_paths[i]);
+        if (strncmp(actual_path, protected_paths[i], prefix_len) == 0) {
+            is_protected = true;
+            break;
+        }
+    }
+
+    if (is_protected) {
+        if (!current_task || !(current_task->capabilities & CAP_SYS_ADMIN)) {
+            kprintf("[VFS SECURITY] PID %d: Denied unlink of protected path '%s'\n",
+                    current_task ? current_task->pid : 0, path);
+            return VFS_EACCES;
+        }
+    }
+
+    return driver_ops->unlink(actual_path);
+}
+
+/**
  * @brief Read directory entries through VFS layer
  *
  * SECURITY: Validates FD and buffer, delegates to driver's readdir function.

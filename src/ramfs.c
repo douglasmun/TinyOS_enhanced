@@ -103,7 +103,13 @@ void ramfs_get_current_credentials(uint16_t* uid_out, uint16_t* gid_out) {
 /**
  * Allocate a new filesystem node
  */
-static ramfs_node_t* alloc_node(const char* name, uint8_t type) {
+/* The creating process's credentials become the node's owner. Passing them in
+ * rather than hardcoding uid 0 matters now that ring 3 can create nodes: the
+ * default modes are 0600/0700 (owner-only), so a root-owned node created on
+ * behalf of a uid-1000 process was one the creator could not then open — a
+ * successful mkdir immediately followed by EACCES on its own directory. */
+static ramfs_node_t* alloc_node(const char* name, uint8_t type,
+                                uint16_t uid, uint16_t gid) {
     if (total_nodes >= RAMFS_MAX_FILES) {
         return NULL;
     }
@@ -137,12 +143,12 @@ static ramfs_node_t* alloc_node(const char* name, uint8_t type) {
 
     /* Set default permissions */
     if (type == RAMFS_TYPE_DIR) {
-        node->mode = RAMFS_DEFAULT_DIR_MODE;   /* 0755 - rwxr-xr-x */
+        node->mode = RAMFS_DEFAULT_DIR_MODE;   /* 0700 - rwx------ */
     } else {
-        node->mode = RAMFS_DEFAULT_FILE_MODE;  /* 0644 - rw-r--r-- */
+        node->mode = RAMFS_DEFAULT_FILE_MODE;  /* 0600 - rw------- */
     }
-    node->uid = 0;  /* Root user */
-    node->gid = 0;  /* Root group */
+    node->uid = uid;
+    node->gid = gid;
 
     total_nodes++;
     return node;
@@ -244,7 +250,7 @@ void ramfs_init(void) {
     mutex_init(&ramfs_mutex, "ramfs", MUTEX_FLAG_RECURSIVE);
 
     // Create root directory
-    root = alloc_node("/", RAMFS_TYPE_DIR);
+    root = alloc_node("/", RAMFS_TYPE_DIR, 0, 0);  /* root dir stays root-owned */
     if (!root) {
         kprintf("RAMFS: Failed to create root directory\n");
         return;
@@ -485,7 +491,8 @@ int ramfs_mkdir(const char* path) {
     }
 
     // Create new directory
-    ramfs_node_t* new_dir = alloc_node(components[num_components - 1], RAMFS_TYPE_DIR);
+    ramfs_node_t* new_dir = alloc_node(components[num_components - 1],
+                                       RAMFS_TYPE_DIR, uid, gid);
     if (!new_dir) {
         mutex_unlock(&ramfs_mutex);
         return -6;  // Allocation failed
@@ -613,7 +620,8 @@ int ramfs_open(const char* path, uint8_t flags) {
             }
 
             // Create new file
-            node = alloc_node(components[num_components - 1], RAMFS_TYPE_FILE);
+            node = alloc_node(components[num_components - 1],
+                              RAMFS_TYPE_FILE, uid, gid);
             if (!node) {
                 mutex_unlock(&ramfs_mutex);
                 return -5;  // Allocation failed
