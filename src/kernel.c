@@ -31,6 +31,8 @@
 #include "sleeper_elf_data.h"
 #include "spawner_elf_data.h"
 #include "fileio_elf_data.h"
+#include "producer_elf_data.h"
+#include "counter_elf_data.h"
 #include "shell_elf_data.h"
 #include "shell.h"
 #include "keyboard.h"
@@ -809,6 +811,27 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
              * shell's own `exec` is unaffected (it runs as root), which is why
              * only the spawn path exposed this. */
             ramfs_chmod("/spawner.elf", 0755);
+        }
+    }
+
+    /* producer.elf | counter.elf is the ring-3 pipeline fixture (SYS_PIPE).
+     * Both stages have to be PROGRAMS: a pipeline stage is a process, and the
+     * shell cannot be both the producer and the consumer at once. 0755 for the
+     * same uid-1000 reason as spawner.elf above — the ring-3 shell spawns
+     * these, so they must be readable by a non-root process. */
+    {
+        int producer_fd = ramfs_open("/producer.elf", RAMFS_FLAG_WRITE);
+        if (producer_fd >= 0) {
+            ramfs_write(producer_fd, producer_elf_data, producer_elf_data_len);
+            ramfs_close(producer_fd);
+            ramfs_chmod("/producer.elf", 0755);
+        }
+
+        int counter_fd = ramfs_open("/counter.elf", RAMFS_FLAG_WRITE);
+        if (counter_fd >= 0) {
+            ramfs_write(counter_fd, counter_elf_data, counter_elf_data_len);
+            ramfs_close(counter_fd);
+            ramfs_chmod("/counter.elf", 0755);
         }
     }
 

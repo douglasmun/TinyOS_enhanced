@@ -174,8 +174,26 @@ int stdout_redirect_to_file(stream_context_t* ctx, const char* filename, bool ap
         return -1;
     }
 
-    /* TODO: If append mode, seek to end of file */
-    (void)append;  /* Suppress unused warning for now */
+    /* `>` vs `>>`. This was a TODO for a long time and both halves of it were
+     * wrong, not just the append half:
+     *
+     * ramfs_open does not truncate (there is no flag for it) and ramfs_write
+     * only ever GROWS node->size, so a plain `>` onto an existing longer file
+     * overwrote from position 0 and left the old tail behind — visible to the
+     * very next `cat`. `>` has to actually shorten the file, which is what
+     * ramfs_truncate is for.
+     *
+     * Append is the other direction: the cursor starts at 0 on open, so `>>`
+     * without a seek is indistinguishable from `>`, silently destroying the
+     * data the user asked to keep. */
+    if (append) {
+        int end = ramfs_fd_size(fd);
+        if (end > 0) {
+            ramfs_seek(fd, (uint32_t)end);
+        }
+    } else {
+        ramfs_truncate(fd);
+    }
 
     /* Set stdout to file */
     ctx->stdout_stream.type = STREAM_TYPE_FILE;

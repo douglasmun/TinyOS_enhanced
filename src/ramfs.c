@@ -864,6 +864,49 @@ int ramfs_write(int fd, const void* buf, size_t count) {
 }
 
 /**
+ * Discard a file's contents, leaving it empty and the cursor at 0.
+ *
+ * ramfs_write only ever GROWS node->size, so without this there was no way to
+ * shorten a file at all: reopening for write and writing fewer bytes than the
+ * file already held left the old tail in place and still reachable by read().
+ * That is what `>` means, so redirection needs it — see the append/truncate
+ * handling in stdout_redirect_to_file.
+ *
+ * The data pages are kept rather than freed. They are about to be written
+ * again in the overwhelmingly common case (this is called on the open that
+ * precedes a write), and ramfs_read is bounded by node->size, so nothing below
+ * it is observable. What matters for disclosure is that the pages are ZEROED:
+ * a subsequent write that grows the file back past a stale page must not
+ * expose the previous contents through the gap.
+ */
+int ramfs_truncate(int fd) {
+    if (fd < 0 || fd >= RAMFS_MAX_FDS || !file_descriptors[fd].in_use) {
+        return -1;
+    }
+    if (!(file_descriptors[fd].flags & RAMFS_FLAG_WRITE)) {
+        return -13;
+    }
+
+    ramfs_node_t* node = file_descriptors[fd].node;
+    if (!node) {
+        return -3;
+    }
+    if (node->type != RAMFS_TYPE_FILE) {
+        return -21;
+    }
+
+    for (int i = 0; i < RAMFS_MAX_PAGES; i++) {
+        if (node->data_pages[i]) {
+            memset(node->data_pages[i], 0, RAMFS_PAGE_SIZE);
+        }
+    }
+
+    node->size = 0;
+    file_descriptors[fd].pos = 0;
+    return 0;
+}
+
+/**
  * Reposition the read/write cursor
  *
  * The `pos` field has been in ramfs_fd_t since the beginning, advanced by

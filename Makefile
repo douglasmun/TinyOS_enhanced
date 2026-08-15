@@ -103,6 +103,8 @@ SRC := \
   src/sleeper_elf_data.c \
   src/spawner_elf_data.c \
   src/fileio_elf_data.c \
+  src/producer_elf_data.c \
+  src/counter_elf_data.c \
   src/shell_elf_data.c \
   src/ramfs.c \
   src/ramfs_vfs.c \

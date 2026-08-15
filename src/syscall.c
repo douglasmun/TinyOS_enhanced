@@ -26,6 +26,9 @@
 #include "elf.h"       // SYS_SPAWN: elf_exec_from_path
 #include "vfs.h"       // SYS_OPEN/CLOSE/READDIR: vfs_* and vfs_dirent_t
 #include "util.h"      // MAX_PATH
+#include "shell_redir.h" // SYS_PIPE: pipe_buffer_t and pipe_init/destroy
+#include "pmm.h"       // SYS_PIPE: frames for the pipe buffer
+#include "paging.h"    // SYS_PIPE: map those frames before touching them
 
 /*-----------------------------------------------------------------------------
  * CPU State Structure (matches syscall stub stack frame)
@@ -1149,6 +1152,318 @@ int sys_chdir(const char* user_path) {
     return task_chdir(self, raw);
 }
 
+/*=============================================================================
+ * FUNCTION: sys_redirect
+ * PURPOSE: Point one of the caller's standard streams at a file, or restore it
+ *
+ * This is the ring-3 half of shell redirection ('>', '>>', '<'). It is
+ * deliberately NOT dup2 — see the SYS_REDIRECT comment in syscall.h for why
+ * fds 0/1/2 cannot come out of the fd table.
+ *
+ * Because sys_spawn inherits the caller's streams into the child, a shell gets
+ * redirection of spawned programs for free: rebind, spawn, restore. The child
+ * captured the redirected stream at spawn time and the restore does not reach
+ * back into it (streams_inherit marks the child's copies borrowed, so the
+ * child never closes the fd the shell owns).
+ *
+ * DRIVE LIMITATION, enforced rather than ignored: the stream layer's
+ * STREAM_TYPE_FILE is hard-wired to RAMFS (stdout_write calls ramfs_write
+ * directly, and stream_t.fd is a RAMFS fd, not a VFS fd). A path on any other
+ * drive is therefore REFUSED with -EXDEV instead of being opened on D: behind
+ * the caller's back, which is what a naive prefix-strip would do. Lifting this
+ * means giving the stream layer a VFS-backed file type, not widening the check.
+ *===========================================================================*/
+int sys_redirect(int fd, const char* user_path, int mode) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    if (fd != STDIN_FILENO && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+        return -EBADF;
+    }
+
+    /* stderr can be RESTORED but not redirected to a file: the stream layer
+     * has no stderr_redirect_to_file, and the shells parse no `2>` syntax to
+     * reach one. Adding a helper for a syntax nothing emits would be untested
+     * code on a security-relevant path, so the gap is refused explicitly here
+     * and closed when `2>` actually lands. */
+    if (fd == STDERR_FILENO && mode != REDIR_MODE_RESTORE) {
+        return -ENOSYS;
+    }
+
+    stream_context_t* streams = &self->streams;
+
+    /* Restore first: it takes no path, and it must stay available even when
+     * everything else about the request is wrong, so a shell can restore
+     * unconditionally in its cleanup path. */
+    if (mode == REDIR_MODE_RESTORE) {
+        switch (fd) {
+            case STDIN_FILENO:  stdin_reset(streams);  break;
+            case STDOUT_FILENO: stdout_reset(streams); break;
+            default:            stderr_reset(streams); break;
+        }
+        return 0;
+    }
+
+    if (mode != REDIR_MODE_TRUNC && mode != REDIR_MODE_APPEND &&
+        mode != REDIR_MODE_READ) {
+        return -EINVAL;
+    }
+
+    /* Direction must match the stream: reading from stdout or writing to
+     * stdin is a caller bug, and honouring it would leave a stream whose type
+     * says one thing and whose fd was opened for the other. */
+    bool wants_read = (mode == REDIR_MODE_READ);
+    if (wants_read != (fd == STDIN_FILENO)) {
+        return -EINVAL;
+    }
+
+    /* Resolved against the caller's cwd like every other path syscall, and
+     * copied into kernel memory before use (TOCTOU). */
+    char path[VFS_MAX_PATH];
+    int rc = syscall_copy_path(path, sizeof(path), user_path);
+    if (rc < 0) {
+        return rc;
+    }
+
+    /* task_resolve_path always yields a drive-qualified path, so this test is
+     * total: anything not on the RAMFS drive cannot be represented by a
+     * STREAM_TYPE_FILE stream. */
+    if (path[0] != VFS_DEFAULT_DRIVE || path[1] != ':') {
+        return -EXDEV;
+    }
+
+    /* The stream helpers take a RAMFS path, which is the drive-relative part.
+     * Skipping "D:" is safe because the check above proved the prefix. */
+    const char* ramfs_path = path + 2;
+
+    int err;
+    if (fd == STDIN_FILENO) {
+        err = stdin_redirect_from_file(streams, ramfs_path);
+    } else {
+        err = stdout_redirect_to_file(streams, ramfs_path,
+                                      mode == REDIR_MODE_APPEND);
+    }
+
+    /* The stream helpers report failure as -1 with no detail. Map it to
+     * something a caller can print: at this point the path parsed and resolved,
+     * so an open failure is a missing file or a permission refusal. */
+    if (err < 0) {
+        return -ENOENT;
+    }
+
+    return 0;
+}
+
+/*=============================================================================
+ * SYS_PIPE (v2.6) — concurrent ring-3 pipelines
+ *
+ * The kernel shell's pipeline is SEQUENTIAL: it runs a stage to completion,
+ * copies up to 4 KB out of the pipe, and feeds that to the next stage. That is
+ * fine there because its stages are function calls. Ring-3 stages are separate
+ * processes that run at the same time, so they need a real pipe: bounded
+ * buffer, blocking on both ends, EOF when the writer goes away.
+ *
+ * All of that already exists (pipe_read/pipe_write in shell_redir.c, with wait
+ * queues). What was missing was a way for ring 3 to NAME one, since the buffer
+ * must stay in kernel memory. Hence a small table of kernel-owned pipes and an
+ * integer ID.
+ *
+ * OWNERSHIP: a pipe belongs to the process that created it, identified by pid
+ * AND generation. The generation is what stops a recycled pid from inheriting
+ * the previous occupant's pipes — the same slot-liveness discipline the
+ * scheduler and waitpid already use.
+ *===========================================================================*/
+#define MAX_PIPES 8
+
+typedef struct {
+    pipe_buffer_t* buf;         /* NULL when the slot is free                */
+    uint32_t       owner_pid;
+    uint32_t       owner_generation;
+    uint32_t       pages;       /* frames backing buf, for the free path     */
+} pipe_slot_t;
+
+static pipe_slot_t pipe_table[MAX_PIPES];
+
+/* Frames needed for one pipe_buffer_t (~4 KB buffer plus its metadata, so this
+ * is 2 in practice). Computed rather than hardcoded so a change to
+ * PIPE_BUFFER_SIZE cannot silently under-allocate. */
+#define PIPE_FRAMES ((sizeof(pipe_buffer_t) + 4095) / 4096)
+
+/* Resolve an ID to a slot the CALLER is allowed to touch. Returns NULL and
+ * sets *err when the ID is unknown or owned by somebody else — a bad ID from
+ * ring 3 must never become a pointer. */
+static pipe_slot_t* pipe_slot_for(int id, task_t* self, int* err) {
+    if (id < 1 || id > MAX_PIPES) {
+        *err = -EBADF;
+        return NULL;
+    }
+    pipe_slot_t* slot = &pipe_table[id - 1];
+    if (!slot->buf) {
+        *err = -EBADF;
+        return NULL;
+    }
+    if (slot->owner_pid != self->pid ||
+        slot->owner_generation != self->generation) {
+        *err = -EPERM;
+        return NULL;
+    }
+    return slot;
+}
+
+/* Point one stream at a pipe. Not borrowed: the shell owns this pipe, and a
+ * child that inherits the stream gets borrowed=true from streams_inherit, so
+ * only the shell's own reset can unbind it. */
+static void pipe_bind_stream(stream_t* s, pipe_buffer_t* buf) {
+    s->type      = STREAM_TYPE_PIPE;
+    s->data      = buf;
+    s->fd        = -1;
+    s->is_open   = true;
+    s->borrowed  = false;
+}
+
+static void pipe_slot_release(pipe_slot_t* slot) {
+    /* pipe_destroy closes both ends first, so anyone still parked in
+     * pipe_read/pipe_write is woken to observe EOF/EPIPE rather than being
+     * left blocked on a buffer that is about to be freed. It also releases the
+     * wait-queue page; the frames below are the pipe_buffer_t itself. */
+    pipe_destroy(slot->buf);
+    uint32_t base = (uint32_t)(uintptr_t)slot->buf;
+    for (uint32_t i = 0; i < slot->pages; i++) {
+        pmm_free(base + i * 4096);
+    }
+    slot->buf = NULL;
+    slot->owner_pid = 0;
+    slot->owner_generation = 0;
+    slot->pages = 0;
+}
+
+void task_pipes_cleanup(task_t* task) {
+    if (!task) {
+        return;
+    }
+    for (int i = 0; i < MAX_PIPES; i++) {
+        pipe_slot_t* slot = &pipe_table[i];
+        if (slot->buf &&
+            slot->owner_pid == task->pid &&
+            slot->owner_generation == task->generation) {
+            pipe_slot_release(slot);
+        }
+    }
+}
+
+int sys_pipe(int op, int id) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    /* RESTORE is checked before the ID lookup, for the same reason
+     * REDIR_MODE_RESTORE is: a shell must be able to put its own streams back
+     * unconditionally in a cleanup path, even if the pipe is already gone. */
+    if (op == PIPE_OP_RESTORE) {
+        stdin_reset(&self->streams);
+        stdout_reset(&self->streams);
+        return 0;
+    }
+
+    /* Same reasoning, and the same unconditional treatment: this runs between
+     * the two spawns, and a shell that could not put its stdout back without a
+     * valid pipe would be stuck writing into a pipe on the failure path. */
+    if (op == PIPE_OP_UNBIND_STDOUT) {
+        stdout_reset(&self->streams);
+        return 0;
+    }
+
+    if (op == PIPE_OP_CREATE) {
+        int slot_idx = -1;
+        for (int i = 0; i < MAX_PIPES; i++) {
+            if (!pipe_table[i].buf) {
+                slot_idx = i;
+                break;
+            }
+        }
+        if (slot_idx < 0) {
+            return -EMFILE;
+        }
+
+        uint32_t phys = pmm_alloc_contiguous((uint32_t)PIPE_FRAMES);
+        if (phys == 0) {
+            return -ENOMEM;
+        }
+
+        /* Map before touching, exactly as pipe_init does for its wait-queue
+         * page: pmm returns a PHYSICAL address and pipe_init writes through
+         * this pointer immediately. Into the KERNEL pdpt explicitly — a pipe
+         * is created from a shell that may have a user PDPT loaded, and the
+         * kernel is the only address space that ever dereferences it. */
+        for (uint32_t i = 0; i < (uint32_t)PIPE_FRAMES; i++) {
+            uint32_t frame = phys + i * 4096;
+            pae_map_page_into(pae_get_kernel_pdpt(), frame, (uint64_t)frame,
+                              PAE_PRESENT | PAE_READWRITE | PAE_NX);
+        }
+
+        pipe_buffer_t* buf = (pipe_buffer_t*)(uintptr_t)phys;
+        pipe_init(buf);
+
+        /* pipe_init falls back to a non-blocking clamping mode when it cannot
+         * get its wait-queue page. That mode silently DROPS data on a full
+         * pipe, which for a concurrent pipeline means truncated output with no
+         * error — refuse instead of shipping a lossy pipe. */
+        if (!buf->readers || !buf->writers) {
+            pipe_destroy(buf);
+            for (uint32_t i = 0; i < (uint32_t)PIPE_FRAMES; i++) {
+                pmm_free(phys + i * 4096);
+            }
+            return -ENOMEM;
+        }
+
+        pipe_table[slot_idx].buf = buf;
+        pipe_table[slot_idx].owner_pid = self->pid;
+        pipe_table[slot_idx].owner_generation = self->generation;
+        pipe_table[slot_idx].pages = (uint32_t)PIPE_FRAMES;
+
+        pipe_bind_stream(&self->streams.stdout_stream, buf);
+        return slot_idx + 1;
+    }
+
+    int err = 0;
+    pipe_slot_t* slot = pipe_slot_for(id, self, &err);
+    if (!slot) {
+        return err;
+    }
+
+    switch (op) {
+        case PIPE_OP_BIND_STDIN:
+            pipe_bind_stream(&self->streams.stdin_stream, slot->buf);
+            return 0;
+
+        case PIPE_OP_CLOSE_WRITE:
+            /* The producer has been reaped, so no further data can arrive and
+             * a consumer parked on an empty buffer should stop waiting. */
+            pipe_close_write(slot->buf);
+            return 0;
+
+        case PIPE_OP_DESTROY:
+            /* Unbind first. The streams may still point at this buffer (the
+             * shell restores its own, but a failure path might not have), and
+             * freeing a buffer a stream still names would leave the next
+             * read/write walking into a released frame. */
+            if (self->streams.stdin_stream.data == slot->buf) {
+                stdin_reset(&self->streams);
+            }
+            if (self->streams.stdout_stream.data == slot->buf) {
+                stdout_reset(&self->streams);
+            }
+            pipe_slot_release(slot);
+            return 0;
+
+        default:
+            return -EINVAL;
+    }
+}
+
 int sys_waitpid(int pid) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -2137,6 +2452,16 @@ static void syscall_dispatch(struct cpu_state* state) {
 
         case SYS_CHDIR:
             ret = sys_chdir((const char*)arg1);
+            break;
+
+        case SYS_REDIRECT:
+            /* arg1 = fd (0/1/2), arg2 = path, arg3 = REDIR_MODE_* */
+            ret = sys_redirect((int)arg1, (const char*)arg2, (int)arg3);
+            break;
+
+        case SYS_PIPE:
+            /* arg1 = PIPE_OP_*, arg2 = pipe id (ignored by CREATE) */
+            ret = sys_pipe((int)arg1, (int)arg2);
             break;
 
         default:

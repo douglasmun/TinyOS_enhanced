@@ -14,7 +14,8 @@ CFLAGS  := -m32 -ffreestanding -fno-pic -fno-builtin -fno-stack-protector \
 LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
 # User programs to build
-PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf
+PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
+            producer.elf counter.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -66,7 +67,22 @@ fileio.elf: fileio.c libc.h $(LIBC_OBJS) user.ld
 	$(LD) $(LDFLAGS) -o fileio.elf crt0.o fileio.o libc.o -lgcc
 	@echo "Built fileio.elf"
 
-# shell.elf provides its own _start and syscall wrappers
+# producer.elf / counter.elf are the two halves of the ring-3 pipeline fixture
+# (see verify-ring3-pipes.sh). They must be a PAIR OF PROGRAMS: a pipeline stage
+# is a process, so a builtin cannot stand in for either side, and counter.elf is
+# the only thing in userspace that reads fd 0 until EOF — which is what proves
+# the pipe blocks while data is coming and ends when the write end closes.
+producer.elf: producer.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c producer.c -o producer.o
+	$(LD) $(LDFLAGS) -o producer.elf crt0.o producer.o libc.o -lgcc
+	@echo "Built producer.elf"
+
+counter.elf: counter.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c counter.c -o counter.o
+	$(LD) $(LDFLAGS) -o counter.elf crt0.o counter.o libc.o -lgcc
+	@echo "Built counter.elf"
+
+# shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c shell.c -o shell.o
 	$(LD) $(LDFLAGS) -o shell.elf crt0.o shell.o libc.o -lgcc

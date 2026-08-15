@@ -67,6 +67,39 @@
 #define SYS_GETCWD     28   // Read the caller's working directory
 #define SYS_CHDIR      29   // Change the caller's working directory
 
+/* Shell redirection: point one of the caller's standard streams at a file.
+ *
+ * NOT dup2(). POSIX dup2 copies one fd-table slot onto another, but fds 0/1/2
+ * are deliberately NOT in this kernel's fdtable — they live in task->streams,
+ * which is what already models console/file/pipe backing and what sys_spawn
+ * inherits into a child (see the fdtable comment in process.h). A dup2 that
+ * took an fd from SYS_OPEN would have to convert a VFS fd into a stream and
+ * would still not compose with inheritance, so the honest primitive is the one
+ * the stream layer actually has: rebind a standard stream to a path.
+ *
+ * Redirection therefore reaches a spawned child for free: the shell rebinds
+ * its own stream, spawns, and restores. The child inherited the redirected
+ * stream at spawn time. */
+#define SYS_REDIRECT   30   // Point stdin/stdout/stderr at a file (or restore)
+
+/* SYS_PIPE — create a pipe and bind one end to one of MY standard streams.
+ *
+ * Not POSIX pipe(int fd[2]), for the same reason SYS_REDIRECT is not dup2: the
+ * ends a shell needs to connect are stdin and stdout, and those are not fds at
+ * all. Handing userspace two fd numbers would mean inventing a way to turn an
+ * fd back into a stream, which is exactly the conversion that does not exist.
+ *
+ * So the pipe is named by an opaque kernel-assigned ID instead, and the
+ * operations are: create one bound to my stdout (the producer end), then bind
+ * that same ID to another process's stdin by having the SHELL bind it to its
+ * own stdin before spawning the consumer — inheritance carries it, the way it
+ * already carries redirection.
+ *
+ * The pipe_buffer_t itself lives in KERNEL memory and is never mapped into any
+ * user address space. Ring 3 only ever holds the ID, so a malicious ID is a
+ * lookup failure (-EBADF), not a pointer. */
+#define SYS_PIPE       31   // Create/bind/close a pipe between two processes
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -137,7 +170,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  29  // Highest valid syscall number (SYS_CHDIR)
+#define MAX_SYSCALL_NUM  31  // Highest valid syscall number (SYS_PIPE)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -301,6 +334,98 @@ int sys_getcwd(char* user_buf, uint32_t size);
  * @return 0 on success, -ENOENT/-ENOTDIR/-EACCES on failure
  */
 int sys_chdir(const char* user_path);
+
+/*-----------------------------------------------------------------------------
+ * SYS_REDIRECT modes. Passed in arg3; the target stream is arg1 and the path
+ * is arg2 (ignored, and may be NULL, for REDIR_MODE_RESTORE).
+ *---------------------------------------------------------------------------*/
+#define REDIR_MODE_TRUNC    0   /* stdout/stderr: create or truncate  ('>')  */
+#define REDIR_MODE_APPEND   1   /* stdout/stderr: create or append    ('>>') */
+#define REDIR_MODE_READ     2   /* stdin: open an existing file       ('<')  */
+#define REDIR_MODE_RESTORE  3   /* put the stream back on the console        */
+
+/**
+ * @brief Point one of the caller's standard streams at a file, or restore it.
+ *
+ * This is the ring-3 half of shell redirection. See the SYS_REDIRECT comment
+ * above for why this is not dup2().
+ *
+ * A restore is always available to the caller and never fails on a missing
+ * path, so a shell can unconditionally restore in its cleanup path after a
+ * failed redirect without having to track what it managed to change.
+ *
+ * stderr may be RESTORED but not redirected to a file (-ENOSYS): the stream
+ * layer has no stderr_redirect_to_file and no shell parses `2>` yet.
+ *
+ * Only the RAMFS drive (D:) can be a redirect target. STREAM_TYPE_FILE is
+ * hard-wired to RAMFS, so a path on another drive is refused with -EXDEV
+ * rather than silently opened on D:.
+ *
+ * @param fd    STDIN_FILENO or STDOUT_FILENO (STDERR_FILENO: restore only)
+ * @param user_path Path to open; unused when mode is REDIR_MODE_RESTORE
+ * @param mode  One of the REDIR_MODE_* values above
+ * @return 0 on success, -EBADF for a non-standard fd, -EINVAL for a bad mode
+ *         or a direction that does not match the stream, -EXDEV for a non-D:
+ *         path, -ENOSYS for redirecting stderr, -ENOENT if the open failed
+ */
+int sys_redirect(int fd, const char* user_path, int mode);
+
+/*-----------------------------------------------------------------------------
+ * SYS_PIPE operations. Passed in arg1; arg2 is the pipe ID (ignored by CREATE,
+ * which returns a fresh one).
+ *
+ * The lifecycle a shell drives for `producer | consumer`:
+ *
+ *   id = pipe(PIPE_OP_CREATE)     bind MY stdout to a new pipe's write end
+ *   spawn(producer)               inherits the bound stdout
+ *   pipe(PIPE_OP_UNBIND_STDOUT,id) MY stdout back to the console
+ *   pipe(PIPE_OP_BIND_STDIN, id)  bind MY stdin to the same pipe's read end
+ *   spawn(consumer)               inherits the bound stdin, console stdout
+ *   pipe(PIPE_OP_RESTORE, id)     put MY OWN stdin/stdout back on the console
+ *   waitpid(producer)
+ *   pipe(PIPE_OP_CLOSE_WRITE, id) the consumer's read() can now see EOF
+ *   waitpid(consumer)
+ *   pipe(PIPE_OP_DESTROY, id)     free the buffer and the wait-queue page
+ *
+ * UNBIND_STDOUT is not a convenience. Because a child inherits the shell's
+ * streams AS THEY ARE AT SPAWN TIME, a stdout still bound to the write end when
+ * the consumer is spawned makes the consumer write its output into the very
+ * pipe it is reading — the data never reaches the console and, worse, the
+ * consumer feeds itself. RESTORE cannot do this job: it resets BOTH streams,
+ * and stdin must stay on the read end across the consumer's spawn.
+ *
+ * CLOSE_WRITE is the step with no safe default: until it runs, a consumer that
+ * has drained the buffer BLOCKS rather than seeing end-of-input, because more
+ * data could still arrive. Nothing in task teardown closes it — a dying task's
+ * inherited streams are marked borrowed precisely so they do not touch the
+ * creator's resources — so the shell must call it after reaping the producer.
+ *---------------------------------------------------------------------------*/
+#define PIPE_OP_CREATE         0  /* new pipe, bind write end to my stdout   */
+#define PIPE_OP_BIND_STDIN     1  /* bind the read end to my stdin           */
+#define PIPE_OP_CLOSE_WRITE    2  /* producer is done: readers now see EOF   */
+#define PIPE_OP_RESTORE        3  /* my own stdin+stdout back to the console */
+#define PIPE_OP_DESTROY        4  /* release the pipe                        */
+#define PIPE_OP_UNBIND_STDOUT  5  /* my stdout only, back to the console     */
+
+/**
+ * @brief Create a pipe, bind it to one of the caller's streams, or release it.
+ *
+ * Not POSIX pipe(): see the SYS_PIPE comment above for why two fds cannot
+ * express this. The pipe is named by an opaque ID and the buffer stays in
+ * kernel memory, so ring 3 never holds a pointer to it.
+ *
+ * A pipe is owned by the process that created it, and only that process may
+ * operate on it. That is what makes an ID safe to hand out: another process
+ * guessing an ID gets -EPERM, not somebody else's data stream.
+ *
+ * @param op One of the PIPE_OP_* values above
+ * @param id Pipe ID from a previous CREATE; ignored by CREATE itself
+ * @return CREATE returns a positive pipe ID; the others return 0 on success.
+ *         -EMFILE if no pipe slot is free, -ENOMEM if the buffer could not be
+ *         allocated, -EBADF for an unknown ID, -EPERM for another process's
+ *         pipe, -EINVAL for an unknown op.
+ */
+int sys_pipe(int op, int id);
 
 /*-----------------------------------------------------------------------------
  * Record a process death and wake every sys_waitpid() waiter.

@@ -34,7 +34,8 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
 4. **Userspace shell** (capstone, depends on 1–3 — now all done). **IN PROGRESS
    — the ring-3 shell is now the DEFAULT LOGIN SHELL (PR #51), with the kernel
    shell as a fallback.** It is not yet a replacement: ~13 builtins against the
-   kernel shell's ~70, no pipes or redirection, nothing privileged. The syscall
+   kernel shell's ~70, and nothing privileged (redirection landed in PR #52 and
+   pipelines in PR #53; a pipeline's stages must both be programs). The syscall
    foundation landed first, one group per PR:
    - PR #43 — per-process **fd table** + `SYS_OPEN`/`SYS_CLOSE`/`SYS_READDIR`/
      `SYS_STAT` (19–22).
@@ -148,7 +149,150 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      keystrokes sent in that window are dropped because nothing is in `read()`
      yet.
 
-   Remaining: pipes/redirection and the privileged commands in ring 3.
+   - PR #52 — **ring-3 redirection** (`>`, `>>`, `<`), via a new
+     **`SYS_REDIRECT` (30)**. Deliberately **NOT `dup2`**: fds 0/1/2 are not in
+     `task->fdtable` at all — they live in `task->streams`, which is what
+     already models console/file/pipe backing and what `sys_spawn` inherits
+     into a child. A `dup2` taking an fd from `SYS_OPEN` would have to convert
+     a VFS fd into a stream and *still* would not compose with inheritance, so
+     the primitive is the one the stream layer actually has: rebind a standard
+     stream to a path (`sys_redirect(fd, path, REDIR_MODE_*)`).
+
+     That choice is what makes ONE mechanism cover builtins and programs alike:
+     the shell redirects **itself**, runs the command, and restores. Builtins
+     write through `write(1, ..)` so they land in the file; a spawned child
+     inherits the redirected stream at spawn time (`streams_inherit` in
+     `sys_spawn`) so it lands there too, with no per-command plumbing.
+
+     Two limitations are refused **explicitly** rather than silently misbehaving:
+     a non-`D:` target gets **`-EXDEV`** (`STREAM_TYPE_FILE` is hard-wired to
+     RAMFS — `stdout_write` calls `ramfs_write` directly and the redirect
+     helpers call `ramfs_open`, so a `C:` path cannot be represented and must
+     not be quietly written to `D:`), and redirecting **stderr** to a file gets
+     **`-ENOSYS`** (there is no `stderr_redirect_to_file`, and no shell parses
+     `2>`; adding a helper for syntax nothing emits would be untested code on a
+     security-relevant path). `RESTORE` works on all three and is checked
+     *before* everything else, so a shell can restore unconditionally in its
+     cleanup path.
+
+     **`>` and `>>` were both broken in the shared stream layer** and are fixed
+     here — this is not new-feature-only work, and it affects the KERNEL shell
+     too. `stdout_redirect_to_file` had a literal `(void)append;` TODO, so `>>`
+     was indistinguishable from `>` and destroyed exactly the data the user
+     asked to keep. `>` was wrong in the other direction: RAMFS has **no
+     truncate flag** and `ramfs_write` only ever **grows** `node->size`, so `>`
+     onto a longer existing file overwrote from offset 0 and left the old tail
+     readable by the very next `cat`. Fixed with a new **`ramfs_truncate(fd)`**
+     (zeroes the retained pages — a later re-growth must not expose the old
+     contents through the gap) plus a seek-to-end for append.
+
+     `cat` with no operands now copies **stdin**; it is the only thing in the
+     shell that reads fd 0 on demand, and therefore the only way `<` is
+     observable from a builtin.
+
+     Harness: `verify-ring3-redirect.sh`. It asserts by **counting marker
+     occurrences**, not presence: "the new text appeared" is also true of a
+     `>>` that truncated, so only the count (alpha must appear 4 times, having
+     survived the append) catches it. Truncation is checked **positionally** —
+     no marker from before an overwrite may appear after it. And the decisive
+     negative for the child case: `Hello from ELF!` must appear only *after*
+     `cat h.txt` echoes, since a child that ignored the inherited redirection
+     would print to the console and satisfy every positive check.
+
+     **`split_args` splits at `>` and `<` mid-word**, so `echo a>b` redirects
+     rather than passing one literal argument — matching the kernel shell
+     (`shell_redir.c:123` stops a token at those characters). Two shells that
+     disagree about an identical-looking line is worse than either behaviour on
+     its own. The split cannot be done purely in place: the word before the
+     operator needs its NUL exactly where the operator byte sits, so the
+     operator and the rest of the line shift one byte right and the NUL goes in
+     the gap. That needs a spare byte, which is why `split_args` takes the
+     buffer **capacity** (not the string length) — `readline` can return a line
+     that fills the buffer completely, and an all-operators line would otherwise
+     walk off the end. Out of room, the operator stays glued and parses as an
+     ordinary argument: degraded, never corrupt. Harness case: `r3-delta`,
+     asserted via an occurrence with the operator **not** attached, since a
+     shell that never split still echoes the whole glued string.
+
+     **A redirected command gives the typist nothing to wait on.** With no
+     expect string the typist sends the next command immediately — harmless
+     after a builtin, but after `/hello.elf > h.txt` the shell is in `waitpid`
+     through signature verification and a full address-space build, nothing is
+     in `read()`, and the keystrokes are dropped. A bare `pwd` after it is a
+     **barrier, not a check**. Same failure as the `[EXEC] Process completed`
+     note in `verify-redirect.sh`, reached from the other side.
+
+   - PR #53 — **ring-3 pipelines** (`a | b`), via a new **`SYS_PIPE` (31)**.
+     Deliberately **NOT POSIX `pipe(int fd[2])`**, for the same reason
+     `SYS_REDIRECT` is not `dup2`: the ends a shell has to connect are stdin and
+     stdout, which are **not in `task->fdtable` at all** — they live in
+     `task->streams`. So a pipe is named by an **opaque integer ID**, its
+     `pipe_buffer_t` stays in **kernel memory and is never mapped into any user
+     address space**, and ring 3 only ever asks the kernel to bind an end to one
+     of *its own* streams. The blocking pipe layer itself already existed in
+     `src/shell_redir.c` (wait queues, EPIPE on both entry and post-wakeup
+     re-check) — the new work is ownership, lifecycle, and the shell driving it.
+
+     Unlike the KERNEL shell's pipeline, which is **sequential** (run stage N to
+     completion → buffer ≤4 KB → feed stage N+1; fine there, its stages are
+     function calls), ring-3 stages are **processes**, so both run at once with
+     real backpressure. That is why the harness moves ~11 KB through a 4 KB
+     buffer: the producer *must* fill it, block, and be woken by the consumer.
+
+     Ops: `CREATE` / `BIND_STDIN` / `UNBIND_STDOUT` / `CLOSE_WRITE` / `RESTORE`
+     / `DESTROY`. Three of them are load-bearing in non-obvious ways:
+
+     - **`UNBIND_STDOUT` is not a convenience.** A child inherits the shell's
+       streams **as they are at spawn time** (`streams_inherit` in `sys_spawn`),
+       so with stdout still on the write end when the **consumer** is spawned,
+       the consumer writes its output into the very pipe it is reading — its
+       report never reaches the console and it partly feeds itself. This shipped
+       broken first and the harness caught it: both stages exited 0 and printed
+       nothing. `RESTORE` cannot substitute — it resets **both** streams, and
+       stdin must stay on the read end across that spawn.
+     - **`CLOSE_WRITE` has no safe default.** Until it runs, a consumer that has
+       drained the buffer **blocks** rather than seeing EOF, because more data
+       could still arrive. Nothing in task teardown does it — a dying child's
+       inherited streams are marked `borrowed` precisely so they never touch the
+       creator's resources — so the shell must call it *after reaping the
+       producer*. A harness **timeout is itself the signal** that this regressed.
+     - **`RESTORE` is checked before the ID lookup** (as `REDIR_MODE_RESTORE` is),
+       so a shell can restore unconditionally in a cleanup path even if the pipe
+       is already gone. `UNBIND_STDOUT` is unconditional for the same reason.
+
+     Ownership: each slot records `{owner_pid, owner_generation}`. The
+     **generation** is what makes an ID safe to hand to ring 3 — a guessed ID
+     from another process gets `-EPERM`, and pid recycling cannot be used to
+     inherit a dead task's pipe. `task_pipes_cleanup()` runs in the task-teardown
+     path next to `task_fdtable_cleanup` (`process.c`), closing the
+     8-slot-exhaustion vector left by a shell that dies mid-pipeline.
+
+     `pipe_init`'s **lossy fallback mode** (it silently DROPS data when it cannot
+     allocate its wait-queue page) is **refused with `-ENOMEM`**, not shipped:
+     `CREATE` checks `buf->readers`/`buf->writers` and fails rather than hand
+     back a pipe that quietly eats output.
+
+     Two things are refused **explicitly** rather than misbehaving: a **builtin
+     stage** (a builtin runs inside the shell process, which cannot also be the
+     other stage — the message points at `kshell`), and a **redirection on the
+     piped end** (`a > f | b`, `a | b < f`), which would fight the pipe for the
+     stream and make the undo unbind the pipe instead of the file.
+
+     `spawn_stage` is **silent on failure by design** — at the moment the
+     producer is spawned, stdout *is* the pipe, so a message printed there would
+     be fed to the consumer as if it were the producer's output. Both callers
+     report the returned errno once stdout is theirs again.
+
+     Harness: `verify-ring3-pipes.sh`. Its decisive check is the **exact** line
+     count (801 = 800 + the producer's own `done`), not `>=`: "data arrived" is
+     also true of a pipe that truncated at `PIPE_BUFFER_SIZE`. Paired with the
+     **negative** — no `pipe-line` may appear on the console, which a shell that
+     ignored the pipe entirely would fail while satisfying every positive check.
+     Also note `tools/qemu_typist.py`'s follow-up expect went 120s → 240s: a
+     pipeline follow-up spawns two ECDSA-verified processes and then streams
+     kilobytes between them under TCG, which the shorter window did not cover.
+
+   Remaining: the privileged commands in ring 3.
 
 Hygiene: the three exec-path items are **done** (failure paths now restore CR3
 then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard
