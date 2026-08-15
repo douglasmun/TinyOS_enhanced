@@ -781,6 +781,19 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         }
     }
 
+    /* shell.elf is the ring-3 shell (roadmap item 4). The kernel shell stays
+     * the default and is untouched; this one is reached with `exec /shell.elf`.
+     * It spawns other programs itself, so it must be readable by uid 1000 for
+     * the same reason as the binaries above. */
+    {
+        int shell_fd = ramfs_open("/shell.elf", RAMFS_FLAG_WRITE);
+        if (shell_fd >= 0) {
+            ramfs_write(shell_fd, shell_elf_data, shell_elf_data_len);
+            ramfs_close(shell_fd);
+            ramfs_chmod("/shell.elf", 0755);
+        }
+    }
+
     /* spawner.elf exercises SYS_SPAWN from ring 3: it spawns /hello.elf with
      * arguments and waits for it. `exec` alone cannot prove that path, since
      * the shell loads processes from inside the kernel. */

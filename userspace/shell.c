@@ -1,183 +1,418 @@
 /*=============================================================================
- * shell.c - TinyOS Interactive Shell
+ * shell.c - TinyOS shell, running in ring 3.
+ *
+ * The first step of roadmap item 4. This is a REAL shell built entirely on the
+ * syscall foundation from PRs #43-#47: every builtin here reaches the
+ * filesystem through open/read/readdir/stat/lseek/mkdir/rmdir/unlink/chdir,
+ * and external programs run via spawn+waitpid. Nothing touches a kernel
+ * structure directly.
+ *
+ * The kernel shell is untouched and stays the default; reach this one with
+ *
+ *     exec /shell.elf
+ *
+ * Deliberately NOT implemented, because the syscalls do not exist yet:
+ * pipes and redirection (need pipe/dup2), and the privileged commands
+ * (pae, mem, wxaudit, auditlog, useradd, passwd, shutdown, networking).
+ * Those stay in the kernel shell until their syscalls land.
  *=============================================================================*/
 
-#define USER_MODE
-#include "../src/syscall.h"
+#include "libc.h"
+
+#define MAX_LINE   256
+#define MAX_ARGS   32
+#define PATH_MAX   256
 
 /*-----------------------------------------------------------------------------
- * String Utilities
- *-----------------------------------------------------------------------------*/
-
-// String length
-static int strlen(const char* str) {
-    int len = 0;
-    while (str[len]) len++;
-    return len;
-}
-
-// String compare
-static int strcmp(const char* s1, const char* s2) {
-    while (*s1 && (*s1 == *s2)) {
-        s1++;
-        s2++;
-    }
-    return *(unsigned char*)s1 - *(unsigned char*)s2;
-}
-
-// Memory set
-static void memset(void* dest, int val, int len) {
-    unsigned char* d = (unsigned char*)dest;
-    while (len--) {
-        *d++ = (unsigned char)val;
+ * Error reporting
+ *
+ * The syscalls return negative errno values straight from the VFS. Mapping
+ * them to text here keeps every builtin's failure path a single line.
+ *---------------------------------------------------------------------------*/
+static const char* errstr(int err) {
+    switch (err) {
+        case -2:  return "no such file or directory";
+        case -13: return "permission denied";
+        case -17: return "file exists";
+        case -20: return "not a directory";
+        case -21: return "is a directory";
+        case -22: return "invalid argument";
+        case -34: return "result too large";
+        case -39: return "directory not empty";
+        default:  return "operation failed";
     }
 }
 
+static void fail(const char* cmd, const char* arg, int err) {
+    if (arg) {
+        printf("%s: %s: %s\n", cmd, arg, errstr(err));
+    } else {
+        printf("%s: %s\n", cmd, errstr(err));
+    }
+}
+
 /*-----------------------------------------------------------------------------
- * Shell Commands
- *-----------------------------------------------------------------------------*/
+ * Builtins
+ *---------------------------------------------------------------------------*/
 
 static void cmd_help(void) {
-    puts("TinyOS Shell - Available Commands:\n");
-    puts("  help   - Show this help message\n");
-    puts("  clear  - Clear the screen\n");
-    puts("  ps     - List running processes\n");
-    puts("  exit   - Exit the shell\n");
-    puts("\n");
+    print("TinyOS ring-3 shell. Builtins:\n"
+          "  help              this message\n"
+          "  echo [args...]    print arguments\n"
+          "  pwd               print working directory\n"
+          "  cd [dir]          change directory (no arg: D:/)\n"
+          "  ls [dir]          list a directory (default: .)\n"
+          "  cat <file>...     print file contents\n"
+          "  stat <path>...    show size and type\n"
+          "  mkdir <dir>...    create directories\n"
+          "  rmdir <dir>...    remove empty directories\n"
+          "  rm <file>...      remove files\n"
+          "  write <f> <text>  write text to a file (truncates)\n"
+          "  getpid            print this shell's pid\n"
+          "  id                print uid and gid\n"
+          "  exit [status]     leave the shell\n"
+          "\n"
+          "Anything else is run as a program: a name containing '/' or ending\n"
+          "in .elf is spawned, and the shell waits for it unless it ends '&'.\n");
 }
 
-static void cmd_clear(void) {
-    // VGA text mode: 80x25
-    // Clear by writing spaces
-    puts("\x1B[2J\x1B[H");  // ANSI escape codes (if supported)
-    // For now, just print newlines
-    for (int i = 0; i < 25; i++) {
-        puts("\n");
+static void cmd_echo(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) print(" ");
+        print(argv[i]);
+    }
+    print("\n");
+}
+
+static void cmd_pwd(void) {
+    char buf[PATH_MAX];
+    int n = getcwd(buf, sizeof(buf));
+    if (n < 0) {
+        fail("pwd", 0, n);
+        return;
+    }
+    printf("%s\n", buf);
+}
+
+static void cmd_cd(int argc, char** argv) {
+    /* Bare `cd` goes to D:/, this system's equivalent of $HOME. */
+    const char* target = (argc > 1) ? argv[1] : "D:/";
+    int err = chdir(target);
+    if (err < 0) {
+        fail("cd", target, err);
     }
 }
 
-static void cmd_ps(void) {
-    puts("PID   NAME\n");
-    puts("---   ----\n");
+static void cmd_ls(int argc, char** argv) {
+    const char* path = (argc > 1) ? argv[1] : ".";
 
-    // For now, just show current process
-    int pid = getpid();
-
-    write(1, "", 0);  // Placeholder - kernel would need to expose process list
-    write(1, "Currently running in PID: ", 26);
-
-    // Convert PID to string
-    char pid_str[12];
-    int i = 0;
-    int temp_pid = pid;
-
-    if (temp_pid == 0) {
-        pid_str[i++] = '0';
-    } else {
-        // Convert to string (reversed)
-        int digits = 0;
-        while (temp_pid > 0) {
-            pid_str[digits++] = '0' + (temp_pid % 10);
-            temp_pid /= 10;
-        }
-        // Reverse
-        for (int j = 0; j < digits / 2; j++) {
-            char tmp = pid_str[j];
-            pid_str[j] = pid_str[digits - 1 - j];
-            pid_str[digits - 1 - j] = tmp;
-        }
-        i = digits;
-    }
-    pid_str[i] = '\0';
-
-    puts(pid_str);
-    puts("\n\n");
-    puts("Note: Full process listing not yet implemented\n");
-}
-
-static void cmd_exit(void) {
-    puts("Exiting shell...\n");
-    exit(0);
-}
-
-/*-----------------------------------------------------------------------------
- * Command Parser
- *-----------------------------------------------------------------------------*/
-
-static void parse_command(const char* cmd) {
-    // Trim leading spaces
-    while (*cmd == ' ') cmd++;
-
-    // Empty command
-    if (*cmd == '\0' || *cmd == '\n') {
+    int fd = open(path, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        fail("ls", path, fd);
         return;
     }
 
-    // Match commands
-    if (strcmp(cmd, "help\n") == 0 || strcmp(cmd, "help") == 0) {
-        cmd_help();
+    /* readdir returns whole records, so read a few at a time rather than one
+     * syscall per entry. */
+    dirent_t ents[8];
+    int count = 0;
+    for (;;) {
+        int n = readdir(fd, ents, sizeof(ents));
+        if (n < 0) {
+            fail("ls", path, n);
+            break;
+        }
+        if (n == 0) break;
+
+        int have = n / (int)sizeof(dirent_t);
+        for (int i = 0; i < have; i++) {
+            if (ents[i].type == DT_DIR) {
+                printf("%s/\n", ents[i].name);
+            } else {
+                printf("%s\n", ents[i].name);
+            }
+            count++;
+        }
     }
-    else if (strcmp(cmd, "clear\n") == 0 || strcmp(cmd, "clear") == 0) {
-        cmd_clear();
+    close(fd);
+
+    if (count == 0) {
+        print("(empty)\n");
     }
-    else if (strcmp(cmd, "ps\n") == 0 || strcmp(cmd, "ps") == 0) {
-        cmd_ps();
+}
+
+static void cmd_cat(int argc, char** argv) {
+    if (argc < 2) {
+        print("usage: cat <file>...\n");
+        return;
     }
-    else if (strcmp(cmd, "exit\n") == 0 || strcmp(cmd, "exit") == 0) {
-        cmd_exit();
+
+    for (int i = 1; i < argc; i++) {
+        int fd = open(argv[i], O_RDONLY);
+        if (fd < 0) {
+            fail("cat", argv[i], fd);
+            continue;
+        }
+
+        char buf[128];
+        for (;;) {
+            int n = read(fd, buf, sizeof(buf));
+            if (n < 0) {
+                fail("cat", argv[i], n);
+                break;
+            }
+            if (n == 0) break;
+            write(1, buf, (size_t)n);
+        }
+        close(fd);
     }
-    else {
-        puts("Unknown command: ");
-        write(1, cmd, strlen(cmd));
-        puts("Type 'help' for available commands\n");
+}
+
+static void cmd_stat(int argc, char** argv) {
+    if (argc < 2) {
+        print("usage: stat <path>...\n");
+        return;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        dirent_t st;
+        int err = stat(argv[i], &st, sizeof(st));
+        if (err < 0) {
+            fail("stat", argv[i], err);
+            continue;
+        }
+        printf("%s  size=%u  %s\n", argv[i], st.size,
+               st.type == DT_DIR ? "directory" : "file");
+    }
+}
+
+/* mkdir/rmdir/rm differ only in which syscall they call and what they are
+ * called, so one helper covers all three. */
+typedef int (*path_op_t)(const char*);
+
+static void cmd_path_op(int argc, char** argv, path_op_t op, const char* name) {
+    if (argc < 2) {
+        printf("usage: %s <path>...\n", name);
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        int err = op(argv[i]);
+        if (err < 0) {
+            fail(name, argv[i], err);
+        }
+    }
+}
+
+static void cmd_write(int argc, char** argv) {
+    if (argc < 3) {
+        print("usage: write <file> <text...>\n");
+        return;
+    }
+
+    int fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        fail("write", argv[1], fd);
+        return;
+    }
+
+    for (int i = 2; i < argc; i++) {
+        if (i > 2) write(fd, " ", 1);
+        int len = (int)strlen(argv[i]);
+        int n = write(fd, argv[i], (size_t)len);
+        if (n < 0) {
+            fail("write", argv[1], n);
+            close(fd);
+            return;
+        }
+    }
+    write(fd, "\n", 1);
+    close(fd);
+}
+
+static void cmd_id(void) {
+    printf("uid=%d gid=%d\n", getuid(), getgid());
+}
+
+/*-----------------------------------------------------------------------------
+ * External programs
+ *
+ * spawn() does not block, so a foreground command is spawn + waitpid and a
+ * background one is spawn alone. The child inherits stdin/stdout/stderr.
+ *---------------------------------------------------------------------------*/
+static void run_program(int argc, char** argv, int background) {
+    (void)argc;
+
+    /* Copy the path out of argv rather than passing argv[0] itself. The two
+     * arguments would otherwise alias the same user string, and the kernel
+     * resolves the path against the cwd before reading the vector. */
+    char path[PATH_MAX];
+    size_t plen = strlen(argv[0]);
+    if (plen >= sizeof(path)) {
+        printf("%s: path too long\n", argv[0]);
+        return;
+    }
+    memcpy(path, argv[0], plen + 1);
+
+    int pid = spawn(path, argv);
+    if (pid < 0) {
+        fail(argv[0], 0, pid);
+        return;
+    }
+
+    if (background) {
+        printf("[%d] %s\n", pid, argv[0]);
+        return;
+    }
+
+    int status = waitpid(pid);
+    if (status != 0) {
+        printf("%s: exited with status %d\n", argv[0], status);
     }
 }
 
 /*-----------------------------------------------------------------------------
- * Main Shell Loop
- *-----------------------------------------------------------------------------*/
+ * Parsing
+ *
+ * Splits on runs of spaces/tabs in place. Quoting is deliberately absent: the
+ * kernel shell does not support it either, and adding it here would be a
+ * behaviour change smuggled into a migration.
+ *---------------------------------------------------------------------------*/
+static int split_args(char* line, char** argv, int max) {
+    int argc = 0;
+    char* p = line;
 
-void _start(void) {
-    // Set up user-mode data segments
-    // Use 0x23 (GDT entry 4, ring 3) not 0x2b (LDT entry 5, ring 3)
-    __asm__ volatile(
-        "mov $0x2b, %ax\n"
-        "mov %ax, %ds\n"
-        "mov %ax, %es\n"
-        "mov %ax, %fs\n"
-        "mov %ax, %gs\n"
-    );
+    while (*p && argc < max - 1) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
 
-    // Welcome message
-    puts("\n");
-    puts("================================\n");
-    puts("  TinyOS Interactive Shell v1.0\n");
-    puts("================================\n");
-    puts("\n");
-    puts("Type 'help' for available commands\n");
-    puts("\n");
+        argv[argc++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) {
+            *p = '\0';
+            p++;
+        }
+    }
+    argv[argc] = 0;
+    return argc;
+}
 
-    // Command buffer
-    char cmd_buffer[256];
+/* A trailing '&' backgrounds the command. It may be its own word or stuck to
+ * the last one ("sleeper.elf&"); both forms are stripped here so the argv the
+ * child sees never contains it. */
+static int take_background_flag(int* argc, char** argv) {
+    if (*argc == 0) return 0;
 
-    // Main shell loop
-    while (1) {
-        // Print prompt
-        puts("tiny$ ");
+    char* last = argv[*argc - 1];
+    size_t len = strlen(last);
 
-        // Read command
-        memset(cmd_buffer, 0, sizeof(cmd_buffer));
-        int bytes_read = read(0, cmd_buffer, sizeof(cmd_buffer) - 1);
+    if (strcmp(last, "&") == 0) {
+        argv[--(*argc)] = 0;
+        return 1;
+    }
+    if (len > 0 && last[len - 1] == '&') {
+        last[len - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
 
-        if (bytes_read > 0) {
-            // Null-terminate
-            cmd_buffer[bytes_read] = '\0';
+/* A word is a program rather than a builtin if it names a path or an ELF. */
+static int looks_like_program(const char* word) {
+    if (strchr(word, '/') != 0) return 1;
 
-            // Parse and execute command
-            parse_command(cmd_buffer);
+    size_t len = strlen(word);
+    return len > 4 && strcmp(word + len - 4, ".elf") == 0;
+}
+
+/*-----------------------------------------------------------------------------
+ * Dispatch
+ *
+ * Returns 0 to keep looping, or 1 to exit the shell (with *status set).
+ *---------------------------------------------------------------------------*/
+static int dispatch(int argc, char** argv, int background, int* status) {
+    const char* cmd = argv[0];
+
+    if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "logout") == 0) {
+        *status = (argc > 1) ? atoi(argv[1]) : 0;
+        return 1;
+    }
+
+    if (strcmp(cmd, "help") == 0)   { cmd_help();               return 0; }
+    if (strcmp(cmd, "echo") == 0)   { cmd_echo(argc, argv);     return 0; }
+    if (strcmp(cmd, "pwd") == 0)    { cmd_pwd();                return 0; }
+    if (strcmp(cmd, "cd") == 0)     { cmd_cd(argc, argv);       return 0; }
+    if (strcmp(cmd, "ls") == 0)     { cmd_ls(argc, argv);       return 0; }
+    if (strcmp(cmd, "cat") == 0)    { cmd_cat(argc, argv);      return 0; }
+    if (strcmp(cmd, "stat") == 0)   { cmd_stat(argc, argv);     return 0; }
+    if (strcmp(cmd, "write") == 0)  { cmd_write(argc, argv);    return 0; }
+    if (strcmp(cmd, "id") == 0)     { cmd_id();                 return 0; }
+
+    if (strcmp(cmd, "mkdir") == 0) { cmd_path_op(argc, argv, mkdir,  "mkdir"); return 0; }
+    if (strcmp(cmd, "rmdir") == 0) { cmd_path_op(argc, argv, rmdir,  "rmdir"); return 0; }
+    if (strcmp(cmd, "rm") == 0)    { cmd_path_op(argc, argv, unlink, "rm");    return 0; }
+
+    if (strcmp(cmd, "getpid") == 0) {
+        printf("%d\n", getpid());
+        return 0;
+    }
+
+    if (looks_like_program(cmd)) {
+        run_program(argc, argv, background);
+        return 0;
+    }
+
+    printf("%s: not found (try 'help')\n", cmd);
+    return 0;
+}
+
+/*-----------------------------------------------------------------------------
+ * Main loop
+ *---------------------------------------------------------------------------*/
+int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+
+    print("\nTinyOS shell (ring 3) - type 'help' for builtins, 'exit' to leave\n");
+
+    char line[MAX_LINE];
+    char* args[MAX_ARGS];
+    int status = 0;
+
+    for (;;) {
+        /* The prompt carries the cwd, which is the whole point of having one. */
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) >= 0) {
+            printf("%s $ ", cwd);
+        } else {
+            print("$ ");
+        }
+
+        int n = readline(line, sizeof(line));
+        if (n < 0) {
+            /* stdin is gone; there is no more input to act on. */
+            print("\n");
+            break;
+        }
+
+        /* Echo the accepted line. The kernel echoes keystrokes in the keyboard
+         * IRQ, which reaches the VGA console but NOT the serial log, so
+         * without this a serial transcript shows output with no commands.
+         * readline() has already stripped the newline. */
+        printf("%s\n", line);
+
+        if (n == 0) continue;
+
+        int nargs = split_args(line, args, MAX_ARGS);
+        if (nargs == 0) continue;
+
+        int background = take_background_flag(&nargs, args);
+        if (nargs == 0) continue;
+
+        if (dispatch(nargs, args, background, &status)) {
+            break;
         }
     }
 
-    // Should never reach here
-    exit(0);
+    print("shell: exiting\n");
+    return status;
 }

@@ -80,8 +80,41 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      rmdir now clear the dirent **before** freeing the chain — a dangling name
      is more dangerous than a leaked chain. `fat32_list_root_cb` is now a
      wrapper over `fat32_list_dir_cb(path, ...)`; `cmd_fatls` takes a path.
-   Remaining before the shell itself: nothing in the kernel — the syscall
-   foundation is complete. Next is migrating the shell itself to ring 3.
+   - PR #48 — **the ring-3 shell itself**, first migration step. The kernel
+     shell is still the default and is untouched; `userspace/shell.c` (was a
+     183-line vestigial stub with 4 hardcoded commands and a hand-rolled
+     `_start`) is now a libc-based `main(argc, argv)` reached with
+     `exec /shell.elf`. Builtins: `help echo pwd cd ls cat stat write mkdir
+     rmdir rm id exit`, plus program launch with argv and `&` backgrounding.
+     `src/kernel.c` seeds `/shell.elf` into RAMFS at 0755 (`shell_elf_data.h`
+     was already included but never referenced). Deferred by design: pipes and
+     redirection (need pipe/dup2 syscalls) and the privileged commands (`pae`,
+     `mem`, `wxaudit`, `auditlog`, `useradd`, `passwd`, `shutdown`, net).
+     Harness: `verify-usershell.sh` — unlike the other harnesses, commands
+     arrive as **keystrokes into a ring-3 `read()`**, so PASS proves the
+     interactive path (prompt, line editing, argv split, dispatch), and it
+     asserts the `rmdir`-non-empty **refusal**, not just success paths.
+     The shell must **echo the accepted line itself**: the kernel echoes
+     keystrokes in the keyboard IRQ, which reaches VGA but NOT the serial log,
+     so without it a serial transcript shows output with no commands — and the
+     typist's `type_verified` echo-check has nothing to match.
+
+   **User ESP is 16-byte aligned DOWNWARD on first entry to ring 3.**
+   `switch_to_user_mode` (`src/context_switch.S`) does `and eax, 0xFFFFFFF0` on
+   the user ESP before building the iret frame (SSE wants 16). That silently
+   moves ESP *down* by up to 15 bytes, past the argc/argv block
+   `task_create_user_argv` just wrote — crt0 then read argc from zeroed stack
+   below the block, so `main` saw `argc == 0` and a garbage argv. Whether it
+   bit depended on the total length of the argument strings, so `exec
+   /hello.elf` and shell→spawner.elf→hello.elf happened to align and passed
+   while `/hello.elf shellarg` did not. Fixed in `process.c` by biasing the
+   block's alignment so the FINAL esp is already 16-aligned (the mask becomes a
+   no-op); the bounds check gained 15 bytes of slack. Do not "simplify" the
+   alignment bias away — pre-existing kernel bug, only reachable once a ring-3
+   parent passed a variable-length vector.
+
+   Remaining: pipes/redirection and the privileged commands, then making the
+   ring-3 shell the default login shell.
 
 Hygiene: the three exec-path items are **done** (failure paths now restore CR3
 then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard
