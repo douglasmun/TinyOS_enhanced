@@ -220,6 +220,12 @@ int ramfs_seek(int fd, uint32_t offset);
 int ramfs_tell(int fd);
 int ramfs_fd_size(int fd);
 int ramfs_write(int fd, const void* buf, size_t count);
+
+/* Discard a file's contents (size 0, cursor 0). ramfs_write only ever grows
+ * node->size, so this is the only way to SHORTEN a file — which is what `>`
+ * means. Requires the fd to be open for writing. Zeroes the retained pages so
+ * a later re-growth cannot expose the old contents. */
+int ramfs_truncate(int fd);
 void ramfs_close(int fd);
 int ramfs_unlink(const char* path);
 

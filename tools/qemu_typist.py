@@ -218,7 +218,12 @@ def main():
             type_verified(sock, cmd + "\n", timeout=60)
             if want:
                 try:
-                    wait_for(want, timeout=120, since=mark)
+                    # Same 240s as the first command's expect: a follow-up can
+                    # be just as expensive (a ring-3 pipeline spawns TWO
+                    # processes, each ECDSA-verified, then streams kilobytes
+                    # between them under TCG). Raising a timeout only ever
+                    # costs time on a run that was going to fail anyway.
+                    wait_for(want, timeout=240, since=mark)
                     print(f"typist: '{want}' observed")
                 except SystemExit as e:
                     print(str(e), file=sys.stderr)

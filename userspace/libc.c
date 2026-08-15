@@ -106,6 +106,15 @@ int chdir(const char* path) {
     return syscall1(SYS_CHDIR, (uint32_t)(uintptr_t)path);
 }
 
+int redirect(int fd, const char* path, int mode) {
+    return syscall3(SYS_REDIRECT, (uint32_t)fd, (uint32_t)(uintptr_t)path,
+                    (uint32_t)mode);
+}
+
+int pipe_op(int op, int id) {
+    return syscall3(SYS_PIPE, (uint32_t)op, (uint32_t)id, 0);
+}
+
 int putchar(int c) {
     char ch = (char)c;
     write(1, &ch, 1);

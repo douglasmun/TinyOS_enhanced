@@ -33,6 +33,8 @@
 #define SYS_UNLINK  27
 #define SYS_GETCWD  28
 #define SYS_CHDIR   29
+#define SYS_REDIRECT 30
+#define SYS_PIPE     31
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -126,6 +128,66 @@ int  unlink(const char* path);
  * it needs only search (x) permission, not read. */
 int  getcwd(char* buf, unsigned int size);
 int  chdir(const char* path);
+
+/* Redirection modes (must match REDIR_MODE_* in src/syscall.h) */
+#define REDIR_TRUNC    0    /* stdout: create or truncate  ('>')  */
+#define REDIR_APPEND   1    /* stdout: create or append    ('>>') */
+#define REDIR_READ     2    /* stdin:  open an existing file ('<') */
+#define REDIR_RESTORE  3    /* put the stream back on the console  */
+
+/* Point stdin or stdout at a file, or restore it to the console.
+ *
+ * NOT dup2 — there is no fd to duplicate, because fds 0/1/2 are not in the
+ * per-process fd table at all; they are the kernel's stream_context_t. This
+ * rebinds one of those streams directly.
+ *
+ * A spawned child INHERITS the redirected stream, so a shell redirects a whole
+ * command by redirecting itself, spawning, and restoring afterwards. Only the
+ * RAMFS drive (D:) can be a target: -EXDEV for anything else. stderr may be
+ * restored but not redirected to a file (-ENOSYS). `path` is ignored for
+ * REDIR_RESTORE and may be NULL. Returns 0 or a negative errno. */
+int  redirect(int fd, const char* path, int mode);
+
+/* Pipe operations (must match PIPE_OP_* in src/syscall.h) */
+#define PIPE_CREATE         0  /* new pipe, bound to my stdout            */
+#define PIPE_BIND_STDIN     1  /* bind its read end to my stdin           */
+#define PIPE_CLOSE_WRITE    2  /* producer done: readers now see EOF      */
+#define PIPE_RESTORE        3  /* my stdin+stdout back to the console     */
+#define PIPE_DESTROY        4  /* release the pipe                        */
+#define PIPE_UNBIND_STDOUT  5  /* my stdout only, back to the console     */
+
+/* Create a pipe, bind an end to one of my streams, or release it.
+ *
+ * NOT POSIX pipe(int fd[2]): the ends a shell needs to connect are stdin and
+ * stdout, which are not fds at all (same reason redirect() is not dup2). The
+ * pipe is named by an opaque ID instead and its buffer stays in the kernel.
+ *
+ * For `producer | consumer` a shell does:
+ *
+ *   int id = pipe_op(PIPE_CREATE, 0);      // my stdout -> pipe
+ *   int a  = spawn("prod.elf", 0);         // inherits it
+ *   pipe_op(PIPE_UNBIND_STDOUT, id);       // my stdout -> console again
+ *   pipe_op(PIPE_BIND_STDIN, id);          // my stdin  -> pipe
+ *   int b  = spawn("cons.elf", 0);         // inherits pipe stdin, real stdout
+ *   pipe_op(PIPE_RESTORE, id);             // my own streams back
+ *   waitpid(a);
+ *   pipe_op(PIPE_CLOSE_WRITE, id);         // consumer can now see EOF
+ *   waitpid(b);
+ *   pipe_op(PIPE_DESTROY, id);
+ *
+ * UNBIND_STDOUT between the spawns is REQUIRED: a child inherits the streams as
+ * they are AT SPAWN TIME, so a stdout still on the write end would make the
+ * consumer write into the pipe it is reading. RESTORE cannot substitute — it
+ * resets stdin too, and stdin must stay on the read end for that spawn.
+ *
+ * CLOSE_WRITE after reaping the producer is REQUIRED: until it runs, a drained
+ * consumer blocks rather than seeing end-of-input, because more data could
+ * still arrive.
+ *
+ * PIPE_CREATE returns a positive ID; the rest return 0. Negative is an errno. */
+int  pipe_op(int op, int id);
+
+/* Console I/O */
 int  putchar(int c);
 int  puts(const char* s);            /* appends newline */
 void print(const char* s);           /* no newline */

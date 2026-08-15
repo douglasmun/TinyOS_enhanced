@@ -794,6 +794,22 @@ void task_fdtable_init(task_t* task);
 void task_fdtable_cleanup(task_t* task);
 
 /**
+ * @brief Release every pipe the task created via SYS_PIPE.
+ *
+ * Called from task_terminate alongside task_fdtable_cleanup. Implemented in
+ * syscall.c, where the pipe table lives.
+ *
+ * A pipe is only ever released by its owner, and the table is a fixed size, so
+ * without this a shell killed mid-pipeline would strand its slots permanently
+ * — repeatable on demand, hence a real exhaustion vector. This also wakes
+ * anything still blocked on the released pipes, since the other stage of that
+ * pipeline may be parked waiting for data that can no longer arrive.
+ *
+ * @param task Task whose pipes should be released
+ */
+void task_pipes_cleanup(task_t* task);
+
+/**
  * @brief Install a global VFS fd in the first free slot.
  * @param task Task to install into
  * @param vfs_fd Global VFS descriptor (from vfs_open)

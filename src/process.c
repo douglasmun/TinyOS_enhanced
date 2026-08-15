@@ -1579,6 +1579,15 @@ void task_terminate(uint32_t pid) {
         // never touches the kernel stack the dying task is still running on.
         task_fdtable_cleanup(task);
 
+        // Same for pipes created via SYS_PIPE. Without this, a shell killed
+        // mid-pipeline would strand its slots forever: nothing else knows the
+        // owner is gone, and the table is a fixed 8 entries, so repeating it
+        // exhausts pipes system-wide. Frees the buffer AND wakes anything still
+        // blocked on either end, which matters because the other stage of the
+        // pipeline may still be parked in pipe_read waiting for data that can
+        // no longer come.
+        task_pipes_cleanup(task);
+
         // A task terminated while not running never reaches the scheduler
         // cleanup queue (it is reaped off the ready queue without freeing its
         // slot), so free its resources and release its slot here. A

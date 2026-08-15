@@ -144,6 +144,10 @@ bgjobs.log
 bgjobs-trace.log
 redirect.log
 redirect-trace.log
+ring3-redirect.log
+ring3-redirect-trace.log
+ring3-pipes.log
+ring3-pipes-trace.log
 scratchpad/
 argv.log
 argv-trace.log

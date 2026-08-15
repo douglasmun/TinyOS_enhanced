@@ -34,10 +34,13 @@ static const char* errstr(int err) {
         case -2:  return "no such file or directory";
         case -13: return "permission denied";
         case -17: return "file exists";
+        case -18: return "cannot redirect across drives (D: only)";
         case -20: return "not a directory";
         case -21: return "is a directory";
         case -22: return "invalid argument";
         case -34: return "result too large";
+        case -36: return "path too long";
+        case -38: return "not supported";
         case -39: return "directory not empty";
         default:  return "operation failed";
     }
@@ -62,7 +65,7 @@ static void cmd_help(void) {
           "  pwd               print working directory\n"
           "  cd [dir]          change directory (no arg: D:/)\n"
           "  ls [dir]          list a directory (default: .)\n"
-          "  cat <file>...     print file contents\n"
+          "  cat [file]...     print file contents (no arg: copy stdin)\n"
           "  stat <path>...    show size and type\n"
           "  mkdir <dir>...    create directories\n"
           "  rmdir <dir>...    remove empty directories\n"
@@ -76,11 +79,23 @@ static void cmd_help(void) {
           "Anything else is run as a program: a name containing '/' or ending\n"
           "in .elf is spawned, and the shell waits for it unless it ends '&'.\n"
           "\n"
+          "Redirection works on builtins and programs alike:\n"
+          "  cmd > file        send output to file (truncates)\n"
+          "  cmd >> file       append output to file\n"
+          "  cmd < file        read input from file\n"
+          "Targets must be on D: (the RAM disk); C: is not redirectable.\n"
+          "\n"
+          "Pipelines run both stages at once, connected by a real pipe:\n"
+          "  prog.elf | prog.elf     output of the left feeds the right\n"
+          "Both sides must be programs — a builtin runs inside the shell\n"
+          "itself, which cannot be both stages at once. `kshell` has\n"
+          "pipelines that work with builtins.\n"
+          "\n"
           "This shell runs at ring 3 and reaches the system only through\n"
           "syscalls. It does not yet cover everything: user management,\n"
-          "shutdown/reboot, ps/top/kill, the security tooling, networking,\n"
-          "pipes and redirection still live in the kernel shell. Type\n"
-          "`kshell` to get there.\n");
+          "shutdown/reboot, ps/top/kill, the security tooling and\n"
+          "networking still live in the kernel shell. Type `kshell` to get\n"
+          "there.\n");
 }
 
 static void cmd_echo(int argc, char** argv) {
@@ -148,9 +163,28 @@ static void cmd_ls(int argc, char** argv) {
     }
 }
 
+/* Copies an already-open fd to stdout. Shared by `cat <file>` and the no-arg
+ * `cat`, which reads fd 0 — the only way `<` is observable from a builtin. */
+static void cat_fd(int fd, const char* label) {
+    char buf[128];
+    for (;;) {
+        int n = read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            fail("cat", label, n);
+            return;
+        }
+        if (n == 0) return;
+        write(1, buf, (size_t)n);
+    }
+}
+
 static void cmd_cat(int argc, char** argv) {
     if (argc < 2) {
-        print("usage: cat <file>...\n");
+        /* No operands: copy stdin. This is what makes `cat < file` mean
+         * anything — nothing else in the shell reads fd 0 on demand. With
+         * stdin left on the console it reads typed lines instead, the same way
+         * the prompt does, which is the conventional behaviour. */
+        cat_fd(0, "(stdin)");
         return;
     }
 
@@ -161,16 +195,7 @@ static void cmd_cat(int argc, char** argv) {
             continue;
         }
 
-        char buf[128];
-        for (;;) {
-            int n = read(fd, buf, sizeof(buf));
-            if (n < 0) {
-                fail("cat", argv[i], n);
-                break;
-            }
-            if (n == 0) break;
-            write(1, buf, (size_t)n);
-        }
+        cat_fd(fd, argv[i]);
         close(fd);
     }
 }
@@ -283,24 +308,78 @@ static void run_program(int argc, char** argv, int background) {
  * Splits on runs of spaces/tabs in place. Quoting is deliberately absent: the
  * kernel shell does not support it either, and adding it here would be a
  * behaviour change smuggled into a migration.
+ *
+ * '>' and '<' also END a word, so `echo a>b` splits as `echo` `a` `>b` — the
+ * same way the kernel shell tokenises it (shell_redir.c stops a token at those
+ * characters). Without this the two shells would disagree about a line that
+ * looks identical in both, which is worse than either behaviour on its own.
+ *
+ * Splitting at an operator cannot be done purely in place: the word before it
+ * needs its NUL exactly where the operator byte sits. So the operator and the
+ * rest of the line are shifted one byte right, and the NUL goes in the gap.
+ * That needs a spare byte, which is why `cap` (the buffer size, not the string
+ * length) is a parameter — readline can return a line that fills the buffer
+ * completely, and without the bound a line of all-operators would walk off the
+ * end. When there is no room the operator is simply left glued to the word,
+ * which parses as an ordinary argument: degraded, not corrupt.
  *---------------------------------------------------------------------------*/
-static int split_args(char* line, char** argv, int max) {
+static int is_redir_char(char c) {
+    return c == '>' || c == '<';
+}
+
+static int split_args(char* line, size_t cap, char** argv, int max) {
     int argc = 0;
     char* p = line;
+    size_t used = strlen(line) + 1;
 
     while (*p && argc < max - 1) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') break;
 
         argv[argc++] = p;
-        while (*p && *p != ' ' && *p != '\t') p++;
-        if (*p) {
-            *p = '\0';
-            p++;
+
+        if (is_redir_char(*p)) {
+            /* An operator word: take the operator (two chars for ">>") plus a
+             * glued target, stopping at the next operator. */
+            if (p[0] == '>' && p[1] == '>') p += 2; else p++;
         }
+        while (*p && *p != ' ' && *p != '\t' && !is_redir_char(*p)) p++;
+
+        if (*p == '\0') break;
+
+        if (is_redir_char(*p)) {
+            if (used >= cap) break;
+            memmove(p + 1, p, used - (size_t)(p - line));
+            used++;
+        }
+        *p = '\0';
+        p++;
     }
     argv[argc] = 0;
     return argc;
+}
+
+/* Split a line at the FIRST '|', in place: `line` keeps the left stage and the
+ * return value points at the right one. Returns 0 when there is no pipe.
+ *
+ * Done before split_args, not after, because each side is then tokenised —
+ * and redirected — entirely on its own. `a < in | b > out` therefore means what
+ * it does in a real shell: the `<` belongs to the left stage and the `>` to the
+ * right, rather than both being collected into one command's redirections.
+ *
+ * Unlike the '>' case in split_args this needs no byte shuffling: the '|' byte
+ * itself is not part of either side, so it can simply become the left stage's
+ * terminator. Only ONE pipe is recognised; see run_pipeline for why more would
+ * need a different execution shape, and note that a second '|' is left in the
+ * right stage's words rather than silently dropped. */
+static char* split_pipeline(char* line) {
+    for (char* p = line; *p; p++) {
+        if (*p == '|') {
+            *p = '\0';
+            return p + 1;
+        }
+    }
+    return 0;
 }
 
 /* A trailing '&' backgrounds the command. It may be its own word or stuck to
@@ -323,12 +402,257 @@ static int take_background_flag(int* argc, char** argv) {
     return 0;
 }
 
+/*-----------------------------------------------------------------------------
+ * Redirection
+ *
+ * `>`, `>>` and `<` are stripped out of argv here, before dispatch, so every
+ * builtin and every program gets them for free without knowing they exist: the
+ * shell rebinds its OWN stdin/stdout, runs the command, and restores. Builtins
+ * write through write(1, ...) and so land in the file; a spawned child inherits
+ * the redirected stream at spawn time (the kernel copies streams into the child
+ * in sys_spawn), so it lands there too.
+ *
+ * The operator may stand alone ("ls > out.txt") or be glued to its target
+ * ("ls >out.txt"), matching the kernel shell.
+ *---------------------------------------------------------------------------*/
+typedef struct {
+    const char* out_path;   /* 0 if no > or >>            */
+    int         out_append; /* 1 for >>, 0 for >          */
+    const char* in_path;    /* 0 if no <                  */
+} redir_t;
+
+/* Removes the redirection words from argv (compacting it) and fills `r`.
+ * Returns 0 on success, -1 if an operator had no target — in which case the
+ * caller must not run the command, since "ls >" would otherwise silently run
+ * unredirected. */
+static int take_redirections(int* argc, char** argv, redir_t* r) {
+    r->out_path = 0;
+    r->out_append = 0;
+    r->in_path = 0;
+
+    int out = 0;
+    for (int i = 0; i < *argc; i++) {
+        char* w = argv[i];
+        const char** target = 0;
+        const char* glued = 0;
+
+        if (w[0] == '>') {
+            target = &r->out_path;
+            if (w[1] == '>') {
+                r->out_append = 1;
+                glued = w + 2;
+            } else {
+                r->out_append = 0;
+                glued = w + 1;
+            }
+        } else if (w[0] == '<') {
+            target = &r->in_path;
+            glued = w + 1;
+        } else {
+            argv[out++] = w;
+            continue;
+        }
+
+        if (*glued != '\0') {
+            *target = glued;
+        } else if (i + 1 < *argc) {
+            *target = argv[++i];
+        } else {
+            return -1;
+        }
+    }
+
+    *argc = out;
+    argv[out] = 0;
+    return 0;
+}
+
+/* Applies `r` to this process's own streams. On failure it restores whatever
+ * it already changed, so the shell never ends up half-redirected and printing
+ * its prompt into a file. Returns 0 or a negative errno. */
+static int redir_apply(const redir_t* r) {
+    if (r->in_path) {
+        int err = redirect(0, r->in_path, REDIR_READ);
+        if (err < 0) {
+            fail("<", r->in_path, err);
+            return err;
+        }
+    }
+    if (r->out_path) {
+        int err = redirect(1, r->out_path,
+                           r->out_append ? REDIR_APPEND : REDIR_TRUNC);
+        if (err < 0) {
+            fail(r->out_append ? ">>" : ">", r->out_path, err);
+            if (r->in_path) redirect(0, 0, REDIR_RESTORE);
+            return err;
+        }
+    }
+    return 0;
+}
+
+static void redir_undo(const redir_t* r) {
+    if (r->out_path) redirect(1, 0, REDIR_RESTORE);
+    if (r->in_path)  redirect(0, 0, REDIR_RESTORE);
+}
+
 /* A word is a program rather than a builtin if it names a path or an ELF. */
 static int looks_like_program(const char* word) {
     if (strchr(word, '/') != 0) return 1;
 
     size_t len = strlen(word);
     return len > 4 && strcmp(word + len - 4, ".elf") == 0;
+}
+
+/*-----------------------------------------------------------------------------
+ * Pipelines
+ *
+ * `producer | consumer` runs the two stages CONCURRENTLY, connected by a real
+ * kernel pipe: both are spawned before either is reaped, so the consumer starts
+ * draining while the producer is still writing. That is what makes the data
+ * unbounded — the 4 KB buffer is a window, not a cap — and it is the difference
+ * from the kernel shell, whose pipeline runs a stage to completion into a
+ * buffer before starting the next one (fine there: its stages are function
+ * calls, not processes).
+ *
+ * The shell never touches the data. It binds its OWN stdout to the pipe, spawns
+ * the producer (which inherits it), binds its OWN stdin to the same pipe, spawns
+ * the consumer, and then restores itself. Exactly the redirection mechanism,
+ * used twice — no per-command plumbing, and no need for either program to know
+ * it is in a pipeline.
+ *
+ * BOTH STAGES MUST BE PROGRAMS. A builtin runs inside the shell process itself,
+ * and the shell cannot simultaneously be the producer and the consumer, so
+ * `echo hi | cat` cannot work the way it does in the kernel shell. Refused with
+ * a message that names the reason rather than mis-running it — the kernel shell
+ * remains available via `kshell` for builtin pipelines.
+ *
+ * ORDERING IS LOAD-BEARING, in two places:
+ *   - CLOSE_WRITE happens only after the producer is REAPED. Do it earlier and
+ *     a still-running producer's writes hit a closed pipe (-EPIPE); never and
+ *     the consumer blocks forever once it drains, because more data could
+ *     always still arrive. Nothing in task teardown closes it for us: a dying
+ *     child's inherited streams are deliberately marked borrowed.
+ *   - RESTORE happens before either waitpid. The shell must not still be
+ *     holding the pipe on its own stdin while it blocks, or its next readline
+ *     would read the pipeline's data instead of the keyboard.
+ *
+ * PRECONDITION, enforced by the caller: lredir has no out_path and rredir has
+ * no in_path. Those are the ends the pipe itself binds, and a stage redirect on
+ * one of them would both fight the pipe for the stream AND make the undo below
+ * unbind the pipe rather than the file. The caller refuses that line outright,
+ * so what reaches here only ever touches the free end of each stage.
+ *---------------------------------------------------------------------------*/
+static int spawn_stage(int argc, char** argv) {
+    (void)argc;
+
+    char path[PATH_MAX];
+    size_t plen = strlen(argv[0]);
+    if (plen >= sizeof(path)) {
+        return -36;  /* ENAMETOOLONG; the errno table above is raw numbers */
+    }
+    memcpy(path, argv[0], plen + 1);
+
+    /* Silent on failure by design: the producer is spawned while stdout is the
+     * pipe, so a message printed here would be fed to the consumer instead of
+     * the user. Both callers report the returned errno once stdout is theirs
+     * again. */
+    return spawn(path, argv);
+}
+
+static void run_pipeline(int largc, char** largv, const redir_t* lredir,
+                         int rargc, char** rargv, const redir_t* rredir) {
+    if (!looks_like_program(largv[0]) || !looks_like_program(rargv[0])) {
+        print("shell: pipelines connect two programs; a builtin runs inside "
+              "the shell itself, which cannot be both stages at once\n");
+        print("shell: use 'kshell' for pipelines involving builtins\n");
+        return;
+    }
+
+    int id = pipe_op(PIPE_CREATE, 0);
+    if (id < 0) {
+        fail("pipe", 0, id);
+        return;
+    }
+
+    /* stdout is the pipe from here until the UNBIND below, so anything printed
+     * in that narrow window would be fed to the consumer as if it were the
+     * producer's output. Only the producer's spawn happens inside it. */
+
+    /* The producer's `< file`, applied only for as long as it takes to spawn
+     * it. PIPE_CREATE already bound stdout, and this binds stdin, so the child
+     * inherits both halves at once. */
+    int lr = redir_apply(lredir);
+
+    int prod = (lr < 0) ? lr : spawn_stage(largc, largv);
+
+    /* Undo it immediately: the consumer's stdin is about to be bound to the
+     * pipe, and leaving the producer's input file there would make the two
+     * setups fight over the same stream. */
+    redir_undo(lredir);
+
+    /* The producer has its copy, so this stream must come off the write end
+     * before the consumer is spawned: a child inherits stdout AS IT IS at spawn
+     * time, and a consumer that inherited the write end would write its output
+     * into the pipe it is reading instead of to the console. RESTORE is the
+     * wrong tool here — it would reset stdin too, and stdin has to stay on the
+     * read end across that spawn. */
+    pipe_op(PIPE_UNBIND_STDOUT, id);
+
+    if (prod < 0) {
+        pipe_op(PIPE_RESTORE, id);
+        pipe_op(PIPE_DESTROY, id);
+        /* Reported only now: spawn_stage stays silent because at the moment it
+         * failed, stdout was the pipe. */
+        fail(largv[0], 0, prod);
+        return;
+    }
+
+    if (pipe_op(PIPE_BIND_STDIN, id) < 0) {
+        pipe_op(PIPE_RESTORE, id);
+        pipe_op(PIPE_CLOSE_WRITE, id);
+        waitpid(prod);
+        pipe_op(PIPE_DESTROY, id);
+        return;
+    }
+
+    /* The consumer's `> file`. Its stdin is the pipe (just bound above) and
+     * this rebinds its stdout, which the pipe is not using on this side. */
+    int rr = redir_apply(rredir);
+    int cons = (rr < 0) ? rr : spawn_stage(rargc, rargv);
+    redir_undo(rredir);
+
+    /* Both stages now hold their inherited copies, so the shell's own streams
+     * are free to go back to the console — and must, before it blocks. */
+    pipe_op(PIPE_RESTORE, id);
+
+    if (cons < 0) {
+        /* No reader will ever drain this. Closing the READ end is what turns
+         * the producer's writes into -EPIPE so it terminates instead of
+         * blocking forever on a full pipe; DESTROY does that as part of
+         * releasing the pipe, but the producer must be reaped first. */
+        pipe_op(PIPE_CLOSE_WRITE, id);
+        waitpid(prod);
+        pipe_op(PIPE_DESTROY, id);
+        fail(rargv[0], 0, cons);
+        return;
+    }
+
+    int pstatus = waitpid(prod);
+    pipe_op(PIPE_CLOSE_WRITE, id);
+    int cstatus = waitpid(cons);
+
+    pipe_op(PIPE_DESTROY, id);
+
+    /* The pipeline's status is the LAST stage's, as in every real shell: it is
+     * the one whose output the user actually sees. A failing producer is still
+     * worth mentioning, because its output silently vanishing into a pipe is
+     * exactly the case that looks like the consumer misbehaving. */
+    if (pstatus != 0) {
+        printf("%s: exited with status %d\n", largv[0], pstatus);
+    }
+    if (cstatus != 0) {
+        printf("%s: exited with status %d\n", rargv[0], cstatus);
+    }
 }
 
 /*-----------------------------------------------------------------------------
@@ -346,7 +670,7 @@ static int dispatch(int argc, char** argv, int background, int* status) {
 
     /* Hand this session over to the kernel shell, which still owns everything
      * privileged (users, shutdown, ps/kill, security tooling, networking) plus
-     * pipes and redirection. We cannot set a flag in the kernel from here, so
+     * pipelines through builtins. We cannot set a flag in the kernel from here, so
      * the request travels as the exit status: the parent recognises 70 and
      * runs its own command loop instead of returning to the login prompt.
      * Keep in sync with SHELL_EXIT_WANT_KERNEL_SHELL in src/shell.c. */
@@ -422,15 +746,82 @@ int main(int argc, char** argv) {
 
         if (n == 0) continue;
 
-        int nargs = split_args(line, args, MAX_ARGS);
+        /* A pipeline is handled entirely here rather than through dispatch():
+         * it is two commands, and dispatch runs exactly one. Split before
+         * tokenising so each stage gets its own words and its own redirections
+         * (see split_pipeline). The right stage is tokenised into its own argv,
+         * since the left stage's is still live while both run. */
+        char* rhs = split_pipeline(line);
+        if (rhs) {
+            char* rargs[MAX_ARGS];
+
+            int lnargs = split_args(line, sizeof(line), args, MAX_ARGS);
+            int rnargs = split_args(rhs, sizeof(line) - (size_t)(rhs - line),
+                                    rargs, MAX_ARGS);
+            if (lnargs == 0 || rnargs == 0) {
+                print("shell: a pipeline needs a command on both sides of '|'\n");
+                continue;
+            }
+
+            redir_t lredir, rredir;
+            if (take_redirections(&lnargs, args, &lredir) < 0 ||
+                take_redirections(&rnargs, rargs, &rredir) < 0) {
+                print("shell: expected a filename after the redirection\n");
+                continue;
+            }
+            if (lnargs == 0 || rnargs == 0) {
+                print("shell: a pipeline needs a command on both sides of '|'\n");
+                continue;
+            }
+
+            /* A stage's own '>' would fight the pipe for the same stream: the
+             * shell binds stdout to the pipe for the producer and stdin to it
+             * for the consumer, so honouring `a > f | b` would mean the pipe
+             * carries nothing while `b` waits on it forever. Refuse rather
+             * than pick a winner silently. The OUTER ends are unambiguous and
+             * would be worth supporting later; these are the inner ones. */
+            if (lredir.out_path || rredir.in_path) {
+                print("shell: cannot redirect the piped end of a stage "
+                      "(the pipe already binds it)\n");
+                continue;
+            }
+
+            /* The free ends — `<` into the producer, `>` out of the consumer —
+             * are compatible with the pipe, since each rebinds the stream the
+             * pipe does not use on that side. They cannot be applied here
+             * though: the shell has ONE set of streams and the two stages are
+             * bound at different moments, so the producer's `<` would be
+             * overwritten by the BIND_STDIN that sets up the consumer. Each is
+             * applied inside run_pipeline, in its own stage's window. */
+            run_pipeline(lnargs, args, &lredir, rnargs, rargs, &rredir);
+            continue;
+        }
+
+        int nargs = split_args(line, sizeof(line), args, MAX_ARGS);
         if (nargs == 0) continue;
 
         int background = take_background_flag(&nargs, args);
         if (nargs == 0) continue;
 
-        if (dispatch(nargs, args, background, &status)) {
-            break;
+        redir_t redir;
+        if (take_redirections(&nargs, args, &redir) < 0) {
+            print("shell: expected a filename after the redirection\n");
+            continue;
         }
+        if (nargs == 0) continue;
+
+        /* Redirect only around the command itself: the prompt, the echoed line
+         * and any error the shell prints about the redirection all belong on
+         * the console. A backgrounded child is safe here even though the undo
+         * runs immediately — sys_spawn copies the streams into the child, so
+         * the child keeps the redirected one after the parent restores. */
+        if (redir_apply(&redir) < 0) continue;
+
+        int done = dispatch(nargs, args, background, &status);
+
+        redir_undo(&redir);
+
+        if (done) break;
     }
 
     /* "shell: exiting" is load-bearing — verify-usershell.sh greps for it.
