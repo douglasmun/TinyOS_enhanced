@@ -1790,9 +1790,19 @@ static void syscall_dispatch(struct cpu_state* state) {
     uint32_t arg2 = state->ecx;
     uint32_t arg3 = state->edx;
 
-    // Debug: Log all syscalls
+    /* Per-syscall tracing, off by default: build -DTINYOS_TRACE_SYSCALLS.
+     *
+     * This fires on EVERY dispatch, so with a ring-3 shell it interleaves a
+     * line into the middle of the user's own output — readline() alone emits
+     * one per keystroke. It also drowns the rare error paths below, which are
+     * the lines actually worth seeing, and pushes them out of a serial log the
+     * verify-*.sh harnesses grep. Kept because it is genuinely useful when
+     * bringing up a new syscall; just not something a normal boot should pay
+     * for. */
+#ifdef TINYOS_TRACE_SYSCALLS
     kprintf("[SYSCALL] num=%d, arg1=0x%x, arg2=0x%x, arg3=0x%x\n",
             syscall_num, arg1, arg2, arg3);
+#endif
 
     /*=========================================================================
      * SECURITY FIX (v1.11): Syscall Number Range Validation
