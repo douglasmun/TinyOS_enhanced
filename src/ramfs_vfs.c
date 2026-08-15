@@ -275,7 +275,11 @@ static int ramfs_vfs_mkdir(const char* path) {
     /* Delegate directly to RAMFS mkdir */
     int ret = ramfs_mkdir(path);
     if (ret < 0) {
-        kprintf("[RAMFS VFS] mkdir failed for '%s': %d\n", path, ret);
+        /* No kprintf here: a failed mkdir is an ordinary userspace error
+         * (EEXIST, EACCES), not a kernel event. The caller gets a real errno
+         * and reports it on its own stream; printing to the kernel console as
+         * well double-reports it and, with a ring-3 shell, interleaves the
+         * line into the middle of the user's output. Same for rmdir/unlink. */
         /* RAMFS returns per-function ad-hoc codes; flattening them all to
          * ENOENT made "permission denied" and "already exists" both read as
          * "no such file", which is actively misleading now that ring 3 sees
@@ -302,7 +306,6 @@ static int ramfs_vfs_rmdir(const char* path) {
     /* Delegate directly to RAMFS rmdir */
     int ret = ramfs_rmdir(path);
     if (ret < 0) {
-        kprintf("[RAMFS VFS] rmdir failed for '%s': %d\n", path, ret);
         switch (ret) {
             case -2: return VFS_ENOTDIR;
             case -3: return VFS_ENOTEMPTY;
@@ -324,7 +327,6 @@ static int ramfs_vfs_rmdir(const char* path) {
 static int ramfs_vfs_unlink(const char* path) {
     int ret = ramfs_unlink(path);
     if (ret < 0) {
-        kprintf("[RAMFS VFS] unlink failed for '%s': %d\n", path, ret);
         switch (ret) {
             case -2: return VFS_EISDIR;
             case -4: return VFS_EACCES;
