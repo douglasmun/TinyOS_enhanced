@@ -100,6 +100,28 @@
  * lookup failure (-EBADF), not a pointer. */
 #define SYS_PIPE       31   // Create/bind/close a pipe between two processes
 
+/* SYS_CRED — credential administration (passwd / useradd / userdel).
+ *
+ * The password NEVER crosses the ring boundary. Ring 3 names an operation and a
+ * username; the KERNEL prints the prompts, reads the keystrokes into its own
+ * buffer, applies the euid checks, and zeroes the buffer before returning. A
+ * plaintext password is therefore never present in any user address space, in
+ * argv, or in a syscall argument register.
+ *
+ * That is the whole reason this is not "let ring 3 read a password and pass it
+ * down". A ring-3 buffer holding a plaintext password would be readable by
+ * anything that later reuses those pages, would appear in a core-style dump of
+ * the shell, and would have to survive an unbounded number of preemptions
+ * between being typed and being hashed. Keeping it kernel-side means the only
+ * copy lives for the length of one syscall and is wiped on every exit path.
+ *
+ * Authorization is NOT reimplemented here: the checks (own password vs another
+ * user's, root-only creation/deletion, refusing to delete root, requiring the
+ * current password from a non-root caller) already exist in shell_user.c and
+ * are the same code the kernel shell uses. This syscall is a ring-3 entry point
+ * to them, not a second copy of the policy. */
+#define SYS_CRED       32   // passwd / useradd / userdel, prompts kernel-side
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -170,7 +192,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  31  // Highest valid syscall number (SYS_PIPE)
+#define MAX_SYSCALL_NUM  32  // Highest valid syscall number (SYS_CRED)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -426,6 +448,37 @@ int sys_redirect(int fd, const char* user_path, int mode);
  *         pipe, -EINVAL for an unknown op.
  */
 int sys_pipe(int op, int id);
+
+/*-----------------------------------------------------------------------------
+ * SYS_CRED operations. arg1 is the op; arg2 is a user pointer to a NUL-
+ * terminated username (may be NULL for CRED_OP_PASSWD, meaning "my own").
+ *
+ * The password is read by the KERNEL, from the keyboard, into a kernel buffer.
+ * Ring 3 never sees it and never supplies it — see the SYS_CRED comment above
+ * for why that is the point rather than an inconvenience.
+ *---------------------------------------------------------------------------*/
+#define CRED_OP_PASSWD   0  /* change a password (own, or another's as root) */
+#define CRED_OP_USERADD  1  /* create a user (root only)                     */
+#define CRED_OP_USERDEL  2  /* delete a user (root only, never root itself)  */
+
+/**
+ * @brief Administer credentials from ring 3, with prompts handled kernel-side.
+ *
+ * Delegates to the same shell_user.c implementations the kernel shell uses, so
+ * the authorization policy has exactly one definition. The only thing added
+ * here is the ring-3 entry point: argument validation, a bounded copy of the
+ * username out of user memory, and routing the command's output to the caller's
+ * stream rather than the kernel console.
+ *
+ * @param op        One of the CRED_OP_* values
+ * @param user_name User pointer to a NUL-terminated username, or NULL for
+ *                  CRED_OP_PASSWD to mean the calling user
+ * @return 0 on success, -EPERM if the caller's euid is not permitted the
+ *         operation, -EINVAL for an unknown op or a missing required name,
+ *         -ENAMETOOLONG if the username exceeds USER_MAX_USERNAME, -EFAULT if
+ *         the username pointer is not readable, -ESRCH if no such user.
+ */
+int sys_cred(int op, const char* user_name);
 
 /*-----------------------------------------------------------------------------
  * Record a process death and wake every sys_waitpid() waiter.

@@ -201,6 +201,13 @@ def main():
     #    command's expect has been observed. Used by the background-jobs
     #    harness to run `jobs`/`ps` while a backgrounded child is still alive.
     #    Each may carry its own expect via "cmd=>expected text".
+    #
+    #    A line prefixed with '!' is sent WITHOUT the echo check. That is for
+    #    input read by something other than the shell's readline — a password
+    #    prompt echoes '*' per keystroke, so verifying the characters back would
+    #    always fail. The '!' is stripped before typing; an expect still applies,
+    #    which is how such a line stays checked at all (on the prompt or result
+    #    that follows it, rather than on its own echo).
     followups = os.environ.get("TINYOS_FOLLOWUP_CMDS", "")
     if followups.strip():
         for item in followups.split(";"):
@@ -212,10 +219,16 @@ def main():
                 cmd, want = cmd.strip(), want.strip()
             else:
                 cmd, want = item, None
+            unverified = cmd.startswith("!")
+            if unverified:
+                cmd = cmd[1:]
             time.sleep(1)
-            print(f"typist: sending '{cmd}'")
+            print(f"typist: sending '{'*' * len(cmd) if unverified else cmd}'")
             mark = len(read_serial())
-            type_verified(sock, cmd + "\n", timeout=60)
+            if unverified:
+                type_str(sock, cmd + "\n")
+            else:
+                type_verified(sock, cmd + "\n", timeout=60)
             if want:
                 try:
                     # Same 240s as the first command's expect: a follow-up can

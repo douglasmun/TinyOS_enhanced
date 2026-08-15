@@ -33,10 +33,11 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
    Subdirectories landed later — see PR #47 under item 4.
 4. **Userspace shell** (capstone, depends on 1–3 — now all done). **IN PROGRESS
    — the ring-3 shell is now the DEFAULT LOGIN SHELL (PR #51), with the kernel
-   shell as a fallback.** It is not yet a replacement: ~13 builtins against the
-   kernel shell's ~70, and nothing privileged (redirection and pipelines both
-   landed in PR #52; a pipeline's stages must both be programs). The syscall
-   foundation landed first, one group per PR:
+   shell as a fallback.** It is not yet a replacement: ~16 builtins against the
+   kernel shell's ~70 (redirection and pipelines both landed in PR #52, a
+   pipeline's stages must both be programs; the credential commands landed in
+   PR #54, the rest of the privileged set is still kernel-shell only). The
+   syscall foundation landed first, one group per PR:
    - PR #43 — per-process **fd table** + `SYS_OPEN`/`SYS_CLOSE`/`SYS_READDIR`/
      `SYS_STAT` (19–22).
    - PR #44 — `SYS_LSEEK` (24).
@@ -297,7 +298,82 @@ Full plan with rationale: `doc/ROADMAP_NEXT.md`. Priority order:
      pipeline follow-up spawns two ECDSA-verified processes and then streams
      kilobytes between them under TCG, which the shorter window did not cover.
 
-   Remaining: the privileged commands in ring 3.
+   - PR #54 — **ring-3 credential commands** (`passwd`, `useradd`, `userdel`),
+     via a new **`SYS_CRED` (32)**. The first of the privileged commands to
+     reach ring 3, and scoped to these three deliberately: they are the only
+     ones that already carry a real **euid-based authorization model** in
+     `shell_user.c`, so ring 3 inherits a checked policy instead of needing a
+     new one invented for it. The introspection and machine-state commands
+     (`pae`, `mem`, `wxaudit`, `auditlog`, `shutdown`, net) are still
+     kernel-shell only.
+
+     **There is no password parameter, and that is the design.** `read_password`
+     (`src/shell_user.c`) calls `keyboard_getchar()` directly, bypassing
+     `task->streams` entirely. Rather than route it through a stream so ring 3
+     could supply the password, the syscall makes that bypass the security
+     property: ring 3 names an **operation and a username**, the KERNEL prints
+     the prompts, reads the keystrokes into its own buffer, applies the euid
+     checks, and zeroes the buffer before returning. A plaintext password never
+     enters a user address space, an argv, or a syscall argument register — the
+     ring-3 shell cannot leak or log what it never holds.
+
+     Authorization is **delegated, not reimplemented**: `sys_cred` validates the
+     op, copies the username in with a bounded `copy_string_from_user` (sized to
+     `USER_MAX_USERNAME`, so an over-long name is rejected rather than truncated
+     into a match against a *different* account), and calls the same
+     `shell_cmd_*` the kernel shell calls. One definition of the policy.
+
+     The three commands changed from `void` to **`int`** so a ring-3 caller has
+     an outcome to branch on, and their 32 `kprintf`s became `cred_printf`
+     (`stream_printf(get_current_streams(), ...)`). That routing is load-bearing,
+     not cosmetic: the prompts are printed by the kernel but must appear in the
+     **calling process's** stream, or an interactive ring-3 user faces a shell
+     that looks hung while something invisible waits for a password. Only these
+     three functions were converted — the other ~106 `kprintf` call sites in the
+     file are unreachable from ring 3, and `stream_printf` falls back to
+     `kprintf` when there is no current stream, so kernel-shell callers are
+     unaffected either way.
+
+     **A redirected credential command is refused explicitly** (`passwd > f`).
+     The prompts are printed by the kernel into the caller's stdout, so
+     redirecting them would put `Enter new password:` in the file while the
+     kernel blocked on the keyboard — an apparently-hung shell, with the user
+     typing a password blind. `< f` cannot work either, since `read_password`
+     reads the keyboard and never stdin. Neither is expressible, so the shell
+     says so rather than misbehaving. (A credential stage in a *pipeline* was
+     already refused: `looks_like_program` rejects every builtin.)
+
+     **Two pre-existing `userdel` holes were fixed in the same change**, both of
+     the same class as the FAT32 dead-code bugs in PR #45 — latent while only
+     root at a kernel console could reach them, serious once ring 3 could:
+     - it refused to delete **`root` by NAME**, comparing the argument to the
+       string. An account created with **uid 0** is root in every way that
+       matters, and under any other name it was deletable. Now refused by uid.
+     - it permitted deleting **the account you are logged in as**, leaving the
+       session running on credentials no database entry backs and freeing the
+       uid to be reissued to a new account that inherits that session.
+
+     Harness: `verify-ring3-cred.sh`. It does **two logins** on purpose: every
+     root-side assertion would pass even with the euid check deleted entirely,
+     so the decisive part is logging in as the just-created unprivileged user
+     and watching `useradd`/`userdel` get refused *by the kernel*. A shell that
+     merely declines to offer the command satisfies every other check while
+     leaving the syscall reachable by anything that calls it directly. Paired
+     with the case that gate must **not** catch — that user changing their **own**
+     password, which also exercises the only path that reads three passwords in
+     a row. `tools/qemu_typist.py` grew a **`!` prefix** for follow-up lines sent
+     without the echo check, since a password prompt echoes `*` per keystroke and
+     verifying the characters back would always fail.
+
+   Remaining: the introspection and machine-state commands in ring 3. Note they
+   are NOT one group. `ps`/`kill`/`top` live in `shell_monitor.c`, which is
+   already **stream-routed** (16 `stream_printf` vs 10 `kprintf`), so exposing
+   them is a policy question — what may an unprivileged process see and signal —
+   and not an output-plumbing one. `pae`/`mem`/`wxaudit`/`auditlog`/`shutdown`
+   live in `shell_system.c`, which has **222 `kprintf` and zero `stream_printf`**:
+   reaching those from ring 3 means the same conversion done for the three
+   credential commands, but two orders of magnitude larger. Do `ps`/`kill` first
+   if this is picked up; do not convert `shell_system.c` wholesale on the way.
 
 Hygiene: the three exec-path items are **done** (failure paths now restore CR3
 then `task_terminate`; `cmd_exec` deliberately does NOT double-reap; user guard
