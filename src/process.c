@@ -715,6 +715,10 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     // Initialize the per-process file descriptor table (fds 3+)
     task_fdtable_init(task);
 
+    // Start at the default drive root; sys_spawn overwrites this with the
+    // parent's cwd, so a child inherits rather than resetting to "D:/".
+    task_cwd_init(task);
+
     // Initialize FD tracking (v1.11)
     task->open_fd_count = 0;
 
@@ -1226,6 +1230,10 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
 
     // Initialize the per-process file descriptor table (fds 3+)
     task_fdtable_init(task);
+
+    // Start at the default drive root; sys_spawn overwrites this with the
+    // parent's cwd, so a child inherits rather than resetting to "D:/".
+    task_cwd_init(task);
 
     // Initialize FD tracking (v1.11)
     task->open_fd_count = 0;
@@ -1800,6 +1808,136 @@ const char* task_get_state_string(task_state_t state) {
         case TASK_STATE_TERMINATED: return "TERMINATED";
         default:                    return "UNKNOWN";
     }
+}
+
+/*=============================================================================
+ * PER-PROCESS CURRENT WORKING DIRECTORY
+ *
+ * task->cwd is always absolute and drive-qualified; see the field's comment in
+ * process.h. These three functions are its only writers and readers of record.
+ *
+ * No locking, for the same reason as the fd table below: a task's cwd is only
+ * touched by that task's own syscalls.
+ *===========================================================================*/
+
+/* task_t sizes cwd independently to avoid a vfs.h <-> process.h include cycle.
+ * If VFS_MAX_PATH ever grows, a path the VFS accepts would no longer fit in a
+ * cwd, and task_resolve_path would start rejecting valid directories. */
+_Static_assert(TASK_CWD_MAX == VFS_MAX_PATH,
+               "task cwd must hold any path the VFS accepts");
+
+void task_cwd_init(task_t* task) {
+    if (!task) {
+        return;
+    }
+    /* Drive root of the default drive: "D:/". Qualified from the start so the
+     * invariant holds even for a task that never calls chdir. */
+    task->cwd[0] = VFS_DEFAULT_DRIVE;
+    task->cwd[1] = ':';
+    task->cwd[2] = '/';
+    task->cwd[3] = '\0';
+}
+
+int task_resolve_path(task_t* task, const char* path, char* out, size_t out_size) {
+    if (!task || !path || !out || out_size == 0) {
+        return -EINVAL;
+    }
+
+    bool drive_qualified = (path[0] != '\0' && path[1] == ':' &&
+                            ((path[0] >= 'A' && path[0] <= 'Z') ||
+                             (path[0] >= 'a' && path[0] <= 'z')));
+
+    /* Already absolute in the VFS's own terms: a drive-qualified path names its
+     * drive, and a leading '/' is resolved by the VFS against the default
+     * drive exactly as before cwd existed. Neither may pick up a cwd prefix. */
+    if (drive_qualified || path[0] == '/') {
+        if (safe_strcpy(out, path, out_size) >= out_size) {
+            return -ENAMETOOLONG;
+        }
+        return 0;
+    }
+
+    /* Relative: join onto the cwd. The cwd invariant (no trailing slash except
+     * at a drive root, which ends in '/') is what makes this a single test
+     * rather than a general path-normalizing join. */
+    size_t cwd_len = strlen(task->cwd);
+    bool needs_sep = (cwd_len > 0 && task->cwd[cwd_len - 1] != '/');
+
+    size_t need = cwd_len + (needs_sep ? 1 : 0) + strlen(path) + 1;
+    if (need > out_size) {
+        return -ENAMETOOLONG;
+    }
+
+    size_t pos = safe_strcpy(out, task->cwd, out_size);
+    if (needs_sep) {
+        out[pos++] = '/';
+    }
+    safe_strcpy(out + pos, path, out_size - pos);
+    return 0;
+}
+
+int task_chdir(task_t* task, const char* path) {
+    if (!task || !path || path[0] == '\0') {
+        return -EINVAL;
+    }
+
+    char joined[TASK_CWD_MAX];
+    int rc = task_resolve_path(task, path, joined, sizeof(joined));
+    if (rc < 0) {
+        return rc;
+    }
+
+    /* Split the drive prefix off before canonicalizing: vfs_canonicalize_path
+     * works on the path part and would treat "D:" as an ordinary component. */
+    char drive = VFS_DEFAULT_DRIVE;
+    const char* rest = joined;
+    if (joined[0] != '\0' && joined[1] == ':') {
+        drive = joined[0];
+        if (drive >= 'a' && drive <= 'z') {
+            drive = drive - 'a' + 'A';
+        }
+        rest = joined + 2;
+    }
+    if (rest[0] == '\0') {
+        rest = "/";     /* Bare "C:" means that drive's root */
+    }
+
+    char canonical[TASK_CWD_MAX];
+    if (vfs_canonicalize_path(rest, canonical, sizeof(canonical)) != 0) {
+        return -EINVAL;
+    }
+
+    /* Rebuild the qualified form that will be stored, and that the existence
+     * check below must run against — checking `canonical` alone would test the
+     * default drive no matter which drive was named. */
+    char resolved[TASK_CWD_MAX];
+    size_t canon_len = strlen(canonical);
+    if (canon_len + 3 > sizeof(resolved)) {
+        return -ENAMETOOLONG;
+    }
+    resolved[0] = drive;
+    resolved[1] = ':';
+    safe_strcpy(resolved + 2, canonical, sizeof(resolved) - 2);
+
+    /* FAT32 is root-directory-only (see fat32.c), so C: has exactly one valid
+     * cwd. Reported as -ENOSYS rather than -ENOENT to distinguish "this driver
+     * cannot do subdirectories" from "that directory is missing" — the
+     * subdirectory may well exist on disk. */
+    if (drive == 'C' && strcmp(canonical, "/") != 0) {
+        return -ENOSYS;
+    }
+
+    /* Existence, directory-ness and permission in one call. Deliberately not
+     * vfs_stat: stat demands read permission, and chdir must only demand
+     * search (x) — a process may stand in a directory it cannot list. */
+    int err = vfs_access_dir(resolved);
+    if (err < 0) {
+        return err;
+    }
+
+    /* Commit only here: every failure above leaves the old cwd intact. */
+    safe_strcpy(task->cwd, resolved, sizeof(task->cwd));
+    return 0;
 }
 
 /*=============================================================================

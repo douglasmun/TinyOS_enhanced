@@ -61,6 +61,12 @@
 #define SYS_RMDIR      26   // Remove an empty directory
 #define SYS_UNLINK     27   // Remove a file
 
+/* Per-process working directory. Every path syscall above resolves a relative
+ * path against the caller's cwd (task_resolve_path), so these two are what
+ * make "open("foo.txt")" mean something other than the default drive root. */
+#define SYS_GETCWD     28   // Read the caller's working directory
+#define SYS_CHDIR      29   // Change the caller's working directory
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -131,7 +137,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  27  // Highest valid syscall number (SYS_UNLINK)
+#define MAX_SYSCALL_NUM  29  // Highest valid syscall number (SYS_CHDIR)
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -276,6 +282,26 @@ int sys_lseek(int fd, int32_t offset, int whence);
 int sys_mkdir(const char* user_path);
 int sys_rmdir(const char* user_path);
 int sys_unlink(const char* user_path);
+
+/**
+ * @brief Copy the caller's cwd out to userspace.
+ *
+ * Writes the absolute, drive-qualified cwd ("D:/scratch") including its NUL.
+ *
+ * @param user_buf Destination in the caller's address space
+ * @param size     Size of user_buf
+ * @return Bytes written excluding the NUL, -ERANGE if the cwd does not fit
+ */
+int sys_getcwd(char* user_buf, uint32_t size);
+
+/**
+ * @brief Change the caller's cwd.
+ *
+ * @param user_path Absolute or relative path, optionally drive-qualified
+ * @return 0 on success, -ENOENT/-ENOTDIR/-EACCES, or -ENOSYS for a FAT32
+ *         subdirectory (the driver is root-directory-only)
+ */
+int sys_chdir(const char* user_path);
 
 /*-----------------------------------------------------------------------------
  * Record a process death and wake every sys_waitpid() waiter.

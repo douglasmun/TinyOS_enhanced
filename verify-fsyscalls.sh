@@ -97,7 +97,7 @@ fi
 
 # Any of the program's own failure lines is a hard FAIL — it got far enough to
 # report, so this is a real defect, not an inconclusive run.
-if grep -qE "fileio: (open for write failed|open for read failed|opendir failed|read failed|readdir failed|short write|content MISMATCH|stale fd accepted|marker\.txt NOT|fileio-test\.txt NOT|fat32 opendir failed|fat32 readdir failed|fat32 partial record|fat32 subdir wrongly accepted)" "$SERIAL" 2>/dev/null; then
+if grep -qE "fileio: (open for write failed|open for read failed|opendir failed|read failed|readdir failed|short write|content MISMATCH|stale fd accepted|marker\.txt NOT|fileio-test\.txt NOT|fat32 opendir failed|fat32 readdir failed|fat32 partial record|fat32 subdir wrongly accepted|getcwd failed|getcwd accepted a short buffer|chdir failed|relative create failed|relative create did not land in the cwd|absolute path broken by cwd|chdir \.\. failed|relative chdir failed|relative unlink failed|chdir to missing dir accepted|failed chdir moved cwd|chdir to a file accepted|chdir to a FAT32 subdirectory accepted|chdir to C:/ failed|chdir back to D:/ failed)" "$SERIAL" 2>/dev/null; then
     echo "RESULT: FAIL — fileio.elf reported an error"
     grep "fileio:" "$SERIAL" | tail -10
     exit 1
@@ -136,16 +136,22 @@ l_seek=$(grep -n "fileio: seek ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1
 # emptiness) until this change wired them into the ops table.
 l_fatns=$(grep -n "fileio: fat32 namespace ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 l_ns=$(grep -n "fileio: namespace ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+# getcwd/chdir, and — the actual point of a cwd — relative paths resolving
+# through it: a file created as "cwdfile.txt" must land in the cwd, an absolute
+# path must ignore the cwd, ".." must clamp at the drive root, a failed chdir
+# must leave the cwd untouched, and a FAT32 subdirectory must be refused
+# (root-directory-only driver) rather than silently accepted.
+l_cwd=$(grep -n "fileio: cwd ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 l_done=$(grep -n "fileio: done" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$l_wfd" ] || [ -z "$l_back" ] || [ -z "$l_dir" ] || [ -z "$l_fat" ] \
    || [ -z "$l_stat" ] || [ -z "$l_seek" ] || [ -z "$l_ns" ] \
-   || [ -z "$l_done" ]; then
+   || [ -z "$l_cwd" ] || [ -z "$l_done" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC)"
     echo "  write fd=${l_wfd:-none} readback=${l_back:-none}" \
          "readdir=${l_dir:-none} fat32=${l_fat:-none} stat=${l_stat:-none}" \
          "seek=${l_seek:-none} fat32ns=${l_fatns:-none}" \
-         "namespace=${l_ns:-none}" \
+         "namespace=${l_ns:-none}" "cwd=${l_cwd:-none}" \
          "done=${l_done:-none}"
     echo "--- tail of $SERIAL ---"
     grep -v "Suspicious" "$SERIAL" | tail -30
@@ -181,8 +187,8 @@ fi
 if [ "$TYPIST_RC" -eq 0 ] && [ "$l_back" -gt "$l_wfd" ] && [ "$l_fat" -gt "$l_dir" ] \
    && [ "$l_stat" -gt "$l_fat" ] && [ "$l_seek" -gt "$l_stat" ] \
    && [ "$l_fatns" -gt "$l_seek" ] && [ "$l_ns" -gt "$l_fatns" ] \
-   && [ "$l_done" -gt "$l_ns" ]; then
-    echo "RESULT: PASS — ring-3 open/write/read/readdir/stat/lseek/mkdir/rmdir/unlink work on both D: and C: (fd=$wfd)"
+   && [ "$l_cwd" -gt "$l_ns" ] && [ "$l_done" -gt "$l_cwd" ]; then
+    echo "RESULT: PASS — ring-3 open/write/read/readdir/stat/lseek/mkdir/rmdir/unlink/getcwd/chdir work on both D: and C: (fd=$wfd)"
     grep "fileio:" "$SERIAL" | head -25
     exit 0
 else

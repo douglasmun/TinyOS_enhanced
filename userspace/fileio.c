@@ -540,6 +540,142 @@ static int do_namespace(void) {
     return 0;
 }
 
+/*=============================================================================
+ * Working directory: SYS_GETCWD / SYS_CHDIR
+ *
+ * The point of the cwd is not the two syscalls but what they do to every OTHER
+ * path syscall, so most of this exercises relative paths through open/stat/
+ * mkdir/unlink rather than testing chdir in isolation.
+ *===========================================================================*/
+static int do_cwd(void) {
+    char buf[256];
+
+    /* A process starts at the default drive root, drive-qualified. */
+    int rc = getcwd(buf, sizeof(buf));
+    if (rc < 0) {
+        printf("fileio: getcwd failed %d\n", rc);
+        return -1;
+    }
+    if (strcmp(buf, "D:/") != 0) {
+        printf("fileio: initial cwd is '%s', expected D:/\n", buf);
+        return -1;
+    }
+    /* The return value is the length written, excluding the NUL. */
+    if (rc != 3) {
+        printf("fileio: getcwd returned %d, expected 3\n", rc);
+        return -1;
+    }
+
+    /* A buffer too small must fail rather than hand back a truncated path: a
+     * truncated path names a different directory. */
+    if (getcwd(buf, 2) >= 0) {
+        print("fileio: getcwd accepted a short buffer\n");
+        return -1;
+    }
+
+    rc = chdir(SCRATCH_DIR);
+    if (rc < 0) {
+        printf("fileio: chdir failed %d\n", rc);
+        return -1;
+    }
+    if (getcwd(buf, sizeof(buf)) < 0 || strcmp(buf, SCRATCH_DIR) != 0) {
+        printf("fileio: cwd after chdir is '%s'\n", buf);
+        return -1;
+    }
+
+    /* THE POINT: a bare relative name now resolves inside the cwd. Created
+     * relative, then verified through its absolute path. */
+    int fd = open("cwdfile.txt", O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        printf("fileio: relative create failed %d\n", fd);
+        return -1;
+    }
+    write(fd, "cwd-relative", 12);
+    close(fd);
+
+    dirent_t st;
+    if (stat(SCRATCH_DIR "/cwdfile.txt", &st, sizeof(st)) < 0) {
+        print("fileio: relative create did not land in the cwd\n");
+        return -1;
+    }
+    if (st.size != 12) {
+        printf("fileio: relative file size %d, expected 12\n", (int)st.size);
+        return -1;
+    }
+
+    /* An absolute path must IGNORE the cwd, not get prefixed with it. */
+    if (stat("D:/scratch/cwdfile.txt", &st, sizeof(st)) < 0) {
+        print("fileio: absolute path broken by cwd\n");
+        return -1;
+    }
+
+    /* ".." resolves against the cwd and is clamped at the drive root. */
+    if (chdir("..") < 0 || getcwd(buf, sizeof(buf)) < 0) {
+        print("fileio: chdir .. failed\n");
+        return -1;
+    }
+    if (strcmp(buf, "D:/") != 0) {
+        printf("fileio: cwd after .. is '%s', expected D:/\n", buf);
+        return -1;
+    }
+
+    /* Relative chdir from the root, to prove the join is not root-only. */
+    if (chdir("scratch") < 0 || getcwd(buf, sizeof(buf)) < 0) {
+        print("fileio: relative chdir failed\n");
+        return -1;
+    }
+    if (strcmp(buf, SCRATCH_DIR) != 0) {
+        printf("fileio: relative chdir landed at '%s'\n", buf);
+        return -1;
+    }
+
+    if (unlink("cwdfile.txt") < 0) {
+        print("fileio: relative unlink failed\n");
+        return -1;
+    }
+
+    /* A failed chdir must leave the cwd untouched — otherwise a process ends
+     * up stranded somewhere that does not resolve. */
+    if (chdir("D:/no-such-dir") >= 0) {
+        print("fileio: chdir to missing dir accepted\n");
+        return -1;
+    }
+    if (getcwd(buf, sizeof(buf)) < 0 || strcmp(buf, SCRATCH_DIR) != 0) {
+        printf("fileio: failed chdir moved cwd to '%s'\n", buf);
+        return -1;
+    }
+
+    /* chdir to a FILE is ENOTDIR, not success. */
+    if (chdir(TEST_PATH) >= 0) {
+        print("fileio: chdir to a file accepted\n");
+        return -1;
+    }
+
+    /* C: root is reachable; a FAT32 SUBdirectory is not (root-directory-only
+     * driver), and must be refused rather than silently accepted. */
+    if (chdir("C:/") < 0) {
+        print("fileio: chdir to C:/ failed\n");
+        return -1;
+    }
+    if (getcwd(buf, sizeof(buf)) < 0 || strcmp(buf, "C:/") != 0) {
+        printf("fileio: cwd after C: chdir is '%s'\n", buf);
+        return -1;
+    }
+    if (chdir("C:/NOPE") >= 0) {
+        print("fileio: chdir to a FAT32 subdirectory accepted\n");
+        return -1;
+    }
+
+    /* Back to a known place so later tests are not affected by the cwd. */
+    if (chdir("D:/") < 0) {
+        print("fileio: chdir back to D:/ failed\n");
+        return -1;
+    }
+
+    print("fileio: cwd ok\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
 
@@ -552,6 +688,7 @@ int main(int argc, char** argv) {
     if (do_stat() < 0) return 1;
     if (do_seek() < 0) return 1;
     if (do_namespace() < 0) return 1;
+    if (do_cwd() < 0) return 1;
 
     /* A never-opened fd must not resolve to anything. The VFS fd pool is
      * system-wide, so if the table leaked raw VFS numbers this could name

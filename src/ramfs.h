@@ -15,6 +15,13 @@
 /* File flags */
 #define RAMFS_FLAG_READ     0x01
 #define RAMFS_FLAG_WRITE    0x02
+/* Search permission on a directory (the x bit), as distinct from listing it.
+ * POSIX splits these: r lets you enumerate a directory's entries, x lets you
+ * traverse into it. Nothing needed the distinction until chdir arrived — a
+ * process must be able to SIT in a directory it may not list, which is what
+ * lets the RAMFS root stay unlistable (0711) while remaining a usable cwd.
+ * The 0100/0010/0001 mode bits already existed; no flag mapped to them. */
+#define RAMFS_FLAG_EXEC     0x10
 #define RAMFS_FLAG_INHERIT  0x08  /* PHASE 13: Keep FD open across exec (not close-on-exec) */
 /*=============================================================================
  * SECURITY (v1.12): O_NOFOLLOW Flag

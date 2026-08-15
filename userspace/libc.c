@@ -96,6 +96,16 @@ int unlink(const char* path) {
     return syscall1(SYS_UNLINK, (uint32_t)(uintptr_t)path);
 }
 
+int getcwd(char* buf, unsigned int size) {
+    /* syscall3 with an unused third argument, like spawn: there is no
+     * two-argument entry stub. */
+    return syscall3(SYS_GETCWD, (uint32_t)(uintptr_t)buf, (uint32_t)size, 0);
+}
+
+int chdir(const char* path) {
+    return syscall1(SYS_CHDIR, (uint32_t)(uintptr_t)path);
+}
+
 int putchar(int c) {
     char ch = (char)c;
     write(1, &ch, 1);
