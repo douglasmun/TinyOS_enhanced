@@ -319,6 +319,27 @@ typedef struct task {
     int fdtable[TASK_FDTABLE_SIZE];  // Global VFS fd per slot, -1 = free
 
     /*=========================================================================
+     * Current working directory (SYS_CHDIR / SYS_GETCWD)
+     *
+     * INVARIANT: always absolute AND drive-qualified ("D:/scratch", "C:/"),
+     * never empty, never with a trailing slash except at a drive root. The
+     * syscall layer prefixes this onto any relative path before handing it to
+     * the VFS, so the invariant is what makes that prefix produce a valid
+     * path without re-parsing. task_chdir() is the only writer and validates
+     * before storing; nothing else may assign this field directly.
+     *
+     * Inherited by value at spawn, like the streams above: a child starts in
+     * its parent's directory, and a later cd in either one does not move the
+     * other. This is a copy, not a shared reference, so there is no lifetime
+     * relationship between parent and child cwds.
+     *=======================================================================*/
+    /* Sized independently of VFS_MAX_PATH rather than including vfs.h here:
+     * vfs.h pulls in process.h transitively, and the two must not become a
+     * cycle. process.c static-asserts the two stay equal. */
+    #define TASK_CWD_MAX  256
+    char cwd[TASK_CWD_MAX];          // Absolute, drive-qualified; see invariant
+
+    /*=========================================================================
      * SECURITY (EDR Phase 2): Behavioral Detection State
      *
      * Per-process syscall pattern tracking and anomaly detection for
@@ -705,6 +726,46 @@ void task_set_priority(task_t* task, priority_t priority);
  * @return String representation of state
  */
 const char* task_get_state_string(task_state_t state);
+
+/*=============================================================================
+ * Per-process current working directory
+ *
+ * task->cwd is only ever written through these; see the field's invariant.
+ *===========================================================================*/
+
+/**
+ * @brief Set the task's cwd to the default drive root. Call before it runs.
+ * @param task Task to initialize (ignored if NULL)
+ */
+void task_cwd_init(task_t* task);
+
+/**
+ * @brief Validate `path` as a directory and make it the task's cwd.
+ *
+ * Resolves `path` against the task's current cwd if relative, canonicalizes,
+ * and requires the result to be an existing directory the task may search.
+ * The cwd is left untouched on any failure, so a failed chdir never strands
+ * a process on a path that does not resolve.
+ *
+ * @param task Task to move
+ * @param path Absolute or relative path, optionally drive-qualified
+ * @return 0 on success, negative errno otherwise
+ */
+int task_chdir(task_t* task, const char* path);
+
+/**
+ * @brief Resolve a possibly-relative path against the task's cwd.
+ *
+ * The shared front half of every path syscall: absolute or drive-qualified
+ * paths pass through unchanged, relative ones are prefixed with the cwd.
+ *
+ * @param task Task whose cwd supplies the prefix
+ * @param path Input path
+ * @param out  Receives the absolute, drive-qualified result
+ * @param out_size Size of `out`
+ * @return 0 on success, -ENAMETOOLONG if the joined path will not fit
+ */
+int task_resolve_path(task_t* task, const char* path, char* out, size_t out_size);
 
 /*=============================================================================
  * Per-process file descriptor table

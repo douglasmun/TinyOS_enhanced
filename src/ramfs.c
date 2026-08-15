@@ -256,6 +256,15 @@ void ramfs_init(void) {
         return;
     }
 
+    /* 0711, not the 0700 default: every process's cwd starts at the root of
+     * the default drive, so a ring-3 (uid 1000) process must be able to SEARCH
+     * "/" — otherwise chdir back to the directory it started in fails, and no
+     * absolute path under it can be traversed. The read bit stays off for
+     * group/other, so the root's contents remain unlistable to non-root; only
+     * traversal to a known name is permitted. Directories created later keep
+     * the 0700 default. */
+    root->mode = 0711;
+
     // Initialize file descriptors
     for (int i = 0; i < RAMFS_MAX_FDS; i++) {
         file_descriptors[i].in_use = false;
@@ -1301,6 +1310,9 @@ bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint
         if (access & RAMFS_FLAG_WRITE) {
             required_perms |= RAMFS_PERM_OWNER_WRITE;
         }
+        if (access & RAMFS_FLAG_EXEC) {
+            required_perms |= RAMFS_PERM_OWNER_EXEC;
+        }
     } else if (gid == node->gid) {
         /* Group permissions (primary group matches) */
         if (access & RAMFS_FLAG_READ) {
@@ -1308,6 +1320,9 @@ bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint
         }
         if (access & RAMFS_FLAG_WRITE) {
             required_perms |= RAMFS_PERM_GROUP_WRITE;
+        }
+        if (access & RAMFS_FLAG_EXEC) {
+            required_perms |= RAMFS_PERM_GROUP_EXEC;
         }
     } else {
         /*=====================================================================
@@ -1332,6 +1347,9 @@ bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint
                     if (access & RAMFS_FLAG_WRITE) {
                         required_perms |= RAMFS_PERM_GROUP_WRITE;
                     }
+                    if (access & RAMFS_FLAG_EXEC) {
+                        required_perms |= RAMFS_PERM_GROUP_EXEC;
+                    }
                     group_match = true;
                     break;
                 }
@@ -1347,6 +1365,9 @@ bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint
             }
             if (access & RAMFS_FLAG_WRITE) {
                 required_perms |= RAMFS_PERM_OTHER_WRITE;
+            }
+            if (access & RAMFS_FLAG_EXEC) {
+                required_perms |= RAMFS_PERM_OTHER_EXEC;
             }
         }
     }

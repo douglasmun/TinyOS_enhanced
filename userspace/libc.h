@@ -31,6 +31,8 @@
 #define SYS_MKDIR   25
 #define SYS_RMDIR   26
 #define SYS_UNLINK  27
+#define SYS_GETCWD  28
+#define SYS_CHDIR   29
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -115,6 +117,15 @@ int  lseek(int fd, int offset, int whence);
 int  mkdir(const char* path);
 int  rmdir(const char* path);
 int  unlink(const char* path);
+
+/* Working directory. Relative paths passed to any of the calls above resolve
+ * against it, so chdir("D:/scratch") then open("f.txt") opens
+ * D:/scratch/f.txt. getcwd returns the length written (excluding the NUL) or
+ * -ERANGE if the path does not fit — it never truncates, since a truncated
+ * path names a different directory. chdir returns -ENOSYS for a FAT32
+ * subdirectory: that driver only supports its root. */
+int  getcwd(char* buf, unsigned int size);
+int  chdir(const char* path);
 int  putchar(int c);
 int  puts(const char* s);            /* appends newline */
 void print(const char* s);           /* no newline */

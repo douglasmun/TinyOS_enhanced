@@ -426,6 +426,37 @@ static int ramfs_vfs_stat(const char* path, vfs_dirent_t* out) {
 }
 
 /**
+ * @brief Check search (x) permission on a RAMFS directory
+ * @param path Canonical absolute path
+ * @return 0 if the caller may traverse it, negative error code otherwise
+ *
+ * Deliberately NOT ramfs_vfs_stat: stat requires r, which chdir must not.
+ * POSIX's x bit is "may traverse", r is "may enumerate"; the RAMFS root is
+ * 0711 precisely so a ring-3 process can sit in it without being able to
+ * list it.
+ */
+static int ramfs_vfs_access_dir(const char* path) {
+    if (!path) {
+        return VFS_EINVAL;
+    }
+
+    ramfs_node_t* node = ramfs_find(path);
+    if (!node) {
+        return VFS_ENOENT;
+    }
+    if (node->type != RAMFS_TYPE_DIR) {
+        return VFS_ENOTDIR;
+    }
+
+    uint16_t uid, gid;
+    ramfs_get_current_credentials(&uid, &gid);
+    if (!ramfs_check_permission(node, uid, gid, RAMFS_FLAG_EXEC)) {
+        return VFS_EACCES;
+    }
+    return 0;
+}
+
+/**
  * @brief Reposition a RAMFS file cursor
  * @param private_data Type-safe handle pointer
  * @param offset Signed displacement, interpreted per `whence`
@@ -493,7 +524,8 @@ static const file_operations_t ramfs_file_ops = {
     .unlink  = ramfs_vfs_unlink,
     .readdir = ramfs_vfs_readdir,
     .stat    = ramfs_vfs_stat,
-    .seek    = ramfs_vfs_seek
+    .seek    = ramfs_vfs_seek,
+    .access_dir = ramfs_vfs_access_dir
 };
 
 /*=============================================================================

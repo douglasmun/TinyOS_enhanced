@@ -75,6 +75,12 @@ typedef int32_t ssize_t;                /* Signed size type for I/O operations *
 #define VFS_RESERVED_FDS    6       /* Reserved FDs for critical processes (10% of VFS_MAX_FDS) */
 #define VFS_MAX_PATH        256     /* Maximum path length */
 
+/* Drive used for a path with no "X:" prefix. RAMFS holds the embedded system
+ * binaries, so resolution must not depend on driver registration order — see
+ * the long rationale above vfs_resolve_drive in vfs.c. Also the drive a task's
+ * cwd starts on (task_cwd_init). */
+#define VFS_DEFAULT_DRIVE   'D'
+
 /*=============================================================================
  * PROCESS CAPABILITY FLAGS (EDR Phase 1)
  *
@@ -356,6 +362,20 @@ typedef struct file_operations {
      */
     int (*unlink)(const char* path);
 
+    /**
+     * @brief May the calling process SEARCH this directory (the x bit)?
+     * @param path Directory path (drive letter already stripped)
+     * @return 0 if permitted, negative error code otherwise
+     *
+     * Distinct from stat, which asks for read permission. POSIX separates the
+     * two on a directory: r enumerates its entries, x traverses into it. chdir
+     * needs exactly x, and asking stat's question instead would deny a cwd
+     * that the process is entitled to sit in — the RAMFS root is 0711 for that
+     * reason. Optional: a driver that leaves this NULL is treated as
+     * permitting search, which is right for FAT32 (no ownership model).
+     */
+    int (*access_dir)(const char* path);
+
 } file_operations_t;
 
 /*=============================================================================
@@ -521,6 +541,13 @@ int vfs_rmdir(const char* path);
  * - Delegates to driver's unlink function
  */
 int vfs_unlink(const char* path);
+
+/**
+ * @brief Check search (x) permission on a directory, as chdir needs
+ * @param path Directory path, optionally drive-qualified
+ * @return 0 if the caller may traverse it, negative error code otherwise
+ */
+int vfs_access_dir(const char* path);
 
 /**
  * @brief Read directory entries

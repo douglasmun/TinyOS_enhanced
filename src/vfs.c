@@ -62,8 +62,10 @@ static bool vfs_initialized = false;
  * on a blank one — the embedded binaries live in RAMFS.
  *
  * Naming the default drive makes the resolution independent of init order.
+ *
+ * The macro itself now lives in vfs.h: a task's cwd must be drive-qualified,
+ * so process.c needs the same default when it initializes one.
  *===========================================================================*/
-#define VFS_DEFAULT_DRIVE 'D'   /* RAMFS: holds the embedded system binaries */
 
 /*=============================================================================
  * FUNCTION: vfs_resolve_drive
@@ -1196,6 +1198,52 @@ int vfs_unlink(const char* path) {
     }
 
     return driver_ops->unlink(actual_path);
+}
+
+/*=============================================================================
+ * FUNCTION: vfs_access_dir
+ * PURPOSE: May the calling process search (traverse) this directory?
+ *
+ * Asks the driver the x-bit question rather than the r-bit question vfs_stat
+ * asks. chdir is the only caller today: a process must be able to sit in a
+ * directory it is not allowed to list, which is exactly the RAMFS root's 0711.
+ *
+ * A driver with no access_dir op permits the search — the right default for a
+ * filesystem with no ownership model at all (FAT32).
+ *===========================================================================*/
+int vfs_access_dir(const char* path) {
+    if (!vfs_initialized) {
+        return VFS_EINVAL;
+    }
+    if (!path) {
+        return VFS_EFAULT;
+    }
+
+    size_t path_len = strlen(path);
+    if (path_len == 0 || path_len >= VFS_MAX_PATH) {
+        return VFS_EINVAL;
+    }
+
+    const file_operations_t* driver_ops = NULL;
+    const char* actual_path = NULL;
+    int rc = vfs_resolve_drive(path, &driver_ops, &actual_path);
+    if (rc < 0) {
+        return rc;
+    }
+    if (!driver_ops) {
+        return VFS_ENOENT;
+    }
+    if (!driver_ops->access_dir) {
+        return 0;   /* No ownership model: nothing to deny */
+    }
+
+    char canonical_path[VFS_MAX_PATH];
+    int canon_ret = vfs_canonicalize_path(actual_path, canonical_path, VFS_MAX_PATH);
+    if (canon_ret < 0) {
+        return canon_ret;
+    }
+
+    return driver_ops->access_dir(canonical_path);
 }
 
 /**

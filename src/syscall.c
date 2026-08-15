@@ -697,6 +697,11 @@ int sys_sleep(uint32_t ms) {
  * SECURITY: only root or the owner of the target process may wait on it —
  * prevents an unprivileged process from siphoning another user's exit codes.
  *-----------------------------------------------------------------------------*/
+/* Defined with the file-I/O syscalls below, where its rationale lives; spawn
+ * needs it too so that path resolution is identical across every syscall that
+ * takes one. */
+static int syscall_copy_path(char* out, size_t out_size, const char* user_path);
+
 /*=============================================================================
  * FUNCTION: sys_spawn
  * PURPOSE: Load an ELF from the filesystem and start it as a child process
@@ -708,9 +713,10 @@ int sys_sleep(uint32_t ms) {
  * RETURNS: child PID (> 0) on success, negative errno on failure
  *
  * The child inherits the caller's streams (so a spawned process writes where
- * its parent's stdout points) and is recorded as the caller's child, which is
- * what makes waitpid() and `jobs` work on it. It does NOT block: the caller
- * waits explicitly with waitpid() if it wants to.
+ * its parent's stdout points) and its cwd (so it resolves relative paths in
+ * the same directory), and is recorded as the caller's child, which is what
+ * makes waitpid() and `jobs` work on it. It does NOT block: the caller waits
+ * explicitly with waitpid() if it wants to.
  *
  * SECURITY: every byte of the path and the argument vector is copied into
  * kernel memory with copy_*_from_user BEFORE use. Nothing below dereferences
@@ -724,14 +730,13 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
         return -ESRCH;
     }
 
-    /* Path first: a bad path is the cheap rejection. */
-    char path[MAX_PATH];
-    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    /* Path first: a bad path is the cheap rejection. Resolved against the
+     * caller's cwd like every other path syscall, so `spawn("prog.elf")` finds
+     * the binary next to the caller rather than only at the default root. */
+    char path[VFS_MAX_PATH];
+    int rc = syscall_copy_path(path, sizeof(path), user_path);
     if (rc < 0) {
-        return rc;   /* -EFAULT / -ENAMETOOLONG */
-    }
-    if (rc == 0) {
-        return -EINVAL;  /* Empty path */
+        return rc;
     }
 
     /* Copy the whole vector into kernel storage. Both the pointer array and
@@ -835,6 +840,13 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
      * closing any redirected fd. */
     streams_inherit(&child->streams, &self->streams);
 
+    /* cwd inherits the same way, and for the same reason: a child spawned from
+     * a shell sitting in some directory must resolve its own relative paths
+     * there. Unlike streams this is a deep copy of a fixed-size buffer, so it
+     * carries no lifetime relationship — the parent may chdir away or exit
+     * without disturbing the child. */
+    safe_strcpy(child->cwd, self->cwd, sizeof(child->cwd));
+
     scheduler_add_task(child);
     return pid;
 }
@@ -855,6 +867,43 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
  * user pointer is ever dereferenced in the kernel, matching sys_spawn.
  *===========================================================================*/
 
+/*=============================================================================
+ * FUNCTION: syscall_copy_path
+ * PURPOSE: Copy a user path in, then resolve it against the caller's cwd
+ *
+ * Every path-taking syscall needs both halves, in this order. The copy-in must
+ * come first so the kernel is working on its own immutable copy (a user thread
+ * could otherwise rewrite the string between validation and use), and the cwd
+ * resolution must come before the VFS sees the path, because the VFS has no
+ * notion of a process and would resolve a bare "foo.txt" against the default
+ * drive root instead of wherever the caller actually is.
+ *
+ * Doing this in one shared helper is what keeps the cwd from being honoured by
+ * some syscalls and silently ignored by others.
+ *
+ * @param out       Kernel buffer receiving the absolute, drive-qualified path
+ * @param out_size  Size of out (callers pass VFS_MAX_PATH)
+ * @param user_path Path pointer from ring 3
+ * @return 0 on success, negative errno otherwise
+ *===========================================================================*/
+static int syscall_copy_path(char* out, size_t out_size, const char* user_path) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    char raw[VFS_MAX_PATH];
+    int rc = copy_string_from_user(raw, user_path, sizeof(raw));
+    if (rc < 0) {
+        return rc;      /* -EFAULT / -ENAMETOOLONG */
+    }
+    if (rc == 0) {
+        return -EINVAL; /* Empty path */
+    }
+
+    return task_resolve_path(self, raw, out, out_size);
+}
+
 int sys_open(const char* user_path, int flags) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -863,14 +912,12 @@ int sys_open(const char* user_path, int flags) {
 
     /* Copy the path in first: a bad pointer is the cheap rejection, and after
      * this the kernel holds its own copy, so the caller cannot swap the string
-     * out between validation and use (TOCTOU). */
+     * out between validation and use (TOCTOU). The same helper applies the
+     * caller's cwd, so a relative path opens where the process actually is. */
     char path[VFS_MAX_PATH];
-    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    int rc = syscall_copy_path(path, sizeof(path), user_path);
     if (rc < 0) {
-        return rc;   /* -EFAULT / -ENAMETOOLONG */
-    }
-    if (rc == 0) {
-        return -EINVAL;  /* Empty path */
+        return rc;
     }
 
     /* Reject unknown flag bits rather than passing them through: it keeps the
@@ -980,12 +1027,9 @@ int sys_stat(const char* user_path, void* user_buf, uint32_t size) {
     }
 
     char path[VFS_MAX_PATH];
-    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    int rc = syscall_copy_path(path, sizeof(path), user_path);
     if (rc < 0) {
         return rc;
-    }
-    if (rc == 0) {
-        return -EINVAL;
     }
 
     /* Same rule as sys_readdir: fill kernel memory, then copy out. */
@@ -1032,12 +1076,9 @@ int sys_lseek(int fd, int32_t offset, int whence) {
  *===========================================================================*/
 static int syscall_path_op(const char* user_path, int (*op)(const char*)) {
     char path[VFS_MAX_PATH];
-    int rc = copy_string_from_user(path, user_path, sizeof(path));
+    int rc = syscall_copy_path(path, sizeof(path), user_path);
     if (rc < 0) {
         return rc;
-    }
-    if (rc == 0) {
-        return -EINVAL;   /* Empty path */
     }
     return op(path);
 }
@@ -1052,6 +1093,60 @@ int sys_rmdir(const char* user_path) {
 
 int sys_unlink(const char* user_path) {
     return syscall_path_op(user_path, vfs_unlink);
+}
+
+/*=============================================================================
+ * WORKING-DIRECTORY SYSCALLS
+ *
+ * The cwd itself lives in task_t and is manipulated only through task_chdir /
+ * task_resolve_path (process.c). These two are thin: their job is the user
+ * memory boundary, not the path logic.
+ *===========================================================================*/
+
+int sys_getcwd(char* user_buf, uint32_t size) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (!user_buf || size == 0) {
+        return -EINVAL;
+    }
+
+    size_t len = strlen(self->cwd);
+
+    /* -ERANGE, not truncation: a half-copied path names a different directory,
+     * and silently handing that back is how a caller ends up operating on the
+     * wrong one. POSIX getcwd behaves the same way. */
+    if (len + 1 > size) {
+        return -ERANGE;
+    }
+
+    if (copy_to_user(user_buf, self->cwd, len + 1) < 0) {
+        return -EFAULT;
+    }
+
+    return (int)len;
+}
+
+int sys_chdir(const char* user_path) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    /* Copied in raw, NOT through syscall_copy_path: task_chdir does its own
+     * cwd-relative resolution and needs the path exactly as the caller wrote
+     * it. Resolving here first would work but would canonicalize twice. */
+    char raw[VFS_MAX_PATH];
+    int rc = copy_string_from_user(raw, user_path, sizeof(raw));
+    if (rc < 0) {
+        return rc;
+    }
+    if (rc == 0) {
+        return -EINVAL;
+    }
+
+    return task_chdir(self, raw);
 }
 
 int sys_waitpid(int pid) {
@@ -2023,6 +2118,15 @@ static void syscall_dispatch(struct cpu_state* state) {
 
         case SYS_UNLINK:
             ret = sys_unlink((const char*)arg1);
+            break;
+
+        case SYS_GETCWD:
+            /* arg1 = user buffer, arg2 = its size */
+            ret = sys_getcwd((char*)arg1, arg2);
+            break;
+
+        case SYS_CHDIR:
+            ret = sys_chdir((const char*)arg1);
             break;
 
         default:
