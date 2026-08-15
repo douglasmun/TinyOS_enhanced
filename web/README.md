@@ -56,12 +56,18 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is currently **ahead of** the signed `v2.3` release asset: it
-is built from `main` at PR #40, which fixes `ls` running a directory's `/`
-marker into the next column. Everything else matches v2.3 — background jobs,
-fd-aware I/O, `SYS_SPAWN` + argv, and shell pipelines from PRs #30–#33, on top
-of the v2.2 framebuffer console, userspace libc + FAT32 exec, and blocking
-syscalls.
+The committed ISO is built from `main` at **PR #40** (`2a93213`), which fixes
+`ls` running a directory's `/` marker into the next column. Relative to the
+signed `v2.3` release asset it is **ahead** by that fix; relative to current
+`main` it is **behind**, and deliberately so — it is a pinned demo image, not a
+rolling build of `main`, and it is only refreshed when someone runs the steps
+above.
+
+That gap is not small, so do not read the demo as showing current behaviour.
+Most visibly, the demo still boots into the **kernel** shell: PR #51 made the
+ring-3 shell the default login shell, and PRs #42–#55 also landed FAT32
+subdirectories, ring-3 redirection and pipelines, the ring-3 credential
+commands, and credential-syscall hardening. None of that is in this image.
 
 SHA-256 `d6ef1079914c7273405b05996017c3835f5b9818212d4a71f568c17f14e35627` as of
 2026-08-14. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
