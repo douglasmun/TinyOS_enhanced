@@ -243,6 +243,8 @@ void e1000_send(void* data, size_t len);
  * fit (and was consumed). */
 int e1000_rx_dequeue(uint8_t* out, uint16_t out_len);
 void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames);
+void net_count_tcp_no_connection(void);
+uint32_t net_get_tcp_no_connection(void);
 void net_count_syscall_rx(void);
 void net_count_syscall_tx(void);
 void e1000_poll_rx(void);

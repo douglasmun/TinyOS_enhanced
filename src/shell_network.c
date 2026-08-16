@@ -187,6 +187,12 @@ void cmd_ifconfig(void) {
     net_get_syscall_stats(&netd_rx, &netd_tx);
     kprintf("  netd sysc:    %u rx-frames, %u tx-frames\n", netd_rx, netd_tx);
 
+    /* Segments for no known connection: port scans, stray retransmissions,
+     * backscatter. This replaced a per-inbound-SYN kprintf when the passive-open
+     * path was removed — a remote host chose how often that one fired. */
+    kprintf("  TCP no-conn:  %u segments dropped (no listener; client-only stack)\n",
+            net_get_tcp_no_connection());
+
     /* DMA region placement (doc/NETWORK_ISOLATION.md item 3). Printed with the
      * live present/absent state of each guard rather than just the addresses:
      * the addresses only show where the guards were MEANT to go, whereas the

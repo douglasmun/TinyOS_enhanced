@@ -1098,78 +1098,30 @@ int tcp_socket(void) {
     return -1;
 }
 
-/**
- * @brief Bind socket to local port
- */
-int tcp_bind(int sockfd, uint16_t port) {
-    if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return -1;
-    tcp_connection_t* conn = &tcp_connections[sockfd];
-    if (!conn->in_use) return -1;
-
-    if (port == 0) {
-        port = tcp_allocate_port();
-    }
-    conn->local_port = port;
-    // kprintf("TCP: Socket %d bound to port %d\n", sockfd, port);  // Commented for less verbosity
-    return 0;
-}
-
-/**
- * @brief Listen for incoming connections
- */
-int tcp_listen(int sockfd) {
-    if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return -1;
-    TCP_LOCK();
-    tcp_connection_t* conn = &tcp_connections[sockfd];
-    if (!conn->in_use || conn->state != TCP_CLOSED) {
-        TCP_UNLOCK();
-        return -1;
-    }
-
-    // Must have a port bound
-    if (conn->local_port == 0) {
-        TCP_UNLOCK();
-        return -1;
-    }
-
-    conn->state = TCP_LISTEN;
-    /* Removed verbose kprintf - TCP listen operation is silent */
-    TCP_UNLOCK();
-    return 0;
-}
-
-/**
- * @brief Accept incoming connection (non-blocking)
- * Returns first ESTABLISHED connection for the listening port
- */
-int tcp_accept(int listen_sockfd, uint8_t* remote_ip, uint16_t* remote_port) {
-    if (listen_sockfd < 0 || listen_sockfd >= TCP_MAX_CONNECTIONS) return -1;
-    TCP_LOCK();
-    tcp_connection_t* listen_conn = &tcp_connections[listen_sockfd];
-    if (!listen_conn->in_use || listen_conn->state != TCP_LISTEN) {
-        TCP_UNLOCK();
-        return -1;
-    }
-
-    uint16_t port = listen_conn->local_port;
-
-    // Find first ESTABLISHED connection on this port
-    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-        if (i == listen_sockfd) continue;  // Skip the listening socket itself
-        tcp_connection_t* conn = &tcp_connections[i];
-        if (conn->in_use && conn->local_port == port &&
-            conn->state == TCP_ESTABLISHED) {
-            // Found an accepted connection
-            if (remote_ip) memcpy(remote_ip, conn->remote_ip, 4);
-            if (remote_port) *remote_port = conn->remote_port;
-            TCP_UNLOCK();
-            return i;
-        }
-    }
-
-    TCP_UNLOCK();
-    return -1;  // No connections ready
-}
+/*=============================================================================
+ * The server path (tcp_bind / tcp_listen / tcp_accept) was REMOVED here.
+ *
+ * Its only caller was ssh.c, which is not in the build (see Makefile). Nothing
+ * else in the tree called it, so it was dead code -- and dead code carrying an
+ * API into a new trust domain is the exact shape of PRs #45/#47/#54/#55, where
+ * every path that was dead-or-kernel-only until it was exposed turned out to
+ * hold a serious bug. This one held two:
+ *
+ *   tcp_bind took NO lock, while every other mutating entry point takes
+ *   TCP_LOCK(). It did an unlocked read-modify-write of conn->local_port and
+ *   called tcp_allocate_port(), which itself walks tcp_connections[] and
+ *   mutates next_ephemeral_port. Two concurrent binds could be handed the same
+ *   port -- defeating the collision check that exists for exactly that reason.
+ *
+ *   tcp_bind ignored allocation failure. tcp_allocate_port() returns 0 when
+ *   exhausted; tcp_bind stored that into conn->local_port and returned success.
+ *
+ * Deleting is the honest reading of "least surface": this is a client-only
+ * stack, so the passive-open branch in tcp_handle_packet is now unreachable
+ * too (nothing can set TCP_LISTEN), and TinyOS accepts no inbound connections
+ * at all. Reintroduce the three against a boundary that exists, with the lock
+ * and the failure check, in the PR that actually needs them.
+ *===========================================================================*/
 
 /**
  * @brief Connect to remote server
@@ -1507,80 +1459,19 @@ void tcp_handle_packet(const uint8_t* src_ip, const uint8_t* dest_ip,
         // Process segment for existing connection
         tcp_process_segment(conn, tcp_hdr, payload, payload_len, src_ip);
     } else {
-        // No existing connection - check if this is a SYN to a listening port
-        uint8_t flags = tcp_hdr->flags;
-        if (flags & TCP_SYN) {
-            // Find a listening socket on the destination port
-            tcp_connection_t* listen_conn = NULL;
-            for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-                if (tcp_connections[i].in_use &&
-                    tcp_connections[i].state == TCP_LISTEN &&
-                    tcp_connections[i].local_port == dest_port) {
-                    listen_conn = &tcp_connections[i];
-                    break;
-                }
-            }
-
-            if (listen_conn) {
-                int half_open = tcp_count_half_open_connections();
-                if (half_open >= TCP_MAX_HALF_OPEN_CONNECTIONS) {
-                    kprintf("TCP: SYN flood protection - too many half-open connections (%d/%d)\n",
-                            half_open, TCP_MAX_HALF_OPEN_CONNECTIONS);
-                    TCP_UNLOCK();
-                    return;
-                }
-
-                // Create new connection for this incoming SYN
-                int new_sockfd = -1;
-                for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-                    if (!tcp_connections[i].in_use) {
-                        new_sockfd = i;
-                        break;
-                    }
-                }
-
-                if (new_sockfd >= 0) {
-                    tcp_connection_t* new_conn = &tcp_connections[new_sockfd];
-                    memset(new_conn, 0, sizeof(tcp_connection_t));
-                    new_conn->in_use = true;
-                    new_conn->state = TCP_SYN_RECEIVED;
-                    new_conn->local_port = dest_port;
-                    new_conn->remote_port = src_port;
-                    memcpy(new_conn->remote_ip, src_ip, 4);
-                    new_conn->rcv_wnd = TCP_RX_BUFFER_SIZE;
-                    new_conn->syn_sent_start = tcp_get_time_ms();  // For SYN_RECEIVED timeout
-
-                    // Get remote MAC address
-                    uint8_t* remote_mac = get_route_mac(src_ip);
-                    if (remote_mac) {
-                        memcpy(new_conn->remote_mac, remote_mac, 6);
-                    }
-
-                    // Initialize sequence numbers (RFC 6528-compliant ISN generation)
-                    uint32_t seq = ntohl(tcp_hdr->sequence_number);
-                    new_conn->irs = seq;
-                    new_conn->rcv_nxt = seq + 1;
-                    new_conn->iss = tcp_generate_isn(my_ip, new_conn->local_port,
-                                                      new_conn->remote_ip, new_conn->remote_port);
-                    new_conn->snd_una = new_conn->iss;
-                    new_conn->snd_nxt = new_conn->iss + 1;
-                    new_conn->snd_wnd = TCP_INITIAL_WINDOW;
-
-                    kprintf("TCP: Incoming connection from %d.%d.%d.%d:%d on port %d\n",
-                            src_ip[0], src_ip[1], src_ip[2], src_ip[3],
-                            src_port, dest_port);
-
-                    // Send SYN-ACK
-                    tcp_send_segment(new_conn, TCP_SYN | TCP_ACK, NULL, 0);
-                } else {
-                    kprintf("TCP: No free sockets for incoming connection\n");
-                }
-            }
-        } else {
-            // kprintf("TCP: No connection found for %d.%d.%d.%d:%d -> :%d\n",
-            //         src_ip[0], src_ip[1], src_ip[2], src_ip[3],
-            //         src_port, dest_port);  // Commented for less verbosity
-        }
+        /* No existing connection, and there is no passive-open path any more.
+         *
+         * The SYN-to-a-listening-socket branch that stood here was gated on a
+         * socket in TCP_LISTEN, a state only tcp_listen() could set. That
+         * function is gone (see the note above tcp_connect), so the branch was
+         * unreachable: this is a client-only stack and it accepts no inbound
+         * connections. Removing it rather than leaving it dead also drops a
+         * per-packet kprintf on the RX path -- a remote host chose how often
+         * that one fired, which is the class CLAUDE.md rules out entirely.
+         *
+         * An unsolicited segment is therefore simply dropped, silently and
+         * without allocating anything. */
+        net_count_tcp_no_connection();
     }
 
     TCP_UNLOCK();

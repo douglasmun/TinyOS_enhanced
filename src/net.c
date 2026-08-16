@@ -1286,10 +1286,13 @@ static void handle_tcp(ip_header_t* ip_hdr, uint16_t ip_len) {
     /*=========================================================================
      * Forward packet to TCP stack for proper state machine handling
      * The TCP stack (tcp.c) handles:
-     * - Server-side: SYN → SYN-ACK → ACK (3-way handshake)
      * - Client-side: SYN-ACK → ACK (handshake completion)
      * - Data transfer: ACK, PSH, FIN, RST
-     * - Connection management: tcp_listen, tcp_accept, tcp_send, tcp_recv
+     * - Connection management: tcp_connect, tcp_send, tcp_recv, tcp_close
+     *
+     * There is no server side. The passive-open path was removed with
+     * tcp_listen/tcp_accept; a segment for no known connection is counted and
+     * dropped, never answered.
      *=======================================================================*/
     tcp_handle_packet(ip_hdr->src_ip, ip_hdr->dest_ip,
                      (uint8_t*)tcp_hdr, tcp_len);
@@ -1712,6 +1715,20 @@ void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames) {
 
 void net_count_syscall_rx(void) { net_syscall_rx++; }
 void net_count_syscall_tx(void) { net_syscall_tx++; }
+
+/*=============================================================================
+ * Segments arriving for no known connection.
+ *
+ * This is a port scan, a stray retransmission, or backscatter -- all of them
+ * remote-driven and none of them interesting one line at a time. It replaces
+ * the passive-open branch removed from tcp_handle_packet, which printed once
+ * per inbound SYN. Count, don't print: the RX path takes no kprintf at all.
+ *===========================================================================*/
+static uint32_t tcp_no_connection = 0;
+
+void net_count_tcp_no_connection(void) { tcp_no_connection++; }
+
+uint32_t net_get_tcp_no_connection(void) { return tcp_no_connection; }
 
 /**
  * @brief Main packet reception handler.

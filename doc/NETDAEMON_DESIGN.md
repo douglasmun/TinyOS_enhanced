@@ -140,6 +140,68 @@ socket netdev cannot produce on demand; it is asserted by reading, not by runnin
 **PR C — socket API across the boundary.** The 23 functions. Largest and least
 glamorous PR; likely splits further.
 
+*The count was stale, and the first step of PR C was finding that out.* Three of
+the 23 — `tcp_bind`, `tcp_listen`, `tcp_accept` — have **no live caller**. Their
+only consumer was `ssh.c`, which is not in the build (Makefile:164 records SSH,
+`ssh_crypto.c` and `rsa.c` as removed, source retained on disk). So the surface
+to carry across is 20, not 23, and the remaining three were dead code.
+
+**C0 (landed) — delete the server path rather than export it.** CLAUDE.md's rule
+is that making a path reachable from ring 3 turns latent bugs into corruption
+primitives, and that PRs #45/#47/#54/#55 each found serious bugs in code that was
+dead or kernel-only until it was exposed. Auditing these three before exporting
+them found two more:
+
+- **`tcp_bind` took no lock.** Every other mutating entry point takes
+  `TCP_LOCK()`. It did an unlocked read-modify-write of `conn->local_port` and
+  called `tcp_allocate_port()`, which itself walks `tcp_connections[]` and
+  mutates the `next_ephemeral_port` global. Two concurrent binds could be handed
+  the same port — defeating the collision check that exists for that exact
+  reason.
+- **`tcp_bind` ignored allocation failure.** `tcp_allocate_port()` returns 0 when
+  exhausted; `tcp_bind` stored that into `conn->local_port` and returned success.
+  Today `tcp_listen` rejects `local_port == 0` so the damage stops at a
+  misleading errno, but the moment any future caller does not recheck, port 0 is
+  live state.
+
+Deleting is the honest reading of "least surface" for a client-only stack. The
+consequence worth stating: `tcp_listen` was the only thing that could assign
+`TCP_LISTEN`, and the passive-open branch in `tcp_handle_packet` was gated on
+that state — so **TinyOS now accepts no inbound connections at all**, and an
+unsolicited segment is counted (`net_get_tcp_no_connection`, surfaced in
+`ifconfig`) and dropped. That deletion also removed a per-inbound-SYN `kprintf`,
+which a remote host chose the rate of — the class CLAUDE.md rules out entirely.
+
+Harness: `verify-tcp-serverpath.sh`. Both guard halves were negative-controlled
+separately, because they catch different failures: restoring a `tcp_listen`
+definition trips the first, and restoring only a `state = TCP_LISTEN` assignment
+(with no API function anywhere) trips the second — the latter being the one that
+would silently reopen remote SYN handling while every deleted function stayed
+deleted.
+
+**A TCP-over-NAT failure was found and is NOT this PR's.** `curl` reaches
+`SYN_SENT` and times out after 10010 ms with no SYN-ACK. Measured identically at
+three points: HEAD with the deletion, HEAD with the deletion stashed (server path
+fully intact), and `9fdf257` (before the entire network-isolation series). DHCP,
+ARP and DNS all work; the outbound SYN leaves and nothing returns. It therefore
+predates this work and needs its own investigation. This is why the harness
+asserts end-to-end on **DNS** rather than an HTTP body: DNS is real inbound
+traffic through the same `handle_packet` dispatch the branch was cut from, and it
+demonstrably works, so a failure there is attributable to this edit. Asserting on
+an HTTP body would fail on `main` too — measuring the pre-existing bug while
+looking like a regression report for this change. The TCP client path is
+consequently not covered end-to-end; that gap is stated in the harness header
+rather than papered over.
+
+**C1/C2 (not started) — the remaining 20.** Split proposed as C1 = the read-only
+state queries (`tcp_available`, `tcp_is_connected`, `tcp_get_state`,
+`dns_is_resolved`, `dns_get_resolved_ip`, `dhcp_is_configured`,
+`dhcp_get_client_info`, plus `my_ip`/`my_mac`/`gateway_ip`/`subnet_mask` as one
+query), which carry no write surface and so land with a much smaller audit; C2 =
+the data path (`tcp_socket`/`tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close`).
+Fixing TCP-over-NAT first would be sensible, since C2 cannot be verified
+end-to-end while a handshake cannot complete.
+
 **PR D — move the parser to ring 3.** Only after A–C. This is the PR where the
 trust domain actually changes.
 
