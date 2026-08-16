@@ -465,8 +465,11 @@ root-side counter-check that the commands still produce real output, since a gua
 refusing *everyone* would satisfy every refusal assertion while breaking the
 commands.
 
-Verified in the **passing direction only** — the negative control (reverting the
-guards and confirming FAIL) has not been run.
+**Validated both ways** (2026-08-16): PASS on the guarded kernel, and FAIL on the
+pre-guard tree (`git checkout af05cf6^ -- src/shell_system.c`), where it caught
+the first missing guard and the serial log shows `pae` printing full PAE status —
+CPU support, CR4/EFER state, W^X enforcement — to unprivileged user `probe` with
+no refusal.
 
 ## Remaining: introspection and machine-state commands in ring 3
 
@@ -485,20 +488,49 @@ They are **NOT one group**:
 Do `ps`/`kill` first if this is picked up; do not convert `shell_system.c`
 wholesale on the way.
 
-## Open gap — task-slot exhaustion
+## Task-slot exhaustion — CLOSED
 
 `shell.elf` can be run recursively (nested, and via `&`, which is the real bomb).
 `task_rate_limit_check()` (`src/process.c`) is a real token bucket, but it limits
 the **rate** of task creation (5/sec sustained), not the **quantity** of live
-tasks one user holds. At that rate, filling the global `MAX_TASKS` (32) takes ~5
-seconds and the slots then stay full. There is no `RLIMIT_NPROC` equivalent.
+tasks one user holds. At that rate, filling the global `MAX_TASKS` (32) took ~5
+seconds and the slots then stayed full — starving the kernel's own tasks and
+blocking root from logging in to fix it, so recovery needed a reboot. Each shell
+instance costs ~170 KB, so memory was never the binding constraint; the 32-slot
+table was.
 
-The table is **global**, so an unprivileged user exhausting it starves the
-kernel's own tasks and blocks root from logging in to fix it — recovery needs a
-reboot. Each shell instance costs ~170 KB, so memory is not the binding
-constraint; the 32-slot table is.
+Fixed with the two limits recommended here — deliberately **not** a
+recursion-depth limit, which misses the `&` case entirely:
 
-Recommended fix (not a recursion-depth limit, which misses the `&` case
-entirely): a per-user concurrent cap (~8–12, `-EAGAIN`) in `task_create_user`,
-plus a root slot reserve (~4) so root can always log in and `kill` the offender.
-Not implemented.
+- **`USER_MAX_CONCURRENT_TASKS` (10)** — a per-uid cap on *live* tasks,
+  `-EAGAIN`.
+- **`TASK_ROOT_RESERVED_SLOTS` (4)** — slots no non-root task may take, so root
+  can always log in and `kill` the offender.
+
+Both live in `task_create_user_argv`, which every user-task creation path
+funnels through. Three details are load-bearing:
+
+- **Charged to the CREATOR's uid.** `task_create_user` hardcodes uid 1000 and
+  the caller overwrites it *after* the call returns, so the new task's own uid
+  is not yet meaningful at check time.
+- **ZOMBIEs count.** A zombie still occupies a slot, which is the resource being
+  rationed. Excluding them would let an unreaped spawn loop past the cap.
+- **Checked BEFORE the rate limiter.** Being over a standing ownership limit is
+  more specific and more durable than a transient rate spike; reporting the rate
+  limiter to a user who is *also* over their cap tells them to retry, which will
+  keep failing.
+
+A **pre-existing bug in the rate limiter** was found and fixed on the way: the
+refill divided by `(1000 / REFILL_INTERVAL)` == 10, so one elapsed second added
+`(1 * 5) / 10` == **0** tokens in integer arithmetic, and the reset discarded
+leftover ticks. The bucket refilled only when a single check saw ≥2 seconds
+elapse, making the limiter far more aggressive than its documented 5/sec. See
+`doc/KERNEL_BUGS.md`.
+
+Harness: `verify-slotcap.sh`, driving `userspace/slotbomb.c` (spawns
+`/slothold.elf` in a loop, never reaps). Its decisive assertion is **which
+guard refused**: both limiters return `-EAGAIN`, so the errno cannot tell them
+apart, and early runs of this harness passed while the RATE limiter did the
+refusing at a count that looked exactly right. It therefore requires the cap's
+own message *and* the absence of the rate limiter's, and finishes by proving
+root can still create a task while the attacker sits at their cap.

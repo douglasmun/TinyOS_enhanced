@@ -209,6 +209,7 @@ def main():
     #    which is how such a line stays checked at all (on the prompt or result
     #    that follows it, rather than on its own echo).
     followups = os.environ.get("TINYOS_FOLLOWUP_CMDS", "")
+    followup_timeout = int(os.environ.get("TINYOS_FOLLOWUP_TIMEOUT", "240"))
     if followups.strip():
         for item in followups.split(";"):
             item = item.strip()
@@ -236,7 +237,13 @@ def main():
                     # processes, each ECDSA-verified, then streams kilobytes
                     # between them under TCG). Raising a timeout only ever
                     # costs time on a run that was going to fail anyway.
-                    wait_for(want, timeout=240, since=mark)
+                    #
+                    # TINYOS_FOLLOWUP_TIMEOUT raises it further for the rare
+                    # harness that drives something even more expensive -- the
+                    # task-slot cap probe spawns TEN ECDSA-verified processes
+                    # inside ONE command, which does not fit in 240s under TCG.
+                    # Default unchanged, so no other harness is affected.
+                    wait_for(want, timeout=followup_timeout, since=mark)
                     print(f"typist: '{want}' observed")
                 except SystemExit as e:
                     print(str(e), file=sys.stderr)

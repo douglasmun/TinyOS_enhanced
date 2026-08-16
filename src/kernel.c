@@ -34,6 +34,8 @@
 #include "producer_elf_data.h"
 #include "counter_elf_data.h"
 #include "credprobe_elf_data.h"
+#include "slotbomb_elf_data.h"
+#include "slothold_elf_data.h"
 #include "shell_elf_data.h"
 #include "shell.h"
 #include "keyboard.h"
@@ -848,6 +850,34 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(credprobe_fd, credprobe_elf_data, credprobe_elf_data_len);
             ramfs_close(credprobe_fd);
             ramfs_chmod("/credprobe.elf", 0755);
+        }
+    }
+
+    /* slotbomb.elf spawns /slothold.elf in a tight loop WITHOUT reaping, to
+     * prove the per-user concurrent task cap engages (see verify-slotcap.sh).
+     * Like credprobe.elf it has to bypass the shell: the cap lives in
+     * task_create_user, and a shell-driven `&` loop is slow enough under TCG
+     * that the RATE limiter would stop it first, which would pass against a
+     * kernel with no cap at all.
+     *
+     * slothold.elf is the child, NOT sleeper.elf: each spawn costs a full ECDSA
+     * verification under TCG, so ~6s sleeper children would exit and free their
+     * slots before the loop finished and the cap would never be reached.
+     *
+     * Both 0755 for the same uid-1000 reason as spawner.elf above. */
+    {
+        int slotbomb_fd = ramfs_open("/slotbomb.elf", RAMFS_FLAG_WRITE);
+        if (slotbomb_fd >= 0) {
+            ramfs_write(slotbomb_fd, slotbomb_elf_data, slotbomb_elf_data_len);
+            ramfs_close(slotbomb_fd);
+            ramfs_chmod("/slotbomb.elf", 0755);
+        }
+
+        int slothold_fd = ramfs_open("/slothold.elf", RAMFS_FLAG_WRITE);
+        if (slothold_fd >= 0) {
+            ramfs_write(slothold_fd, slothold_elf_data, slothold_elf_data_len);
+            ramfs_close(slothold_fd);
+            ramfs_chmod("/slothold.elf", 0755);
         }
     }
 

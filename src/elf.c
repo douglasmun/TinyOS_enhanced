@@ -420,9 +420,17 @@ int elf_exec_from_path(const char* path, const char* name,
     if (pid < 0) {
         /* elf_load_process_argv owns its own teardown: every failure path
          * after task creation goes through elf_abort_load(), which restores
-         * kernel CR3 and terminates the partial process. Nothing to reap. */
+         * kernel CR3 and terminates the partial process. Nothing to reap.
+         *
+         * Propagate its errno rather than flattening to -ENOEXEC: "exec format
+         * error" is a statement about the FILE, and it is wrong for a failure
+         * that has nothing to do with the file's contents. A resource cap
+         * (-EAGAIN) in particular must survive to the caller, who can retry or
+         * kill something -- advice that makes no sense for a malformed binary.
+         * The checks ABOVE keep -ENOEXEC, since those really are format
+         * problems. */
         reason = "failed to load";
-        result = -ENOEXEC;
+        result = pid;
         goto out;
     }
     result = pid;
@@ -835,8 +843,12 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
     int pid = task_create_user_argv((uint32_t)ehdr->e_entry, name,
                                     USER_STACK_LARGE, argc, argv);
     if (pid < 0) {
-        kprintf("[ELF] ERROR: Failed to create process\n");
-        return -1;
+        /* Propagate the real errno rather than flattening to -1: the caller
+         * has to distinguish a resource cap (-EAGAIN, retry later or kill
+         * something) from a malformed binary, and only this value says which.
+         * Every other failure below is a property of the ELF itself. */
+        kprintf("[ELF] ERROR: Failed to create process (%d)\n", pid);
+        return pid;
     }
 
     // Get the task to access its page directory. Use task_get_any (no state

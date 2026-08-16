@@ -15,7 +15,7 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
 # User programs to build
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
-            producer.elf counter.elf credprobe.elf
+            producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -89,6 +89,25 @@ credprobe.elf: credprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c credprobe.c -o credprobe.o
 	$(LD) $(LDFLAGS) -o credprobe.elf crt0.o credprobe.o libc.o -lgcc
 	@echo "Built credprobe.elf"
+
+# slotbomb.elf spawns /slothold.elf in a tight loop without reaping, to prove the
+# per-user concurrent task cap engages (see verify-slotcap.sh). It has to be a
+# program rather than a shell loop: the cap lives at the syscall boundary, and
+# driving `&` from the shell is slow enough under TCG that the RATE limiter
+# would stop it first — which would pass against a kernel with no cap at all.
+slotbomb.elf: slotbomb.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c slotbomb.c -o slotbomb.o
+	$(LD) $(LDFLAGS) -o slotbomb.elf crt0.o slotbomb.o libc.o -lgcc
+	@echo "Built slotbomb.elf"
+
+# slothold.elf is slotbomb.elf's child: it holds a task slot for minutes. It
+# cannot be sleeper.elf, which lives ~6s -- under TCG each ECDSA-verified spawn
+# takes tens of seconds, so sleeper children would exit and free their slots
+# before the loop finished and the cap would never be reached.
+slothold.elf: slothold.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c slothold.c -o slothold.o
+	$(LD) $(LDFLAGS) -o slothold.elf crt0.o slothold.o libc.o -lgcc
+	@echo "Built slothold.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld
