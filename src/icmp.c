@@ -30,6 +30,28 @@ static uint32_t last_icmp_reply_time = 0;
 static uint32_t icmp_replies_dropped = 0;
 
 /*=============================================================================
+ * RX-PATH COUNTERS (replacing per-packet kprintf)
+ *=============================================================================
+ * Every site below is driven by a remote host, from the RX path, with no local
+ * account required -- the same class item 2 closed in the e1000/net RX loops.
+ * The echo-reply print these replace was NOT rate limited: it sat in the
+ * ECHO_REPLY branch, which returns before reaching the limiter above. Matching
+ * ping_identifier is 1-in-65536 for an off-path attacker but free for an
+ * on-path one, since the identifier is sent in cleartext in every ping.
+ *
+ * Counters, not prints: surfaced by ifconfig. See doc/NETDAEMON_DESIGN.md (A1).
+ *===========================================================================*/
+static uint32_t icmp_echo_replies_rx = 0;   /* echo replies matching our ID   */
+static uint32_t icmp_echo_requests_rx = 0;  /* echo requests we answered      */
+
+void icmp_get_rx_stats(uint32_t* echo_replies, uint32_t* echo_requests,
+                       uint32_t* rate_limited) {
+    if (echo_replies) *echo_replies = icmp_echo_replies_rx;
+    if (echo_requests) *echo_requests = icmp_echo_requests_rx;
+    if (rate_limited) *rate_limited = icmp_replies_dropped;
+}
+
+/*=============================================================================
  * FUNCTION: calculate_icmp_checksum
  *
  * SECURITY: Odd-Length Padding Safety
@@ -204,9 +226,8 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
         
         if (identifier == ping_identifier) {
             pings_received++;
-            const uint8_t* req_ip_src = ip_hdr + 12;
-            kprintf("  64 bytes from %d.%d.%d.%d: icmp_seq=%d ttl=64 time<1ms\n", 
-                    req_ip_src[0], req_ip_src[1], req_ip_src[2], req_ip_src[3], sequence);
+            icmp_echo_replies_rx++;
+            (void)sequence;
         }
         return;
     }
@@ -220,10 +241,6 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
         uint32_t current_ticks = get_timer_ticks();
         if (current_ticks - last_icmp_reply_time < ICMP_RATE_LIMIT_TICKS) {
             icmp_replies_dropped++;
-            // Silently drop - don't flood logs
-            if (icmp_replies_dropped % 100 == 0) {
-                kprintf("ICMP: Rate limit - dropped %u requests\n", icmp_replies_dropped);
-            }
             return;
         }
         last_icmp_reply_time = current_ticks;
@@ -235,8 +252,7 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
 
         const uint8_t* req_ip_src = ip_hdr + 12;
 
-        kprintf("ICMP: Echo Request from %d.%d.%d.%d, replying...\n",
-                req_ip_src[0], req_ip_src[1], req_ip_src[2], req_ip_src[3]);
+        icmp_echo_requests_rx++;
 
         // ---- Build reply frame: ETH(14) + IP(20) + ICMP(8 + data) ----
         const size_t ip_header_len = 20;
@@ -316,8 +332,6 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
 
         // ---- Send ----
         e1000_send(buf, off);
-        kprintf("ICMP: Echo Reply sent to %d.%d.%d.%d\n",
-                req_ip_src[0], req_ip_src[1], req_ip_src[2], req_ip_src[3]);
     }
 }
 

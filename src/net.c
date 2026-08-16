@@ -15,6 +15,7 @@
 #include "tcp.h"
 #include "firewall.h"
 #include "ids.h"
+#include "critical.h" // in_interrupt_context() for the parse-context assertion
 
 /*=============================================================================
  * NETWORK CONFIGURATION
@@ -1285,10 +1286,13 @@ static void handle_tcp(ip_header_t* ip_hdr, uint16_t ip_len) {
     /*=========================================================================
      * Forward packet to TCP stack for proper state machine handling
      * The TCP stack (tcp.c) handles:
-     * - Server-side: SYN → SYN-ACK → ACK (3-way handshake)
      * - Client-side: SYN-ACK → ACK (handshake completion)
      * - Data transfer: ACK, PSH, FIN, RST
-     * - Connection management: tcp_listen, tcp_accept, tcp_send, tcp_recv
+     * - Connection management: tcp_connect, tcp_send, tcp_recv, tcp_close
+     *
+     * There is no server side. The passive-open path was removed with
+     * tcp_listen/tcp_accept; a segment for no known connection is counted and
+     * dropped, never answered.
      *=======================================================================*/
     tcp_handle_packet(ip_hdr->src_ip, ip_hdr->dest_ip,
                      (uint8_t*)tcp_hdr, tcp_len);
@@ -1638,6 +1642,94 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
     }
 }
 
+/*=============================================================================
+ * RX DROP COUNTERS (see doc/NETWORK_ISOLATION.md, item 2)
+ *
+ * These two drops used to kprintf one line per packet. Both are reachable
+ * BEFORE the firewall by anyone on the segment — no local account needed — and
+ * both execute in the ISR with interrupts disabled, so serial console output
+ * turned a malformed frame into a remote amplification primitive. CLAUDE.md's
+ * "no per-operation kprintf on a ring-3-reachable path" rule applies here with
+ * more force, because this path does not even require ring 3.
+ *
+ * A counter is strictly better than a rate-limited print: it survives the
+ * flood and stays accurate, where a suppressed print loses the count. Surfaced
+ * via net_get_drop_stats() in `ifconfig`.
+ *
+ * Not converted to stream_printf: this is interrupt context, there is no
+ * current user stream to route to.
+ *
+ * uint32_t wrap is acceptable and deliberate — these are diagnostic counters,
+ * not quota enforcement, and a wrap is visible as a count that went backwards.
+ *===========================================================================*/
+static uint32_t net_drop_runt = 0;       /* frame shorter than an Ethernet header */
+static uint32_t net_drop_ethertype = 0;  /* EtherType we do not handle */
+
+void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype) {
+    if (runt) *runt = net_drop_runt;
+    if (ethertype) *ethertype = net_drop_ethertype;
+}
+
+/*=============================================================================
+ * PARSE-CONTEXT ACCOUNTING (doc/NETWORK_ISOLATION.md item 1)
+ *
+ * The whole point of the knetd bottom half is that handle_packet() — and the
+ * ~8,350-line parser below it — runs with interrupts ENABLED. "Ping still
+ * replies" does not prove that; the parser replies either way. These two
+ * counters are the actual assertion, and the only thing a harness can read
+ * that distinguishes a deferred build from an in-ISR one.
+ *
+ * net_parse_irq MUST stay 0. A nonzero value means some path calls
+ * handle_packet() from an ISR again and item 1 has been silently undone.
+ *===========================================================================*/
+static uint32_t net_parse_thread = 0;  /* frames parsed with IF enabled  */
+static uint32_t net_parse_irq = 0;     /* frames parsed in an ISR (== 0) */
+
+void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx) {
+    if (thread_ctx) *thread_ctx = net_parse_thread;
+    if (irq_ctx) *irq_ctx = net_parse_irq;
+}
+
+/*=============================================================================
+ * SYSCALL-BOUNDARY ACCOUNTING (doc/NETDAEMON_DESIGN.md, item 4 PR B)
+ *=============================================================================
+ * Frames that crossed the ring boundary via SYS_NETRX / SYS_NETTX.
+ *
+ * These exist for the same reason as the parse counters above: "networking
+ * still works" is what a build with the syscalls bypassed ALSO shows, so it
+ * proves nothing about the boundary. A nonzero rx count is the only evidence a
+ * harness can read that a frame actually travelled through the syscall rather
+ * than around it.
+ *
+ * In PR B they read 0 during normal operation, because nothing calls the
+ * syscalls yet -- knetd still parses in the kernel. That is the honest baseline
+ * and the harness asserts against it explicitly.
+ *===========================================================================*/
+static uint32_t net_syscall_rx = 0;
+static uint32_t net_syscall_tx = 0;
+
+void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames) {
+    if (rx_frames) *rx_frames = net_syscall_rx;
+    if (tx_frames) *tx_frames = net_syscall_tx;
+}
+
+void net_count_syscall_rx(void) { net_syscall_rx++; }
+void net_count_syscall_tx(void) { net_syscall_tx++; }
+
+/*=============================================================================
+ * Segments arriving for no known connection.
+ *
+ * This is a port scan, a stray retransmission, or backscatter -- all of them
+ * remote-driven and none of them interesting one line at a time. It replaces
+ * the passive-open branch removed from tcp_handle_packet, which printed once
+ * per inbound SYN. Count, don't print: the RX path takes no kprintf at all.
+ *===========================================================================*/
+static uint32_t tcp_no_connection = 0;
+
+void net_count_tcp_no_connection(void) { tcp_no_connection++; }
+
+uint32_t net_get_tcp_no_connection(void) { return tcp_no_connection; }
+
 /**
  * @brief Main packet reception handler.
  * @param data Pointer to received Ethernet frame.
@@ -1648,8 +1740,16 @@ void handle_packet(uint8_t* data, size_t len) {
     // pkt_count++;
     // kprintf("[NET_DEBUG] handle_packet called (count=%u, len=%zu)\n", pkt_count, len);
 
+    /* Counted before any early return: a runt frame is still a frame that was
+     * parsed, and the context it was parsed in is what item 1 asserts. */
+    if (in_interrupt_context()) {
+        net_parse_irq++;
+    } else {
+        net_parse_thread++;
+    }
+
     if (len < sizeof(eth_header_t)) {
-        kprintf("NET: Received packet too short (%zu bytes). Dropping.\n", len);
+        net_drop_runt++;
         return;
     }
 
@@ -1684,7 +1784,7 @@ void handle_packet(uint8_t* data, size_t len) {
                       len - sizeof(eth_header_t));               // IP packet length
             break;
         default:
-            kprintf("NET: Unhandled EtherType 0x%x. Dropping packet.\n", ethertype);
+            net_drop_ethertype++;
             break;
     }
 }
@@ -1907,9 +2007,12 @@ void net_init() {
         // Pass the VIRTUAL address to the E1000 driver
         e1000_init(virtual_base);
         kprintf("[NET] E1000 initialized............. [OK]\n");
-    } else {
-        kprintf("E1000 not found.\n");
     }
+    /* No `else` branch. pci_find_e1000() already reported the outcome, naming
+     * the device it wanted and any other NIC it saw; a second bare "E1000 not
+     * found." here only made a supported configuration look like two errors.
+     * The stack stays initialized either way: everything below runs with no
+     * NIC, and send paths fail harmlessly because e1000_send has no MMIO base. */
 
     /*=========================================================================
      * SECURITY: Initialize ICMP with randomized identifier

@@ -10,6 +10,7 @@
 #include "dhcp.h"
 #include "icmp.h"
 #include "kernel.h"  /* For get_timer_ticks() */
+#include "paging.h"  /* pae_get_pte() to read the DMA guard mapping state */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -124,6 +125,15 @@ static bool safe_parse_int(const char* str, int* result) {
 /*=============================================================================
  * COMMAND: ifconfig - Display network configuration
  *=============================================================================*/
+/* Reads the LIVE mapping state of a guard page. Deliberately queries the page
+ * tables rather than a "we called unmap" flag: the property worth reporting is
+ * that the page is actually absent, and a flag would still read "unmapped"
+ * after something remapped the address underneath us. */
+static bool guard_is_present(uint32_t virt) {
+    pae_pte_t* pte = pae_get_pte(virt);
+    return pte && (*pte & PAE_PRESENT);
+}
+
 void cmd_ifconfig(void) {
     kprintf("\nNetwork Configuration:\n");
     kprintf("  MAC Address:  %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -134,6 +144,65 @@ void cmd_ifconfig(void) {
             subnet_mask[0], subnet_mask[1], subnet_mask[2], subnet_mask[3]);
     kprintf("  Gateway:      %d.%d.%d.%d\n",
             gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3]);
+
+    /* RX drop counters. These replaced five per-packet kprintf sites that any
+     * host on the segment could flood from the ISR — see
+     * doc/NETWORK_ISOLATION.md item 2. Reported here so the events stay
+     * visible under load, which a suppressed print would not be. */
+    uint32_t tx_count = 0, rx_count = 0;
+    uint32_t err_drops = 0, badlen_drops = 0, backlog_drops = 0;
+    uint32_t runt_drops = 0, ethertype_drops = 0;
+    uint32_t parse_thread = 0, parse_irq = 0;
+    e1000_get_stats(&tx_count, &rx_count);
+    e1000_get_drop_stats(&err_drops, &badlen_drops, &backlog_drops);
+    net_get_drop_stats(&runt_drops, &ethertype_drops);
+    net_get_parse_stats(&parse_thread, &parse_irq);
+
+    kprintf("  RX packets:   %u\n", rx_count);
+    kprintf("  TX packets:   %u\n", tx_count);
+    kprintf("  RX dropped:   %u hw-error, %u bad-length, %u runt, %u unsupported-ethertype\n",
+            err_drops, badlen_drops, runt_drops, ethertype_drops);
+    /* Separate line: a backlog drop means knetd fell behind, which is a
+     * different diagnosis from any hardware-side drop above. */
+    kprintf("  RX backlog:   %u dropped (softirq ring full)\n", backlog_drops);
+    /* irq-ctx must read 0. Nonzero means the parser ran inside an ISR, i.e.
+     * doc/NETWORK_ISOLATION.md item 1 has been undone. */
+    kprintf("  RX parsed:    %u thread-ctx, %u irq-ctx\n", parse_thread, parse_irq);
+
+    /* ICMP RX counters. Same reasoning as the drop counters above: these
+     * replaced per-packet prints a remote host drove. The echo-reply count in
+     * particular was NOT rate limited before — see doc/NETDAEMON_DESIGN.md
+     * finding A1. */
+    uint32_t icmp_replies = 0, icmp_requests = 0, icmp_limited = 0;
+    icmp_get_rx_stats(&icmp_replies, &icmp_requests, &icmp_limited);
+    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited\n",
+            icmp_replies, icmp_requests, icmp_limited);
+
+    /* SYS_NETRX/SYS_NETTX traffic (doc/NETDAEMON_DESIGN.md PR B). These read 0
+     * on a stock boot: the boundary exists, but the parser has not moved to
+     * ring 3 yet, so nothing calls it. That zero is the baseline
+     * verify-netd-boundary.sh asserts against before it drives the syscalls
+     * itself — "networking works" is exactly what a bypassed boundary shows. */
+    uint32_t netd_rx = 0, netd_tx = 0;
+    net_get_syscall_stats(&netd_rx, &netd_tx);
+    kprintf("  netd sysc:    %u rx-frames, %u tx-frames\n", netd_rx, netd_tx);
+
+    /* Segments for no known connection: port scans, stray retransmissions,
+     * backscatter. This replaced a per-inbound-SYN kprintf when the passive-open
+     * path was removed — a remote host chose how often that one fired. */
+    kprintf("  TCP no-conn:  %u segments dropped (no listener; client-only stack)\n",
+            net_get_tcp_no_connection());
+
+    /* DMA region placement (doc/NETWORK_ISOLATION.md item 3). Printed with the
+     * live present/absent state of each guard rather than just the addresses:
+     * the addresses only show where the guards were MEANT to go, whereas the
+     * mapping state is the property that actually contains an overrun. */
+    uint32_t dma_base = 0, dma_bytes = 0, g_lo = 0, g_hi = 0;
+    e1000_get_dma_layout(&dma_base, &dma_bytes, &g_lo, &g_hi);
+    kprintf("  DMA region:   %u KB at 0x%08x\n", dma_bytes / 1024, dma_base);
+    kprintf("  DMA guards:   0x%08x %s, 0x%08x %s\n",
+            g_lo, guard_is_present(g_lo) ? "MAPPED(!)" : "unmapped",
+            g_hi, guard_is_present(g_hi) ? "MAPPED(!)" : "unmapped");
     kprintf("\n");
 }
 

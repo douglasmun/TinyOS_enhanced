@@ -28,3 +28,4 @@ void task_exit_test(void);
  */
 void task_idle(void);
 void task_ktimerd(void);  /* timer bottom-half task */
+void task_knetd(void);    /* RX bottom-half task (doc/NETWORK_ISOLATION.md) */

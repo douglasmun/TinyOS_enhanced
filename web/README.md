@@ -108,8 +108,23 @@ The branch holds only what the site serves: `index.html`, `tinyos.iso`,
 - **No hard disk attached** → drive **C:** (FAT32) is unavailable
   (`[IDE] not initialized` is expected). **D:** (in-memory RAMFS) works.
   To enable C:, attach a FAT32 image as an IDE `hda` in `index.html`.
-- **No networking** — v86 emulates NE2000 / virtio-net, not the e1000 TinyOS
-  drives. Boot proceeds offline (DHCP → APIPA fallback).
+- **No networking** — `index.html` constructs `V86` with no `net_device`, so
+  **no NIC is attached at all** and the PCI scan finds nothing. Expect exactly
+  one line:
+
+  ```
+  [PCI] No NIC present; networking disabled  [OK]
+  ```
+
+  This is a supported configuration, not an error: boot proceeds offline
+  (DHCP → APIPA fallback). Adding `net_device` would attach an NE2000 or
+  virtio-net, neither of which TinyOS drives — it drives the Intel e1000
+  (`8086:100e`) only — so the message would then name the device instead:
+
+  ```
+  [PCI] No supported NIC (want 8086:100e); found 1 other NIC(s),
+        first 10ec:8029 -- networking disabled  [OK]
+  ```
 - **NX unavailable** in v86 → W^X enforcement degrades to PARTIAL (by design;
   PAE paging itself works and is active).
 

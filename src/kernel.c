@@ -34,6 +34,7 @@
 #include "producer_elf_data.h"
 #include "counter_elf_data.h"
 #include "credprobe_elf_data.h"
+#include "netprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -556,6 +557,15 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         /* Poll network for DHCP responses */
         e1000_poll_rx();
 
+        /* Drain the RX softirq ring by hand: e1000_poll_rx() only queues
+         * frames now (doc/NETWORK_ISOLATION.md item 1), and knetd — which
+         * normally drains it — does not exist yet. Without this the DHCP
+         * offer sits in the ring until the scheduler starts and the lease
+         * always times out. Safe here because this loop is thread context,
+         * so handle_packet() runs with interrupts enabled exactly as it does
+         * under knetd. */
+        e1000_rx_softirq_run();
+
         uint32_t now_ticks = get_timer_ticks();
         uint32_t elapsed = now_ticks - dhcp_start_ticks;
 
@@ -853,6 +863,23 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         }
     }
 
+    /* netprobe.elf drives SYS_NETRX/SYS_NETTX straight through int 0x80
+     * (doc/NETDAEMON_DESIGN.md item 4, PR B). Nothing in the kernel calls those
+     * syscalls yet — the parser has not moved to ring 3 — so the boundary is
+     * unreachable from any shell command, and "networking still works" is what
+     * a build with the boundary bypassed shows too. Only a ring-3 caller can
+     * demonstrate frames traversing the pair. 0755 for the same uid-1000 reason
+     * as spawner.elf above; the syscalls themselves are root-only, which is
+     * half of what this probe exists to assert. */
+    {
+        int netprobe_fd = ramfs_open("/netprobe.elf", RAMFS_FLAG_WRITE);
+        if (netprobe_fd >= 0) {
+            ramfs_write(netprobe_fd, netprobe_elf_data, netprobe_elf_data_len);
+            ramfs_close(netprobe_fd);
+            ramfs_chmod("/netprobe.elf", 0755);
+        }
+    }
+
     /* slotbomb.elf spawns /slothold.elf in a tight loop WITHOUT reaping, to
      * prove the per-user concurrent task cap engages (see verify-slotcap.sh).
      * Like credprobe.elf it has to bypass the shell: the cap lives in
@@ -970,6 +997,14 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         for(;;) __asm__ volatile("hlt");
     }
 
+    /* RX bottom half. Without it the e1000 ISR still queues frames but nothing
+     * parses them, so the box goes silently deaf — fatal, same as ktimerd. */
+    int pid_knetd = task_create_kernel(task_knetd, "knetd");
+    if (pid_knetd < 0) {
+        kprintf("ERROR: Failed to create knetd task\n");
+        for(;;) __asm__ volatile("hlt");
+    }
+
     /* Start EDR daemon - PID 3 (Phase 4a MVP) - Protected background monitoring */
     int pid_edr = -1;
     edr_daemon_start();
@@ -1023,6 +1058,7 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     }
     scheduler_add_task(task_get((uint32_t)pid_idle));
     scheduler_add_task(task_get((uint32_t)pid_ktimerd));
+    scheduler_add_task(task_get((uint32_t)pid_knetd));
 
     kprintf("[SHELL] Tinyshell is ready to play!  [OK]\n");
 

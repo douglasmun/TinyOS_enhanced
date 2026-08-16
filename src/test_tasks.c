@@ -8,6 +8,7 @@
 #include "kprintf.h"
 #include "scheduler.h"
 #include "kernel.h"  /* timer_softirq_run() */
+#include "net.h"     /* e1000_rx_softirq_run() */
 
 /* get_timer_ticks() / timer_softirq_run() declared in kernel.h */
 
@@ -222,6 +223,28 @@ void task_ktimerd(void) {
         timer_softirq_run();
         /* Yield; we'll be rescheduled on the next tick. timer_softirq_run()
          * is cheap (a flag check) when nothing is pending. */
+        scheduler_yield();
+    }
+}
+
+/*=============================================================================
+ * KNETD: Receive bottom-half task
+ * PURPOSE: Parse inbound packets in TASK context. The e1000 ISR now only
+ *          copies frames into a software ring; this task drains it and runs
+ *          handle_packet() — and with it the whole IP/TCP/UDP/DNS/DHCP
+ *          parser — with interrupts ENABLED.
+ *
+ *          Same top-half/bottom-half split as ktimerd above, and for the same
+ *          reason. See doc/NETWORK_ISOLATION.md item 1: E1000_UNLOCK() does
+ *          not re-enable interrupts inside an ISR, so before this task existed
+ *          the entire parser ran with IF=0 despite the driver's packet budget
+ *          claiming otherwise.
+ *=============================================================================*/
+void task_knetd(void) {
+    kprintf("[KNETD] RX bottom-half task started [OK]\n");
+    while (1) {
+        e1000_rx_softirq_run();
+        /* Cheap (one head/tail comparison) when the ring is empty. */
         scheduler_yield();
     }
 }

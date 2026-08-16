@@ -48,6 +48,48 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   by default and **must stay that way** (`readline()` costs one syscall per keystroke).
   Same for routine FS errors: a failed `rmdir` is a userspace error the caller already
   reports on its own stream.
+- **The RX path is stricter still: no per-packet `kprintf` at all.** Those sites need no
+  local account — any host on the segment drives them, from the ISR, before the firewall.
+  Five such prints were replaced by counters surfaced in `ifconfig` (PR: `net_drop_runt`,
+  `net_drop_ethertype`, `rx_drop_errors`, `rx_drop_badlen`). Count, don't print, and don't
+  reach for `stream_printf` here either: interrupt context has no current user stream.
+  Harness: `verify-rxdrop-counters.sh`; rationale in `doc/NETWORK_ISOLATION.md`.
+  **That sweep covered the RX loops and so missed `icmp.c`**, which had three more
+  (`icmp_echo_replies_rx`, `icmp_echo_requests_rx`, `icmp_replies_dropped` now).
+  The echo-*reply* one was unbounded — its branch returns before the rate limiter,
+  and the identifier it gates on is cleartext in every outbound ping, so an on-path
+  attacker drove one line per packet. When looking for this class of bug, sweep the
+  protocol files too, not just the loops. Harness: `verify-icmp-counters.sh`.
+- **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
+  `critical_section_exit()` only touches `IF` when `__interrupt_context_depth == 0`, and
+  that clause is deliberate (a `popfl` mid-ISR would corrupt the preempted thread's
+  flags). So `e1000_poll_rx`'s mid-loop unlocks and its post-budget "process with
+  interrupts RE-ENABLED" block are depth decrements only, and `E1000_RX_PACKET_BUDGET`
+  does not bound interrupt-off time the way its comments claim. Don't trust those
+  comments; see `doc/NETWORK_ISOLATION.md`.
+- **The RX path parses in *task* context, on `knetd` — keep it that way.** The ISR only
+  copies each frame into `rx_softirq_ring` and returns; `e1000_rx_softirq_run()` drains
+  it and calls `handle_packet()` with `IF=1`. Never call `handle_packet()` (or anything
+  that reaches the parser) from an ISR — that is the ~8,350-line surface running with
+  interrupts disabled at a remote host's chosen rate. Three things easy to undo: the
+  frame **must be copied** before RDT is advanced (the NIC refills that descriptor, so a
+  retained `rx_bufs[]` pointer is an attacker-timed UAF); the boot DHCP loop in
+  `kernel.c` **must keep its explicit `e1000_rx_softirq_run()` call**, because `knetd`
+  does not exist yet there (a "did it run" flag was tried and reverted — it masks a
+  stalled `knetd`); and ring overflow is **drop-newest**, counted, because drop-oldest
+  lets a fast sender evict frames already accepted. `ifconfig`'s `irq-ctx` count must
+  read **0**. Harness: `verify-rx-thread-context.sh`.
+- **The e1000 DMA buffers are a guarded PMM region, not `.bss`.**
+  `e1000_dma_region_init()` carves 38 contiguous pages with an **unmapped guard page at
+  each end**; `rx_bufs/tx_bufs/rx_ring/tx_ring` are pointers into it. Three things to
+  know before touching it: allocation **must stay after `pae_init()`**, whose identity-map
+  sweep panics on any not-present page, so unmapping guards earlier is a boot panic;
+  `TDLEN`/`RDLEN` must be computed from the **element count**, never `sizeof(ring)` —
+  the rings are pointers now, so `sizeof` is 4 and the NIC would be told its ring is one
+  dword long (a clean `-Werror` build, caught only by clang-tidy); and raising
+  `NUM_RX_DESC`/`RX_BUF_SIZE` grows the payload, which the init-time bounds check
+  catches. Guard pages do **not** contain a malicious bus master — no IOMMU does that
+  here; they turn our own overruns into faults. Harness: `verify-dma-guard.sh`.
 - **Route user-facing output through `stream_printf(get_current_streams())`**, not
   `kprintf` — the latter goes to the kernel console, which a shell session doesn't show.
 - **`MAX_SYSCALL_NUM` must cover the highest syscall number**, not the highest in its own

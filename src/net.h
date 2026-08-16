@@ -237,6 +237,38 @@ bool pci_find_e1000(uint32_t* mmio_base);
 // E1000 Driver Functions
 void e1000_init(uint32_t base);
 void e1000_send(void* data, size_t len);
+
+/* The SYS_NETRX/SYS_NETTX packet-path boundary (doc/NETDAEMON_DESIGN.md PR B).
+ * e1000_rx_dequeue returns bytes copied, 0 if empty, -1 if the frame did not
+ * fit (and was consumed). */
+int e1000_rx_dequeue(uint8_t* out, uint16_t out_len);
+void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames);
+void net_count_tcp_no_connection(void);
+uint32_t net_get_tcp_no_connection(void);
+void net_count_syscall_rx(void);
+void net_count_syscall_tx(void);
 void e1000_poll_rx(void);
 void e1000_set_packet_dump(bool enable);
 void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count);
+
+/* RX drop counters — see doc/NETWORK_ISOLATION.md item 2. These replaced
+ * per-packet kprintf sites that any host on the segment could flood. */
+void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
+                          uint32_t* backlog_count);
+
+/* Drains queued RX frames and parses them in TASK context. Called by knetd,
+ * and by the boot-time DHCP loop before the scheduler exists. Must NEVER be
+ * called from interrupt context — that would undo item 1 entirely. */
+void e1000_rx_softirq_run(void);
+void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype);
+
+/* Parse-context accounting: irq_ctx must always read 0. A nonzero value means
+ * handle_packet() ran inside an ISR again, undoing doc/NETWORK_ISOLATION.md
+ * item 1. This is what verify-rx-thread-context.sh asserts on. */
+void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx);
+
+/* DMA region layout (doc/NETWORK_ISOLATION.md item 3). The guard addresses are
+ * reported so `netdma` and verify-dma-guard.sh can assert they are genuinely
+ * not present, rather than trusting that the unmap was called. */
+void e1000_get_dma_layout(uint32_t* payload_base, uint32_t* payload_bytes,
+                          uint32_t* guard_lo, uint32_t* guard_hi);

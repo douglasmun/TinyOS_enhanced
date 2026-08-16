@@ -33,6 +33,19 @@ typedef struct {
 void icmp_init(void);
 
 /**
+ * @brief Read the ICMP RX-path counters (surfaced by ifconfig).
+ *
+ * These replaced per-packet kprintf sites that a remote host could drive from
+ * the RX path with no local account. Any argument may be NULL.
+ *
+ * @param echo_replies  Echo replies received matching our ping identifier
+ * @param echo_requests Echo requests received and answered
+ * @param rate_limited  Echo requests dropped by the ICMP rate limiter
+ */
+void icmp_get_rx_stats(uint32_t* echo_replies, uint32_t* echo_requests,
+                       uint32_t* rate_limited);
+
+/**
  * @brief Handle received ICMP packet with full context for proper replies
  * @param eth_frame Pointer to full Ethernet frame
  * @param eth_len Length of Ethernet frame

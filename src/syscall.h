@@ -169,6 +169,46 @@
  * action is unconditional termination. */
 #define SYS_KILL       34   // Terminate a process, subject to the same policy
 
+/* SYS_NETRX / SYS_NETTX — the packet-path boundary for the ring-3 network
+ * daemon (doc/NETDAEMON_DESIGN.md, item 4 PR B).
+ *
+ * WHAT THESE ARE FOR. The end state is a ring-3 daemon running the ~8,350-line
+ * L4 parser, with the kernel keeping only MMIO, DMA and the descriptor rings,
+ * which need physical addresses and port access. These two calls are that
+ * boundary and nothing more: dequeue one received frame, hand one frame to the
+ * NIC. The parser's ENTIRE dependency on kernel services is e1000_send(), which
+ * is why the packet path needs two syscalls rather than a subsystem.
+ *
+ * IN PR B THE PARSER HAS NOT MOVED. knetd still calls handle_packet() in the
+ * kernel. These calls exist so the boundary can be proven to carry real traffic
+ * BEFORE anything changes trust domain -- the exposure PR is separate and comes
+ * after the audit. Nothing is exposed by adding them that is not already
+ * reachable: a frame is bytes off the wire that the kernel parser already
+ * accepts from any host on the segment.
+ *
+ * ROOT ONLY, DELIBERATELY. Both refuse for euid != 0. SYS_NETRX hands over raw
+ * frames addressed to other services on the host, and SYS_NETTX forges the
+ * source MAC and IP of anything it likes -- ARP poisoning, DHCP spoofing and
+ * off-host traffic with no local account are all one call away. The daemon runs
+ * as root; that is the whole population that should reach these. A capability
+ * would be the better long-term answer and is noted in the design doc, but a
+ * euid check is the honest version of "root only" today rather than a bespoke
+ * mechanism invented at the same moment as its first user.
+ *
+ * NON-BLOCKING, DELIBERATELY. SYS_NETRX returns -EAGAIN on an empty ring rather
+ * than sleeping. A blocking receive needs a wait queue whose wakeup is driven
+ * from the ISR, and a lost wakeup there is a silently wedged network stack --
+ * real complexity that belongs in the PR that needs it, not in the one whose
+ * job is to prove the boundary works. The caller polls and yields, which is
+ * exactly what knetd already does. The design doc records this as an open
+ * question for the PR that moves the parser.
+ *
+ * arg1 = user buffer, arg2 = buffer length.
+ * SYS_NETRX returns bytes copied, -EAGAIN if empty, -EMSGSIZE if the frame does
+ * not fit (the frame is CONSUMED in that case -- see sys_netrx). */
+#define SYS_NETRX      35   // Dequeue one received Ethernet frame (non-blocking)
+#define SYS_NETTX      36   // Transmit one Ethernet frame
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -260,7 +300,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  34  // Highest valid syscall number (SYS_KILL)
+#define MAX_SYSCALL_NUM  36  // Highest valid syscall number (SYS_NETTX)
 
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
@@ -480,6 +520,19 @@ int sys_psinfo(void* user_buf, uint32_t size);
  *         holds CAP_UNKILLABLE, -EINVAL for a non-positive pid
  */
 int sys_kill(int pid);
+
+/**
+ * SYS_NETRX / SYS_NETTX — raw Ethernet frames across the ring boundary.
+ * Root only; non-blocking. See the SYS_NETRX comment block above and
+ * doc/NETDAEMON_DESIGN.md.
+ *
+ * @return netrx: bytes copied, -EAGAIN if the ring is empty, -EMSGSIZE if the
+ *         frame did not fit (it is dropped, not left to wedge the ring).
+ *         nettx: bytes sent, -EMSGSIZE if too long, -EINVAL if shorter than an
+ *         Ethernet header. Both: -EPERM if euid != 0, -EFAULT on a bad buffer.
+ */
+int sys_netrx(void* user_buf, size_t len);
+int sys_nettx(const void* user_buf, size_t len);
 
 /**
  * @brief Change the caller's cwd.

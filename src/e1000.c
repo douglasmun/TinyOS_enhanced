@@ -8,6 +8,8 @@
 #include "util.h"
 #include "tcp.h"  // For tcp_get_time_ms() - link status debounce
 #include "critical.h"  /* For proper nested critical section support */
+#include "pmm.h"       /* pmm_alloc_contiguous() for the guarded DMA region */
+#include "paging.h"    /* pae_map_page/pae_unmap_page for the guard pages */
 
 /*=============================================================================
  * E1000 REGISTER OFFSETS
@@ -133,10 +135,55 @@ struct rx_desc {
 /*=============================================================================
  * STATIC VARIABLES
  *============================================================================*/
-static struct tx_desc tx_ring[NUM_TX_DESC] __attribute__((aligned(16)));
-static struct rx_desc rx_ring[NUM_RX_DESC] __attribute__((aligned(16)));
-static uint8_t tx_bufs[NUM_TX_DESC][RX_BUF_SIZE] __attribute__((aligned(16)));
-static uint8_t rx_bufs[NUM_RX_DESC][RX_BUF_SIZE] __attribute__((aligned(16)));
+/*=============================================================================
+ * DMA REGION (doc/NETWORK_ISOLATION.md item 3)
+ *
+ * These four objects are the only memory the NIC writes to by bus-mastering.
+ * They used to be .bss arrays, which put attacker-influenced DMA targets
+ * immediately adjacent to unrelated kernel data: a descriptor-driven overrun
+ * corrupted whatever the linker happened to place next, silently.
+ *
+ * They now live in one page-aligned region carved out of physical memory at
+ * init, with an UNMAPPED GUARD PAGE either side, so an overrun off either end
+ * takes a page fault at the boundary instead of scribbling on a neighbour.
+ *
+ * BE HONEST ABOUT WHAT THIS BUYS. It does not constrain a fully
+ * attacker-controlled NIC — nothing short of an IOMMU can, and TinyOS has no
+ * IOMMU support (see the Qubes section of the doc). A malicious bus master can
+ * still target any physical address it likes; the guard pages are not in its
+ * way. What this converts is the realistic case: a length/index bug on OUR
+ * side, or a NIC writing past a descriptor it was handed, turns from silent
+ * neighbouring-data corruption into an immediate, diagnosable fault.
+ *
+ * WHY POINTERS RATHER THAN ARRAYS: the region's address is not known until
+ * pmm_alloc_contiguous() runs, so these cannot be link-time objects. Every use
+ * site is unchanged — rx_bufs[i] still indexes a 2048-byte frame — because the
+ * pointer types preserve the original element sizes.
+ *
+ * IDENTITY MAPPING: PAE identity-maps all RAM (pae.c verifies no holes at
+ * boot), so the physical base doubles as the virtual address and the values
+ * programmed into RDBAL/TDBAL are the same expressions as before.
+ *===========================================================================*/
+#define E1000_DMA_PAYLOAD_BYTES  (sizeof(struct tx_desc) * NUM_TX_DESC + \
+                                  sizeof(struct rx_desc) * NUM_RX_DESC + \
+                                  (uint32_t)RX_BUF_SIZE * NUM_TX_DESC +  \
+                                  (uint32_t)RX_BUF_SIZE * NUM_RX_DESC)
+#define E1000_DMA_PAGE_SIZE      4096u
+#define E1000_DMA_PAYLOAD_PAGES  ((E1000_DMA_PAYLOAD_BYTES + E1000_DMA_PAGE_SIZE - 1) \
+                                  / E1000_DMA_PAGE_SIZE)
+/* +2: one unmapped guard page below the payload and one above. */
+#define E1000_DMA_TOTAL_PAGES    (E1000_DMA_PAYLOAD_PAGES + 2u)
+
+static struct tx_desc* tx_ring = 0;
+static struct rx_desc* rx_ring = 0;
+static uint8_t (*tx_bufs)[RX_BUF_SIZE] = 0;
+static uint8_t (*rx_bufs)[RX_BUF_SIZE] = 0;
+
+/* Base of the payload (i.e. just past the low guard page), and the two guard
+ * page addresses, kept for the `netdma` report and for teardown. */
+static uint32_t dma_payload_base = 0;
+static uint32_t dma_guard_lo = 0;
+static uint32_t dma_guard_hi = 0;
 
 /*=============================================================================
  * SECURITY: Volatile MMIO Pointer for E1000 Registers
@@ -171,6 +218,67 @@ static uint32_t rx_tail = 0;  // Track which descriptor we're processing
 static uint32_t packet_tx_count = 0;
 static uint32_t packet_rx_count = 0;
 
+/* Frames dropped for hardware-detected errors (CRC/checksum/symbol/...).
+ * Counted rather than printed — see doc/NETWORK_ISOLATION.md item 2. */
+static uint32_t rx_drop_errors = 0;
+
+/* Frames dropped for an implausible descriptor length (over RX_BUF_SIZE, or
+ * zero). Same reasoning: per-packet and remotely driven. */
+static uint32_t rx_drop_badlen = 0;
+
+/*=============================================================================
+ * RX SOFTIRQ RING (doc/NETWORK_ISOLATION.md item 1)
+ *
+ * The top-half/bottom-half split for the receive path, matching the one the
+ * timer already uses (timer_softirq_pending -> ktimerd -> timer_softirq_run).
+ * That split exists because heavy work in an ISR corrupted interrupted
+ * computations — it root-caused the bug that broke password login and ECDSA
+ * verification. The RX path had the same shape and had not been converted.
+ *
+ * WHY THIS IS NEEDED AT ALL, given the driver already has a packet budget:
+ *
+ * E1000_UNLOCK() does NOT re-enable interrupts on the IRQ11 path.
+ * critical_section_exit() only touches IF when __interrupt_context_depth == 0,
+ * and that clause is deliberate (a popfl mid-ISR would corrupt the preempted
+ * thread's flags). So the mid-loop unlock before handle_packet, and the
+ * post-budget "process with interrupts RE-ENABLED" block, were depth
+ * decrements only: the whole ~8,350-line parser ran with IF=0 and the budget
+ * did not bound interrupt-off time the way its comments claimed.
+ *
+ * With this split the ISR only copies frames and the parser runs in knetd,
+ * where E1000_UNLOCK() genuinely re-enables interrupts and preemption works.
+ *
+ * WHY THE FRAME IS COPIED rather than referenced:
+ *
+ * The ISR advances RDT to hand the descriptor back to the NIC, which may DMA
+ * a new frame into rx_bufs[] immediately. A deferred parser holding a pointer
+ * into rx_bufs[] would read whatever arrived next — an attacker-timed use
+ * after free, in a buffer an attacker fills. The copy is what makes deferral
+ * safe, so do not "optimize" it away.
+ *
+ * SIZING: 64 slots x 2048B = 128 KB in .bss, matching NUM_RX_DESC so the
+ * software ring cannot be the tighter constraint (a smaller ring would drop
+ * frames the hardware accepted, which reads as packet loss rather than as
+ * backpressure).
+ *===========================================================================*/
+#define RX_SOFTIRQ_SLOTS NUM_RX_DESC
+
+struct rx_softirq_slot {
+    uint16_t length;
+    uint8_t  data[RX_BUF_SIZE];
+};
+
+static struct rx_softirq_slot rx_softirq_ring[RX_SOFTIRQ_SLOTS];
+static volatile uint32_t rx_softirq_head = 0;  /* producer: the ISR   */
+static volatile uint32_t rx_softirq_tail = 0;  /* consumer: knetd     */
+
+/* Frames dropped because the software ring was full — knetd is not keeping up.
+ * Distinct from every hardware drop counter: this one means the deferral
+ * itself is the bottleneck, which is a different diagnosis and a different
+ * fix, so it gets its own counter rather than being folded into the others. */
+static uint32_t rx_drop_backlog = 0;
+
+
 // Packet dump control (set to 1 to enable, 0 to disable)
 static int enable_packet_dump = 0;  // Disabled to reduce verbosity
 
@@ -201,6 +309,135 @@ static bool link_status_stable = true;  // Link considered stable
  *=============================================================================*/
 #define E1000_LOCK()   CRITICAL_SECTION_ENTER()
 #define E1000_UNLOCK() CRITICAL_SECTION_EXIT()
+
+/*=============================================================================
+ * FUNCTION: rx_softirq_enqueue  (TOP HALF — runs in the ISR)
+ *
+ * Copies one frame into the software ring. Caller holds E1000_LOCK(), so the
+ * head/tail update needs no further protection against knetd: on a single CPU
+ * with IF=0, the consumer cannot run concurrently.
+ *
+ * Drop-newest on overflow, deliberately. Drop-oldest would mean an attacker
+ * who can outrun knetd evicts legitimate frames that were already accepted —
+ * turning a backlog into a targeted denial of the traffic you care about.
+ * Dropping the newest degrades to "we are full", which is the honest signal,
+ * and it is what the hardware itself does when the descriptor ring fills.
+ *===========================================================================*/
+static void rx_softirq_enqueue(const uint8_t* data, uint16_t length) {
+    uint32_t next = (rx_softirq_head + 1) % RX_SOFTIRQ_SLOTS;
+
+    if (next == rx_softirq_tail) {
+        /* Ring full — knetd has not drained yet. Counted, never printed:
+         * this is exactly the path a flood drives. */
+        rx_drop_backlog++;
+        return;
+    }
+
+    if (length > RX_BUF_SIZE) {
+        /* Cannot happen: the caller validated length against RX_BUF_SIZE
+         * before reaching here. Kept as a hard bound anyway, because this is
+         * the memcpy that would turn a missed check upstream into a .bss
+         * overrun, and the check costs nothing on this path. */
+        rx_drop_badlen++;
+        return;
+    }
+
+    memcpy(rx_softirq_ring[rx_softirq_head].data, data, length);
+    rx_softirq_ring[rx_softirq_head].length = length;
+
+    /* Publish the slot only after its contents are visible. */
+    __asm__ volatile("" ::: "memory");
+    rx_softirq_head = next;
+}
+
+/*=============================================================================
+ * FUNCTION: e1000_rx_softirq_run  (BOTTOM HALF — runs in knetd, task context)
+ *
+ * Drains the software ring, calling handle_packet() with interrupts ENABLED.
+ * This is where the ~8,350-line parser now runs.
+ *
+ * The frame is copied out of the ring before handle_packet() is called, and
+ * the tail is advanced after. Holding the lock across handle_packet() would
+ * reinstate exactly the property this change exists to remove.
+ *
+ * Bounded per call (RX_SOFTIRQ_SLOTS) so a sustained flood cannot livelock
+ * knetd inside one invocation and starve everything else it might later do.
+ * Anything still queued is picked up on the next pass — the task loop yields
+ * and comes straight back.
+ *===========================================================================*/
+void e1000_rx_softirq_run(void) {
+    uint32_t drained = 0;
+
+    while (drained < RX_SOFTIRQ_SLOTS) {
+        static uint8_t frame[RX_BUF_SIZE];  /* static: keep 2 KB off the task stack */
+        uint16_t length;
+
+        E1000_LOCK();
+        if (rx_softirq_tail == rx_softirq_head) {
+            E1000_UNLOCK();
+            break;
+        }
+        length = rx_softirq_ring[rx_softirq_tail].length;
+        if (length > RX_BUF_SIZE) {
+            length = RX_BUF_SIZE;
+        }
+        memcpy(frame, rx_softirq_ring[rx_softirq_tail].data, length);
+        rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+        E1000_UNLOCK();
+
+        handle_packet(frame, length);
+        drained++;
+    }
+}
+
+/*=============================================================================
+ * FUNCTION: e1000_rx_dequeue  (the SYS_NETRX half of the ring-3 boundary)
+ *
+ * Copies one frame out of the software ring into a KERNEL buffer and advances
+ * the tail. Same producer/consumer discipline as e1000_rx_softirq_run() above;
+ * this is that function's body with handle_packet() replaced by "give it to the
+ * caller". See doc/NETDAEMON_DESIGN.md (item 4, PR B).
+ *
+ * Returns bytes copied, 0 if the ring is empty, or -1 if the frame does not fit
+ * in out_len. In the -1 case the frame IS consumed: a frame too large for the
+ * caller's buffer would otherwise sit at the tail forever and wedge the queue
+ * for every subsequent frame, which is a remote denial of service via a single
+ * oversized frame. Losing it is the lesser failure, and the caller learns from
+ * the return value that it happened.
+ *
+ * The caller must NOT be holding E1000_LOCK(). The copy to the user buffer
+ * happens in the syscall layer, outside the lock, because copy_to_user can
+ * fault and faulting with interrupts masked is how a page fault becomes a
+ * double fault.
+ *===========================================================================*/
+int e1000_rx_dequeue(uint8_t* out, uint16_t out_len) {
+    uint16_t length;
+
+    if (!out) {
+        return 0;
+    }
+
+    E1000_LOCK();
+    if (rx_softirq_tail == rx_softirq_head) {
+        E1000_UNLOCK();
+        return 0;
+    }
+    length = rx_softirq_ring[rx_softirq_tail].length;
+    if (length > RX_BUF_SIZE) {
+        length = RX_BUF_SIZE;
+    }
+    if (length > out_len) {
+        /* Consume it anyway — see the head comment. */
+        rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+        E1000_UNLOCK();
+        return -1;
+    }
+    memcpy(out, rx_softirq_ring[rx_softirq_tail].data, length);
+    rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+    E1000_UNLOCK();
+
+    return (int)length;
+}
 
 /* Bounded spin cap for the TX descriptor-done (DD) wait in e1000_send().
  * Large enough to ride out a saturated link, finite so a wedged NIC can't
@@ -558,8 +795,7 @@ void e1000_poll_rx(void) {
          * over-read when we pass data to handle_packet().
          *===================================================================*/
         if (length > RX_BUF_SIZE) {
-            kprintf("E1000: RX packet length (%d) exceeds buffer size (%d). Dropping.\n",
-                    length, RX_BUF_SIZE);
+            rx_drop_badlen++;
             // Clear descriptor and continue
             rx_ring[rx_tail].status = 0;
             __asm__ volatile("sfence" ::: "memory");  // DMA coherence
@@ -571,7 +807,7 @@ void e1000_poll_rx(void) {
 
         // Additional sanity check: reject zero-length packets
         if (length == 0) {
-            kprintf("E1000: RX packet with zero length. Dropping.\n");
+            rx_drop_badlen++;
             rx_ring[rx_tail].status = 0;
             __asm__ volatile("sfence" ::: "memory");  // DMA coherence
             uint32_t old_tail = rx_tail;
@@ -616,19 +852,11 @@ void e1000_poll_rx(void) {
         uint8_t errors = rx_ring[rx_tail].errors;
 
         if (errors != 0) {
-            /* Packet has hardware-detected errors - SECURITY CRITICAL DROP */
-            const char* error_type = "UNKNOWN";
-
-            if (errors & E1000_RXD_ERR_CE)   error_type = "CRC/Alignment";
-            else if (errors & E1000_RXD_ERR_IPE)  error_type = "IP Checksum";
-            else if (errors & E1000_RXD_ERR_TCPE) error_type = "TCP/UDP Checksum";
-            else if (errors & E1000_RXD_ERR_SE)   error_type = "Symbol";
-            else if (errors & E1000_RXD_ERR_SEQ)  error_type = "Sequence";
-            else if (errors & E1000_RXD_ERR_CXE)  error_type = "Carrier Extension";
-            else if (errors & E1000_RXD_ERR_RXE)  error_type = "RX Data";
-
-            kprintf("E1000: SECURITY - Dropping packet with %s error (errors=0x%02x)\n",
-                    error_type, errors);
+            /* Packet has hardware-detected errors - SECURITY CRITICAL DROP.
+             * Counted, not printed: an attacker sets the rate directly by
+             * sending frames with bad CRCs, and this runs in the ISR. See
+             * doc/NETWORK_ISOLATION.md item 2. */
+            rx_drop_errors++;
 
             /* Log to IDS BEFORE dropping - records evasion attempt */
             // TODO: Call ids_log_malformed_packet(rx_bufs[rx_tail], length, error_type)
@@ -648,10 +876,9 @@ void e1000_poll_rx(void) {
         // kprintf("[E1000] RX Packet #%d\n", packet_rx_count);  // Commented for less verbosity
         dump_packet("RX", rx_bufs[rx_tail], length);
 
-        // Process the packet (temporarily unlock to allow nested operations)
-        E1000_UNLOCK();
-        handle_packet(rx_bufs[rx_tail], length);
-        E1000_LOCK();
+        /* Hand the frame to knetd instead of parsing it here. See the
+         * RX SOFTIRQ RING comment above. */
+        rx_softirq_enqueue(rx_bufs[rx_tail], length);
 
         // Clear descriptor status for reuse
         rx_ring[rx_tail].status = 0;
@@ -716,6 +943,7 @@ void e1000_poll_rx(void) {
 
             // Validate length
             if (length > RX_BUF_SIZE || length == 0) {
+                rx_drop_badlen++;
                 rx_ring[rx_tail].status = 0;
                 __asm__ volatile("sfence" ::: "memory");  // DMA coherence
                 uint32_t old_tail = rx_tail;
@@ -728,13 +956,7 @@ void e1000_poll_rx(void) {
             /* Validate NIC checksum (same as primary loop) */
             uint8_t errors = rx_ring[rx_tail].errors;
             if (errors != 0) {
-                const char* error_type = "UNKNOWN";
-                if (errors & E1000_RXD_ERR_CE)   error_type = "CRC/Alignment";
-                else if (errors & E1000_RXD_ERR_IPE)  error_type = "IP Checksum";
-                else if (errors & E1000_RXD_ERR_TCPE) error_type = "TCP/UDP Checksum";
-
-                kprintf("E1000: SECURITY - Dropping packet with %s error (errors=0x%02x)\n",
-                        error_type, errors);
+                rx_drop_errors++;
 
                 rx_ring[rx_tail].status = 0;
                 __asm__ volatile("sfence" ::: "memory");  // DMA coherence
@@ -749,10 +971,8 @@ void e1000_poll_rx(void) {
             packet_rx_count++;
             dump_packet("RX", rx_bufs[rx_tail], length);
 
-            // Process packet (unlock during processing)
-            E1000_UNLOCK();
-            handle_packet(rx_bufs[rx_tail], length);
-            E1000_LOCK();
+            /* Defer to knetd, as in the primary loop above. */
+            rx_softirq_enqueue(rx_bufs[rx_tail], length);
 
             // Clear and advance
             rx_ring[rx_tail].status = 0;
@@ -800,7 +1020,111 @@ void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count) {
 }
 
 /*=============================================================================
+ * FUNCTION: e1000_get_drop_stats
+ * PURPOSE: Report frames dropped for hardware-detected errors
+ *============================================================================*/
+void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
+                          uint32_t* backlog_count) {
+    if (err_count) *err_count = rx_drop_errors;
+    if (badlen_count) *badlen_count = rx_drop_badlen;
+    if (backlog_count) *backlog_count = rx_drop_backlog;
+}
+
+/*=============================================================================
  * FUNCTION: e1000_init
+ * PURPOSE: Carve the guarded DMA region out of physical memory.
+ * RETURN:  true on success; false if the region could not be allocated.
+ *
+ * Runs at e1000_init time, which is well after pae_init(): that ordering is
+ * load-bearing. pae_init() sweeps the whole identity map and PANICS on any
+ * not-present page ("would fault in memset later"), so unmapping guard pages
+ * before it ran would turn this hardening into a boot panic. Allocating here,
+ * after the sweep, is what makes deliberate holes safe.
+ *
+ * LAYOUT — the two large, attacker-driven buffer arrays are placed against the
+ * guard pages, because they are the objects an overrun actually starts from:
+ *
+ *   [ guard ][ rx_bufs (128K) ][ tx_bufs (16K) ][ rx_ring ][ tx_ring ][ guard ]
+ *
+ * rx_bufs sits at the low end because it is the one the NIC writes to from
+ * remote input, so a backwards overrun hits the low guard immediately. The
+ * descriptor rings are small and sit inboard, where a run off either end is
+ * still contained by the payload rather than reaching kernel data.
+ *============================================================================*/
+static bool e1000_dma_region_init(void) {
+    uint32_t phys = pmm_alloc_contiguous(E1000_DMA_TOTAL_PAGES);
+    if (!phys) {
+        kprintf("[E1000] FATAL: no contiguous run of %u pages for the DMA region\n",
+                E1000_DMA_TOTAL_PAGES);
+        return false;
+    }
+
+    dma_guard_lo = phys;
+    dma_payload_base = phys + E1000_DMA_PAGE_SIZE;
+    dma_guard_hi = dma_payload_base + E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE;
+
+    /* Carve the payload. Order matches the layout comment above; each object
+     * is placed at its natural alignment, which page alignment of the base
+     * plus the fixed sizes already guarantees. */
+    uint32_t cursor = dma_payload_base;
+    rx_bufs = (uint8_t (*)[RX_BUF_SIZE])(uintptr_t)cursor;
+    cursor += (uint32_t)RX_BUF_SIZE * NUM_RX_DESC;
+    tx_bufs = (uint8_t (*)[RX_BUF_SIZE])(uintptr_t)cursor;
+    cursor += (uint32_t)RX_BUF_SIZE * NUM_TX_DESC;
+    rx_ring = (struct rx_desc*)(uintptr_t)cursor;
+    cursor += sizeof(struct rx_desc) * NUM_RX_DESC;
+    tx_ring = (struct tx_desc*)(uintptr_t)cursor;
+    cursor += sizeof(struct tx_desc) * NUM_TX_DESC;
+
+    /* The cursor must not have run past the payload into the high guard. This
+     * is a build-time-constant relationship, but assert it at runtime too:
+     * NUM_RX_DESC and RX_BUF_SIZE are the kind of constants that get raised
+     * later, and the failure mode otherwise is the NIC DMAing into an
+     * unmapped page on the first burst rather than at init. */
+    if (cursor > dma_guard_hi) {
+        kprintf("[E1000] FATAL: DMA payload (%u bytes) overruns its %u pages\n",
+                (uint32_t)E1000_DMA_PAYLOAD_BYTES, E1000_DMA_PAYLOAD_PAGES);
+        return false;
+    }
+
+    /* The region is handed to the NIC, which never executes it. Mark the
+     * payload NX so a descriptor-driven write cannot become executable kernel
+     * memory. Interrupts are not yet enabled for this device, so no DMA can
+     * land while the mapping is being adjusted. */
+    for (uint32_t off = 0; off < E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE;
+         off += E1000_DMA_PAGE_SIZE) {
+        uint32_t page = dma_payload_base + off;
+        pae_map_page(page, page, PAE_PAGE_KERNEL_DATA);
+    }
+
+    /* Punch the guards. This is the actual mechanism: with these unmapped, an
+     * overrun off either end of the region faults instead of corrupting a
+     * neighbour silently. */
+    pae_unmap_page(dma_guard_lo);
+    pae_unmap_page(dma_guard_hi);
+
+    memset((void*)(uintptr_t)dma_payload_base, 0,
+           E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE);
+
+    kprintf("[E1000] DMA region: %u KB at 0x%08x, guards 0x%08x / 0x%08x [OK]\n",
+            (E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE) / 1024,
+            dma_payload_base, dma_guard_lo, dma_guard_hi);
+    return true;
+}
+
+/*=============================================================================
+ * Report the DMA region layout. Used by `netdma` and by the item 3 harness,
+ * which needs the guard addresses to assert they are genuinely not present.
+ *============================================================================*/
+void e1000_get_dma_layout(uint32_t* payload_base, uint32_t* payload_bytes,
+                          uint32_t* guard_lo, uint32_t* guard_hi) {
+    if (payload_base)  *payload_base  = dma_payload_base;
+    if (payload_bytes) *payload_bytes = E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE;
+    if (guard_lo)      *guard_lo      = dma_guard_lo;
+    if (guard_hi)      *guard_hi      = dma_guard_hi;
+}
+
+/*=============================================================================
  * PURPOSE: Initialize E1000 NIC with interrupt support
  *============================================================================*/
 void e1000_init(uint32_t base) {
@@ -813,6 +1137,15 @@ void e1000_init(uint32_t base) {
      * a memory-mapped I/O operation, not a normal memory access.
      *=======================================================================*/
     e1000 = (volatile uint32_t*)base;
+
+    /* Must happen before any ring or buffer is touched below — until this
+     * runs, tx_ring/rx_ring/tx_bufs/rx_bufs are all NULL. Failure is fatal:
+     * continuing would dereference NULL while programming the descriptor
+     * rings, and a NIC left half-initialised is worse than a clear panic. */
+    if (!e1000_dma_region_init()) {
+        kernel_panic("E1000: could not allocate the guarded DMA region");
+    }
+
     rx_tail = 0;
     packet_tx_count = 0;
     packet_rx_count = 0;
@@ -894,7 +1227,11 @@ void e1000_init(uint32_t base) {
      *=======================================================================*/
     e1000[E1000_TDBAH / 4] = 0;  /* High 32 bits = 0 (32-bit mode) */
     e1000[E1000_TDBAL / 4] = (uint32_t)(uintptr_t)tx_ring;
-    e1000[E1000_TDLEN / 4] = sizeof(tx_ring);
+    /* Ring length in BYTES. Must be computed from the element count, not
+     * sizeof(tx_ring): tx_ring is a pointer into the DMA region now, so
+     * sizeof would be 4 and the NIC would be told the ring is one dword
+     * long. */
+    e1000[E1000_TDLEN / 4] = sizeof(struct tx_desc) * NUM_TX_DESC;
     e1000[E1000_TDH / 4] = 0;
     e1000[E1000_TDT / 4] = 0;
 
@@ -942,7 +1279,8 @@ void e1000_init(uint32_t base) {
      *=======================================================================*/
     e1000[E1000_RDBAH / 4] = 0;  /* High 32 bits = 0 (32-bit mode) */
     e1000[E1000_RDBAL / 4] = (uint32_t)(uintptr_t)rx_ring;
-    e1000[E1000_RDLEN / 4] = sizeof(rx_ring);
+    /* Ring length in BYTES — see the TDLEN note above. */
+    e1000[E1000_RDLEN / 4] = sizeof(struct rx_desc) * NUM_RX_DESC;
     e1000[E1000_RDH / 4] = 0;
     e1000[E1000_RDT / 4] = NUM_RX_DESC - 1;  // All descriptors available
 

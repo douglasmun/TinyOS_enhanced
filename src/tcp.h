@@ -213,33 +213,11 @@ tcp_state_t tcp_get_state(int sockfd);
  */
 int tcp_available(int sockfd);
 
-/**
- * @brief Bind a socket to a specific local port
- * @param sockfd Socket descriptor
- * @param port Local port number (or 0 for auto-assign)
- * @return 0 on success, -1 on error
- */
-int tcp_bind(int sockfd, uint16_t port);
-
-/**
- * @brief Listen for incoming connections on a port
- * @param sockfd Socket descriptor
- * @return 0 on success, -1 on error
- *
- * Puts the socket into LISTEN state to accept incoming connections
- */
-int tcp_listen(int sockfd);
-
-/**
- * @brief Accept an incoming connection (non-blocking)
- * @param listen_sockfd Listening socket descriptor
- * @param remote_ip Output: remote IP address (4 bytes)
- * @param remote_port Output: remote port number
- * @return Socket descriptor for new connection, or -1 if none available
- *
- * Returns immediately with -1 if no pending connections
- */
-int tcp_accept(int listen_sockfd, uint8_t* remote_ip, uint16_t* remote_port);
+/* tcp_bind / tcp_listen / tcp_accept were removed -- see the note above
+ * tcp_connect in tcp.c. This is a client-only stack: nothing called them
+ * (their only caller, ssh.c, is not in the build) and both tcp_bind's missing
+ * lock and its ignored allocation failure were live bugs waiting for a caller.
+ * TCP_LISTEN is consequently unreachable, and so is the passive-open path. */
 
 /*=============================================================================
  * TCP INTERNAL FUNCTIONS - Called by Network Stack
