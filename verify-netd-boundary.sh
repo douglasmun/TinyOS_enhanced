@@ -214,6 +214,62 @@ if [ "$NETSTAT_MARKERS" -eq 0 ]; then
     guard_fail "the embedded netprobe.elf predates PR C1 (no 'PROBE NETSTAT
   VERDICT' string), so the SYS_NETSTAT half would be silently untested"
 fi
+TCPSOCK_MARKERS=$(strings "$ISO" | grep -c "PROBE TCPSOCK VERDICT")
+if [ "$TCPSOCK_MARKERS" -eq 0 ]; then
+    guard_fail "the embedded netprobe.elf predates PR C2 (no 'PROBE TCPSOCK
+  VERDICT' string), so the SYS_TCPSOCK half would be silently untested"
+fi
+
+#=============================================================================
+# PR C2 source guards.
+#
+# The first one is load-bearing in a way the runtime half cannot replace, for
+# the same reason the C1 guard below it is: see the long note there. The
+# difference is that C2's runtime probe CAN now witness the ownership filter,
+# because it opens a socket before asking which sockets it can see -- so these
+# guards cover the two bugs the C2 audit found in the primitives, which the
+# probe cannot reach from ring 3.
+#=============================================================================
+
+# tcp_socket() has TWO allocation paths: the fast scan, and the retry after
+# TIME_WAIT eviction. The retry one memset()s the connection and originally did
+# not re-stamp owner_uid -- so a socket allocated under TIME_WAIT pressure came
+# back owned by uid 0. Nothing in the probe can force that path (it needs half
+# the table in TIME_WAIT), so only this guard holds the fix in place.
+if [ "$(grep -c 'owner_uid = tcp_current_owner_uid()' src/tcp.c)" -lt 2 ]; then
+    guard_fail "tcp_socket() stamps owner_uid on fewer than two paths. The
+  TIME_WAIT eviction retry memset()s the connection and must re-stamp it;
+  without that, a socket allocated under TIME_WAIT pressure comes back
+  root-owned -- invisible to the unprivileged caller that asked for it, and
+  visible to every root query. The runtime probe CANNOT reach this path."
+fi
+
+# tcp_recv() must take TCP_LOCK before reading in_use/state/rx_head/rx_tail.
+# tcp_rx_available() subtracts rx_head and rx_tail, and the IRQ-path receiver
+# mutates both; a torn pair returns a length near TCP_RX_BUFFER_SIZE for an
+# almost-empty buffer, which then drives the copy loop.
+# Comment lines are stripped first: the explanatory comment above the lock
+# names tcp_rx_available(), and matching that text instead of the call made this
+# guard fire against the very code it was written to protect.
+if ! awk '/^int tcp_recv/,/^}/' src/tcp.c \
+     | grep -v '^\s*\*' | grep -v '^\s*/\*' | grep -v '^\s*//' \
+     | awk '/TCP_LOCK\(\)/{lock=1} /tcp_rx_available/{if(!lock) exit 1}' ; then
+    guard_fail "tcp_recv() reads tcp_rx_available() before taking TCP_LOCK().
+  rx_head/rx_tail are mutated by the IRQ-path receiver, so a torn pair yields a
+  bogus length that drives the copy loop. With SYS_TCPSOCK the remote peer
+  chooses the arrival timing and the caller chooses when to race it."
+fi
+
+# The ownership check must be applied at the syscall boundary, on every
+# subcommand that names a socket. It deliberately does NOT live inside
+# tcp_send/tcp_recv/tcp_close -- the kernel's own callers run with no current
+# task and must not be filtered -- so this is the only place it exists.
+if [ "$(grep -c 'tcpsock_check_owner' src/syscall.c)" -lt 5 ]; then
+    guard_fail "sys_tcpsock() calls tcpsock_check_owner() on fewer than four
+  subcommands (plus its definition). CONNECT/SEND/RECV/CLOSE each name a
+  sockfd, and an unchecked one lets a caller drive another user's connection.
+  The check lives at the boundary because the primitives are uid-blind."
+fi
 
 echo "==> Copying pristine disk.img -> $RUN_DISK"
 rm -f "$RUN_DISK" "$SERIAL" "$MON_SOCK"
@@ -463,24 +519,23 @@ esac
 # was meant to test, which is the same false pass as the cat-based O_TRUNC
 # harness in CLAUDE.md.
 #
-# Creating a socket from ring 3 needs SYS_NETSTAT's write-side counterpart
-# (tcp_socket/connect/close), which is deliberately PR C2 -- this PR adds no
-# write surface at all. So the runtime evidence available here is:
+# PR C2 CHANGED THIS. The probe now opens a socket of its own via SYS_TCPSOCK
+# before asking which sockets it can see, so the mask is non-zero BY
+# CONSTRUCTION for the caller that owns it. That converts the weakest assertion
+# in this harness into a real one, asserted further down as tcpsock_ownmask:
+# the caller's own descriptor must appear in its own bitmap. An inert
+# tcp_owner_visible() that returns true for everything no longer produces
+# identical output -- it shows descriptors the caller does not own.
 #
-#   - both masks are 0, consistent with an empty table (asserted below), and
-#   - the per-socket query refuses every descriptor identically.
-#
-# The filter's LOGIC is covered by the source guard above (owner_uid stamped in
-# tcp_socket, tcp_owner_visible consulted by tcp_snapshot) and its truth table
-# was checked directly: root sees all, a user sees only its own, kernel-owned
-# sockets are invisible to non-root. What is NOT covered end-to-end is a live
-# foreign socket being hidden from a real unprivileged caller. PR C2 can prove
-# that, because it can open one; until then this is stated rather than implied.
+# The line below therefore no longer asserts "unprivileged mask == 0"; that was
+# true only while ring 3 had no way to create a socket. What survives from C1 is
+# the direction check (a non-root caller must never see MORE than root), which
+# holds regardless of how many sockets exist.
 NS_MASK_ROOT=$(grep -a "PROBE netstat_socklist" "$SERIAL" | tr -d '\r' \
     | sed -n '1s/.*mask=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
 NS_MASK_UNPRIV=$(grep -a "PROBE netstat_socklist" "$SERIAL" | tr -d '\r' \
     | sed -n '2s/.*mask=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
-echo "  socket bitmaps: root=${NS_MASK_ROOT:-none} unpriv=${NS_MASK_UNPRIV:-none} (table is empty this boot)"
+echo "  socket bitmaps: root=${NS_MASK_ROOT:-none} unpriv=${NS_MASK_UNPRIV:-none} (netstat_probe runs before any socket is opened)"
 
 # An unprivileged caller must never see MORE than root. That much is real
 # regardless of how many sockets exist, and it is the direction the leak would
@@ -497,6 +552,105 @@ if [ -n "$NS_MASK_UNPRIV" ] && [ "$NS_MASK_UNPRIV" -ne 0 ]; then
         "No task-owned socket exists on this boot, so a non-root caller must" \
         "see an empty set. A nonzero value means the filter is reporting" \
         "sockets that either do not exist or belong to the kernel."
+fi
+
+#===========================================================================
+# PR C2 -- SYS_TCPSOCK, the data path.
+#
+# Polarity note, third time in this file because it is the thing most likely to
+# be inverted by someone copying an assertion from the RX/TX half: this syscall
+# is ownership-gated, NOT euid-gated. An unprivileged caller must be able to
+# open and drive its OWN sockets. A -EPERM here is a bug, not a pass.
+#===========================================================================
+TS_ROOT=$(grep -a "PROBE TCPSOCK VERDICT" "$SERIAL" | tr -d '\r' | sed -n '1p')
+TS_UNPRIV=$(grep -a "PROBE TCPSOCK VERDICT" "$SERIAL" | tr -d '\r' | sed -n '2p')
+echo "  tcpsock verdicts: root='${TS_ROOT:-none}' unpriv='${TS_UNPRIV:-none}'"
+
+for who in root unpriv; do
+    case "$who" in
+        root)   v="$TS_ROOT" ;;
+        unpriv) v="$TS_UNPRIV" ;;
+    esac
+    case "$v" in
+        *ok) ;;
+        *no_socket*)
+            fail_with "$who could not open a socket at all ($v)" \
+                "SYS_TCPSOCK's SOCKET subcommand failed. Check the dispatcher" \
+                "case and MAX_SYSCALL_NUM -- a stale bound returns -ENOSYS for" \
+                "every subcommand while the code below looks complete." ;;
+        *own_socket_invisible)
+            fail_with "$who opened a socket that does not appear in its own bitmap" \
+                "This is the assertion PR C1 could not make. The caller owns" \
+                "this descriptor by construction, so an absent bit means" \
+                "tcp_socket() did not stamp owner_uid, or tcp_owner_visible()" \
+                "is comparing against the wrong field." ;;
+        *own_socket_query_failed)
+            fail_with "$who could not query a socket it owns ($v)" \
+                "The per-socket query refused the caller's OWN descriptor." \
+                "Most likely the ownership comparison is inverted, or the" \
+                "syscall was euid-gated by mistake." ;;
+        *) fail_with "$who's SYS_TCPSOCK verdict was '${v:-none}', expected 'ok'" \
+                "One of the argument-validation assertions in tcpsock_probe" \
+                "failed; the PROBE tcpsock_* lines above name which." ;;
+    esac
+done
+
+# The ownership evidence C1 could not produce. The unprivileged caller opened a
+# socket, so its bitmap must be NON-ZERO -- and that is what makes the filter
+# falsifiable at runtime for the first time.
+TS_OWNMASK=$(grep -a "PROBE tcpsock_ownmask" "$SERIAL" | tr -d '\r' \
+    | sed -n '2s/.*mask=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+TS_OWNFD=$(grep -a "PROBE tcpsock_ownmask" "$SERIAL" | tr -d '\r' \
+    | sed -n '2s/.*fd=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+echo "  unpriv owned-socket bitmap: mask=${TS_OWNMASK:-none} fd=${TS_OWNFD:-none}"
+if [ -z "$TS_OWNMASK" ] || [ "$TS_OWNMASK" -eq 0 ]; then
+    fail_with "the unprivileged caller's bitmap was ${TS_OWNMASK:-none} after it opened a socket" \
+        "A zero here is now a real failure rather than an empty table: the" \
+        "caller holds a descriptor it just created. This is exactly the case" \
+        "the C1 harness could not distinguish from an inert filter."
+fi
+
+# --- EXCLUSION: the assertion the own-socket check cannot make -------------
+#
+# READ THIS BEFORE SIMPLIFYING THE PROBE.
+#
+# "The caller sees its own socket" passes against a hollowed-out
+# tcp_owner_visible() that returns true unconditionally -- verified by negative
+# control, because only one socket exists at the moment the bitmap is read, so
+# mask=1 either way. The own-socket check is necessary and NOT sufficient.
+#
+# What makes it sufficient: the ROOT pass deliberately leaks a socket (opens
+# one, never closes it), so when the unprivileged pass runs there is a live
+# FOREIGN socket in the table. A working filter reports only the caller's own
+# bit; an inert one reports root's leaked socket too. That is the difference
+# this block asserts, and it is the first end-to-end proof of the ownership
+# filter in this file -- the gap PR C1 documented and could not close.
+TS_LEAK=$(grep -a "PROBE tcpsock_leak" "$SERIAL" | tr -d '\r' \
+    | sed -n '1s/.*fd=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+if [ -z "$TS_LEAK" ] || [ "$TS_LEAK" -lt 0 ]; then
+    fail_with "root's pass did not leak a socket (fd=${TS_LEAK:-none})" \
+        "Without a live foreign socket during the unprivileged pass, the" \
+        "exclusion assertion below cannot fail even against a completely" \
+        "inert ownership filter. The probe MUST leave that socket open."
+fi
+
+TS_FOREIGN=$(grep -a "PROBE tcpsock_foreign" "$SERIAL" | tr -d '\r' \
+    | sed -n '1s/.*foreign=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+TS_FMASK=$(grep -a "PROBE tcpsock_foreign" "$SERIAL" | tr -d '\r' \
+    | sed -n '1s/.*mask=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+echo "  unpriv exclusion: mask=${TS_FMASK:-none} foreign-bits=${TS_FOREIGN:-none} (root leaked fd=$TS_LEAK)"
+if [ -z "$TS_FOREIGN" ]; then
+    fail_with "the unprivileged pass never reported its foreign-socket check" \
+        "Expected a 'PROBE tcpsock_foreign' line. Without it the exclusion" \
+        "property is untested."
+fi
+if [ "$TS_FOREIGN" -ne 0 ]; then
+    fail_with "an unprivileged caller can see a root-owned socket (foreign bits=$TS_FOREIGN)" \
+        "root's pass left descriptor $TS_LEAK open. It appears in the" \
+        "unprivileged caller's bitmap, so tcp_owner_visible() is not" \
+        "excluding it: a bare sockfd index is a read oracle over another" \
+        "user's connection -- peer address, state, and rx_available as a" \
+        "traffic side channel. This is the finding, not a test failure."
 fi
 
 # --- Argument validation, from the probe's own lines -----------------------

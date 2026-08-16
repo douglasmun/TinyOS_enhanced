@@ -142,6 +142,10 @@ doc/WX_PAE_IMPLEMENTATION_PLAN.md
 doc/vibe-code-your-own-OS-readme.txt
 bgjobs.log
 bgjobs-trace.log
+netdb.log
+netdb-trace.log
+tcpserverpath.log
+tcpserverpath-trace.log
 redirect.log
 redirect-trace.log
 ring3-redirect.log

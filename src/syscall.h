@@ -245,6 +245,66 @@
  * through the error code alone. */
 #define SYS_NETSTAT    37   // Read-only network state; ownership-filtered
 
+/*=============================================================================
+ * SYS_TCPSOCK -- the socket data path (doc/NETDAEMON_DESIGN.md PR C2)
+ *
+ * The WRITE half of the socket API, and the counterpart to SYS_NETSTAT's
+ * read-only queries: socket/connect/send/recv/close. This is the first time
+ * ring 3 can make the kernel emit an attacker-chosen TCP payload, so every
+ * primitive it reaches was audited in this same PR (the #45/#47/#54/#55 rule).
+ * That audit found two live bugs, both fixed here rather than in a follow-up:
+ * tcp_socket()'s TIME_WAIT eviction retry never stamped owner_uid (sockets came
+ * back root-owned), and tcp_recv() read in_use/state/rx_head/rx_tail OUTSIDE
+ * TCP_LOCK, so a torn head/tail pair could hand the copy loop a bogus length.
+ *
+ * ONE syscall with a subcommand, for the reason SYS_NETSTAT gives: five entry
+ * points is five chances to omit a credential or bounds check.
+ *
+ * Ownership-gated, not euid-gated -- same polarity as SYS_NETSTAT and the
+ * OPPOSITE of SYS_NETRX/SYS_NETTX. An unprivileged caller MUST be able to open
+ * and drive its own sockets; that is the point. tcp_owner_visible() is checked
+ * on every subcommand that names an existing sockfd, and a socket the caller
+ * cannot see is -EBADF, never -EPERM, so the errno cannot enumerate the table.
+ *
+ * The ownership check lives HERE rather than inside tcp_send/tcp_recv/tcp_close
+ * deliberately: the kernel's own callers (curl, tcp_tick, the IRQ-path
+ * receiver) run with no current task or as root and must not be filtered. The
+ * primitive stays uid-blind; the boundary is where the credential exists.
+ *
+ * arg1 = TCPSOCK_ARG(subcmd, sockfd), arg2 = user buffer, arg3 = length.
+ * CONNECT takes a tcpsock_connect_t in the buffer; SEND/RECV take raw bytes;
+ * SOCKET and CLOSE take no buffer.
+ *
+ * RECV is NON-BLOCKING, matching SYS_NETRX. It returns the byte count, 0 when
+ * nothing is queued or the peer closed and the buffer is drained, and a
+ * negative errno on a dead socket. A blocking variant needs an ISR-driven wait
+ * queue, where one lost wakeup wedges the stack with no diagnostic; that is a
+ * separate PR, not a flag on this one. */
+#define SYS_TCPSOCK    38   // Socket data path; ownership-filtered
+
+/* SYS_TCPSOCK subcommands. */
+#define TCPSOCK_SOCKET     0   // Allocate a socket; returns the descriptor
+#define TCPSOCK_CONNECT    1   // Connect to remote (tcpsock_connect_t in buf)
+#define TCPSOCK_SEND       2   // Send bytes on an ESTABLISHED socket
+#define TCPSOCK_RECV       3   // Non-blocking receive; 0 = nothing queued/EOF
+#define TCPSOCK_CLOSE      4   // Close a socket the caller owns
+
+/* Same packing as NETSTAT_ARG: subcmd low 16, sockfd high 16. */
+#define TCPSOCK_ARG(subcmd, sockfd) \
+    (((uint32_t)(subcmd) & 0xFFFFu) | (((uint32_t)(sockfd) & 0xFFFFu) << 16))
+#define TCPSOCK_SUBCMD(a)  ((uint32_t)(a) & 0xFFFFu)
+#define TCPSOCK_SOCKFD(a)  ((int)(((uint32_t)(a) >> 16) & 0xFFFFu))
+
+/* Largest payload one SEND/RECV may carry. Bounds the kernel staging buffer;
+ * a caller asking for more is refused, not silently truncated. */
+#define TCPSOCK_MAX_IO     1024
+
+typedef struct {
+    uint8_t  remote_ip[4];
+    uint16_t remote_port;
+    uint16_t _pad;
+} tcpsock_connect_t;
+
 /* SYS_NETSTAT subcommands. */
 #define NETSTAT_IFACE      0   // Interface addresses (ip/mask/gateway/mac)
 #define NETSTAT_DHCP       1   // DHCP lease state, by value
@@ -404,7 +464,7 @@ typedef struct {
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  37  // Highest valid syscall number (SYS_NETSTAT)
+#define MAX_SYSCALL_NUM  38  // Highest valid syscall number (SYS_TCPSOCK)
 
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
@@ -638,6 +698,7 @@ int sys_kill(int pid);
 int sys_netrx(void* user_buf, size_t len);
 int sys_nettx(const void* user_buf, size_t len);
 int sys_netstat(uint32_t subcmd, int sockfd, void* user_buf, size_t len);
+int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len);
 
 /**
  * @brief Change the caller's cwd.

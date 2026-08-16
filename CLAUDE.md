@@ -173,6 +173,27 @@ between records and a compacted index skips a task when an earlier one exits; an
 visibility check must read the fields in the **same** critical section that passed it,
 or a reused slot copies another user's name out. Harness: `verify-ring3-ps.sh`.
 
+**The socket API crosses the boundary as two syscalls with subcommands**, not
+twenty-three entry points: `SYS_NETSTAT` (37, read-only queries) and `SYS_TCPSOCK`
+(38, the data path — socket/connect/send/recv/close). Both are **ownership-gated,
+the opposite polarity to `SYS_NETRX`/`SYS_NETTX`**, which are euid-gated because raw
+frames are the whole segment's traffic. An unprivileged caller *must* succeed here;
+a `-EPERM` is the bug. Copying an assertion between the two halves inverts it — that
+has nearly happened three times, so the shared harness header says so explicitly.
+Four things not to undo: the ownership check lives at the **syscall boundary**, not
+in the TCP primitives (the one place the `ramfs_chmod` "enforce in the primitive"
+rule inverts — `curl`/`tcp_tick`/the IRQ receiver have no current task to check);
+`tcp_socket()` stamps `owner_uid` on **both** allocation paths, the fast scan and the
+TIME_WAIT eviction retry, since `memset` zeroes it and uid 0 is root; `tcp_recv()`
+takes `TCP_LOCK` **before** reading `in_use`/`state`/`rx_head`/`rx_tail`, because
+`tcp_rx_available()` subtracts a head/tail pair the IRQ path mutates and a torn read
+drives the copy loop; and a socket the caller cannot see is **`-EBADF`, never
+`-EPERM`**, or the errno enumerates the table. Harness: `verify-netd-boundary.sh`.
+**Its ownership assertion only works because the root pass leaks a socket** — a probe
+that merely checks "I can see my own socket" passes against a completely inert
+filter, since the caller's is the only socket in the table at that moment. Exclusion
+needs a live *foreign* socket to not see. Don't "clean up" that leak.
+
 **AUDIT-8E is closed for the network half.** `ids_inspect_payload()` (`ids.c`, called at
 the end of `ids_analyze_packet`) scans every inbound IP payload against the signature
 table, and `secstatus` reports a **match count** beside the signature count — a loaded

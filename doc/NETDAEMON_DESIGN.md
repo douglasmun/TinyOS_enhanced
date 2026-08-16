@@ -240,6 +240,18 @@ way, and it is commented as load-bearing. C2 can prove it end-to-end, because C2
 can open a socket. Stated rather than implied, because a zero that looks like
 evidence is exactly the O_TRUNC/`cat` trap.
 
+**C2 closed that gap — and the first attempt at closing it failed the same way.**
+The obvious fix was to have the probe open a socket and assert it appears in its
+own bitmap. That passed, and a negative control showed it passed against an
+inert filter too: at the moment the bitmap is read, the caller's socket is the
+*only* one in the table, so `mask=1` either way. "I can see my own socket" is
+necessary and proves nothing about **exclusion**, which is the entire property.
+What works: the **root pass deliberately leaks a socket** (opens one, never
+closes it), so a live *foreign* socket exists while the unprivileged pass runs.
+Working filter → `mask=1`, `foreign=0`; hollowed filter → `mask=3`, `foreign=2`,
+and the harness names it. That is the first end-to-end proof of the ownership
+filter in this tree.
+
 `dhcp_get_client_info()` returns a pointer **into** kernel state; it is read
 field-by-field and never handed across. The copied struct also omits the DHCP
 transaction id, which is the value needed to forge a reply into an in-flight
@@ -250,15 +262,56 @@ four values, so subcommand and sockfd share arg1 (`NETSTAT_ARG`). Widening the
 ABI to a fourth register would touch the asm entry path and every existing
 syscall — not this PR's job.
 
-**C2 (not started) — the data path** (`tcp_socket`/`tcp_connect`/`tcp_send`/
-`tcp_recv`/`tcp_close`). Fixing TCP-over-NAT first would be sensible, since C2
-cannot be verified end-to-end while a handshake cannot complete.
+**C2 (landed) — the data path.** `SYS_TCPSOCK` (38) carries
+`tcp_socket`/`tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close` across the boundary
+behind five subcommands, same one-syscall-with-a-subcommand shape and same
+three-register packing as C1. Ownership-gated, not euid-gated — the opposite
+polarity to `SYS_NETRX`/`SYS_NETTX`, and the third place in this tree where
+copying an assertion between the two halves would invert it.
+
+The ownership check lives at the **syscall boundary**, not inside
+`tcp_send`/`tcp_recv`/`tcp_close`. This is the one place the `ramfs_chmod`
+"enforce in the primitive" rule does *not* apply: the kernel's own callers
+(`curl`, `tcp_tick`, the IRQ-path receiver) run with no current task or as root
+and must not be filtered. The primitive stays uid-blind; the boundary is where a
+credential exists at all.
+
+**The audit found two live bugs in the primitives, fixed in the same PR** (the
+#45/#47/#54/#55 rule — every time a dead or kernel-only path was exposed, it
+turned out to carry something serious):
+
+- `tcp_socket()` has two allocation paths, and the **TIME_WAIT eviction retry
+  never stamped `owner_uid`**. `memset` zeroes it and uid 0 is root, so a socket
+  allocated under TIME_WAIT pressure came back *root-owned* — invisible to the
+  unprivileged caller that asked for it, visible to every root query. Latent
+  while `tcp_socket` was kernel-only.
+- `tcp_recv()` read `in_use`/`state`/`rx_head`/`rx_tail` **outside `TCP_LOCK`**.
+  `tcp_rx_available()` subtracts head and tail, both mutated by the IRQ-path
+  receiver; a torn pair returns a length near `TCP_RX_BUFFER_SIZE` for an
+  almost-empty buffer, and that length drove the copy loop. With `SYS_TCPRECV`
+  the remote peer chooses the arrival timing and the caller chooses when to race
+  it.
+
+Neither is reachable from the ring-3 probe (the first needs half the table in
+TIME_WAIT), so both are held by source guards rather than runtime assertions —
+each verified by removing the fix and confirming the guard fires.
+
+`tcp_recv` is **non-blocking**, matching `SYS_NETRX`: byte count, 0 for
+nothing-queued-or-EOF, negative errno on a dead socket. A blocking variant needs
+an ISR-driven wait queue where one lost wakeup wedges the stack with no
+diagnostic — a separate PR, not a flag on this one.
+
+**TCP-over-NAT was never broken.** The belief that a handshake could not complete
+came from reading `verify-tcp-serverpath.sh`, which drives `dig`, exercises the
+*server* path, and never calls `tcp_connect`. A pcap of `curl example.com` shows
+a clean SYN / SYN-ACK / ACK, HTTP/1.1 200, and a two-way FIN. Before fixing a
+network bug, run the reproducer for the **direction** in question.
 
 **PR D — move the parser to ring 3.** Only after A–C. This is the PR where the
 trust domain actually changes.
 
-`MAX_SYSCALL_NUM` is **37** as of PR C1 (`SYS_NETRX` 35, `SYS_NETTX` 36,
-`SYS_NETSTAT` 37); it was 34 (`SYS_KILL`) before PR B. Every PR that adds a syscall must bump it — CLAUDE.md records
+`MAX_SYSCALL_NUM` is **38** as of PR C2 (`SYS_NETRX` 35, `SYS_NETTX` 36,
+`SYS_NETSTAT` 37, `SYS_TCPSOCK` 38); it was 34 (`SYS_KILL`) before PR B. Every PR that adds a syscall must bump it — CLAUDE.md records
 this exact bug: it sat at 16 while `SYS_SLEEP` (17) and `SYS_WAITPID` (18) had
 working dispatcher cases, silently rejecting both. `verify-netd-boundary.sh`'s
 source guard now compares the two numerically rather than trusting a reading, on
