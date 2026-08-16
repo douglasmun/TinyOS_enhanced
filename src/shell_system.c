@@ -1053,6 +1053,25 @@ void cmd_auditlog(int argc, char* argv[]) {
         .end_time = 0
     };
 
+    /* ~17.6 KB on the kernel task stack (sizeof audit_event_t is ~176: a
+     * 96-byte description plus a 64-byte HMAC). That is a big local of exactly
+     * the kind the stack budget warns about. It is left alone deliberately:
+     *
+     *   - `static` is the usual fix in this tree (exec_buffer,
+     *     allocated_frames) and is WRONG here. Printing now goes through
+     *     stream_printf, which on a redirected stream reaches ramfs_write and
+     *     can block and reschedule inside the print loop below; two shell
+     *     sessions running `auditlog` would interleave into one shared array
+     *     and print each other's records. A stack buffer is per-task.
+     *   - Batching into a small buffer needs a cursor, and audit_query() has
+     *     none -- it always returns from the same end of the ring, so a loop
+     *     either repeats the first N records forever or silently truncates the
+     *     listing. Giving audit_query a cursor is the real fix and is a change
+     *     to audit.c, not to this call site.
+     *
+     * 17.6 KB fits the 128 KB stack with room to spare and this is not on the
+     * exec chain. Revisit when `auditlog` moves to ring 3, where it will not be
+     * running on this stack at all. */
     audit_event_t results[100];
     int count = audit_query(&filter, results, max_results > 100 ? 100 : max_results);
 
