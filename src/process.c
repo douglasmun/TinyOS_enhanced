@@ -1672,8 +1672,32 @@ void task_free_resources(task_t* task) {
         return;
     }
 
-    // Free guard page
+    /* Free guard page.
+     *
+     * RESTORE THE MAPPING FIRST. The guard page is identity-mapped NOT PRESENT
+     * (see task_create_kernel), and that PTE lives in the KERNEL identity map,
+     * which every address space shares. Handing the frame back to the PMM while
+     * its PTE still reads not-present poisons the physical frame permanently:
+     * the next pmm_alloc() returns it to some unrelated caller, which writes
+     * through the identity mapping and takes a kernel-mode #PF -> panic. The
+     * boot-time "identity map verified complete (no holes)" check cannot catch
+     * this, because the hole is punched later, at runtime.
+     *
+     * NOT specific to kernel tasks: task_create_user_argv allocates the same
+     * kernel-side guard page, so every user process that has ever exited
+     * returned a poisoned frame to the allocator. It went unnoticed because the
+     * damage is deferred and looks unrelated -- the panic lands on whoever next
+     * pmm_alloc()s that frame (here, EDR's per-process state during a task
+     * creation), with nothing pointing back at the task that died earlier.
+     *
+     * Found via PR D2: the supervisor restarting knetd is simply the first path
+     * that reliably frees a task and allocates again immediately afterwards, so
+     * it turned an intermittent, long-latency corruption into a deterministic
+     * fault on the very next allocation. */
     if (task->guard_page_phys != 0) {
+        map_page(task->guard_page_phys, task->guard_page_phys,
+                 PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
+        flush_tlb_single(task->guard_page_phys);
         pmm_free(task->guard_page_phys);
         task->guard_page_phys = 0;
     }

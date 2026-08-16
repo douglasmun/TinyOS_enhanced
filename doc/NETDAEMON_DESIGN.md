@@ -709,3 +709,46 @@ Sequencing: D2's supervisor is independent of D1's parser move and can be built
 and tested against `knetd` as it exists today (a deliberately-killed `knetd` is a
 complete test case without any ring-3 code). Building it first means D1 lands into
 a kernel that already survives the death of the task it is about to make killable.
+
+#### D2 as built — what was answered, and what was not
+
+Landed: `src/supervisor.{c,h}`, `knetd` registered in `kernel.c`, supervision state
+on `ifconfig`, harness `verify-supervisor.sh`.
+
+Three of the five questions above are answered:
+
+- **What owns the restart** — a supervisor task, as preferred. It is itself
+  `CAP_UNKILLABLE` while `knetd` deliberately is not; a killable supervisor would
+  let one `kill` disable restarts for everything it watches.
+- **Restart storms** — `SUPERVISOR_MAX_RESTARTS` within `SUPERVISOR_WINDOW_MS`,
+  checked inside `supervisor_restart()` so no second restart path can skip it.
+  Give-up is one-way, printed, and surfaced in `ifconfig`'s `gave-up` count.
+- **What the harness asserts** — four parts, the load-bearing one being that the
+  RX counter *rises* across the kill. "Networking still works" was rejected
+  exactly as this document warned: it passes when the kill silently failed.
+
+Two are **not** answered, and both are D1 prerequisites rather than D2 omissions:
+
+- **What happens to in-flight state** — untouched, because it cannot be settled
+  before open question 2 (copy-in vs shared buffer). The softirq ring is
+  kernel-owned and survives a `knetd` restart today, which is itself an argument
+  for copy-in.
+- **Does the killing frame get dropped** — no consumed-but-not-completed
+  bookkeeping exists. It has no consequence yet: nothing can currently crash the
+  parser, so no frame has ever killed the daemon. It acquires teeth the moment
+  D1 lands, and without it the rate limiter is the *only* thing standing between
+  an attacker-chosen frame and an unbounded restart loop.
+
+Corresponding harness gap: `verify-supervisor.sh` only ever asserts `gave-up == 0`,
+proving the limiter does not fire spuriously and nothing more. **D1 must not land
+without a control that drives `knetd` past the budget and asserts the daemon stays
+dead** — a give-up that still restarts is worse than no limiter at all.
+
+Two pre-existing kernel bugs surfaced while building this; both are fixed here and
+neither is specific to supervision. `task_free_resources()` returned the task's
+guard page to the PMM without restoring its not-present identity mapping, poisoning
+that physical frame for the next `pmm_alloc()` — live for every user process exit,
+not just kernel tasks, and invisible because the panic lands on an unrelated later
+allocation. And `task_create_kernel()` does not enqueue, so both the restart path
+and the supervisor's own creation needed an explicit `scheduler_add_task()`;
+without it a task is created, listed by `ps`, counted healthy, and never run.

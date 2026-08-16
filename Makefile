@@ -76,6 +76,7 @@ SRC := \
   src/usermode_test.c \
   src/process.c \
   src/scheduler.c \
+  src/supervisor.c \
   src/wait_queue.c \
   src/vfs.c \
   src/user.c \

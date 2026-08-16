@@ -9,6 +9,8 @@
 #include "scheduler.h"
 #include "kernel.h"  /* timer_softirq_run() */
 #include "net.h"     /* e1000_rx_softirq_run() */
+#include "process.h" /* task_terminate() (fault injection only) */
+#include "vfs.h"     /* CAP_UNKILLABLE (fault injection only) */
 
 /* get_timer_ticks() / timer_softirq_run() declared in kernel.h */
 
@@ -240,10 +242,50 @@ void task_ktimerd(void) {
  *          the entire parser ran with IF=0 despite the driver's packet budget
  *          claiming otherwise.
  *=============================================================================*/
+#ifdef TINYOS_FAULT_INJECT
+/*
+ * Fault injection for verify-supervisor.sh. OFF by default, and named as an
+ * explicit opt-out like every other build flag in this tree.
+ *
+ * It exists because knetd CANNOT be killed from outside: task_create_kernel()
+ * grants CAP_ALL (0xFFFFFFFF), which includes CAP_UNKILLABLE, and both sys_kill
+ * and task_terminate refuse that flag. Without a way to make the daemon die,
+ * the restart path has no test at all -- and an untested restart path is
+ * exactly what PR D1 must not be built on top of.
+ *
+ * The task clears its own CAP_UNKILLABLE before exiting, because task_terminate()
+ * refuses that flag no matter who asks -- including the task itself. Doing it
+ * here, in the victim, keeps the capability check itself unmodified: no
+ * production path learns how to bypass it.
+ */
+volatile int knetd_die_now = 0;
+#endif
+
 void task_knetd(void) {
     kprintf("[KNETD] RX bottom-half task started [OK]\n");
     while (1) {
         e1000_rx_softirq_run();
+#ifdef TINYOS_FAULT_INJECT
+        if (knetd_die_now) {
+            task_t* self = scheduler_get_current_task();
+            knetd_die_now = 0;
+            if (self) {
+                kprintf("[KNETD] fault injection: exiting on request\n");
+                self->capabilities &= ~CAP_UNKILLABLE;
+                /* task_terminate(), not task_exit(): task_exit() reads
+                 * process.c's own `current_task` static, which is only ever set
+                 * by task_switch_to() and stays NULL for scheduler-run tasks --
+                 * so it returns silently and the task keeps running. Passing our
+                 * pid explicitly takes task_terminate's self-exit branch, which
+                 * marks us TERMINATED and defers the resource free to the
+                 * scheduler's post-context-switch reaper (freeing the kernel
+                 * stack we are still running on would be a use-after-free). */
+                uint32_t self_pid = self->pid;
+                task_terminate(self_pid);
+                scheduler_yield();
+            }
+        }
+#endif
         /* Cheap (one head/tail comparison) when the ring is empty. */
         scheduler_yield();
     }

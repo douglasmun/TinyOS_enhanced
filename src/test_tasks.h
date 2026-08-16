@@ -29,3 +29,9 @@ void task_exit_test(void);
 void task_idle(void);
 void task_ktimerd(void);  /* timer bottom-half task */
 void task_knetd(void);    /* RX bottom-half task (doc/NETWORK_ISOLATION.md) */
+
+#ifdef TINYOS_FAULT_INJECT
+/* Set to 1 to make knetd exit at its next loop iteration; see test_tasks.c for
+ * why the restart path cannot be tested without it. verify-supervisor.sh only. */
+extern volatile int knetd_die_now;
+#endif

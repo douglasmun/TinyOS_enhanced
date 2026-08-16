@@ -5,6 +5,7 @@
 #include "kprintf.h"
 #include "util.h"
 #include "net.h"
+#include "supervisor.h"
 #include "tcp.h"
 #include "dns.h"
 #include "dhcp.h"
@@ -209,6 +210,17 @@ void cmd_ifconfig(void) {
     kprintf("  DMA guards:   0x%08x %s, 0x%08x %s\n",
             g_lo, guard_is_present(g_lo) ? "MAPPED(!)" : "unmapped",
             g_hi, guard_is_present(g_hi) ? "MAPPED(!)" : "unmapped");
+
+    /* Supervision state (doc/NETDAEMON_DESIGN.md item 4, PR D2). Reported on
+     * ifconfig because the task being supervised today is knetd, and "is the RX
+     * bottom half alive" is a networking question. `restarts` should read 0 on
+     * any healthy boot; a nonzero count means knetd died and came back, and
+     * gave-up means it died too often and is NOT coming back. */
+    uint32_t sup_watched = 0, sup_restarts = 0, sup_gaveup = 0;
+    supervisor_get_stats(&sup_watched, &sup_restarts, &sup_gaveup);
+    kprintf("  Supervisor:   %u watched, %u restarts, %u gave-up\n",
+            sup_watched, sup_restarts, sup_gaveup);
+
     kprintf("\n");
 }
 

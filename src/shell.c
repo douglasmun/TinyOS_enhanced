@@ -7,6 +7,7 @@
 #include "scheduler.h"
 #include "util.h"
 #include "env.h"
+#include "test_tasks.h"   /* knetd_die_now, under TINYOS_FAULT_INJECT */
 #include "shell_fileops.h"
 #include "shell_search.h"
 #include "shell_monitor.h"
@@ -878,7 +879,16 @@ static void parse_and_execute(char* cmd_line) {
     /* Network Commands */
     else if (strcmp(argv[0], "ifconfig") == 0) {
         cmd_ifconfig();
-    } else if (strcmp(argv[0], "ping") == 0) {
+    }
+#ifdef TINYOS_FAULT_INJECT
+    /* verify-supervisor.sh only. Not in the command table, so it never appears
+     * in `help` -- see the rationale on knetd_die_now in test_tasks.c. */
+    else if (strcmp(argv[0], "killknetd") == 0) {
+        knetd_die_now = 1;
+        kprintf("[FAULT] knetd death requested\n");
+    }
+#endif
+    else if (strcmp(argv[0], "ping") == 0) {
         cmd_ping(argc, argv);
     } else if (strcmp(argv[0], "dig") == 0) {
         cmd_dig(argc, argv);
