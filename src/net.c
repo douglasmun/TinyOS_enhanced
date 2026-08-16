@@ -15,6 +15,7 @@
 #include "tcp.h"
 #include "firewall.h"
 #include "ids.h"
+#include "critical.h" // in_interrupt_context() for the parse-context assertion
 
 /*=============================================================================
  * NETWORK CONFIGURATION
@@ -1666,6 +1667,26 @@ void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype) {
     if (ethertype) *ethertype = net_drop_ethertype;
 }
 
+/*=============================================================================
+ * PARSE-CONTEXT ACCOUNTING (doc/NETWORK_ISOLATION.md item 1)
+ *
+ * The whole point of the knetd bottom half is that handle_packet() — and the
+ * ~8,350-line parser below it — runs with interrupts ENABLED. "Ping still
+ * replies" does not prove that; the parser replies either way. These two
+ * counters are the actual assertion, and the only thing a harness can read
+ * that distinguishes a deferred build from an in-ISR one.
+ *
+ * net_parse_irq MUST stay 0. A nonzero value means some path calls
+ * handle_packet() from an ISR again and item 1 has been silently undone.
+ *===========================================================================*/
+static uint32_t net_parse_thread = 0;  /* frames parsed with IF enabled  */
+static uint32_t net_parse_irq = 0;     /* frames parsed in an ISR (== 0) */
+
+void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx) {
+    if (thread_ctx) *thread_ctx = net_parse_thread;
+    if (irq_ctx) *irq_ctx = net_parse_irq;
+}
+
 /**
  * @brief Main packet reception handler.
  * @param data Pointer to received Ethernet frame.
@@ -1675,6 +1696,14 @@ void handle_packet(uint8_t* data, size_t len) {
     // static uint32_t pkt_count = 0;
     // pkt_count++;
     // kprintf("[NET_DEBUG] handle_packet called (count=%u, len=%zu)\n", pkt_count, len);
+
+    /* Counted before any early return: a runt frame is still a frame that was
+     * parsed, and the context it was parsed in is what item 1 asserts. */
+    if (in_interrupt_context()) {
+        net_parse_irq++;
+    } else {
+        net_parse_thread++;
+    }
 
     if (len < sizeof(eth_header_t)) {
         net_drop_runt++;

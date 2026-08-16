@@ -183,6 +183,8 @@ idssig.log
 idssig-trace.log
 rxdrop.log
 rxdrop-trace.log
+rxctx.log
+rxctx-trace.log
 sysredirect.log
 sysredirect-trace.log
 spray-pos.log

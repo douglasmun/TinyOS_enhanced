@@ -179,6 +179,59 @@ static uint32_t rx_drop_errors = 0;
  * zero). Same reasoning: per-packet and remotely driven. */
 static uint32_t rx_drop_badlen = 0;
 
+/*=============================================================================
+ * RX SOFTIRQ RING (doc/NETWORK_ISOLATION.md item 1)
+ *
+ * The top-half/bottom-half split for the receive path, matching the one the
+ * timer already uses (timer_softirq_pending -> ktimerd -> timer_softirq_run).
+ * That split exists because heavy work in an ISR corrupted interrupted
+ * computations — it root-caused the bug that broke password login and ECDSA
+ * verification. The RX path had the same shape and had not been converted.
+ *
+ * WHY THIS IS NEEDED AT ALL, given the driver already has a packet budget:
+ *
+ * E1000_UNLOCK() does NOT re-enable interrupts on the IRQ11 path.
+ * critical_section_exit() only touches IF when __interrupt_context_depth == 0,
+ * and that clause is deliberate (a popfl mid-ISR would corrupt the preempted
+ * thread's flags). So the mid-loop unlock before handle_packet, and the
+ * post-budget "process with interrupts RE-ENABLED" block, were depth
+ * decrements only: the whole ~8,350-line parser ran with IF=0 and the budget
+ * did not bound interrupt-off time the way its comments claimed.
+ *
+ * With this split the ISR only copies frames and the parser runs in knetd,
+ * where E1000_UNLOCK() genuinely re-enables interrupts and preemption works.
+ *
+ * WHY THE FRAME IS COPIED rather than referenced:
+ *
+ * The ISR advances RDT to hand the descriptor back to the NIC, which may DMA
+ * a new frame into rx_bufs[] immediately. A deferred parser holding a pointer
+ * into rx_bufs[] would read whatever arrived next — an attacker-timed use
+ * after free, in a buffer an attacker fills. The copy is what makes deferral
+ * safe, so do not "optimize" it away.
+ *
+ * SIZING: 64 slots x 2048B = 128 KB in .bss, matching NUM_RX_DESC so the
+ * software ring cannot be the tighter constraint (a smaller ring would drop
+ * frames the hardware accepted, which reads as packet loss rather than as
+ * backpressure).
+ *===========================================================================*/
+#define RX_SOFTIRQ_SLOTS NUM_RX_DESC
+
+struct rx_softirq_slot {
+    uint16_t length;
+    uint8_t  data[RX_BUF_SIZE];
+};
+
+static struct rx_softirq_slot rx_softirq_ring[RX_SOFTIRQ_SLOTS];
+static volatile uint32_t rx_softirq_head = 0;  /* producer: the ISR   */
+static volatile uint32_t rx_softirq_tail = 0;  /* consumer: knetd     */
+
+/* Frames dropped because the software ring was full — knetd is not keeping up.
+ * Distinct from every hardware drop counter: this one means the deferral
+ * itself is the bottleneck, which is a different diagnosis and a different
+ * fix, so it gets its own counter rather than being folded into the others. */
+static uint32_t rx_drop_backlog = 0;
+
+
 // Packet dump control (set to 1 to enable, 0 to disable)
 static int enable_packet_dump = 0;  // Disabled to reduce verbosity
 
@@ -209,6 +262,86 @@ static bool link_status_stable = true;  // Link considered stable
  *=============================================================================*/
 #define E1000_LOCK()   CRITICAL_SECTION_ENTER()
 #define E1000_UNLOCK() CRITICAL_SECTION_EXIT()
+
+/*=============================================================================
+ * FUNCTION: rx_softirq_enqueue  (TOP HALF — runs in the ISR)
+ *
+ * Copies one frame into the software ring. Caller holds E1000_LOCK(), so the
+ * head/tail update needs no further protection against knetd: on a single CPU
+ * with IF=0, the consumer cannot run concurrently.
+ *
+ * Drop-newest on overflow, deliberately. Drop-oldest would mean an attacker
+ * who can outrun knetd evicts legitimate frames that were already accepted —
+ * turning a backlog into a targeted denial of the traffic you care about.
+ * Dropping the newest degrades to "we are full", which is the honest signal,
+ * and it is what the hardware itself does when the descriptor ring fills.
+ *===========================================================================*/
+static void rx_softirq_enqueue(const uint8_t* data, uint16_t length) {
+    uint32_t next = (rx_softirq_head + 1) % RX_SOFTIRQ_SLOTS;
+
+    if (next == rx_softirq_tail) {
+        /* Ring full — knetd has not drained yet. Counted, never printed:
+         * this is exactly the path a flood drives. */
+        rx_drop_backlog++;
+        return;
+    }
+
+    if (length > RX_BUF_SIZE) {
+        /* Cannot happen: the caller validated length against RX_BUF_SIZE
+         * before reaching here. Kept as a hard bound anyway, because this is
+         * the memcpy that would turn a missed check upstream into a .bss
+         * overrun, and the check costs nothing on this path. */
+        rx_drop_badlen++;
+        return;
+    }
+
+    memcpy(rx_softirq_ring[rx_softirq_head].data, data, length);
+    rx_softirq_ring[rx_softirq_head].length = length;
+
+    /* Publish the slot only after its contents are visible. */
+    __asm__ volatile("" ::: "memory");
+    rx_softirq_head = next;
+}
+
+/*=============================================================================
+ * FUNCTION: e1000_rx_softirq_run  (BOTTOM HALF — runs in knetd, task context)
+ *
+ * Drains the software ring, calling handle_packet() with interrupts ENABLED.
+ * This is where the ~8,350-line parser now runs.
+ *
+ * The frame is copied out of the ring before handle_packet() is called, and
+ * the tail is advanced after. Holding the lock across handle_packet() would
+ * reinstate exactly the property this change exists to remove.
+ *
+ * Bounded per call (RX_SOFTIRQ_SLOTS) so a sustained flood cannot livelock
+ * knetd inside one invocation and starve everything else it might later do.
+ * Anything still queued is picked up on the next pass — the task loop yields
+ * and comes straight back.
+ *===========================================================================*/
+void e1000_rx_softirq_run(void) {
+    uint32_t drained = 0;
+
+    while (drained < RX_SOFTIRQ_SLOTS) {
+        static uint8_t frame[RX_BUF_SIZE];  /* static: keep 2 KB off the task stack */
+        uint16_t length;
+
+        E1000_LOCK();
+        if (rx_softirq_tail == rx_softirq_head) {
+            E1000_UNLOCK();
+            break;
+        }
+        length = rx_softirq_ring[rx_softirq_tail].length;
+        if (length > RX_BUF_SIZE) {
+            length = RX_BUF_SIZE;
+        }
+        memcpy(frame, rx_softirq_ring[rx_softirq_tail].data, length);
+        rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+        E1000_UNLOCK();
+
+        handle_packet(frame, length);
+        drained++;
+    }
+}
 
 /* Bounded spin cap for the TX descriptor-done (DD) wait in e1000_send().
  * Large enough to ride out a saturated link, finite so a wedged NIC can't
@@ -647,10 +780,9 @@ void e1000_poll_rx(void) {
         // kprintf("[E1000] RX Packet #%d\n", packet_rx_count);  // Commented for less verbosity
         dump_packet("RX", rx_bufs[rx_tail], length);
 
-        // Process the packet (temporarily unlock to allow nested operations)
-        E1000_UNLOCK();
-        handle_packet(rx_bufs[rx_tail], length);
-        E1000_LOCK();
+        /* Hand the frame to knetd instead of parsing it here. See the
+         * RX SOFTIRQ RING comment above. */
+        rx_softirq_enqueue(rx_bufs[rx_tail], length);
 
         // Clear descriptor status for reuse
         rx_ring[rx_tail].status = 0;
@@ -743,10 +875,8 @@ void e1000_poll_rx(void) {
             packet_rx_count++;
             dump_packet("RX", rx_bufs[rx_tail], length);
 
-            // Process packet (unlock during processing)
-            E1000_UNLOCK();
-            handle_packet(rx_bufs[rx_tail], length);
-            E1000_LOCK();
+            /* Defer to knetd, as in the primary loop above. */
+            rx_softirq_enqueue(rx_bufs[rx_tail], length);
 
             // Clear and advance
             rx_ring[rx_tail].status = 0;
@@ -797,9 +927,11 @@ void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count) {
  * FUNCTION: e1000_get_drop_stats
  * PURPOSE: Report frames dropped for hardware-detected errors
  *============================================================================*/
-void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count) {
+void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
+                          uint32_t* backlog_count) {
     if (err_count) *err_count = rx_drop_errors;
     if (badlen_count) *badlen_count = rx_drop_badlen;
+    if (backlog_count) *backlog_count = rx_drop_backlog;
 }
 
 /*=============================================================================

@@ -243,5 +243,16 @@ void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count);
 
 /* RX drop counters — see doc/NETWORK_ISOLATION.md item 2. These replaced
  * per-packet kprintf sites that any host on the segment could flood. */
-void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count);
+void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
+                          uint32_t* backlog_count);
+
+/* Drains queued RX frames and parses them in TASK context. Called by knetd,
+ * and by the boot-time DHCP loop before the scheduler exists. Must NEVER be
+ * called from interrupt context — that would undo item 1 entirely. */
+void e1000_rx_softirq_run(void);
 void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype);
+
+/* Parse-context accounting: irq_ctx must always read 0. A nonzero value means
+ * handle_packet() ran inside an ISR again, undoing doc/NETWORK_ISOLATION.md
+ * item 1. This is what verify-rx-thread-context.sh asserts on. */
+void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx);

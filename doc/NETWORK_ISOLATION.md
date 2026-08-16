@@ -166,7 +166,7 @@ of in neighbouring kernel state.
 Ordered by value per unit of risk. 1–3 are independent of each other; 4 depends on
 all three.
 
-### 1. Move packet parsing out of interrupt context
+### 1. Move packet parsing out of interrupt context — **DONE**
 
 **Why first:** it is the only item that changes the severity of the entire ~8,350-line
 surface at once, and it repairs the budget mechanism described above rather than
@@ -199,6 +199,43 @@ networking still works — assert on `__interrupt_context_depth` observed inside
 `handle_packet`, or on a preemption that could not occur with `IF=0`. Per
 `harness-design-principles`: a test that shows "ping still replies" passes against
 the unfixed kernel and proves nothing.
+
+#### How it was resolved
+
+`rx_softirq_ring` in `e1000.c` (a `RX_BUF_SIZE` slot per descriptor), fed by
+`rx_softirq_enqueue()` in the top half and drained by `e1000_rx_softirq_run()` from
+`task_knetd()` (`test_tasks.c`), mirroring `task_ktimerd` exactly.
+
+- **Overflow policy: drop-newest**, counted as `rx_drop_backlog` and reported on its
+  own `RX backlog:` line in `ifconfig` — deliberately separate from the hardware-side
+  drops, because "knetd fell behind" is a different diagnosis from "the NIC rejected
+  it". Drop-oldest was rejected: it would let an attacker who outruns the consumer
+  evict already-accepted legitimate frames, whereas drop-newest degrades to an honest
+  "we are full".
+- **The frame is copied** into the ring before RDT is advanced, and copied out again
+  before the lock is released. A retained pointer into `rx_bufs[]` would be an
+  attacker-timed use-after-free in a buffer the attacker refills.
+- **The boot-path question** — the sharpest edge, per the note above — was resolved by
+  keeping it explicit rather than implicit: the DHCP wait loop in `kernel.c` calls
+  `e1000_rx_softirq_run()` directly after `e1000_poll_rx()`, because `knetd` does not
+  exist yet at that point. An intermediate `rx_softirq_ran` flag was tried and
+  reverted: it would have silently masked a stalled `knetd`.
+
+**Harness: `verify-rx-thread-context.sh`.** `handle_packet()` counts its own calls by
+context via `in_interrupt_context()`; `ifconfig` reports `RX parsed: N thread-ctx,
+M irq-ctx`. The assertion is two-sided — thread-ctx must rise by the injected count,
+and irq-ctx must be 0 at *every* reading — because each half alone passes a broken
+build: irq-ctx == 0 is trivially true when no frame ever arrives, and a rising
+thread-ctx is trivially true on a kernel that parses in *both* contexts.
+
+The negative control proved that concretely. Restoring the in-ISR call in the primary
+loop only, leaving the drain loop deferred, produced `4 thread-ctx, 16 irq-ctx` — 16
+being exactly `E1000_RX_PACKET_BUDGET`. A delta-only harness would have passed that
+kernel. The 16/4 split is also the tidiest statement of the original bug: the attacker's
+arrival rate decided how much of the parser ran with `IF=0`.
+
+Also re-ran `verify-ids-signature.sh`, which needs a DHCP lease and inbound UDP and so
+covers the boot-drain path this harness's NAT-less netdev cannot reach. Both pass.
 
 ### 2. Remove the remotely-floodable `kprintf` sites — **DONE**
 
@@ -269,9 +306,10 @@ Design the harness before the code.
 ## Sequencing
 
 1. ~~**Item 2**~~ — **done**, `verify-rxdrop-counters.sh`.
-2. **Item 1** — the substantive win; needs the boot-path question resolved first.
-   Next up.
-3. **Item 3** — independent of both; can land in any order.
+2. ~~**Item 1**~~ — **done**, `verify-rx-thread-context.sh` (+ `verify-ids-signature.sh`
+   for the DHCP/boot-drain path). The boot-path question was the sharp edge as
+   predicted; it is resolved with an explicit drain in `kernel.c`'s DHCP loop.
+3. **Item 3** — independent of both; can land in any order. **Next up.**
 4. **Item 4** — its own roadmap entry, after 1–3, with its harness designed up front.
 
 ## Corrections to the first-pass assessment
@@ -287,3 +325,11 @@ Recorded so the reasoning is auditable:
   They are **inert on the IRQ path** because `critical_section_exit()` will not touch
   `IF` while `__interrupt_context_depth > 0`. This strengthens item 1 considerably and
   was only visible by reading `src/critical.h` rather than the driver's own comments.
+  Item 1's negative control later put a number on it: with the in-ISR call restored,
+  exactly `E1000_RX_PACKET_BUDGET` (16) frames were parsed with `IF=0` before the
+  budget spilled — the budget bounds which *loop* runs, never the interrupt-off time.
+- Item 1's first harness run was **INCONCLUSIVE from a harness bug, not a kernel one**:
+  a whole-file `grep handle_packet src/e1000.c` source guard matched the bottom half,
+  where that call is the whole point, and so reported the fix as the bug. The guard is
+  now scoped to `e1000_poll_rx()` with a staleness check, so renaming that function
+  fails loudly instead of matching nothing and passing.

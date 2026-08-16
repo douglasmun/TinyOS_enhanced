@@ -58,9 +58,21 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   `critical_section_exit()` only touches `IF` when `__interrupt_context_depth == 0`, and
   that clause is deliberate (a `popfl` mid-ISR would corrupt the preempted thread's
   flags). So `e1000_poll_rx`'s mid-loop unlocks and its post-budget "process with
-  interrupts RE-ENABLED" block are depth decrements only — the whole parser runs with
-  `IF=0`, and `E1000_RX_PACKET_BUDGET` does not bound interrupt-off time the way its
-  comments claim. Don't trust those comments; see `doc/NETWORK_ISOLATION.md`.
+  interrupts RE-ENABLED" block are depth decrements only, and `E1000_RX_PACKET_BUDGET`
+  does not bound interrupt-off time the way its comments claim. Don't trust those
+  comments; see `doc/NETWORK_ISOLATION.md`.
+- **The RX path parses in *task* context, on `knetd` — keep it that way.** The ISR only
+  copies each frame into `rx_softirq_ring` and returns; `e1000_rx_softirq_run()` drains
+  it and calls `handle_packet()` with `IF=1`. Never call `handle_packet()` (or anything
+  that reaches the parser) from an ISR — that is the ~8,350-line surface running with
+  interrupts disabled at a remote host's chosen rate. Three things easy to undo: the
+  frame **must be copied** before RDT is advanced (the NIC refills that descriptor, so a
+  retained `rx_bufs[]` pointer is an attacker-timed UAF); the boot DHCP loop in
+  `kernel.c` **must keep its explicit `e1000_rx_softirq_run()` call**, because `knetd`
+  does not exist yet there (a "did it run" flag was tried and reverted — it masks a
+  stalled `knetd`); and ring overflow is **drop-newest**, counted, because drop-oldest
+  lets a fast sender evict frames already accepted. `ifconfig`'s `irq-ctx` count must
+  read **0**. Harness: `verify-rx-thread-context.sh`.
 - **Route user-facing output through `stream_printf(get_current_streams())`**, not
   `kprintf` — the latter goes to the kernel console, which a shell session doesn't show.
 - **`MAX_SYSCALL_NUM` must cover the highest syscall number**, not the highest in its own

@@ -140,15 +140,24 @@ void cmd_ifconfig(void) {
      * doc/NETWORK_ISOLATION.md item 2. Reported here so the events stay
      * visible under load, which a suppressed print would not be. */
     uint32_t tx_count = 0, rx_count = 0;
-    uint32_t err_drops = 0, badlen_drops = 0, runt_drops = 0, ethertype_drops = 0;
+    uint32_t err_drops = 0, badlen_drops = 0, backlog_drops = 0;
+    uint32_t runt_drops = 0, ethertype_drops = 0;
+    uint32_t parse_thread = 0, parse_irq = 0;
     e1000_get_stats(&tx_count, &rx_count);
-    e1000_get_drop_stats(&err_drops, &badlen_drops);
+    e1000_get_drop_stats(&err_drops, &badlen_drops, &backlog_drops);
     net_get_drop_stats(&runt_drops, &ethertype_drops);
+    net_get_parse_stats(&parse_thread, &parse_irq);
 
     kprintf("  RX packets:   %u\n", rx_count);
     kprintf("  TX packets:   %u\n", tx_count);
     kprintf("  RX dropped:   %u hw-error, %u bad-length, %u runt, %u unsupported-ethertype\n",
             err_drops, badlen_drops, runt_drops, ethertype_drops);
+    /* Separate line: a backlog drop means knetd fell behind, which is a
+     * different diagnosis from any hardware-side drop above. */
+    kprintf("  RX backlog:   %u dropped (softirq ring full)\n", backlog_drops);
+    /* irq-ctx must read 0. Nonzero means the parser ran inside an ISR, i.e.
+     * doc/NETWORK_ISOLATION.md item 1 has been undone. */
+    kprintf("  RX parsed:    %u thread-ctx, %u irq-ctx\n", parse_thread, parse_irq);
     kprintf("\n");
 }
 
