@@ -195,7 +195,13 @@ static void pci_enable_bus_mastering(uint8_t bus, uint8_t slot, uint8_t func) {
  * PURPOSE: Find E1000 NIC and configure it for operation
  *============================================================================*/
 bool pci_find_e1000(uint32_t* mmio_base_out) {
-    kprintf("[PCI] Scanning for E1000 NIC........ [OK]\n");
+    /* No banner here. The old one printed "Scanning ... [OK]" BEFORE the scan
+     * ran, so a machine with no NIC showed an [OK] line immediately followed by
+     * two failure lines. The outcome is reported once, below, when it is
+     * actually known. */
+    unsigned int other_nic_count = 0;
+    uint16_t other_nic_vendor = 0;
+    uint16_t other_nic_device = 0;
 
     /*=========================================================================
      * SECURITY FIX: Use Unsigned Types for Loop Bounds
@@ -214,7 +220,24 @@ bool pci_find_e1000(uint32_t* mmio_base_out) {
                 continue;
             }
             
-            if (vendor == E1000_VENDOR_ID && device == E1000_DEVICE_ID) {
+            if (vendor != E1000_VENDOR_ID || device != E1000_DEVICE_ID) {
+                /* Remember any OTHER network controller so the not-found
+                 * message can name it. Class 0x02 is "network controller" per
+                 * the PCI spec; the subclass is not checked because any of them
+                 * answers the question the message is for. Read from the class
+                 * register (offset 0x08) whose high byte is the base class. */
+                uint32_t class_reg = pci_read_config(bus, slot, 0, 0x08);
+                if (((class_reg >> 24) & 0xFF) == 0x02) {
+                    if (other_nic_count == 0) {
+                        other_nic_vendor = vendor;
+                        other_nic_device = device;
+                    }
+                    other_nic_count++;
+                }
+                continue;
+            }
+
+            {
                 kprintf("[PCI] E1000 at bus=%d, slot=%d, func=0 [OK]\n", bus, slot);
 
                 // Read BAR0 (Memory-Mapped I/O base address)
@@ -248,6 +271,23 @@ bool pci_find_e1000(uint32_t* mmio_base_out) {
         }
     }
     
-    kprintf("[PCI] E1000 not found\n");
+    /* No supported NIC. This is a CONFIGURATION, not a failure: the browser
+     * demo runs under v86, which attaches no network device at all unless the
+     * page passes a `net_device` option, and the kernel is expected to boot and
+     * run without one.
+     *
+     * The message says which NIC was looked for and reports the other NICs the
+     * scan did see, because the previous bare "E1000 not found" read as a fault
+     * and sent people looking for a driver bug that was not there. Naming the
+     * device that IS present is the difference between "your emulator has no
+     * NIC" and "your NIC is unsupported", and those need different answers. */
+    if (other_nic_count == 0) {
+        kprintf("[PCI] No NIC present; networking disabled  [OK]\n");
+    } else {
+        kprintf("[PCI] No supported NIC (want 8086:%04x); found %u other NIC(s), "
+                "first %04x:%04x -- networking disabled  [OK]\n",
+                E1000_DEVICE_ID, other_nic_count,
+                other_nic_vendor, other_nic_device);
+    }
     return false;
 }

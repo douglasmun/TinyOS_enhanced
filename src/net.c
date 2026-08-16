@@ -1964,9 +1964,12 @@ void net_init() {
         // Pass the VIRTUAL address to the E1000 driver
         e1000_init(virtual_base);
         kprintf("[NET] E1000 initialized............. [OK]\n");
-    } else {
-        kprintf("E1000 not found.\n");
     }
+    /* No `else` branch. pci_find_e1000() already reported the outcome, naming
+     * the device it wanted and any other NIC it saw; a second bare "E1000 not
+     * found." here only made a supported configuration look like two errors.
+     * The stack stays initialized either way: everything below runs with no
+     * NIC, and send paths fail harmlessly because e1000_send has no MMIO base. */
 
     /*=========================================================================
      * SECURITY: Initialize ICMP with randomized identifier
