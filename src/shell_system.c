@@ -365,9 +365,16 @@ void cmd_kill(int argc, char* argv[]) {
      *=======================================================================*/
     task_t* current = scheduler_get_current_task();
     if (current && task->uid != current->uid && current->euid != 0) {
-        kprintf("kill: permission denied (not owner, not root)\n");
-        kprintf("Process %d belongs to UID=%d, you are UID=%d\n",
-                pid, task->uid, current->uid);
+        /* Report this exactly as a nonexistent PID would be reported.
+         *
+         * `ps` now shows an unprivileged user only their OWN processes
+         * (shell_monitor.c task_visible_to_current), so distinguishing "exists
+         * but is not yours" from "does not exist" here would hand back the
+         * process existence that listing withholds -- a user could enumerate
+         * every live PID, and the old message named the OWNER's UID on top of
+         * that. Same set of processes, same answer, whichever command is used.
+         */
+        kprintf("kill: no such process: %d\n", pid);
         return;
     }
 

@@ -16,6 +16,48 @@
 #include <stdint.h>
 
 /*=============================================================================
+ * HELPER: May the calling session see this task?
+ *
+ * POLICY: an unprivileged user sees ONLY their own processes; root sees all.
+ *
+ * The alternative -- everyone sees everything, as on a stock Unix -- leaks what
+ * root is running to any logged-in user: process NAMES and argv are visible in
+ * `ps`, so a root-run recovery or maintenance command becomes an announcement.
+ * On a single-user teaching kernel that is a poor default, and own-only is the
+ * conservative direction: it can be relaxed later without breaking anyone,
+ * whereas tightening it afterwards would.
+ *
+ * Matches the existing kill/waitpid rule (shell_system.c cmd_kill,
+ * syscall.c sys_waitpid), so what you can SEE and what you can SIGNAL are the
+ * same set -- a `ps` listing a process you may not kill, or a `kill` refusing a
+ * PID `ps` never showed, are both worse than one consistent rule.
+ *
+ * euid for the privilege decision, real uid for ownership -- the convention
+ * used throughout this kernel. euid is what a setuid program drops to give up
+ * authority; real uid is the account that owns the resource.
+ *
+ * KERNEL TASKS are hidden from unprivileged users along with everything else:
+ * they are uid 0. That is deliberate -- the EDR daemon's presence and the idle
+ * task's timing are exactly the sort of machine state this policy withholds.
+ *===========================================================================*/
+static bool task_visible_to_current(const task_t* task) {
+    if (!task) {
+        return false;
+    }
+
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return true;  /* No session context: kernel-internal caller, show all */
+    }
+
+    if (self->euid == 0) {
+        return true;  /* root sees everything */
+    }
+
+    return task->uid == self->uid;
+}
+
+/*=============================================================================
  * HELPER: Get task state string
  *=============================================================================*/
 static const char* get_state_string(task_state_t state) {
@@ -115,16 +157,24 @@ void cmd_ps_extended(int argc, char** argv) {
     }
 
     // Print each task (validate before accessing)
+    int shown = 0;
     for (int i = 0; i < count; i++) {
         task_t* task = tasks[i];
 
         // Validate task pointer and ensure it's not a freed slot (pid != 0)
         if (!task || task->pid == 0) continue;
 
+        /* Own-only for unprivileged users; see task_visible_to_current. */
+        if (!task_visible_to_current(task)) {
+            continue;
+        }
+
         // Skip terminated unless -a
         if (!show_all && task->state == TASK_STATE_TERMINATED) {
             continue;
         }
+
+        shown++;
 
         if (long_format) {
             const char* type = task->is_kernel_task ? "KERNEL" : "USER";
@@ -148,7 +198,10 @@ void cmd_ps_extended(int argc, char** argv) {
         }
     }
 
-    stream_printf(ctx, "\nTotal: %d process(es)\n", count);
+    /* `shown`, not `count`: printing the raw table total would tell an
+     * unprivileged user exactly how many processes they are not allowed to
+     * see, which is most of what hiding them was meant to withhold. */
+    stream_printf(ctx, "\nTotal: %d process(es)\n", shown);
 }
 
 /*=============================================================================
@@ -289,9 +342,16 @@ void cmd_top(int argc, char** argv) {
         int sleeping_count = 0;
         int zombie_count = 0;
 
+        /* Aggregate counts cover only what this session may see, for the same
+         * reason ps totals `shown` rather than `count`: a "12 total" against a
+         * two-row table states the size of what is being withheld. */
+        int visible_count = 0;
         for (int i = 0; i < task_count; i++) {
             // Validate task pointer and ensure it's not a freed slot
             if (!tasks[i] || tasks[i]->pid == 0) continue;
+            if (!task_visible_to_current(tasks[i])) continue;
+
+            visible_count++;
 
             switch (tasks[i]->state) {
                 case TASK_STATE_RUNNING:    running_count++; break;
@@ -304,7 +364,7 @@ void cmd_top(int argc, char** argv) {
         }
 
         kprintf("Tasks: %d total (%d run, %d ready, %d block, %d sleep, %d zombie)\n\n",
-                task_count, running_count, ready_count, blocked_count, sleeping_count, zombie_count);
+                visible_count, running_count, ready_count, blocked_count, sleeping_count, zombie_count);
 
         // Top processes by CPU time
         kprintf("PID  STATE  %%CPU  TICKS   NAME\n");
@@ -335,14 +395,27 @@ void cmd_top(int argc, char** argv) {
             quicksort_tasks(tasks, 0, task_count - 1);
         }
 
-        // Display top processes (up to 10)
-        int display_count = task_count < 10 ? task_count : 10;
-        for (int i = 0; i < display_count; i++) {
+        /* Display the top 10 VISIBLE processes.
+         *
+         * The cap is applied after the visibility filter, not before: taking
+         * tasks[0..9] of the sorted array first and then hiding what the user
+         * may not see would show an unprivileged user an EMPTY table whenever
+         * root's tasks happened to occupy the ten busiest slots -- the list
+         * would silently depend on other users' CPU time.
+         *
+         * The percentage denominator stays system-wide on purpose: %CPU is a
+         * share of the machine, and rescaling it to the visible subset would
+         * report a user's idle process as 100% of a busy system. */
+        int displayed = 0;
+        for (int i = 0; i < task_count && displayed < 10; i++) {
             task_t* task = tasks[i];
 
             // Validate task pointer and ensure it's not a freed slot
             if (!task || task->pid == 0) continue;
             if (task->state == TASK_STATE_TERMINATED) continue;
+            if (!task_visible_to_current(task)) continue;
+
+            displayed++;
 
             uint32_t cpu_percent = 0;
             if (total_ticks > 0) {

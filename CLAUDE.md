@@ -58,6 +58,13 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   page-table copy-on-write in `pae_map_page_into`, and the interrupt masking around
   PBKDF2 / sha256 / `csprng_reseed`. Each is load-bearing; `doc/KERNEL_BUGS.md` and
   `doc/CRYPTO_INVARIANTS.md` say what breaks.
+- **Process visibility is own-only; root sees all.** `task_visible_to_current()` in
+  `shell_monitor.c` is the single predicate — use it for any new command that lists
+  tasks, rather than writing the uid check again. Two corollaries that are easy to
+  miss: totals must count only the rows actually printed (a raw total states how many
+  processes are being withheld), and a filtered-out PID must be reported as
+  **nonexistent**, never "permission denied" — `cmd_kill` and `sys_waitpid` both do
+  this, so a user cannot enumerate live PIDs through the error message.
 - **Making a path reachable from ring 3 turns latent bugs into corruption primitives.**
   This recurred in PRs #45, #47, #54, #55 — every time, dead or kernel-only code carried
   serious bugs. Audit the path in the same PR that exposes it.
@@ -95,12 +102,10 @@ limiter itself (`doc/KERNEL_BUGS.md`).
 Open, in rough priority order:
 
 - **`ps`/`kill`/`top` in ring 3** — the next migration step. `shell_monitor.c` is already
-  stream-routed, so this is a **policy** question (what may an unprivileged process see
-  and signal), not plumbing. Do this before `shell_system.c`, which needs ~222 `kprintf`
-  conversions.
+  stream-routed and the **visibility policy is now decided and enforced** (below), so
+  what remains is plumbing: a syscall to expose the listing. Do this before
+  `shell_system.c`, which needs ~222 `kprintf` conversions.
 - **AUDIT-8E IDS-not-wired gap.**
-- **`ps`/`kill`/`top` visibility policy** — undecided: may an unprivileged user see all
-  processes (leaks what root runs) or only their own? Needed before that migration.
 
 ## Not compiled (don't audit/fix)
 

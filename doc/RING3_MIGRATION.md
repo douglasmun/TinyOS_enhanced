@@ -476,10 +476,10 @@ no refusal.
 They are **NOT one group**:
 
 - `ps`/`kill`/`top` live in `shell_monitor.c`, which is already **stream-routed**
-  (16 `stream_printf` vs 10 `kprintf`), so exposing them is a **policy** question
-  — what may an unprivileged process see and signal — not an output-plumbing one.
-  Note `shell_monitor.c` currently has no privilege checks at all, though
-  `cmd_kill` does check ownership.
+  (16 `stream_printf` vs 10 `kprintf`). Exposing them was a **policy** question —
+  what may an unprivileged process see and signal — and that policy is now
+  **decided and enforced**; see below. What remains is a syscall to carry the
+  listing to ring 3.
 - `pae`/`mem`/`wxaudit`/`auditlog`/`shutdown` live in `shell_system.c`, which has
   ~222 `kprintf` and zero `stream_printf`: reaching those from ring 3 means the
   same conversion done for the three credential commands, but two orders of
@@ -487,6 +487,51 @@ They are **NOT one group**:
 
 Do `ps`/`kill` first if this is picked up; do not convert `shell_system.c`
 wholesale on the way.
+
+## Process visibility policy — DECIDED
+
+**An unprivileged user sees only their own processes; root sees all.**
+
+The alternative — everyone sees everything, as on a stock Unix — leaks what root
+is running to any logged-in user. Process names and argv are visible in `ps`, so
+a root-run recovery or maintenance command becomes an announcement. On a
+single-user teaching kernel that is a poor default, and own-only is the
+conservative direction: it can be relaxed later without breaking anyone, whereas
+tightening it afterwards would.
+
+The rule lives in **one** predicate, `task_visible_to_current()`
+(`shell_monitor.c`), shared by `ps` and `top` so the two cannot drift apart. It
+uses **euid for the privilege decision and real uid for ownership**, matching
+`cmd_kill` and `sys_waitpid` — so what you can *see* and what you can *signal*
+are the same set. A `ps` listing a process you may not kill, or a `kill`
+refusing a PID `ps` never showed, are both worse than one consistent rule.
+
+Kernel tasks (Idle, the EDR daemon) are uid 0 and therefore hidden from
+unprivileged users along with everything else. That is deliberate: the EDR
+daemon's presence and the idle task's timing are exactly the machine state this
+policy withholds.
+
+Three consequences that are easy to get wrong, each fixed here:
+
+- **Totals must count only what was printed.** `ps` reported the raw table
+  count, which states precisely how many processes are being withheld — most of
+  what hiding them was for. Both `ps` and `top` now count visible rows.
+- **`top` must filter before it truncates.** It sorted by CPU time and took the
+  first ten, so filtering afterwards would show an unprivileged user an *empty*
+  table whenever root's tasks happened to occupy the ten busiest slots. The
+  %CPU denominator deliberately stays system-wide: %CPU is a share of the
+  machine, and rescaling to the visible subset would report a user's idle
+  process as 100% of a busy system.
+- **Errors must not leak existence.** `cmd_kill` answered "permission denied
+  (not owner)" and named the owner's UID, which confirms the PID is live and
+  lets a user enumerate every live PID. It now reports a foreign PID exactly as
+  it reports a nonexistent one; `sys_waitpid` likewise returns `-ECHILD` rather
+  than `-EPERM`.
+
+Harness: `verify-psvisibility.sh`. Its load-bearing assertion is the **paired
+positive** — the user must see their *own* process. "The unprivileged user sees
+fewer rows than root" is also satisfied by a `ps` that shows them nothing, which
+is not the policy and would be a plainly broken `ps`.
 
 ## Task-slot exhaustion — CLOSED
 
