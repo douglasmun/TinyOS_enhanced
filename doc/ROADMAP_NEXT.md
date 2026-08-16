@@ -80,11 +80,33 @@ volume persists.
 Still limited to the **root directory** and to `fat32_create`'s first root
 cluster; subdirectory creation and multi-cluster root scans remain future work.
 
-## 4. Move the shell to userspace (capstone)
+## 4. Move the shell to userspace (capstone) — IN PROGRESS
 Deferred design item; depends on 1–3 (shell needs spawn, waitpid, file
 syscalls to live in ring 3). Once done, the kernel/user boundary becomes
 architecturally honest — the kernel stops containing its own UI. Largest
 item; do last.
+
+**Landed so far:** the ring-3 shell is the default login shell (PR #51), with
+redirection, pipelines, the credential commands, `ps`/`kill`/`top`, and
+`cp`/`mv`/`touch` — ~25 builtins against the kernel shell's ~70.
+
+**The remaining gap is smaller than the raw count suggests.** Of the ~36
+commands the ring-3 shell lacks, roughly 20 are machine-state and security
+tooling (`pae`, `mem`, `aslr`, `wxaudit`, `auditlog`, the networking stack)
+that **should stay kernel-only**: PR #58 gated them behind `require_root`
+precisely because `pae`+`mem`+`aslr`+`wxaudit` together are an ASLR defeat
+readable by any user. Exposing them to ring 3 would re-open that. `exec` is
+not a gap either — the ring-3 shell already spawns `.elf` files directly.
+
+What is genuinely left is one coherent group needing **new syscalls**:
+`env`/`export`/`set`/`unset`/`alias` (needs an environment the kernel can
+hand across the ring boundary), `chmod`, and `date`. Each adds ring-3-reachable
+kernel surface, so it belongs in its own PR with its own audit — see the
+recurring lesson in CLAUDE.md that exposing a path to ring 3 turns latent bugs
+into corruption primitives (PRs #45, #47, #54, #55).
+
+Doing `cp`/`mv`/`touch` also surfaced a live kernel bug in a shipping builtin:
+`open(O_TRUNC)` was a no-op on the RAM disk. See `doc/KERNEL_BUGS.md`.
 
 ## Hygiene (fold into whichever PR comes first)
 Known, low-severity, from the PR #1 audit (see memory `exec-failure-path-leaks`):

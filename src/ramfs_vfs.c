@@ -171,6 +171,37 @@ static int ramfs_vfs_open(const char* path, int flags, void** private_data) {
         // kprintf("[RAMFS VFS DEBUG] ramfs_open failed, fd=%d\n", ramfs_fd);
         return VFS_ENOENT;  /* File not found or other error */
     }
+
+    /* O_TRUNC on an existing file, matching fat32_vfs_open's handling.
+     *
+     * This was silently dropped before: ramfs_open takes a uint8_t of
+     * RAMFS_FLAG_* and cannot represent VFS_O_TRUNC (0x0200) at all, so the
+     * translation above only ever carried the access mode. sys_open validates
+     * the flag and passes it down, and then nothing acted on it.
+     *
+     * The consequence is data corruption, not a missing feature, because
+     * ramfs_write only ever GROWS node->size: rewriting a long file with a
+     * short one leaves the previous tail in place, still inside node->size and
+     * still reachable by read().
+     *
+     * Measured on a real boot, `write /p.txt BBB` over thirty A's:
+     *
+     *   without this call:  stat -> size=31    (28 stale bytes retained)
+     *   with this call:     stat -> size=4     ("BBB" + newline)
+     *
+     * Note that `cat` prints "BBB" in BOTH cases, so a content check cannot
+     * see this bug -- only the size can. verify-ring3-fileops.sh asserts on
+     * stat for exactly that reason; an earlier cat-based version of it passed
+     * against a build with this call removed.
+     *
+     * stdio.c's `>` handling hit exactly this and fixed it locally by calling
+     * ramfs_truncate() itself. That fixed redirection and left every
+     * open(O_TRUNC) caller broken -- which was every ring-3 user of the flag,
+     * since userspace has no other way to ask for truncation. Doing it here
+     * instead means the flag works wherever it is passed. */
+    if (flags & VFS_O_TRUNC) {
+        ramfs_truncate(ramfs_fd);
+    }
     // kprintf("[RAMFS VFS DEBUG] ramfs_open succeeded, fd=%d\n", ramfs_fd);
 
     /* Allocate type-safe handle */

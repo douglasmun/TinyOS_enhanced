@@ -72,6 +72,9 @@ static void cmd_help(void) {
           "  rmdir <dir>...    remove empty directories\n"
           "  rm <file>...      remove files\n"
           "  write <f> <text>  write text to a file (truncates)\n"
+          "  cp <src> <dst>    copy a file\n"
+          "  mv <src> <dst>    move a file (copy then remove)\n"
+          "  touch <file>...   create a file if it does not exist\n"
           "  getpid            print this shell's pid\n"
           "  id                print uid and gid\n"
           "  ps [-l]           list your processes (root: all)\n"
@@ -247,6 +250,181 @@ static void cmd_path_op(int argc, char** argv, path_op_t op, const char* name) {
         if (err < 0) {
             fail(name, argv[i], err);
         }
+    }
+}
+
+/*-----------------------------------------------------------------------------
+ * cp / mv / touch
+ *
+ * All three are pure userspace: open/read/write/stat/unlink already cross the
+ * ring boundary, so nothing here needed a new syscall.
+ *---------------------------------------------------------------------------*/
+
+/* Returns 1 if `path` is a directory, 0 if it is not, and 0 if it does not
+ * exist (the caller's subsequent open() reports the real error -- deciding
+ * "missing" here would duplicate that and get the errno wrong). */
+static int is_dir(const char* path) {
+    dirent_t st;
+    if (stat(path, &st, sizeof(st)) < 0) return 0;
+    return st.type == DT_DIR;
+}
+
+/* Copies src -> dst, returning 0 or a negative errno.
+ *
+ * O_TRUNC is load-bearing, not decoration: ramfs_write only ever GROWS a
+ * file, so copying a short file over a longer one without truncating leaves
+ * the previous tail in place. That flag was silently ignored by the ramfs VFS
+ * layer until this change wired it to ramfs_truncate() -- see ramfs_vfs.c. A
+ * cp built on the old behaviour would have quietly corrupted its output.
+ *
+ * The buffer is 128 bytes to match cat_fd(); this runs on the ring-3 stack,
+ * so it stays small deliberately. */
+static int copy_file(const char* src, const char* dst, const char* who) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return in;
+
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    if (out < 0) {
+        close(in);
+        return out;
+    }
+
+    char buf[128];
+    int rc = 0;
+    for (;;) {
+        int n = read(in, buf, sizeof(buf));
+        if (n < 0) { rc = n; break; }
+        if (n == 0) break;
+
+        /* Loop on the write: a short write is not an error, and treating it
+         * as completion would truncate the copy silently. cat_fd() ignores
+         * this because a short write to the console costs a garbled line;
+         * here it would cost file contents. */
+        int off = 0;
+        int stalled = 0;
+        while (off < n) {
+            int w = write(out, buf + off, (size_t)(n - off));
+            if (w < 0) { rc = w; break; }
+            if (w == 0) { stalled = 1; break; }  /* no progress; see below */
+            off += w;
+        }
+        if (rc < 0) break;
+        if (stalled) {
+            /* write() returned 0 with bytes still pending. Retrying would
+             * spin forever, and there is no errno in the userspace headers
+             * that honestly describes it, so report it in plain terms rather
+             * than borrowing a code that means something else. */
+            printf("%s: %s: write stalled with %d byte(s) unwritten\n",
+                   who, dst, n - off);
+            rc = -1;
+            break;
+        }
+    }
+
+    close(in);
+    close(out);
+    return rc;
+}
+
+static void cmd_cp(int argc, char** argv) {
+    if (argc != 3) {
+        print("usage: cp <src> <dst>\n");
+        return;
+    }
+
+    /* Refuse both directory operands rather than half-doing them. There is no
+     * readdir-based recursive walk here and no rename syscall, so `cp -r` and
+     * "copy into a directory" would each be a different feature; failing
+     * clearly beats creating a file whose name happens to be a directory's. */
+    if (is_dir(argv[1])) {
+        printf("cp: %s: is a directory\n", argv[1]);
+        return;
+    }
+    if (is_dir(argv[2])) {
+        printf("cp: %s: is a directory\n", argv[2]);
+        return;
+    }
+
+    /* Self-copy would otherwise open the same file for read and for write,
+     * and the O_TRUNC above would empty it before the first read -- turning
+     * `cp f f` into `rm f`. Compared by path string, which is the only
+     * identity userspace can see: there is no inode number in dirent_t. That
+     * catches the literal case; two different paths naming one file (via a
+     * symlink) are not detectable from here and are not claimed to be. */
+    if (strcmp(argv[1], argv[2]) == 0) {
+        printf("cp: %s and %s are the same file\n", argv[1], argv[2]);
+        return;
+    }
+
+    int rc = copy_file(argv[1], argv[2], "cp");
+    if (rc < 0) fail("cp", argv[1], rc);
+}
+
+static void cmd_mv(int argc, char** argv) {
+    if (argc != 3) {
+        print("usage: mv <src> <dst>\n");
+        return;
+    }
+
+    if (is_dir(argv[1])) {
+        printf("mv: %s: is a directory\n", argv[1]);
+        return;
+    }
+    if (is_dir(argv[2])) {
+        printf("mv: %s: is a directory\n", argv[2]);
+        return;
+    }
+
+    /* `mv f f` is a no-op, and must NOT fall through to copy-then-unlink --
+     * that sequence would copy the file onto itself and then delete it. */
+    if (strcmp(argv[1], argv[2]) == 0) {
+        return;
+    }
+
+    /* Copy then unlink, because there is no rename syscall. This is not
+     * atomic: an interruption between the two steps leaves both files, which
+     * is the recoverable direction. The unlink is deliberately conditional on
+     * the copy succeeding -- unlinking first, or unconditionally, would lose
+     * the source when the destination could not be written (no space, no
+     * permission), and the source is the only copy the user still has. */
+    int rc = copy_file(argv[1], argv[2], "mv");
+    if (rc < 0) {
+        fail("mv", argv[1], rc);
+        return;
+    }
+
+    rc = unlink(argv[1]);
+    if (rc < 0) {
+        /* The data is safe in dst; say so rather than reporting a bare
+         * failure, because the user's next move depends on which file now
+         * holds their content. */
+        printf("mv: %s: copied to %s but source not removed: %s\n",
+               argv[1], argv[2], errstr(rc));
+    }
+}
+
+static void cmd_touch(int argc, char** argv) {
+    if (argc < 2) {
+        print("usage: touch <file>...\n");
+        return;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        /* No O_TRUNC: touch must not destroy an existing file's contents.
+         * Opening for write is what creates a missing one -- ramfs_open
+         * auto-creates on write, which is why O_CREAT alone is enough and why
+         * this cannot be an O_RDONLY open.
+         *
+         * There is no utime syscall, so this does not update a timestamp on a
+         * file that already exists; it is create-if-missing only. Said plainly
+         * because a `touch` that silently fails to do the other half of its
+         * job is worse than one that never claimed to. */
+        int fd = open(argv[i], O_WRONLY | O_CREAT);
+        if (fd < 0) {
+            fail("touch", argv[i], fd);
+            continue;
+        }
+        close(fd);
     }
 }
 
@@ -938,6 +1116,9 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "cat") == 0)    { cmd_cat(argc, argv);      return 0; }
     if (strcmp(cmd, "stat") == 0)   { cmd_stat(argc, argv);     return 0; }
     if (strcmp(cmd, "write") == 0)  { cmd_write(argc, argv);    return 0; }
+    if (strcmp(cmd, "cp") == 0)     { cmd_cp(argc, argv);       return 0; }
+    if (strcmp(cmd, "mv") == 0)     { cmd_mv(argc, argv);       return 0; }
+    if (strcmp(cmd, "touch") == 0)  { cmd_touch(argc, argv);    return 0; }
     if (strcmp(cmd, "id") == 0)     { cmd_id();                 return 0; }
     if (strcmp(cmd, "ps") == 0)     { cmd_ps(argc, argv);       return 0; }
     if (strcmp(cmd, "kill") == 0)   { cmd_kill(argc, argv);     return 0; }
