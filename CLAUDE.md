@@ -84,9 +84,10 @@ corrupted the signature hash until `exec_buffer` and `elf_load_process`'s
 ## Current state
 
 The **ring-3 shell is the default login shell** (PR #51), with the kernel shell as a
-fallback (`kshell` hands over; `exit` logs out). It has ~16 builtins against the kernel
-shell's ~70 — redirection, pipelines, and the credential commands have landed; the
-introspection and machine-state commands are still kernel-shell only.
+fallback (`kshell` hands over; `exit` logs out). It has ~22 builtins against the kernel
+shell's ~70 — redirection, pipelines, the credential commands and now `ps`/`kill`/`top`
+have landed; the machine-state commands (`pae`, `mem`, `wxaudit`, `auditlog`, the
+networking and security tooling) are still kernel-shell only.
 
 Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**. Item 4
 (userspace shell) is in progress. `fork()` was skipped deliberately (PAE, no COW pages).
@@ -99,13 +100,18 @@ the printed message identifies which one refused — see `doc/RING3_MIGRATION.md
 `verify-slotcap.sh`. Fixing this also uncovered a pre-existing refill bug in the rate
 limiter itself (`doc/KERNEL_BUGS.md`).
 
+**`ps`/`kill`/`top` now work from ring 3** via `SYS_PSINFO` (33) / `SYS_KILL` (34), which
+carry the listing across the ring boundary with `task_visible_to_current()` applied
+kernel-side. Two invariants that are easy to undo: `sys_psinfo` walks **raw task slots**
+(`task_get_slot`), not `task_get_all`'s compacted output, because it drops the lock
+between records and a compacted index skips a task when an earlier one exits; and the
+visibility check must read the fields in the **same** critical section that passed it,
+or a reused slot copies another user's name out. Harness: `verify-ring3-ps.sh`.
+
 Open, in rough priority order:
 
-- **`ps`/`kill`/`top` in ring 3** — the next migration step. `shell_monitor.c` is already
-  stream-routed and the **visibility policy is now decided and enforced** (below), so
-  what remains is plumbing: a syscall to expose the listing. Do this before
-  `shell_system.c`, which needs ~222 `kprintf` conversions.
 - **AUDIT-8E IDS-not-wired gap.**
+- **`shell_system.c`** — ~222 `kprintf` conversions before it can move to ring 3.
 
 ## Not compiled (don't audit/fix)
 

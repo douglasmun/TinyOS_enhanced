@@ -36,6 +36,8 @@
 #define SYS_REDIRECT 30
 #define SYS_PIPE     31
 #define SYS_CRED     32
+#define SYS_PSINFO   33
+#define SYS_KILL     34
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -61,6 +63,44 @@ typedef struct {
     uint8_t  reserved;
     char     name[NAME_MAX + 1];
 } dirent_t;
+
+/* Process listing — the kernel copies this out byte-for-byte, so the layout
+ * must stay identical to psinfo_t in src/syscall.h.
+ *
+ * The kernel decides which tasks appear here: an unprivileged process receives
+ * only its own, root receives all. That filtering is not advisory and cannot be
+ * bypassed by calling SYS_PSINFO directly — see the SYS_PSINFO comment in
+ * src/syscall.h. */
+#define PSINFO_NAME_LEN 32
+
+/* task_state_t values, as widened into psinfo_t.state */
+#define PS_READY      0
+#define PS_RUNNING    1
+#define PS_BLOCKED    2
+#define PS_SLEEPING   3
+#define PS_ZOMBIE     4
+#define PS_TERMINATED 5
+
+typedef struct {
+    uint32_t pid;
+    uint32_t ppid;
+    uint32_t state;
+    uint32_t total_ticks;
+    uint32_t time_slice;
+    uint32_t capabilities;
+    uint16_t uid;
+    uint16_t priority;
+    uint8_t  is_kernel_task;
+    uint8_t  reserved[3];
+    char     name[PSINFO_NAME_LEN];
+} psinfo_t;
+
+/* Must match psinfo_t in src/syscall.h byte for byte -- the kernel copies
+ * records straight into a buffer declared with THIS type. The same assertions
+ * are made kernel-side; both must be updated together. */
+_Static_assert(sizeof(psinfo_t) == 64, "psinfo_t layout changed: update src/syscall.h to match");
+_Static_assert(offsetof(psinfo_t, uid) == 24, "psinfo_t.uid moved: update src/syscall.h to match");
+_Static_assert(offsetof(psinfo_t, name) == 32, "psinfo_t.name moved: update src/syscall.h to match");
 
 /* Raw syscall wrappers */
 int syscall0(int num);
@@ -101,6 +141,25 @@ int  readdir(int fd, void* buf, size_t size);
  * size before deciding to read it. `size` must be at least sizeof(dirent_t).
  * Returns 0 on success or a negative errno. */
 int  stat(const char* path, void* buf, size_t size);
+
+/* Fill `buf` with psinfo_t records for the processes this caller may see.
+ * Returns the number of BYTES written (a multiple of sizeof(psinfo_t)) or a
+ * negative errno. A buffer too small for every visible process truncates
+ * rather than failing, so size it at 32 records to get the whole table. */
+int  psinfo(void* buf, size_t size);
+
+/* The two errno values callers actually branch on, named rather than spelled as
+ * bare -1/-3 at the use site. Same numbers as src/errno.h; userspace has no
+ * errno.h of its own, and a magic number here would silently start meaning
+ * something else if the kernel's table were ever renumbered. */
+#define ELIBC_EPERM 1   /* Operation not permitted    (src/errno.h EPERM) */
+#define ELIBC_ESRCH 3   /* No such process            (src/errno.h ESRCH) */
+
+/* Terminate a process. Returns 0, or a negative errno: -ELIBC_ESRCH if no such
+ * process OR one this caller may not see -- the two are deliberately the same
+ * answer, so kill cannot be used to discover PIDs psinfo() hides.
+ * -ELIBC_EPERM means the target is a protected system process. */
+int  kill(int pid);
 
 /* Seek origins — same values as VFS_SEEK_* in src/vfs.h, passed straight
  * through without translation so the two cannot drift apart. */

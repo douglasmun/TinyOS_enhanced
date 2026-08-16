@@ -650,6 +650,24 @@ bool task_is_valid_ptr(const void* p);  /* true if p points at a real tasks[] sl
 bool task_slot_is_live(const task_t* task);  /* true if slot is live + current generation */
 
 /**
+ * @brief May the CURRENT task see this one?
+ *
+ * The single process-visibility predicate: an unprivileged caller sees only
+ * its own tasks, root (euid 0) sees all. euid decides privilege, real uid
+ * decides ownership.
+ *
+ * Lives here rather than in shell_monitor.c because both the kernel shell
+ * (ps/top) and the SYS_PSINFO syscall must apply the SAME rule -- two copies
+ * of a security policy drift, and the ring-3 copy is the one that would be
+ * wrong. Matches cmd_kill and sys_waitpid, so what you can see and what you
+ * can signal stay the same set.
+ *
+ * @param task Candidate task (NULL is not visible)
+ * @return true if the current session may observe this task's existence
+ */
+bool task_visible_to_current(const task_t* task);
+
+/**
  * @brief Terminate a task
  * @param pid Process ID
  */
@@ -687,6 +705,19 @@ uint32_t task_alloc_pid(void);
  * but finds ALL active tasks regardless of PID value.
  */
 int task_get_all(task_t** tasks_out, int max_tasks);
+
+/**
+ * @brief Get the task occupying raw slot @p slot, or NULL if it is not live.
+ * @param slot Index into the internal task table, 0 <= slot < MAX_TASKS
+ * @return Pointer to the live task in that slot, or NULL (free/terminated/OOR)
+ *
+ * The stable-index counterpart to task_get_all(), which COMPACTS its output: a
+ * caller that walks by index across several critical sections skips a process
+ * whenever an earlier one exits mid-walk. A raw slot denotes the same task on
+ * every iteration. Call under CRITICAL_SECTION and do not retain the pointer
+ * past it -- the slot can be reused.
+ */
+task_t* task_get_slot(int slot);
 
 /**
  * @brief Free a task slot in the allocator bitmap (for scheduler cleanup)

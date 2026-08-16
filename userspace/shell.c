@@ -11,10 +11,10 @@
  *
  *     exec /shell.elf
  *
- * Deliberately NOT implemented, because the syscalls do not exist yet:
- * pipes and redirection (need pipe/dup2), and the privileged commands
- * (pae, mem, wxaudit, auditlog, useradd, passwd, shutdown, networking).
- * Those stay in the kernel shell until their syscalls land.
+ * Redirection, pipelines, the credential commands, and ps/kill/top have since
+ * landed. Still kernel-shell only, because their syscalls do not exist:
+ * shutdown/reboot, the security tooling (pae, mem, wxaudit, auditlog) and
+ * networking.
  *=============================================================================*/
 
 #include "libc.h"
@@ -74,6 +74,9 @@ static void cmd_help(void) {
           "  write <f> <text>  write text to a file (truncates)\n"
           "  getpid            print this shell's pid\n"
           "  id                print uid and gid\n"
+          "  ps [-l]           list your processes (root: all)\n"
+          "  kill <pid>        terminate a process\n"
+          "  top               one-shot snapshot of CPU use\n"
           "  passwd [user]     change a password (no arg: your own)\n"
           "  useradd <user>    create a user  (root only)\n"
           "  userdel <user>    delete a user  (root only)\n"
@@ -99,10 +102,15 @@ static void cmd_help(void) {
           "here: this shell never holds one, and cannot leak what it never\n"
           "sees. Permission is the same root check the kernel shell applies.\n"
           "\n"
+          "ps shows YOUR processes; root sees every process. kill answers\n"
+          "the same way: a pid you cannot see reads as 'no such process',\n"
+          "so the two commands agree about what exists. `top` here is a\n"
+          "one-shot snapshot -- kshell's is the live, interactive one.\n"
+          "\n"
           "This shell runs at ring 3 and reaches the system only through\n"
           "syscalls. It does not yet cover everything: shutdown/reboot,\n"
-          "ps/top/kill, the security tooling and networking still live in\n"
-          "the kernel shell. Type `kshell` to get there.\n");
+          "the security tooling and networking still live in the kernel\n"
+          "shell. Type `kshell` to get there.\n");
 }
 
 static void cmd_echo(int argc, char** argv) {
@@ -270,6 +278,201 @@ static void cmd_write(int argc, char** argv) {
 
 static void cmd_id(void) {
     printf("uid=%d gid=%d\n", getuid(), getgid());
+}
+
+/*-----------------------------------------------------------------------------
+ * ps / kill / top
+ *
+ * WHICH processes appear here is the KERNEL's decision, not this shell's: an
+ * unprivileged caller gets only its own records back from psinfo(). Nothing is
+ * filtered on this side, and nothing needs to be -- a program supplying its own
+ * syscall stub would get the same filtered answer. See SYS_PSINFO in
+ * src/syscall.h.
+ *
+ * MAX_PS_RECORDS matches MAX_TASKS in src/process.h: the whole table is the
+ * most the kernel can ever return, so one call always suffices and there is no
+ * pagination to get wrong. 32 * 64 bytes is 2 KB of the 1 MB user stack.
+ *---------------------------------------------------------------------------*/
+#define MAX_PS_RECORDS 32
+
+static const char* ps_state_str(uint32_t state) {
+    switch (state) {
+        case PS_READY:      return "READY";
+        case PS_RUNNING:    return "RUN";
+        case PS_BLOCKED:    return "BLOCK";
+        case PS_SLEEPING:   return "SLEEP";
+        case PS_ZOMBIE:     return "ZOMBI";
+        case PS_TERMINATED: return "TERM";
+        default:            return "UNK";
+    }
+}
+
+/* Shared by ps and top: fetch the visible table into `buf`, returning the
+ * record count, or a negative errno already reported to the user. */
+static int ps_fetch(psinfo_t* buf, const char* who) {
+    int n = psinfo(buf, sizeof(psinfo_t) * MAX_PS_RECORDS);
+    if (n < 0) {
+        printf("%s: %s\n", who, errstr(n));
+        return n;
+    }
+    return n / (int)sizeof(psinfo_t);
+}
+
+static void cmd_ps(int argc, char** argv) {
+    int long_format = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-l") == 0) {
+            long_format = 1;
+        } else if (strcmp(argv[i], "-h") == 0) {
+            print("usage: ps [-l]\n  -l  long format (ppid, priority, ticks)\n");
+            return;
+        }
+    }
+
+    psinfo_t procs[MAX_PS_RECORDS];
+    int count = ps_fetch(procs, "ps");
+    if (count < 0) {
+        return;
+    }
+
+    /* PID and PPID are 5 wide, not 3. PIDs here are NOT sequential --
+     * task_alloc_pid() draws them from the CSPRNG, so a normal boot shows
+     * five-digit values and a 3-wide column overflows on every row, pushing
+     * STATE out of alignment with its own header. */
+    if (long_format) {
+        print("PID    PPID   UID   PRI  STATE  TICKS   NAME\n");
+        print("-----  -----  ---   ---  -----  ------  ----\n");
+    } else {
+        print("PID    STATE  NAME\n");
+        print("-----  -----  ----\n");
+    }
+
+    for (int i = 0; i < count; i++) {
+        psinfo_t* p = &procs[i];
+        if (long_format) {
+            printf("%-5u  %-5u  %-4u  %-3u  %-5s  %-6u  %s\n",
+                   p->pid, p->ppid, p->uid, p->priority,
+                   ps_state_str(p->state), p->total_ticks, p->name);
+        } else {
+            printf("%-5u  %-5s  %s\n", p->pid, ps_state_str(p->state), p->name);
+        }
+    }
+
+    /* The count is what was PRINTED. The kernel already withheld the rest, and
+     * a total larger than the table would restate exactly how many processes
+     * are being hidden -- see the same rule in shell_monitor.c. */
+    printf("\nTotal: %d process(es)\n", count);
+}
+
+static void cmd_kill(int argc, char** argv) {
+    if (argc != 2) {
+        print("usage: kill <pid>\n");
+        return;
+    }
+
+    int pid = atoi(argv[1]);
+    if (pid <= 0) {
+        printf("kill: invalid PID: '%s'\n", argv[1]);
+        return;
+    }
+
+    int err = kill(pid);
+    if (err == 0) {
+        printf("kill: terminated %d\n", pid);
+        return;
+    }
+
+    /* -3 (ESRCH) covers "no such process" AND "not yours", deliberately and
+     * identically: telling them apart would confirm the PID is live and let a
+     * user enumerate what ps hides. Print the same words for both. */
+    if (err == -ELIBC_ESRCH) {
+        printf("kill: no such process: %d\n", pid);
+    } else if (err == -ELIBC_EPERM) {
+        printf("kill: cannot kill protected system process %d\n", pid);
+    } else {
+        printf("kill: %s\n", errstr(err));
+    }
+}
+
+/*-----------------------------------------------------------------------------
+ * top — a SNAPSHOT, not the kernel shell's interactive display.
+ *
+ * The kernel-shell `top` loops on keyboard_has_data() until 'q'. This shell
+ * cannot do that: read() is line-buffered and blocks, so there is no way to
+ * poll for a keypress without stopping the display. Rather than ship a `top`
+ * that traps the session until Enter is pressed, this prints one frame and
+ * returns -- composable with redirection and pipelines, which the interactive
+ * version is not. `kshell` still has the live one.
+ *---------------------------------------------------------------------------*/
+static void cmd_top(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+
+    psinfo_t procs[MAX_PS_RECORDS];
+    int count = ps_fetch(procs, "top");
+    if (count < 0) {
+        return;
+    }
+
+    int running = 0, ready = 0, blocked = 0, sleeping = 0, zombie = 0;
+    uint32_t total_ticks = 0;
+
+    for (int i = 0; i < count; i++) {
+        switch (procs[i].state) {
+            case PS_RUNNING:  running++;  break;
+            case PS_READY:    ready++;    break;
+            case PS_BLOCKED:  blocked++;  break;
+            case PS_SLEEPING: sleeping++; break;
+            case PS_ZOMBIE:   zombie++;   break;
+            default: break;
+        }
+        total_ticks += procs[i].total_ticks;
+    }
+
+    printf("Tasks: %d total (%d run, %d ready, %d block, %d sleep, %d zombie)\n\n",
+           count, running, ready, blocked, sleeping, zombie);
+
+    /* 5-wide PID, as in cmd_ps: these are random, not sequential. */
+    print("PID    STATE  %CPU  TICKS   NAME\n");
+    print("-----  -----  ----  ------  ----\n");
+
+    /* Selection sort by ticks, descending. n is at most 32 and this runs once
+     * per invocation, so the O(n^2) is irrelevant and it needs no scratch
+     * buffer -- the records are swapped in place. */
+    for (int i = 0; i < count; i++) {
+        int max = i;
+        for (int j = i + 1; j < count; j++) {
+            if (procs[j].total_ticks > procs[max].total_ticks) {
+                max = j;
+            }
+        }
+        if (max != i) {
+            psinfo_t tmp = procs[i];
+            procs[i] = procs[max];
+            procs[max] = tmp;
+        }
+    }
+
+    int shown = (count < 10) ? count : 10;
+    for (int i = 0; i < shown; i++) {
+        psinfo_t* p = &procs[i];
+
+        /* Percent of the ticks in THIS listing. For root that is the whole
+         * machine; for an unprivileged user it is a share of their own
+         * processes, which is the only denominator they are entitled to.
+         * Integer math, no FPU in userspace: scale before dividing. */
+        uint32_t pct = (total_ticks > 0)
+                     ? (p->total_ticks * 100u) / total_ticks
+                     : 0;
+
+        printf("%-5u  %-5s  %-4u  %-6u  %s\n",
+               p->pid, ps_state_str(p->state), pct, p->total_ticks, p->name);
+    }
+
+    if (count > shown) {
+        printf("\n(%d more not shown)\n", count - shown);
+    }
 }
 
 /*-----------------------------------------------------------------------------
@@ -736,6 +939,9 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "stat") == 0)   { cmd_stat(argc, argv);     return 0; }
     if (strcmp(cmd, "write") == 0)  { cmd_write(argc, argv);    return 0; }
     if (strcmp(cmd, "id") == 0)     { cmd_id();                 return 0; }
+    if (strcmp(cmd, "ps") == 0)     { cmd_ps(argc, argv);       return 0; }
+    if (strcmp(cmd, "kill") == 0)   { cmd_kill(argc, argv);     return 0; }
+    if (strcmp(cmd, "top") == 0)    { cmd_top(argc, argv);      return 0; }
 
     if (strcmp(cmd, "passwd") == 0)  { cmd_cred(argc, argv, CRED_PASSWD,  "passwd");  return 0; }
     if (strcmp(cmd, "useradd") == 0) { cmd_cred(argc, argv, CRED_USERADD, "useradd"); return 0; }

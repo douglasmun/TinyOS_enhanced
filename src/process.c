@@ -159,6 +159,51 @@ static uint32_t task_count_live_for_uid(uint16_t uid) {
 }
 
 /*=============================================================================
+ * FUNCTION: task_visible_to_current
+ * PURPOSE: The one process-visibility predicate (ps, top, SYS_PSINFO)
+ *
+ * POLICY: an unprivileged user sees ONLY their own processes; root sees all.
+ *
+ * The alternative -- everyone sees everything, as on a stock Unix -- leaks what
+ * root is running to any logged-in user: process NAMES and argv are visible in
+ * `ps`, so a root-run recovery or maintenance command becomes an announcement.
+ * Own-only is also the conservative direction: it can be relaxed later without
+ * breaking anyone, whereas tightening it afterwards would.
+ *
+ * Matches the kill/waitpid rule (shell_system.c cmd_kill, syscall.c
+ * sys_waitpid), so what you can SEE and what you can SIGNAL are the same set --
+ * a `ps` listing a process you may not kill, or a `kill` refusing a PID `ps`
+ * never showed, are both worse than one consistent rule.
+ *
+ * euid for the privilege decision, real uid for ownership -- the convention
+ * used throughout this kernel. euid is what a setuid program drops to give up
+ * authority; real uid is the account that owns the resource.
+ *
+ * KERNEL TASKS are hidden from unprivileged users along with everything else:
+ * they are uid 0. That is deliberate -- the EDR daemon's presence and the idle
+ * task's timing are exactly the sort of machine state this policy withholds.
+ *
+ * Lives in process.c, not shell_monitor.c, because SYS_PSINFO must apply the
+ * identical rule and the syscall layer should not depend on a shell module.
+ *===========================================================================*/
+bool task_visible_to_current(const task_t* task) {
+    if (!task) {
+        return false;
+    }
+
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return true;  /* No session context: kernel-internal caller, show all */
+    }
+
+    if (self->euid == 0) {
+        return true;  /* root sees everything */
+    }
+
+    return task->uid == self->uid;
+}
+
+/*=============================================================================
  * FUNCTION: task_count_free_slots
  * PURPOSE: Count task slots available for allocation
  *===========================================================================*/
@@ -1848,6 +1893,31 @@ int task_get_all(task_t** tasks_out, int max_tasks) {
     }
 
     return count;
+}
+
+/*=============================================================================
+ * FUNCTION: task_get_slot
+ * PURPOSE: Return the task in raw slot `slot`, or NULL if it is not live.
+ *
+ * The STABLE-INDEX counterpart to task_get_all(), which compacts: its output is
+ * dense, so if a task exits between two calls every entry after it shifts down
+ * and an index-based walk silently skips a process. A caller that cannot hold
+ * the lock across its whole loop -- sys_psinfo, which must drop it to
+ * copy_to_user without risking a fault under masked interrupts -- needs an
+ * index that means the same thing on every iteration. A raw slot does; a
+ * position in a compacted list does not.
+ *
+ * Returns NULL for a free or terminated slot, so callers filter exactly as they
+ * would on task_get_all()'s output.
+ *===========================================================================*/
+task_t* task_get_slot(int slot) {
+    if (slot < 0 || slot >= MAX_TASKS) {
+        return NULL;
+    }
+    if (tasks[slot].pid == 0 || tasks[slot].state == TASK_STATE_TERMINATED) {
+        return NULL;
+    }
+    return &tasks[slot];
 }
 
 /*=============================================================================

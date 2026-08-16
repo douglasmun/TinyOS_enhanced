@@ -14,6 +14,9 @@
 #include "audit.h"
 #include "secure_delete.h"
 #include "vfs.h"  /* For CAP_UNKILLABLE */
+#include "syscall.h"  /* sys_kill: the kill policy lives there, not here */
+#include "errno.h"
+#include "critical.h"
 #include "aslr.h"  /* For ASLR statistics */
 #include "paging.h"  /* For PAE/W^X functions */
 #include "security_tests.h"  /* For security test suite */
@@ -352,56 +355,54 @@ void cmd_kill(int argc, char* argv[]) {
         return;
     }
 
-    task_t* task = task_get(pid);
-    if (!task) {
+    /* The name is COPIED OUT before the kill, for the messages below: after
+     * task_terminate the slot may already have been reused, so a task_t*
+     * retained across it would print the wrong process's name.
+     *
+     * Copied under CRITICAL_SECTION and the pointer dropped immediately -- the
+     * same slot reuse applies between task_get() and the read. The name is only
+     * ever displayed on paths sys_kill has already permitted, so this is a
+     * correctness guard on the message, not the policy check; the policy is
+     * sys_kill's alone. */
+    char name[TASK_NAME_LEN];
+    name[0] = '\0';
+    CRITICAL_SECTION_ENTER();
+    {
+        task_t* task = task_get(pid);
+        if (task) {
+            safe_strcpy(name, task->name, sizeof(name));
+        }
+    }
+    CRITICAL_SECTION_EXIT();
+
+    /*=========================================================================
+     * The policy (own-only unless euid 0, CAP_UNKILLABLE protected, and an
+     * invisible PID reported as nonexistent) lives in sys_kill, so the kernel
+     * shell and ring 3 cannot drift apart. This function is now presentation:
+     * it turns the errno into the messages this shell has always printed.
+     *
+     * -ESRCH covers both "no such process" and "not yours" deliberately --
+     * distinguishing them would let a user enumerate every live PID, which is
+     * exactly what filtering `ps` was meant to prevent.
+     *=======================================================================*/
+    int rc = sys_kill(pid);
+
+    if (rc == -ESRCH) {
         kprintf("kill: no such process: %d\n", pid);
         return;
     }
-
-    /*=========================================================================
-     * SECURITY: Privilege check for kill command
-     * - Allow killing own processes
-     * - Require root to kill other users' processes
-     *=======================================================================*/
-    task_t* current = scheduler_get_current_task();
-    if (current && task->uid != current->uid && current->euid != 0) {
-        /* Report this exactly as a nonexistent PID would be reported.
-         *
-         * `ps` now shows an unprivileged user only their OWN processes
-         * (shell_monitor.c task_visible_to_current), so distinguishing "exists
-         * but is not yours" from "does not exist" here would hand back the
-         * process existence that listing withholds -- a user could enumerate
-         * every live PID, and the old message named the OWNER's UID on top of
-         * that. Same set of processes, same answer, whichever command is used.
-         */
-        kprintf("kill: no such process: %d\n", pid);
-        return;
-    }
-
-    /*=========================================================================
-     * SECURITY FIX (v1.20): Protect processes with CAP_UNKILLABLE capability
-     *
-     * CRITICAL: Instead of hardcoding process names, check the CAP_UNKILLABLE
-     * capability flag. This provides a generic protection mechanism that works
-     * for any critical system process.
-     *
-     * Protected processes include:
-     * - Shell: Main shell (set by process_init or manually)
-     * - Idle: Idle task (set by process_init or manually)
-     * - edr_daemon: EDR monitoring daemon (self-protects on startup)
-     * - Any future critical system services
-     *
-     * The capability is enforced at both the shell command level (here) and
-     * the kernel syscall level (task_terminate in process.c).
-     *=======================================================================*/
-    if (task->capabilities & CAP_UNKILLABLE) {
-        kprintf("kill: cannot kill protected system process '%s' (PID %d, CAP_UNKILLABLE)\n", task->name, pid);
+    if (rc == -EPERM) {
+        kprintf("kill: cannot kill protected system process '%s' (PID %d, CAP_UNKILLABLE)\n",
+                name, pid);
         kprintf("Processes 'Shell' and 'Idle' are essential and cannot be terminated.\n");
         return;
     }
+    if (rc < 0) {
+        kprintf("kill: invalid PID: %d\n", pid);
+        return;
+    }
 
-    kprintf("Terminating task %d (%s)...\n", pid, task->name);
-    task_terminate(pid);
+    kprintf("Terminating task %d (%s)...\n", pid, name);
     kprintf("Task terminated.\n");
 }
 

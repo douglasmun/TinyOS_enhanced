@@ -106,6 +106,14 @@ int chdir(const char* path) {
     return syscall1(SYS_CHDIR, (uint32_t)(uintptr_t)path);
 }
 
+int psinfo(void* buf, size_t size) {
+    return syscall3(SYS_PSINFO, (uint32_t)(uintptr_t)buf, (uint32_t)size, 0);
+}
+
+int kill(int pid) {
+    return syscall1(SYS_KILL, (uint32_t)pid);
+}
+
 int redirect(int fd, const char* path, int mode) {
     return syscall3(SYS_REDIRECT, (uint32_t)fd, (uint32_t)(uintptr_t)path,
                     (uint32_t)mode);
@@ -151,7 +159,15 @@ int readline(char* buf, size_t size) {
 }
 
 /*-----------------------------------------------------------------------------
- * printf — supports %c %s %d %i %u %x %p %%, no width/precision.
+ * printf — supports %c %s %d %i %u %x %p %%, an optional minimum field width
+ * and a leading '-' to left-align within it. No precision, no '0' padding.
+ *
+ * Width is not a nicety: without it an unknown conversion like "%-3u" fell into
+ * the default case, printed "%-" literally, consumed NO argument, and every
+ * later conversion in that call took the WRONG one -- a %s then dereferenced an
+ * integer and the process took a page fault. Any column-aligned output (ps,
+ * top) needs this, so it is implemented rather than worked around.
+ *
  * Output is batched into a buffer to keep syscall count low.
  *---------------------------------------------------------------------------*/
 typedef struct {
@@ -177,19 +193,27 @@ static void out_str(out_t* o, const char* s) {
     while (*s) out_ch(o, *s++);
 }
 
-static void out_udec(out_t* o, uint32_t v) {
-    char tmp[12];
-    int i = 0;
-    do { tmp[i++] = (char)('0' + v % 10u); v /= 10u; } while (v);
-    while (i > 0) out_ch(o, tmp[--i]);
+/* Render one conversion into `tmp` (NUL-terminated) so the caller can pad it to
+ * a field width. 32 bytes covers the longest: 10 digits for a uint32, 11 for a
+ * negative int, 10 for "0x" + 8 hex. */
+#define CONV_MAX 32
+
+static void conv_udec(char* dst, uint32_t v) {
+    char rev[12];
+    int i = 0, j = 0;
+    do { rev[i++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    while (i > 0) dst[j++] = rev[--i];
+    dst[j] = '\0';
 }
 
-static void out_hex(out_t* o, uint32_t v) {
+static void conv_hex(char* dst, uint32_t v, int prefix) {
     static const char digits[] = "0123456789abcdef";
-    char tmp[8];
-    int i = 0;
-    do { tmp[i++] = digits[v & 0xF]; v >>= 4; } while (v);
-    while (i > 0) out_ch(o, tmp[--i]);
+    char rev[8];
+    int i = 0, j = 0;
+    if (prefix) { dst[j++] = '0'; dst[j++] = 'x'; }
+    do { rev[i++] = digits[v & 0xF]; v >>= 4; } while (v);
+    while (i > 0) dst[j++] = rev[--i];
+    dst[j] = '\0';
 }
 
 int vprintf(const char* fmt, va_list ap) {
@@ -201,33 +225,70 @@ int vprintf(const char* fmt, va_list ap) {
             continue;
         }
         fmt++;
+
+        int left = 0;
+        while (*fmt == '-') { left = 1; fmt++; }
+
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+        }
+
+        /* `body` points at the rendered conversion; `tmp` backs it when the
+         * conversion is numeric. Padding is applied uniformly afterwards, so
+         * every conversion honours the width the same way. */
+        char tmp[CONV_MAX];
+        const char* body = tmp;
+
         switch (*fmt) {
-        case 'c': out_ch(&o, (char)va_arg(ap, int)); break;
+        case 'c':
+            tmp[0] = (char)va_arg(ap, int);
+            tmp[1] = '\0';
+            break;
         case 's': {
             const char* s = va_arg(ap, const char*);
-            out_str(&o, s ? s : "(null)");
+            body = s ? s : "(null)";
             break;
         }
         case 'd':
         case 'i': {
             int v = va_arg(ap, int);
-            if (v < 0) { out_ch(&o, '-'); out_udec(&o, (uint32_t)(-(int64_t)v)); }
-            else out_udec(&o, (uint32_t)v);
+            if (v < 0) {
+                tmp[0] = '-';
+                conv_udec(tmp + 1, (uint32_t)(-(int64_t)v));
+            } else {
+                conv_udec(tmp, (uint32_t)v);
+            }
             break;
         }
-        case 'u': out_udec(&o, va_arg(ap, uint32_t)); break;
-        case 'x': out_hex(&o, va_arg(ap, uint32_t)); break;
-        case 'p':
-            out_str(&o, "0x");
-            out_hex(&o, (uint32_t)(uintptr_t)va_arg(ap, void*));
+        case 'u': conv_udec(tmp, va_arg(ap, uint32_t)); break;
+        case 'x': conv_hex(tmp, va_arg(ap, uint32_t), 0); break;
+        case 'p': conv_hex(tmp, (uint32_t)(uintptr_t)va_arg(ap, void*), 1); break;
+        case '%':
+            tmp[0] = '%';
+            tmp[1] = '\0';
             break;
-        case '%': out_ch(&o, '%'); break;
-        case '\0': fmt--; break;
+        case '\0':
+            /* Trailing '%' with nothing after it. Step back so the loop's
+             * fmt++ lands on the NUL and terminates. */
+            fmt--;
+            continue;
         default:
+            /* Unknown conversion: echo it back verbatim rather than consuming
+             * an argument, which would desynchronise everything after it. */
             out_ch(&o, '%');
             out_ch(&o, *fmt);
-            break;
+            continue;
         }
+
+        int len = 0;
+        while (body[len]) len++;
+        int pad = (width > len) ? width - len : 0;
+
+        if (!left) { while (pad-- > 0) out_ch(&o, ' '); }
+        out_str(&o, body);
+        if (left)  { while (pad-- > 0) out_ch(&o, ' '); }
     }
 
     out_flush(&o);

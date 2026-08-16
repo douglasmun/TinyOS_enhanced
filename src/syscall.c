@@ -1148,6 +1148,188 @@ int sys_getcwd(char* user_buf, uint32_t size) {
     return (int)len;
 }
 
+/*=============================================================================
+ * SYS_PSINFO — the process table, filtered by the visibility policy.
+ *
+ * The filter (task_visible_to_current, process.c) runs BEFORE anything is
+ * copied out, so an unprivileged caller never receives a record for a task it
+ * may not see -- not even one it could ignore. That is the difference between
+ * a policy and a convention: a ring-3 program supplying its own syscall stub
+ * cannot opt out of a filter applied kernel-side.
+ *
+ * One record is built at a time in a kernel local and copied out individually.
+ * Building the whole array on the stack would put MAX_TASKS * sizeof(psinfo_t)
+ * on the kernel task stack, which the exec chain already shares -- see the
+ * stack budget note in CLAUDE.md. copy_to_user per record is the same shape
+ * sys_readdir uses, and for the same reason: the driver must never write
+ * straight into a user pointer.
+ *
+ * NO kprintf on this path. `ps` from the ring-3 shell reaches it, and the
+ * kernel console and the user's stream are the same serial line.
+ *===========================================================================*/
+int sys_psinfo(void* user_buf, uint32_t size) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (!user_buf || size < sizeof(psinfo_t)) {
+        /* Too small for even one record: nothing useful to report, and a
+         * partial record would be read as a whole one by the caller. */
+        return -EINVAL;
+    }
+    if (size > MAX_IO_SIZE) {
+        return -EINVAL;
+    }
+
+    uint32_t written = 0;
+
+    /* ONE RECORD PER CRITICAL SECTION, and the visibility check must happen in
+     * the SAME one that reads the fields.
+     *
+     * The loop cannot simply hold the lock throughout: copy_to_user touches a
+     * ring-3 page and can fault, which must not happen with interrupts masked.
+     * But it also cannot snapshot the pointer array once and dereference it
+     * afterwards, for two reasons:
+     *
+     *   - scheduler_get_all_tasks() hands back a pointer to a SHARED STATIC
+     *     array (all_tasks_array in scheduler.c). A concurrent caller -- the
+     *     kernel shell's own ps, say -- refills it underneath us.
+     *
+     *   - a task_t can terminate and its slot be reused between the uid check
+     *     and the field reads, so a record that passed task_visible_to_current()
+     *     as the caller's own could be copied out carrying the NAME and PID of
+     *     whatever process took the slot. That is exactly the leak the filter
+     *     exists to prevent, arrived at through the back door.
+     *
+     * So: re-enter the critical section per iteration and build the whole record
+     * before leaving it.
+     *
+     * The index is a RAW SLOT, not a position in a compacted list. Both
+     * task_get_all() and scheduler_get_all_tasks() compact -- their output is
+     * dense -- so if a task exits between two iterations, every live task after
+     * it shifts down one position and an index walk skips a process outright.
+     * A raw slot means the same task on every iteration, so the only effect of
+     * concurrent churn is that a slot may be empty (skipped) or newly filled
+     * (included), never that a live task silently vanishes from the listing.
+     */
+    for (int slot = 0; slot < MAX_TASKS; slot++) {
+        if (written + sizeof(psinfo_t) > size) {
+            break;   /* Caller's buffer is full: truncate, do not fail. */
+        }
+
+        /* Zeroed in full first: `rec` is a stack local, and the padding and
+         * any unused name bytes would otherwise carry whatever the previous
+         * iteration or an unrelated call left on the stack into ring 3. */
+        psinfo_t rec;
+        memset(&rec, 0, sizeof(rec));
+
+        bool have_rec = false;
+
+        CRITICAL_SECTION_ENTER();
+        {
+            task_t* task = task_get_slot(slot);
+
+            if (task && task_visible_to_current(task)) {
+                rec.pid            = task->pid;
+                rec.ppid           = task->parent_pid;
+                rec.state          = (uint32_t)task->state;
+                rec.total_ticks    = task->total_ticks;
+                rec.time_slice     = task->time_slice;
+                rec.capabilities   = task->capabilities;
+                rec.uid            = task->uid;
+                rec.priority       = (uint16_t)task->priority;
+                rec.is_kernel_task = task->is_kernel_task ? 1 : 0;
+
+                /* safe_strcpy has strlcpy semantics: it always NUL-terminates
+                 * and truncates rather than overrunning, so a task name longer
+                 * than the record's field cannot run off the end of `rec`. */
+                safe_strcpy(rec.name, task->name, sizeof(rec.name));
+
+                have_rec = true;
+            }
+        }
+        CRITICAL_SECTION_EXIT();
+
+        if (!have_rec) {
+            continue;
+        }
+
+        if (copy_to_user((uint8_t*)user_buf + written, &rec, sizeof(rec)) < 0) {
+            return -EFAULT;
+        }
+        written += sizeof(rec);
+    }
+
+    return (int)written;
+}
+
+/*=============================================================================
+ * SYS_KILL — terminate a process, subject to the same visibility policy.
+ *
+ * The -ESRCH-for-invisible rule is the whole security content of this call.
+ * Returning -EPERM for "exists but is not yours" would make kill an existence
+ * oracle: a user could walk the PID space and recover exactly the process
+ * table that SYS_PSINFO filtered out. See the SYS_KILL comment in syscall.h.
+ *
+ * CAP_UNKILLABLE is checked here AND again inside task_terminate. The
+ * duplication is deliberate: this one produces a distinguishable errno for a
+ * process the caller can legitimately see, while task_terminate's is the
+ * backstop that holds no matter which path reaches it.
+ *===========================================================================*/
+int sys_kill(int pid) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (pid <= 0) {
+        return -EINVAL;
+    }
+
+    /* The LOOKUP AND BOTH CHECKS are one atomic step; the terminate follows
+     * outside it.
+     *
+     * Atomic because, split apart, a target could exit and its slot be reused
+     * between the visibility check and the read of ->capabilities, so the two
+     * decisions would be made about different processes.
+     *
+     * The terminate stays OUTSIDE because task_terminate() is not a small
+     * operation -- wait-queue removal, pipe teardown, stream cleanup, and
+     * kprintf -- and no other caller in the tree runs it with interrupts
+     * masked. Doing so here would mask interrupts for the whole teardown.
+     *
+     * That leaves a window in which the target exits on its own and its slot is
+     * reused before task_terminate runs. The terminate is by PID, and a reused
+     * slot is issued a FRESH CRYPTO-RANDOM PID (task_alloc_pid), not the one it
+     * had -- so the lookup inside task_terminate finds nothing and the call is a
+     * no-op rather than landing on an unrelated process. The kernel shell's
+     * cmd_kill has the same window; see the note at shell_system.c:358. */
+    int result;
+
+    CRITICAL_SECTION_ENTER();
+    {
+        task_t* target = task_get((uint32_t)pid);
+
+        if (!target || target->state == TASK_STATE_TERMINATED ||
+            !task_visible_to_current(target)) {
+            /* Absent and invisible collapse to the same answer, deliberately. */
+            result = -ESRCH;
+        } else if (target->capabilities & CAP_UNKILLABLE) {
+            /* -EPERM is safe here: the caller can already see this process, so
+             * the error confirms nothing that SYS_PSINFO withheld. */
+            result = -EPERM;
+        } else {
+            result = 0;
+        }
+    }
+    CRITICAL_SECTION_EXIT();
+
+    if (result == 0) {
+        task_terminate((uint32_t)pid);
+    }
+
+    return result;
+}
+
 int sys_chdir(const char* user_path) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -1554,7 +1736,7 @@ int sys_waitpid(int pid) {
             /* -ECHILD, the same answer a nonexistent PID gets above: -EPERM
              * would confirm the PID is live and owned by someone else, which
              * is the existence `ps` deliberately withholds from unprivileged
-             * users (shell_monitor.c task_visible_to_current). -ECHILD is also
+             * users (process.c task_visible_to_current). -ECHILD is also
              * the honest answer to the question actually asked -- that process
              * is not this caller's child. */
             CRITICAL_SECTION_EXIT();
@@ -2629,6 +2811,16 @@ static void syscall_dispatch(struct cpu_state* state) {
 
         case SYS_CHDIR:
             ret = sys_chdir((const char*)arg1);
+            break;
+
+        case SYS_PSINFO:
+            /* arg1 = user buffer of psinfo_t, arg2 = its size in bytes */
+            ret = sys_psinfo((void*)arg1, arg2);
+            break;
+
+        case SYS_KILL:
+            /* arg1 = target pid */
+            ret = sys_kill((int)arg1);
             break;
 
         case SYS_REDIRECT:
