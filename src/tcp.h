@@ -132,8 +132,22 @@ typedef struct {
     bool fin_sent;         // We sent FIN
     bool fin_received;     // We received FIN
     bool ack_pending;      // Need to send ACK
-    
+
+    /* Owner of this socket, stamped by tcp_socket() from the calling task's
+     * real uid. Before SYS_NETSTAT the socket table was kernel-only and a bare
+     * array index was a sufficient handle; once ring 3 can name a sockfd, an
+     * unowned table is a read oracle over every other user's connections --
+     * state, and rx_available as a traffic side channel. Same shape as the
+     * process-visibility policy: the check belongs in the primitive
+     * (tcp_owner_visible), not in each caller. TCP_SOCKET_OWNER_KERNEL marks
+     * sockets opened before any task exists (boot DHCP/DNS). */
+    uint32_t owner_uid;
+
 } tcp_connection_t;
+
+/* Sentinel owner for sockets created with no current task -- boot-time paths.
+ * Chosen as a value no real uid takes so it cannot alias uid 0. */
+#define TCP_SOCKET_OWNER_KERNEL 0xFFFFFFFFu
 
 /*=============================================================================
  * TCP API - Application Interface
@@ -212,6 +226,42 @@ tcp_state_t tcp_get_state(int sockfd);
  * @return Number of bytes in receive buffer
  */
 int tcp_available(int sockfd);
+
+/**
+ * @brief Is this socket visible to the calling task?
+ *
+ * Root sees all; an unprivileged task sees only sockets its own real uid
+ * opened. Returns true in kernel context (no current task), so boot paths and
+ * tcp_tick are unaffected. See the ownership note in tcp.c.
+ */
+bool tcp_owner_visible(int sockfd);
+
+/*=============================================================================
+ * Observable socket state, filled under TCP_LOCK() by tcp_snapshot().
+ *
+ * Layout is shared with netstat_socket_t in syscall.h, which is copied to ring
+ * 3 verbatim; a static assertion there keeps the two in step. Every field is a
+ * fixed-width scalar -- no pointers into kernel state cross the boundary.
+ *===========================================================================*/
+typedef struct {
+    uint32_t state;
+    uint32_t connected;
+    uint32_t available;
+    uint8_t  remote_ip[4];
+    uint16_t local_port;
+    uint16_t remote_port;
+} tcp_snapshot_t;
+
+/**
+ * @brief Snapshot one socket's state atomically. False if absent or not
+ *        visible to the caller -- those cases are not distinguishable.
+ */
+bool tcp_snapshot(int sockfd, tcp_snapshot_t* out);
+
+/**
+ * @brief Bitmap of in-use sockets visible to the calling task (bit N = sockfd N).
+ */
+uint32_t tcp_visible_mask(void);
 
 /* tcp_bind / tcp_listen / tcp_accept were removed -- see the note above
  * tcp_connect in tcp.c. This is a client-only stack: nothing called them

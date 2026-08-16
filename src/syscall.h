@@ -210,6 +210,110 @@
 #define SYS_NETTX      36   // Transmit one Ethernet frame
 
 /*=============================================================================
+ * SYS_NETSTAT -- read-only network state (doc/NETDAEMON_DESIGN.md PR C1)
+ *
+ * The query half of the socket API: seven kernel-only accessors (tcp_available,
+ * tcp_is_connected, tcp_get_state, dns_is_resolved, dns_get_resolved_ip,
+ * dhcp_is_configured, dhcp_get_client_info) plus the interface addresses, made
+ * readable from ring 3. There is no write surface here -- nothing this syscall
+ * reaches can open, send on, or close a connection.
+ *
+ * ONE syscall with a subcommand rather than seven, deliberately. Each separate
+ * entry point would need its own credential check and its own bounds check;
+ * seven of those is seven chances to omit one. This gates once, in one place.
+ *
+ * NOT euid-gated, unlike SYS_NETRX/SYS_NETTX. Those two hand over raw frames --
+ * the whole segment's traffic -- so they are root-only. These report the
+ * caller's OWN sockets, and the access control is ownership rather than
+ * privilege: tcp_owner_visible() filters per socket, root sees all. Gating on
+ * euid instead would make the ring-3 shell unable to see its own connections,
+ * which is the point of the syscall.
+ *
+ * The syscall ABI carries three registers (ebx/ecx/edx) and this call wants
+ * four values, so the subcommand and the sockfd share arg1: subcmd in the low
+ * 16 bits, sockfd in the high 16. Build it with NETSTAT_ARG().
+ *
+ * arg1 = NETSTAT_ARG(subcmd, sockfd), arg2 = user buffer receiving a
+ * fixed-size struct, arg3 = buffer length.
+ * Structs are copied out by value; no kernel pointer crosses the boundary --
+ * dhcp_get_client_info returns a pointer INTO kernel state and must never be
+ * handed over as one.
+ *
+ * A socket the caller cannot see is reported as nonexistent (-EBADF), never
+ * -EPERM -- the ps/kill policy, for the same reason: -EPERM on a live socket
+ * and -EBADF on a dead one lets a caller enumerate other users' sockets
+ * through the error code alone. */
+#define SYS_NETSTAT    37   // Read-only network state; ownership-filtered
+
+/* SYS_NETSTAT subcommands. */
+#define NETSTAT_IFACE      0   // Interface addresses (ip/mask/gateway/mac)
+#define NETSTAT_DHCP       1   // DHCP lease state, by value
+#define NETSTAT_DNS        2   // Last DNS resolution result
+#define NETSTAT_SOCKET     3   // One socket's state, if visible to the caller
+#define NETSTAT_SOCKLIST   4   // Visible socket descriptors as a bitmap
+
+/* subcmd in the low 16 bits, sockfd in the high 16. The sockfd is masked back
+ * to a signed int by NETSTAT_SOCKFD; a value above TCP_MAX_CONNECTIONS is
+ * rejected downstream by tcp_snapshot(), so a caller cannot smuggle a negative
+ * index through the high half. */
+#define NETSTAT_ARG(subcmd, sockfd) \
+    (((uint32_t)(subcmd) & 0xFFFFu) | (((uint32_t)(sockfd) & 0xFFFFu) << 16))
+#define NETSTAT_SUBCMD(a)  ((uint32_t)(a) & 0xFFFFu)
+#define NETSTAT_SOCKFD(a)  ((int)(((uint32_t)(a) >> 16) & 0xFFFFu))
+
+/*=============================================================================
+ * SYS_NETSTAT payload structs.
+ *
+ * Fixed layout, no pointers, no padding-dependent fields. Each is copied out
+ * whole; the caller passes sizeof() as arg4 and a mismatch is -EINVAL, so
+ * adding a field is a visible break rather than a silent short read.
+ *===========================================================================*/
+typedef struct {
+    uint8_t ip[4];
+    uint8_t netmask[4];
+    uint8_t gateway[4];
+    uint8_t mac[6];
+    uint8_t _pad[2];
+} netstat_iface_t;
+
+/* Deliberately NOT the whole dhcp_client_t. That struct carries the DHCP
+ * transaction id, which is exactly the value needed to forge a reply into an
+ * in-flight exchange, and there is no reason an unprivileged caller learns it.
+ * The server IP and lease timings below are facts a client legitimately
+ * reports; xid is not among them. */
+typedef struct {
+    uint32_t configured;       // bool widened, for a stable layout
+    uint32_t state;            // dhcp_state_t widened
+    uint8_t  server_ip[4];
+    uint8_t  dns_server[4];
+    uint32_t lease_time;
+    uint32_t lease_start;
+    uint32_t renewal_time;
+} netstat_dhcp_t;
+
+typedef struct {
+    uint32_t resolved;         // bool widened
+    uint8_t  ip[4];
+} netstat_dns_t;
+
+typedef struct {
+    uint32_t state;            // tcp_state_t widened
+    uint32_t connected;        // bool widened
+    uint32_t available;        // bytes pending in the RX buffer
+    uint8_t  remote_ip[4];
+    uint16_t local_port;
+    uint16_t remote_port;
+} netstat_socket_t;
+
+/* Bitmap of socket descriptors visible to the caller: bit N set means sockfd N
+ * is in use AND passes tcp_owner_visible(). A bitmap rather than a count,
+ * because a bare count of foreign sockets would state how many are being
+ * withheld -- the same leak the ps totals had. */
+typedef struct {
+    uint32_t visible_mask;
+} netstat_socklist_t;
+
+/*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
  * REVOLUTIONARY SECURITY: Eliminate setuid binaries entirely
@@ -300,7 +404,7 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  36  // Highest valid syscall number (SYS_NETTX)
+#define MAX_SYSCALL_NUM  37  // Highest valid syscall number (SYS_NETSTAT)
 
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
@@ -533,6 +637,7 @@ int sys_kill(int pid);
  */
 int sys_netrx(void* user_buf, size_t len);
 int sys_nettx(const void* user_buf, size_t len);
+int sys_netstat(uint32_t subcmd, int sockfd, void* user_buf, size_t len);
 
 /**
  * @brief Change the caller's cwd.
