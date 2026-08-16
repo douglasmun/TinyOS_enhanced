@@ -32,6 +32,7 @@
 static const char* errstr(int err) {
     switch (err) {
         case -2:  return "no such file or directory";
+        case -11: return "resource limit reached (too many processes)";
         case -13: return "permission denied";
         case -17: return "file exists";
         case -18: return "cannot redirect across drives (D: only)";

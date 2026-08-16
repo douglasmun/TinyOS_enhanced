@@ -173,3 +173,5 @@ audit-optype.log
 audit-optype-trace.log
 privcmd-guard.log
 privcmd-guard-trace.log
+slotcap.log
+slotcap-trace.log

@@ -95,6 +95,86 @@ static uint32_t task_rate_tokens = TASK_RATE_LIMIT_TOKENS;  // Current tokens
 static uint32_t task_rate_last_refill = 0;  // Last refill timestamp (ticks)
 
 /*=============================================================================
+ * CONCURRENT TASK LIMITS (complements the rate limiter above)
+ *
+ * The token bucket limits the RATE of task creation, not the QUANTITY of live
+ * tasks one user holds. At 5/sec a user fills all MAX_TASKS slots in ~5s and
+ * the slots then STAY full -- the bucket refills but the table never drains.
+ * `/shell.elf &` in a loop is enough, and the ring-3 shell has no recursion
+ * guard (nor should it: nesting a shell is legitimate).
+ *
+ * The task table is GLOBAL, so exhausting it starves the kernel's own tasks
+ * and blocks root from logging in to kill the offender -- recovery needs a
+ * reboot. Two limits close that:
+ *
+ * - USER_MAX_CONCURRENT_TASKS: per-uid ceiling. Bounds the damage regardless
+ *   of HOW the tasks were spawned (nesting, `&`, or a program calling spawn in
+ *   a loop), which a recursion-depth limit would not -- depth is not the
+ *   vector, quantity is.
+ *
+ * - TASK_ROOT_RESERVED_SLOTS: slots no non-root task may take. This is what
+ *   makes the DoS RECOVERABLE rather than terminal: root can still log in and
+ *   `kill`. Without it a per-user cap alone still lets several unprivileged
+ *   users between them fill the table.
+ *
+ * Both apply to USER tasks only. Kernel tasks (idle, timer bottom-half, EDR
+ * daemon) are created by the kernel itself and must never be refused; they are
+ * also what the reserve exists to protect.
+ *
+ * uid 0 is exempt from the per-user cap: a root fork bomb is not a privilege
+ * boundary being crossed, and capping root would be the thing that stops the
+ * administrator from cleaning up.
+ *===========================================================================*/
+#define USER_MAX_CONCURRENT_TASKS 10  // Live tasks one non-root uid may hold
+#define TASK_ROOT_RESERVED_SLOTS 4    // Slots reserved for root/kernel use
+
+/*=============================================================================
+ * FUNCTION: task_count_live_for_uid
+ * PURPOSE: Count live tasks owned by a uid (for the per-user concurrent cap)
+ *
+ * Counts by REAL uid, not euid: euid can be dropped and raised by a setuid
+ * program, so a cap keyed on it could be evaded by lowering euid before each
+ * spawn. Real uid is the account that owns the resource.
+ *
+ * ZOMBIE tasks are counted deliberately -- a zombie still occupies its slot
+ * until reaped, so excluding them would let a user hold the table full of
+ * unreaped children while appearing to be under the cap.
+ *===========================================================================*/
+static uint32_t task_count_live_for_uid(uint16_t uid) {
+    uint32_t count = 0;
+
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (tasks[i].pid == 0) {
+            continue;  // Never-used or fully released slot
+        }
+        if (tasks[i].state == TASK_STATE_TERMINATED) {
+            continue;  // Slot is reusable, not held
+        }
+        if (tasks[i].uid == uid) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+/*=============================================================================
+ * FUNCTION: task_count_free_slots
+ * PURPOSE: Count task slots available for allocation
+ *===========================================================================*/
+static uint32_t task_count_free_slots(void) {
+    uint32_t count = 0;
+
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (tasks[i].pid == 0 || tasks[i].state == TASK_STATE_TERMINATED) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+/*=============================================================================
  * FUNCTION: task_rate_limit_check
  * PURPOSE: Check if task creation is allowed (rate limiting)
  * RETURNS: true if allowed (token consumed), false if rate limited
@@ -121,16 +201,28 @@ static bool task_rate_limit_check(void) {
         // tokens = (ticks * REFILL_PER_SEC) / (TICKS_PER_SEC)
         // Since TICKS_PER_SEC = 100 and REFILL_INTERVAL = 100:
         // Every 100 ticks (1 second) we add REFILL_PER_SEC tokens
+        /* REFILL_INTERVAL is 100 ticks and the PIT runs at 100 Hz, so one
+         * "period" is exactly one second and the refill is simply
+         * periods * REFILL_PER_SEC.
+         *
+         * This previously divided that by (1000 / REFILL_INTERVAL) == 10, which
+         * made one elapsed second add (1 * 5) / 10 == 0 tokens in integer
+         * arithmetic. The bucket therefore refilled ONLY when a single check
+         * saw >= 2 seconds elapse, so after an initial burst of 10 the limiter
+         * denied task creation far more aggressively than the documented
+         * 5/sec -- a correctness bug in the limiter, not in its callers. */
         uint32_t refill_periods = ticks_since_refill / TASK_RATE_LIMIT_REFILL_INTERVAL;
-        uint32_t tokens_to_add = (refill_periods * TASK_RATE_LIMIT_REFILL_PER_SEC) /
-                                 (1000 / TASK_RATE_LIMIT_REFILL_INTERVAL);
+        uint32_t tokens_to_add = refill_periods * TASK_RATE_LIMIT_REFILL_PER_SEC;
 
         task_rate_tokens += tokens_to_add;
         if (task_rate_tokens > TASK_RATE_LIMIT_TOKENS) {
             task_rate_tokens = TASK_RATE_LIMIT_TOKENS;  // Cap at max
         }
 
-        task_rate_last_refill = now;
+        /* Advance by whole periods only, so the leftover ticks count toward the
+         * next refill. Setting this to `now` discarded them and made the
+         * effective rate slower than configured. */
+        task_rate_last_refill += refill_periods * TASK_RATE_LIMIT_REFILL_INTERVAL;
     }
 
     /*=========================================================================
@@ -819,12 +911,57 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     }
 
     /*=========================================================================
+     * CONCURRENT LIMITS: bound how many slots one user can hold at once.
+     *
+     * Keyed on the CREATOR's credentials, not the new task's: task_create_user
+     * hardcodes uid 1000 and the caller overwrites it after this function
+     * returns (see the credential-inheritance note in launch_login_shell), so
+     * the child's own uid is not yet meaningful here. The creator is the
+     * account that will own the child in every case that matters -- a shell
+     * spawning a program, or a program calling spawn.
+     *
+     * No current task means early boot with no owner to charge; the rate
+     * limiter and its boot grace period already cover that path.
+     *
+     * CHECKED BEFORE THE RATE LIMITER, deliberately. Being over a standing
+     * ownership limit is a more specific and more durable condition than a
+     * transient rate spike: it stays true until the user's tasks exit, whereas
+     * the bucket refills on its own. Reporting the rate limiter for a user who
+     * is ALSO over their concurrent cap tells them to retry, which will keep
+     * failing, and hides the real reason. It also makes the two limits
+     * separable in testing -- both return -EAGAIN, so whichever runs first is
+     * the one that gets observed.
+     *=======================================================================*/
+    task_t* limit_creator = scheduler_get_current_task();
+    if (limit_creator && limit_creator->uid != 0) {
+        uint32_t owned = task_count_live_for_uid(limit_creator->uid);
+        if (owned >= USER_MAX_CONCURRENT_TASKS) {
+            kprintf("[PROCESS] ERROR: uid %u already holds %u tasks (limit %d)\n",
+                    limit_creator->uid, owned, USER_MAX_CONCURRENT_TASKS);
+            return -EAGAIN;
+        }
+
+        /* Root reserve: checked AFTER the per-user cap so the more specific
+         * message wins, and applied to non-root only -- the whole point is
+         * that root can still get a slot when the table is nearly full. */
+        uint32_t free_slots = task_count_free_slots();
+        if (free_slots <= TASK_ROOT_RESERVED_SLOTS) {
+            kprintf("[PROCESS] ERROR: only %u slots free, %d reserved for root\n",
+                    free_slots, TASK_ROOT_RESERVED_SLOTS);
+            return -EAGAIN;
+        }
+    }
+
+    /*=========================================================================
      * SECURITY FIX (Issue 4.1): Rate Limiting Check
      * Prevent DoS via rapid task creation (fork bomb defense)
      *=======================================================================*/
     if (!task_rate_limit_check()) {
+        /* -EAGAIN, not -1: this is a "try again later" condition, exactly like
+         * the concurrent caps above, and a caller that cannot tell it apart
+         * from a malformed binary has no basis for retrying. */
         kprintf("[PROCESS] ERROR: User task creation rate limited\n");
-        return -1;  // Rate limited
+        return -EAGAIN;
     }
 
     // Find free slot

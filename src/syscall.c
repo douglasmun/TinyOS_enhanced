@@ -837,6 +837,22 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
     child->parent_pid = self->pid;
     child->parent_generation = self->generation;
 
+    /* Credentials, for the same before-scheduling reason. task_create_user
+     * hardcodes uid/gid 1000, so WITHOUT this every child of every user ran as
+     * uid 1000 no matter who spawned it: a uid-1002 process got a uid-1000
+     * child with access to uid-1000's files, and a user could spawn a child
+     * more privileged than themselves relative to that account. Spawn must
+     * carry the caller's credentials, never invent them -- there is no setuid
+     * bit here, so a child is exactly its parent.
+     *
+     * This also makes the per-uid task cap in task_create_user_argv mean what
+     * it says: charged to the creator, children previously pooled into uid
+     * 1000, so one user's spawns consumed another user's quota. */
+    child->uid  = self->uid;
+    child->gid  = self->gid;
+    child->euid = self->euid;
+    child->egid = self->egid;
+
     /* Streams before scheduling too — a child made runnable with the default
      * console context would ignore the caller's redirection on its first
      * write. See streams_inherit's ownership caveat in stdio.h: the copy is

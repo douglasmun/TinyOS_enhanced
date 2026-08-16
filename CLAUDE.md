@@ -84,19 +84,23 @@ introspection and machine-state commands are still kernel-shell only.
 Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**. Item 4
 (userspace shell) is in progress. `fork()` was skipped deliberately (PAE, no COW pages).
 
+**Task-slot exhaustion is closed**: a per-uid live-task cap (`USER_MAX_CONCURRENT_TASKS`)
+plus a root slot reserve (`TASK_ROOT_RESERVED_SLOTS`) in `task_create_user_argv`, checked
+**before** the rate limiter and charged to the **creator's** uid (the child's is not set
+until the caller overwrites it after the call). Both limiters return `-EAGAIN`, so only
+the printed message identifies which one refused — see `doc/RING3_MIGRATION.md` and
+`verify-slotcap.sh`. Fixing this also uncovered a pre-existing refill bug in the rate
+limiter itself (`doc/KERNEL_BUGS.md`).
+
 Open, in rough priority order:
 
 - **`ps`/`kill`/`top` in ring 3** — the next migration step. `shell_monitor.c` is already
   stream-routed, so this is a **policy** question (what may an unprivileged process see
   and signal), not plumbing. Do this before `shell_system.c`, which needs ~222 `kprintf`
   conversions.
-- **Task-slot exhaustion** — `task_rate_limit_check()` caps the *rate* of task creation
-  but not the *quantity* one user holds, so any user can fill the global `MAX_TASKS` (32)
-  in ~5s and starve root. Needs a per-user concurrent cap plus a root slot reserve.
-  Details in `doc/RING3_MIGRATION.md`.
 - **AUDIT-8E IDS-not-wired gap.**
-- `verify-privcmd-guard.sh` is verified in the passing direction only — the negative
-  control (revert the guards, confirm FAIL) has not been run.
+- **`ps`/`kill`/`top` visibility policy** — undecided: may an unprivileged user see all
+  processes (leaks what root runs) or only their own? Needed before that migration.
 
 ## Not compiled (don't audit/fix)
 

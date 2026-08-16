@@ -1526,6 +1526,27 @@ void cmd_exec(int argc, char* argv[]) {
             streams_inherit(&task->streams, get_current_streams());
         }
 
+        /* Credentials, unlike streams, are inherited for BACKGROUND children
+         * too: the stream caveat above is about fd lifetime, which has no
+         * bearing on who the child runs as.
+         *
+         * task_create_user hardcodes uid/gid 1000 and leaves it to the caller
+         * to set the real owner. Without this, a child exec'd after `su` ran as
+         * uid 1000 rather than as the user who typed the command -- so it could
+         * touch uid-1000's files, and the per-uid task cap charged the wrong
+         * account. Same omission as sys_spawn had; see doc/KERNEL_BUGS.md.
+         *
+         * Before scheduler_add_task, for the same reason the streams are. */
+        {
+            task_t* self = scheduler_get_current_task();
+            if (self) {
+                task->uid  = self->uid;
+                task->gid  = self->gid;
+                task->euid = self->euid;
+                task->egid = self->egid;
+            }
+        }
+
         scheduler_add_task(task);
         kprintf("[EXEC] Process added to scheduler\n");
 

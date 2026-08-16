@@ -200,3 +200,80 @@ runs with no current task (`ramfs_get_current_credentials` falls back to uid/gid
 Corollary: a 0777 RAMFS directory (e.g. the `/scratch` created at boot for the
 harness) permits cross-user deletion — a real property of the model, not an
 oversight.
+
+## Task-creation rate limiter never refilled at the configured rate
+
+Found 2026-08-16 while building `verify-slotcap.sh`. Pre-existing, and independent
+of the concurrent-task cap added in the same change.
+
+`task_rate_limit_check()` (`src/process.c`) is a token bucket documented as "burst
+of 10, sustained 5/sec". The refill computed:
+
+```c
+uint32_t refill_periods = ticks_since_refill / TASK_RATE_LIMIT_REFILL_INTERVAL;
+uint32_t tokens_to_add = (refill_periods * TASK_RATE_LIMIT_REFILL_PER_SEC) /
+                         (1000 / TASK_RATE_LIMIT_REFILL_INTERVAL);
+```
+
+`REFILL_INTERVAL` is 100 ticks and the PIT runs at 100 Hz (`pit_init(100)` in
+`kernel.c`), so one period is exactly one second and the refill should simply be
+`periods * 5`. The extra `/ (1000/100)` == `/10` made one elapsed second add
+`(1 * 5) / 10` == **0 tokens** in integer arithmetic. The bucket only gained
+tokens when a single check happened to see **≥2 seconds** elapse.
+
+Compounding it, `task_rate_last_refill = now` discarded the leftover ticks on every
+refill, so the partial second never accumulated toward the next one.
+
+Net effect: after the initial burst of 10, task creation was denied far more
+aggressively than the documented 5/sec. Not a security hole — it fails closed —
+but it is the reason the first run of `verify-slotcap.sh` saw the RATE limiter
+refuse at 9 spawns while the concurrent cap (10) was never reached.
+
+Fixed to `refill_periods * TASK_RATE_LIMIT_REFILL_PER_SEC`, advancing
+`task_rate_last_refill` by whole periods so the remainder carries.
+
+**Why this matters for the harness**: both limiters return `-EAGAIN`, so an
+assertion on the errno alone cannot tell them apart — and the wrong one firing
+produced a count that looked exactly right. `verify-slotcap.sh` therefore asserts
+the cap's own message (`already holds N tasks (limit M)`), not just the errno.
+
+## FIXED: child processes did not inherit the caller's credentials
+
+Found 2026-08-16, one layer down from the bug above and by the same harness: the
+cap fired correctly but reported **`uid 1000`** in a session where `useradd` had
+just assigned the user **uid 1002**.
+
+`task_create_user` hardcodes `task->uid = task->euid = 1000` (`process.c:1089`),
+leaving it to the caller to overwrite with the real owner. `launch_login_shell`
+(`shell.c:1017`) does exactly that. **Neither path that creates a child did** —
+`sys_spawn` (`syscall.c`) and `cmd_exec` (`shell_fileops.c`) both carefully
+inherited streams (and, in spawn's case, parentage and cwd) while silently
+skipping credentials.
+
+Both had to be fixed. Fixing only `sys_spawn` left the bug fully live, because
+the harness types `kshell` and so reaches task creation through `cmd_exec` — the
+second run after the "fix" reported the identical wrong uid, which is what
+pointed at the second call site.
+
+So every child of every user ran as **uid 1000 regardless of who spawned it**:
+
+- a uid-1002 process got a uid-1000 child, which could read and write uid-1000's
+  files — a privilege boundary crossed by spawning, with no setuid bit involved;
+- conversely a child could be *less* privileged than a parent whose uid was not
+  1000, breaking the "a child is exactly its parent" expectation the rest of the
+  model assumes;
+- and every user's children pooled into a single uid for accounting, so under the
+  new per-uid task cap one user's spawns consumed another user's quota.
+
+Fixed by copying `uid`/`gid`/`euid`/`egid` from the caller at both sites, set
+**before `scheduler_add_task`** for the same reason parentage is: the child can
+run on the very next tick.
+
+In `cmd_exec` the copy is deliberately **not** gated on `!background`, unlike the
+adjacent `streams_inherit`. That gate exists because streams are a shallow fd
+copy with a lifetime problem; credentials have no such relationship, and a
+backgrounded child must run as its user just as a foreground one does.
+
+Latent for the usual reason — while the only interesting user was the uid-1000
+default, "hardcoded 1000" and "inherited" were indistinguishable. It became
+observable the moment a harness created a user with a different uid.
