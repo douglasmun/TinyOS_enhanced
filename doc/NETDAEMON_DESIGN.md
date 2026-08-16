@@ -115,6 +115,92 @@ trust domain actually changes.
 bump it — CLAUDE.md records this exact bug: it sat at 16 while `SYS_SLEEP` (17)
 and `SYS_WAITPID` (18) had working dispatcher cases, silently rejecting both.
 
+## PR A — audit findings
+
+Scope as settled above: the L4 parsers (`tcp.c`, `dns.c`, `dhcp.c`, `icmp.c`) and
+the dispatch switch in `net.c` below line 1553.
+
+### Audited and found sound
+
+Recorded because "we looked and it was fine" is a result, and because the next
+person to read this should not re-derive it:
+
+- **DNS name decompression** (`dns.c:329-413`) — the classic remote-code-execution
+  site in any DNS implementation. It is correct. Compression pointers must point
+  **strictly backward** (`packet_start + offset >= current_pos` rejects), which
+  makes decompression loops structurally impossible rather than merely bounded;
+  the output-space check precedes the `memcpy`; label length is capped at 63 and
+  label count at 127. The `followed_pointer` flag is dead code (assigned, never
+  read) — harmless, since the backward-only rule is what actually prevents loops,
+  but it advertises a defence that isn't the real one.
+- **`last_queried_domain`** (`dns.c:655-661`) — buffer is `MAX_DOMAIN_NAME_LEN + 1`
+  and the guard rejects `> MAX_DOMAIN_NAME_LEN`, so the copy fits with the NUL.
+- **ICMP echo-reply construction** (`icmp.c:241-315`) — bounds arithmetic is sound.
+  `reply_total > 1514` rejects before any write, and `off` cannot exceed it.
+
+### Finding A1 — unthrottled per-packet `kprintf` on the ICMP echo-**reply** path
+
+`icmp.c:208` prints once per received echo reply whose identifier matches
+`ping_identifier`. It sits in the `ICMP_ECHO_REPLY` branch, which returns before
+reaching the rate limiter — so unlike the echo-*request* prints below it, nothing
+bounds it.
+
+`ping_identifier` is CSPRNG-derived (`icmp.c:449`) and fixed for the boot, so an
+off-path attacker faces 1-in-65536 per packet. An **on-path** attacker does not
+have to guess at all: the identifier travels in cleartext in every outbound ping,
+so observing one ping yields it, after which every injected packet drives a
+console print from the RX path.
+
+This is precisely the class item 2 closed — CLAUDE.md: *"The RX path is stricter
+still: no per-packet `kprintf` at all. Those sites need no local account — any host
+on the segment drives them."* Five such sites were replaced with counters; this one
+was missed, because it is in `icmp.c` rather than in the RX loops that sweep
+covered.
+
+**Fix — landed.** Counter plus `ifconfig` reporting, following the `net_drop_runt`
+pattern: `icmp_echo_replies_rx`, surfaced through `icmp_get_rx_stats()`. Harness
+`verify-icmp-counters.sh`.
+
+The per-reply detail line is gone, not relocated. `send_test_ping()` already
+prints a transmitted/received/loss summary from `pings_received` (which still
+increments), so the `ping` command keeps its actual result reporting; what is lost
+is the per-packet line, which is precisely the thing a remote host was driving.
+
+**Coverage limit, stated plainly:** the harness cannot drive this path. Acceptance
+requires matching `ping_identifier`, which is CSPRNG-derived at boot and never
+printed, so injected traffic cannot reach the branch. A1 is therefore proven by
+the harness's **source guard only** — the print is gone and a counter stands in
+its place — while A2's sibling path is proven end-to-end by traffic. A guard-only
+proof is weaker than an end-to-end one and is not presented as equivalent.
+
+### Finding A2 — the two echo-*request* prints are throttled, but by accident
+
+`icmp.c:238` and `icmp.c:320` are also per-packet, but the `ICMP_RATE_LIMIT_TICKS`
+check (10 ticks ≈ 100 ms) precedes them, capping the flood at ~10 lines/second.
+That is a real bound, so this is not the same severity as A1.
+
+It is worth recording that the bound is **incidental**: the rate limiter exists to
+cap reply *generation*, not console output, and the prints are downstream of it by
+placement rather than by design. Anyone who later moves the rate limiter, or adds a
+print above it, silently reopens A1. They are converted to counters in the same
+change so the invariant is structural rather than positional.
+
+**Fixed alongside A1**, as `icmp_echo_requests_rx` and the existing
+`icmp_replies_dropped`, both surfaced by `ifconfig`. The negative control put a
+number on the "incidental" claim: with this print restored, 20 injected frames
+produced exactly **one** console line, the limiter throttling it — visibly bounded,
+and bounded by something that was never meant to bound it.
+
+### Finding A3 — 1514-byte stack buffer on the path that is moving
+
+`icmp.c:254` declares `uint8_t buf[1514]` as a local. On the kernel task stack this
+is the pattern CLAUDE.md warns about ("keep big locals off the kernel task stack";
+an earlier overflow silently corrupted a signature hash until the offenders were
+made `static`). At 1.5 KB against 128 KB it is not currently a problem, and this
+audit does not change it — but it is on the code path that PR D moves to ring 3,
+where the stack is a different size and the budget is not the one reasoned about
+here. Flagged for PR D, not fixed now.
+
 ## Harness design — before the code
 
 Per instruction, and per `harness-design-principles`: test the boundary the fix
@@ -132,6 +218,37 @@ weak version of this harness — "ping still works" — passes against a kernel 
 nothing moved, so it must instead witness the ring: parse-context accounting
 extended with a CPL field, asserted as 3, paired with a negative control that
 restores the ring-0 call and must read 0.
+
+### What building `verify-icmp-counters.sh` cost, and what PRs B–D should expect
+
+Two earlier versions of that harness passed nothing while looking healthy. Both
+showed `RX packets: 20` and `RX parsed: 20 thread-ctx` — every indicator green
+except the counter under test, which stayed at 0.
+
+- **v1** addressed packets to `net.c`'s compiled-in default `192.168.0.80`. The
+  socket netdev has no DHCP, so the guest self-assigns a link-local `169.254.x.x`;
+  every frame died at the destination-IP check.
+- **v2** read the guest IP at runtime but used a link-local **source**. Every frame
+  died one layer later, in the firewall's bogon filter — which rejects `0/8`,
+  `127/8`, `169.254/16`, `10/8`, `172.16/12`, `192.168/16`, `224/4` and `240/4`,
+  i.e. every range a lab setup reaches for by instinct. The fix was TEST-NET-3
+  (`203.0.113.0/24`, RFC 5737).
+
+The generalizable points, all of which apply directly to PRs B–D:
+
+1. **An exact-count assertion is what caught this.** A `>= 1` or "networking still
+   works" check passes in both failure modes above. This is the harness-design
+   principle "assert counts, not presence" earning its keep twice in one afternoon.
+2. **Injected traffic must survive every layer above the one under test.** The
+   ICMP counters sit below IP validation, the destination check, the firewall and
+   the IDS. Any of them silently eats the test. PR B's syscall boundary sits below
+   all of the same layers.
+3. **Instrument to find the drop point; don't read harder.** Both were located in
+   one run by temporarily printing at each early return in `handle_ip`. Two rounds
+   of careful source reading had already missed them.
+4. **Assert the sum when a limiter splits the count.** 20 frames arrived as 1
+   answered + 19 rate-limited. Asserting either half alone is either flaky or
+   toothless; asserting `answered + limited == sent` is neither.
 
 **Explicitly not planned: a memory-poke command to inspect daemon state.** Item 3
 faced this and declined for the same reason — it would be a kernel-address read
@@ -156,10 +273,48 @@ writes the code without saying so.
    daemon plausibly exists. Item 1 already hit this: `kernel.c`'s boot DHCP loop
    needs its explicit `e1000_rx_softirq_run()` drain because `knetd` does not
    exist yet. The same ordering problem, one ring further out.
-4. **Is `firewall.c`/`ids.c` on the ring-3 side?** Moving the enforcement point
-   out of the kernel is a security *regression* if the daemon is the thing being
-   attacked. Plausibly these stay in ring 0 and the split is not simply
-   "driver | parser".
+4. ~~**Is `firewall.c`/`ids.c` on the ring-3 side?**~~ **Settled — they stay in
+   ring 0.** See below; this reshaped the split, as predicted.
 
-Question 4 is the one most likely to reshape the whole item, and it should be
-settled before PR A's audit scope is fixed.
+## Settled: where the boundary actually falls
+
+Question 4 was the one flagged as most likely to reshape the item, and it did —
+though the answer is better than either option originally sketched.
+
+`firewall_check_packet()` and `ids_analyze_packet()` are called from `net.c:1543`
+and `1553`, **after** IP header validation and **before** the L4 dispatch switch.
+That is a seam that exists nowhere else in `handle_packet()`, and it splits the
+parser in two along exactly the line this item needs:
+
+```
+  ethernet + IP header validation      <- stays ring 0 (small, already audited)
+  firewall_check_packet()              <- stays ring 0 (enforcement)
+  ids_analyze_packet()                 <- stays ring 0 (enforcement)
+  ---------------------------------- the boundary
+  switch (protocol) { TCP UDP ICMP }   <- moves to ring 3 (the bulk)
+  tcp.c / dns.c / dhcp.c / icmp.c      <- moves to ring 3
+```
+
+The seam holds under inspection: `firewall.c` and `ids.c` call **nothing** in the
+L4 parsers (no `tcp_*`, `dns_*`, `dhcp_*`, `icmp_*`, `handle_*`), and their state —
+`rules[]`, `connections[]`, `rate_limits[]`, `attack_detectors[]` — is entirely
+their own. Neither reaches across.
+
+**Why they stay in ring 0.** Moving the enforcement point out of the kernel is a
+regression precisely when the daemon is what is being attacked: a compromised
+ring-3 parser that also owns the firewall can switch it off. Keeping enforcement
+kernel-side means a hostile packet must get past the firewall and the IDS *before*
+it reaches the code that would be running at CPL 3 — and if it compromises that
+code, the firewall is still there, still enforcing, in an address space the daemon
+cannot write. This is the arrangement that makes the move a security improvement
+rather than a lateral relocation of the same trust.
+
+It also shrinks the item: L2/L3 validation and enforcement stay put, so the code
+changing trust domain is the L4 parsers and nothing else.
+
+**Consequence for PR A's audit scope**, which this question was blocking: the audit
+covers the L4 parsers and their dispatch — `tcp.c`, `dns.c`, `dhcp.c`, `icmp.c`,
+and the switch in `net.c` below line 1553. `firewall.c` and `ids.c` are *out* of
+the exposure audit, because they are not being exposed. They stay in scope for the
+separate question of whether they remain correct when their caller is no longer
+the same-privilege code that follows them.

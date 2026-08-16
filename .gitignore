@@ -187,6 +187,8 @@ rxctx.log
 rxctx-trace.log
 dmaguard.log
 dmaguard-trace.log
+icmpctr.log
+icmpctr-trace.log
 sysredirect.log
 sysredirect-trace.log
 spray-pos.log

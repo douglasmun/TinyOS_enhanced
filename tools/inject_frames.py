@@ -44,12 +44,69 @@ def build_frame(dst_mac, src_mac, ethertype, payload_len):
     return frame
 
 
+def checksum16(data):
+    """Standard internet checksum (RFC 1071)."""
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def build_icmp_frame(dst_mac, src_mac, src_ip, dst_ip, icmp_type,
+                     identifier, sequence, payload_len):
+    """A well-formed Ethernet/IPv4/ICMP frame.
+
+    Unlike build_frame() above, every layer here must actually validate: the
+    ICMP counters under test live past the IP header checks in handle_packet,
+    so a malformed IP header would be dropped earlier and the test would
+    silently measure nothing. Both checksums are therefore computed for real.
+
+    icmp_type 8 = Echo Request, 0 = Echo Reply. The reply case is the one that
+    matters for the unthrottled-print finding (A1): TinyOS accepts it only if
+    `identifier` matches its CSPRNG-chosen ping_identifier, which models an
+    on-path attacker who has observed one outbound ping.
+    """
+    payload = bytes(range(payload_len % 256)) [:payload_len] if payload_len else b""
+    if len(payload) < payload_len:
+        payload = (payload * (payload_len // max(len(payload), 1) + 1))[:payload_len]
+
+    icmp = struct.pack("!BBHHH", icmp_type, 0, 0, identifier, sequence) + payload
+    icmp = icmp[:2] + struct.pack("!H", checksum16(icmp)) + icmp[4:]
+
+    total_len = 20 + len(icmp)
+    ip = struct.pack("!BBHHHBBH4s4s",
+                     0x45, 0x00, total_len,
+                     0x1234, 0x0000,
+                     64, 1, 0,
+                     socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    ip = ip[:10] + struct.pack("!H", checksum16(ip)) + ip[12:]
+
+    frame = dst_mac + src_mac + struct.pack("!H", 0x0800) + ip + icmp
+    if len(frame) < 60:
+        frame += bytes(60 - len(frame))
+    return frame
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--mcast", required=True, help="group:port, e.g. 230.0.0.1:1234")
     ap.add_argument("--count", type=int, default=20)
-    ap.add_argument("--ethertype", required=True,
-                    help="EtherType, e.g. 0x88b5")
+    ap.add_argument("--ethertype", default="0x88b5",
+                    help="EtherType, e.g. 0x88b5 (ignored in --mode icmp)")
+    ap.add_argument("--mode", choices=("ethertype", "icmp"), default="ethertype",
+                    help="ethertype: raw frame with an unhandled EtherType. "
+                         "icmp: well-formed IPv4/ICMP echo request or reply.")
+    ap.add_argument("--icmp-type", type=int, default=8,
+                    help="8 = Echo Request, 0 = Echo Reply")
+    ap.add_argument("--icmp-id", type=lambda s: int(s, 0), default=0,
+                    help="ICMP identifier (must match the guest's "
+                         "ping_identifier for an Echo Reply to be accepted)")
+    ap.add_argument("--src-ip", default="10.0.2.99")
+    ap.add_argument("--dst-ip", default="10.0.2.15")
     ap.add_argument("--dst", type=parse_mac, required=True,
                     help="destination MAC (the guest)")
     ap.add_argument("--src", type=parse_mac, default=parse_mac("52:54:00:aa:bb:cc"),
@@ -67,7 +124,14 @@ def main():
     if not 0 <= ethertype <= 0xFFFF:
         sys.exit("--ethertype out of range")
 
-    frame = build_frame(args.dst, args.src, ethertype, args.payload_len)
+    if args.mode == "icmp":
+        frame = build_icmp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
+                                 args.icmp_type, args.icmp_id, 1,
+                                 args.payload_len)
+        desc = f"icmp type {args.icmp_type} id 0x{args.icmp_id:04x}"
+    else:
+        frame = build_frame(args.dst, args.src, ethertype, args.payload_len)
+        desc = f"ethertype 0x{ethertype:04x}"
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # TTL 1: the frames must not escape the host. This is deliberately not
@@ -80,7 +144,7 @@ def main():
     finally:
         sock.close()
 
-    print(f"sent {args.count} frames, ethertype 0x{ethertype:04x}, {len(frame)} bytes each")
+    print(f"sent {args.count} frames, {desc}, {len(frame)} bytes each")
 
 
 if __name__ == "__main__":

@@ -169,6 +169,15 @@ void cmd_ifconfig(void) {
      * doc/NETWORK_ISOLATION.md item 1 has been undone. */
     kprintf("  RX parsed:    %u thread-ctx, %u irq-ctx\n", parse_thread, parse_irq);
 
+    /* ICMP RX counters. Same reasoning as the drop counters above: these
+     * replaced per-packet prints a remote host drove. The echo-reply count in
+     * particular was NOT rate limited before — see doc/NETDAEMON_DESIGN.md
+     * finding A1. */
+    uint32_t icmp_replies = 0, icmp_requests = 0, icmp_limited = 0;
+    icmp_get_rx_stats(&icmp_replies, &icmp_requests, &icmp_limited);
+    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited\n",
+            icmp_replies, icmp_requests, icmp_limited);
+
     /* DMA region placement (doc/NETWORK_ISOLATION.md item 3). Printed with the
      * live present/absent state of each guard rather than just the addresses:
      * the addresses only show where the guards were MEANT to go, whereas the
