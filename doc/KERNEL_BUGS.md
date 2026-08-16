@@ -324,3 +324,43 @@ check that had never actually verified anything finally announced itself.
 Ring-3 commands should be sent with the `!` (unverified) prefix and an expect on
 their **result**, which is a stronger check than a per-character echo that
 unrelated output can satisfy.
+
+## FIXED: `open(O_TRUNC)` was a no-op on the RAM disk
+
+`ramfs_vfs_open()` translated only the **access mode** of the `VFS_O_*` flags into
+`ramfs_open`'s `uint8_t` of `RAMFS_FLAG_*`. `VFS_O_TRUNC` is `0x0200` and cannot be
+represented in that byte at all, so the flag was validated by `sys_open`, carried
+intact through `vfs_open`, handed to the driver — and then silently dropped.
+
+Because `ramfs_write` only ever **grows** `node->size`, the consequence was data
+corruption rather than a missing feature: rewriting a long file with a short one left
+the previous tail in place, inside `node->size` and still reachable by `read()`. This
+hit the shipping ring-3 `write` builtin, which has always passed `O_TRUNC`.
+
+`stdio.c` had already hit exactly this for `>` and fixed it **locally** by calling
+`ramfs_truncate()` itself (`stdout_redirect_to_file`). That fixed redirection and left
+every other `open(O_TRUNC)` caller broken — which was every ring-3 user of the flag,
+since userspace has no other way to ask for truncation. FAT32 was never affected:
+`fat32_vfs_open` has always honoured the flag.
+
+The fix is three lines in `ramfs_vfs_open`, after the `ramfs_open` call succeeds.
+
+**The part worth remembering is how it hides.** `cat` cannot witness this bug:
+
+```
+write /p.txt AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   (30 A's)
+write /p.txt BBB
+                       fix disabled      fix enabled
+stat /p.txt            size=31           size=4
+cat  /p.txt            BBB               BBB
+```
+
+The content check passes in both directions. An earlier version of
+`verify-ring3-fileops.sh` asserted on `cat` and returned a full PASS against a build
+with the fix reverted — `objdump` confirmed the shipped `kernel.elf` had zero
+`ramfs_truncate` calls in `ramfs_vfs_open`. Only `stat` exposes it, because the
+symptom **is** the size. Both `cat` assertions are kept in the harness on purpose, as
+a standing demonstration that they cannot fail.
+
+Generalises: when a bug's symptom is metadata, assert on metadata. A content check
+that passes with the fix removed is not a weak test, it is not a test.

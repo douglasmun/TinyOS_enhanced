@@ -84,10 +84,21 @@ corrupted the signature hash until `exec_buffer` and `elf_load_process`'s
 ## Current state
 
 The **ring-3 shell is the default login shell** (PR #51), with the kernel shell as a
-fallback (`kshell` hands over; `exit` logs out). It has ~22 builtins against the kernel
-shell's ~70 — redirection, pipelines, the credential commands and now `ps`/`kill`/`top`
-have landed; the machine-state commands (`pae`, `mem`, `wxaudit`, `auditlog`, the
-networking and security tooling) are still kernel-shell only.
+fallback (`kshell` hands over; `exit` logs out). It has ~25 builtins against the kernel
+shell's ~70 — redirection, pipelines, the credential commands, `ps`/`kill`/`top` and now
+`cp`/`mv`/`touch` have landed; the machine-state commands (`pae`, `mem`, `wxaudit`,
+`auditlog`, the networking and security tooling) are still kernel-shell only, and ~20 of
+those stay that way by design (PR #58 gated them: together they are an ASLR defeat).
+
+**`open(O_TRUNC)` did nothing on the RAM disk** until `ramfs_vfs_open` was wired to
+`ramfs_truncate` — `ramfs_open` takes a `uint8_t` of `RAMFS_FLAG_*` and cannot represent
+`VFS_O_TRUNC` (0x0200), so the flag was validated by `sys_open`, passed down, and then
+dropped. Since `ramfs_write` only ever **grows** `node->size`, every short rewrite left
+the old tail live inside the file — silent corruption in the shipping `write` builtin,
+not a missing feature. The trap for anyone testing this: **`cat` cannot see it** (it
+prints `BBB` either way); only `stat` can, because the symptom is the size (31 vs 4).
+A `cat`-based harness passed against a build with the fix removed. Harness:
+`verify-ring3-fileops.sh`, which asserts on `stat`.
 
 Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**. Item 4
 (userspace shell) is in progress. `fork()` was skipped deliberately (PAE, no COW pages).

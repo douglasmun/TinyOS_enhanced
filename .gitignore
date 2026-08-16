@@ -187,3 +187,5 @@ spray-pos.log
 spray-neg.log
 sectest-redirect.log
 sectest-redirect-trace.log
+ring3-fileops.log
+ring3-fileops-trace.log
