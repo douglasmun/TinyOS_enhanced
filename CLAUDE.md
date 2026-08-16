@@ -90,6 +90,30 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   pre-move baseline the move has to invert, which is why the witness was built before
   the move rather than after. Harness: `verify-netd-ring3.sh` (flip with
   `TINYOS_EXPECT_CPL3=1`); rationale in `doc/NETDAEMON_DESIGN.md`.
+- **Three traps around kernel task lifetime**, each of which reads as healthy when
+  wrong. `task_create_kernel()` allocates but does **not** enqueue — every caller needs
+  `scheduler_add_task()`, or the task is created, listed by `ps`, counted by every
+  status surface, and never runs one instruction. It grants `CAP_ALL` (`0xFFFFFFFF`),
+  which **includes `CAP_UNKILLABLE`** — so every kernel task is unkillable, the explicit
+  `|= CAP_UNKILLABLE` grants in `kernel.c` are no-ops, and a test that plans to `kill`
+  one is grading a daemon that never died. And `task_exit()` is **inert** for
+  scheduler-run tasks (it reads `process.c`'s `current_task`, set only by
+  `task_switch_to`) — use `task_terminate(pid)`, capturing the pid first.
+- **Freeing a guard page requires restoring its mapping first.** They are
+  identity-mapped **not present** in the kernel identity map every address space shares,
+  so `pmm_free` without re-mapping poisons that frame permanently and the #PF lands on
+  whoever `pmm_alloc()`s it next — nowhere near the task that died. The boot-time "no
+  holes" check can't catch it (runtime hole). User tasks have one too.
+- **`knetd` is supervised; the supervisor is `CAP_UNKILLABLE` and `knetd` is not.**
+  `supervisor_run_once()` must use `task_get_validated(pid, generation)` — slots are
+  recycled, so a bare `task_get()` can match a *different* task in the same slot and
+  make a dead daemon look alive. The rate limit lives **inside** `supervisor_restart()`
+  so no second restart path skips it. Its give-up branch is **not exercised by any
+  harness** (only asserted `== 0`); PR D1 must not land without one that drives past the
+  budget and proves the daemon stays dead. Harness: `verify-supervisor.sh` (needs
+  `-DTINYOS_FAULT_INJECT`, and `make clean`s on exit — that flag is not in the
+  dependency graph, so its objects break the *other* harnesses at link time).
+  Rationale in `doc/NETDAEMON_DESIGN.md`.
 - **The e1000 DMA buffers are a guarded PMM region, not `.bss`.**
   `e1000_dma_region_init()` carves 38 contiguous pages with an **unmapped guard page at
   each end**; `rx_bufs/tx_bufs/rx_ring/tx_ring` are pointers into it. Three things to

@@ -193,6 +193,8 @@ ring3.log
 ring3-trace.log
 dmaguard.log
 dmaguard-trace.log
+supervisor.log
+supervisor-trace.log
 icmpctr.log
 icmpctr-trace.log
 sysredirect.log

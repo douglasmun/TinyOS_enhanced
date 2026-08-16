@@ -26,6 +26,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "test_tasks.h"
+#include "supervisor.h"
 #include "elf.h"
 #include "hello_elf_data.h"
 #include "sleeper_elf_data.h"
@@ -1005,6 +1006,33 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         for(;;) __asm__ volatile("hlt");
     }
 
+    /*
+     * Supervise knetd (doc/NETDAEMON_DESIGN.md item 4, PR D2).
+     *
+     * knetd cannot currently be killed: task_create_kernel() assigns CAP_ALL
+     * (process.c), which is 0xFFFFFFFF and therefore INCLUDES CAP_UNKILLABLE,
+     * so sys_kill refuses every kernel task. The explicit `|= CAP_UNKILLABLE`
+     * grants further down are redundant for that reason -- they are kept only
+     * because they document intent for the three tasks that would still want it
+     * if the default ever narrowed.
+     *
+     * So supervision is not closing a live `kill <pid>` hole today; it is the
+     * prerequisite for PR D1, which moves the parser to ring 3 where the whole
+     * premise is that it CAN die -- crash, fault, or be killed -- and must come
+     * back. Protection is the wrong answer there: a ring-3 parser that faults
+     * cannot be protected into staying alive, only restarted.
+     *
+     * Registered here, watched by task_supervisor below.
+     */
+    supervisor_init();
+    supervisor_watch("knetd", task_knetd, (uint32_t)pid_knetd);
+
+    int pid_supervisor = task_create_kernel(task_supervisor, "supervisor");
+    if (pid_supervisor < 0) {
+        kprintf("ERROR: Failed to create supervisor task\n");
+        for(;;) __asm__ volatile("hlt");
+    }
+
     /* Start EDR daemon - PID 3 (Phase 4a MVP) - Protected background monitoring */
     int pid_edr = -1;
     edr_daemon_start();
@@ -1027,6 +1055,20 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     if (edr_task_ptr) {
         edr_task_ptr->capabilities |= CAP_UNKILLABLE;
         kprintf("[KERNEL] EDR daemon protected (CAP_UNKILLABLE)\n");
+    }
+
+    /*
+     * The supervisor itself IS protected, and knetd deliberately is not.
+     * That asymmetry is the design: the supervised task must stay killable or
+     * the restart path can never be exercised (and after PR D1 it must be able
+     * to die anyway), while a killable supervisor would let one `kill` disable
+     * restarts for everything it watches -- turning a recoverable failure back
+     * into a permanent one, silently.
+     */
+    task_t* supervisor_task_ptr = task_get((uint32_t)pid_supervisor);
+    if (supervisor_task_ptr) {
+        supervisor_task_ptr->capabilities |= CAP_UNKILLABLE;
+        kprintf("[KERNEL] Supervisor protected (CAP_UNKILLABLE)\n");
     }
 
     // Set task priorities
@@ -1059,6 +1101,12 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     scheduler_add_task(task_get((uint32_t)pid_idle));
     scheduler_add_task(task_get((uint32_t)pid_ktimerd));
     scheduler_add_task(task_get((uint32_t)pid_knetd));
+    /* task_create_kernel() does NOT enqueue -- every kernel task is added here
+     * explicitly. Omitting this line leaves the supervisor created, registered
+     * and CAP_UNKILLABLE, but never once scheduled: `ps` still lists it and
+     * `ifconfig` still reports "1 watched", so the omission reads as healthy
+     * from both status surfaces while nothing is actually being supervised. */
+    scheduler_add_task(task_get((uint32_t)pid_supervisor));
 
     kprintf("[SHELL] Tinyshell is ready to play!  [OK]\n");
 
