@@ -100,10 +100,16 @@ Known, low-severity, from the PR #1 audit (see memory `exec-failure-path-leaks`)
 - ~~user guard page isn't wired into the #PF handler~~ DONE — required adding
   `user_guard_page_virt` to `task_t`; only the *physical* address was stored,
   but user faults report CR2 as a *virtual* address.
-- AUDIT-8E gap: IDS exists but isn't wired to anything at runtime — STILL OPEN
-  (unrelated to the exec path; split out deliberately).
+- ~~AUDIT-8E gap: IDS exists but isn't wired to anything at runtime~~ DONE for
+  the network half — `ids_inspect_payload()` matches inbound payloads against
+  the signature table, and `secstatus` reports match count alongside signature
+  count so a dead matcher is distinguishable from a quiet network. The
+  host-based detectors (`ids_analyze_syscall`, `ids_register_login_attempt`,
+  `ids_check_fork_bomb`) are still empty stubs and deliberately still have no
+  callers. Harness: `verify-ids-signature.sh`.
 
 ## Recommendation
 1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
-dependencies (spawn, waitpid, file syscalls) are now all in place. The
-AUDIT-8E IDS-not-wired gap is still open and independent of that work.
+dependencies (spawn, waitpid, file syscalls) are now all in place. AUDIT-8E's
+signature-matching half is closed and was independent of that work; what
+remains of it is the three host-based detector stubs.

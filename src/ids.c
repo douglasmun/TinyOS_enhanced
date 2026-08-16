@@ -158,6 +158,69 @@ void ids_generate_alert(ids_alert_type_t type, ids_severity_t severity,
 }
 
 /*=============================================================================
+ * FUNCTION: ids_inspect_payload
+ * PURPOSE: Match a packet payload against the loaded signature database.
+ *
+ * This closes AUDIT-8E. The signatures were loaded, counted, and displayed by
+ * `secstatus` while nothing ever compared a byte against them -- the worst kind
+ * of gap, because the status line read as protection.
+ *
+ * Returns false if a BLOCK-action signature matched, so the caller drops the
+ * packet; ALERT-only matches still return true.
+ *
+ * BOUNDS. The obvious loop, `for (j = 0; j <= len - pattern_len; j++)`, is
+ * WRONG here, and is exactly what the AUDIT-8E fix sketch in this file used to
+ * recommend: `len` and `pattern_len` are both size_t, so when the payload is
+ * shorter than the
+ * pattern the subtraction WRAPS to a huge positive number and the scan reads
+ * far off the end of the packet buffer. A short packet is entirely
+ * attacker-controlled, which makes that an out-of-bounds read reachable from
+ * the network -- exactly the class of bug this function exists to catch. The
+ * length is compared BEFORE any subtraction.
+ *
+ * A zero-length pattern would match everywhere and alert on every packet, so
+ * it is skipped rather than trusted; ids_add_signature does not check it.
+ *===========================================================================*/
+static bool ids_inspect_payload(const uint8_t* payload, size_t len, uint32_t src_ip) {
+    bool allow = true;
+
+    for (int i = 0; i < signature_count; i++) {
+        ids_signature_t* sig = &signatures[i];
+
+        if (!sig->enabled || sig->pattern == NULL) {
+            continue;
+        }
+        /* Guard BEFORE the subtraction below -- see the BOUNDS note above. */
+        if (sig->pattern_len == 0 || sig->pattern_len > len) {
+            continue;
+        }
+
+        size_t last = len - sig->pattern_len;
+        for (size_t j = 0; j <= last; j++) {
+            if (memcmp(&payload[j], sig->pattern, sig->pattern_len) != 0) {
+                continue;
+            }
+
+            sig->match_count++;
+            stats.signature_matches++;
+
+            /* ids_generate_alert blocks the source itself for HIGH and above;
+             * calling firewall_block_ip here as well would double-block. The
+             * return value is what stops THIS packet. */
+            ids_generate_alert(sig->alert_type, sig->severity, src_ip,
+                               sig->description);
+
+            if (sig->action == IDS_ACTION_BLOCK) {
+                allow = false;
+            }
+            break;  /* One alert per signature per packet, not per offset. */
+        }
+    }
+
+    return allow;
+}
+
+/*=============================================================================
  * Network IDS - Packet Analysis
  *===========================================================================*/
 bool ids_analyze_packet(const ip_header_t* ip_header, size_t packet_len) {
@@ -179,12 +242,36 @@ bool ids_analyze_packet(const ip_header_t* ip_header, size_t packet_len) {
         ids_generate_alert(IDS_ALERT_TRAFFIC_ANOMALY, IDS_SEVERITY_LOW,
                           src_ip, "Unusually large packet");
     }
-    return true;
+
+    /* Signature matching over the L4 payload (AUDIT-8E).
+     *
+     * ihl is validated above, but ihl*4 can still EXCEED packet_len -- a header
+     * length longer than the packet is malformed and, left unchecked, would
+     * make the payload length underflow. Both bounds are re-derived here rather
+     * than assumed from the caller: net.c computes the same offset, but this
+     * function is exported and must hold on its own.
+     *
+     * The scan covers the payload only. Running it over the header as well
+     * would let ordinary address and checksum bytes trip a short signature. */
+    size_t hdr_len = (size_t)ihl * 4u;
+    if (hdr_len >= packet_len) {
+        return true;   /* No payload to inspect; header checks already passed. */
+    }
+
+    const uint8_t* payload = (const uint8_t*)ip_header + hdr_len;
+    return ids_inspect_payload(payload, packet_len - hdr_len, src_ip);
 }
 
 /*=============================================================================
  * Host IDS - Syscall Analysis
  *===========================================================================*/
+/* STUB -- detects nothing, and has no callers. Kept because the header
+ * advertises it and removing it would change the public API, but note that
+ * wiring it into the syscall dispatcher as it stands would be worse than
+ * leaving it out: it would cost a call on every syscall, raise
+ * "Syscalls analyzed" off zero, and still return true for every input. That
+ * misleading counter is the same shape of bug AUDIT-8E named. Give it a real
+ * body before giving it a call site. */
 bool ids_analyze_syscall(uint32_t syscall_num, const task_t* task) {
     stats.syscalls_analyzed++;
     (void)syscall_num;
@@ -215,12 +302,18 @@ int ids_remove_signature(int sig_id) {
 /*=============================================================================
  * Convenience Functions
  *===========================================================================*/
+/* STUB -- no callers, no state, always "not a brute force". The login path
+ * does its own throttling; this would need a per-source-IP attempt table with
+ * a decay window before it is worth calling. See ids_analyze_syscall(). */
 bool ids_register_login_attempt(uint32_t src_ip, const char* username) {
     (void)src_ip;
     (void)username;
     return false;
 }
 
+/* STUB -- no callers, always false. Note the actual defence against task-slot
+ * exhaustion is the per-uid live-task cap in task_create_user_argv(), which is
+ * enforced, tested, and does not depend on this. */
 bool ids_check_fork_bomb(uint32_t pid) {
     (void)pid;
     return false;
@@ -248,95 +341,56 @@ bool ids_is_traffic_anomalous(uint64_t current_rate) {
 }
 
 /*=============================================================================
- * SECURITY DOCUMENTATION (AUDIT 8E): IDS Pattern Matching Gap
+ * SECURITY DOCUMENTATION (AUDIT 8E): IDS Pattern Matching Gap -- FIXED
  *
- * VULNERABILITY: Placebo Security - Signatures Never Checked
+ * WAS: Placebo Security - Signatures Never Checked
  *
- * PROBLEM: Missing Pattern Matching Implementation
- * The IDS loads attack signatures (shellcode patterns, SQL injection, etc.)
- * but NEVER actually checks network packets or syscall data against them.
- * The signature database exists only for display purposes.
+ * ids_load_default_signatures() populated signatures[] and ids_print_status()
+ * reported "Signatures loaded: 1", but nothing ever compared a byte of network
+ * traffic against them. A packet carrying the exact NOP sled in signatures[0]
+ * produced no alert. The status line was the whole problem: a loaded count with
+ * no match count reads identically whether the matcher is running or absent.
  *
- * CURRENT BEHAVIOR:
- * 1. ids_load_default_signatures() populates signatures[] array
- * 2. ids_print_status() shows "Signatures loaded: 1"
- * 3. NO function ever calls a pattern matching routine
- * 4. NO packet inspection code compares payload to signatures
- * 5. Alerts are generated only from behavioral heuristics (port scans, etc.)
+ * FIX: ids_inspect_payload() (above ids_analyze_packet) walks every enabled
+ * signature over the IP payload and calls ids_generate_alert() on a hit.
+ * ids_analyze_packet() calls it as its last step, so the existing hook in
+ * net.c:ip_receive is the only call site -- there is no second one to get wrong
+ * or to leave out of a future protocol handler.
  *
- * SECURITY IMPACT: False Sense of Security
- * - Administrators see "Loaded 1 attack signatures" and believe protection exists
- * - Real attacks containing shellcode/SQL injection pass undetected
- * - IDS marketing claims "signature-based detection" but reality is heuristic-only
- * - Example: Shellcode NOP sled (0x90 0x90 0x90 0x90 0x31 0xc0) is NEVER detected
+ * Two properties worth keeping if this is ever rewritten:
  *
- * MISSING COMPONENTS:
- * 1. Pattern Matching Engine: No Boyer-Moore, Aho-Corasick, or regex engine
- * 2. Packet Inspection Hook: No integration with network stack to inspect payloads
- * 3. Content Normalization: No HTTP decoding, URL decoding, or encoding detection
- * 4. Signature Update Mechanism: No way to add new signatures at runtime
+ * 1. BOUNDS. The obvious loop bound `j <= len - pattern_len` is a size_t
+ *    underflow when the payload is shorter than the pattern: it wraps to ~4e9
+ *    and memcmp() walks off the end of the packet buffer. Since the payload is
+ *    attacker-controlled and this runs in the receive path, that is a remotely
+ *    triggerable OOB read. ids_inspect_payload() rejects pattern_len == 0 and
+ *    pattern_len > len BEFORE the subtraction. (An earlier revision of this
+ *    comment recommended exactly the underflowing loop -- do not restore it.)
  *
- * WHY THIS IS DANGEROUS:
- * - Known attack patterns documented in signatures[] are ignored
- * - Attacker can send raw shellcode that exactly matches loaded signatures
- * - IDS will not generate alerts, logs show "Packets analyzed: X" but signatures unused
- * - System claims compliance with signature-based IDS requirements (false compliance)
+ * 2. ONE ALERT PER SIGNATURE PER PACKET. The inner loop breaks on first match.
+ *    A NOP sled matches at every offset; alerting per offset would let one
+ *    packet flood the alert ring and evict real alerts.
  *
- * RECOMMENDED FIX:
- * Implement pattern matching in network packet processing:
+ * stats.signature_matches counts hits so the status line can distinguish a
+ * quiet network from a dead matcher. That is the assertion verify-ids.sh keys
+ * on, and the negative control is a packet that matches nothing.
  *
- * 1. Add to tcp_process_packet() or network interrupt handler:
- *    ```c
- *    void ids_inspect_packet(const uint8_t* payload, size_t len, uint32_t src_ip) {
- *        for (int i = 0; i < signature_count; i++) {
- *            if (!signatures[i].enabled) continue;
+ * STILL HEURISTIC-ONLY, deliberately: this is a naive O(n*m) memcmp scan, not
+ * Aho-Corasick, and there is no content normalization (no URL/HTTP decoding),
+ * so an attacker who encodes the payload evades it. That is acceptable for one
+ * six-byte signature on a teaching kernel; it would not be with a real ruleset.
  *
- *            // Simple Boyer-Moore or memchr-based pattern search
- *            for (size_t j = 0; j <= len - signatures[i].pattern_len; j++) {
- *                if (memcmp(&payload[j], signatures[i].pattern,
- *                           signatures[i].pattern_len) == 0) {
- *                    // MATCH FOUND!
- *                    ids_generate_alert(signatures[i].alert_type,
- *                                     signatures[i].severity,
- *                                     src_ip,
- *                                     signatures[i].description);
- *                    signatures[i].match_count++;
- *                    if (signatures[i].action == IDS_ACTION_BLOCK) {
- *                        firewall_block_ip(src_ip);
- *                    }
- *                    break;
- *                }
- *            }
- *        }
- *    }
- *    ```
- *
- * 2. Call from network stack:
- *    - In tcp_process_packet(): ids_inspect_packet(payload, payload_len, src_ip);
- *    - In ssh_process_packets(): ids_inspect_packet(packet_data, len, remote_ip);
- *    - In http_handle_request(): ids_inspect_packet(http_body, len, client_ip);
- *
- * 3. Performance considerations:
- *    - Use Boyer-Moore for multi-byte patterns (O(n/m) average case)
- *    - Consider Aho-Corasick for multiple pattern matching (O(n + m + z))
- *    - Implement pattern length threshold (skip patterns < 4 bytes)
- *    - Add signature enable/disable based on protocol (HTTP-only signatures)
- *
- * REFERENCES:
- * - Snort IDS: Pattern Matching with AC (Aho-Corasick) algorithm
- * - Suricata: Hyperscan regex engine for high-performance matching
- * - Bro/Zeek: Signature vs. Behavioral detection trade-offs
- *
- * STATUS: **NOT FIXED** - This is documentation only
- * The signature database remains unused pending pattern matching implementation.
+ * NOT covered by this fix -- the host-based detectors remain empty stubs:
+ * ids_analyze_syscall(), ids_register_login_attempt(), ids_check_fork_bomb().
+ * They count and return; they detect nothing. See ids_analyze_syscall().
  *===========================================================================*/
 
 /*=============================================================================
  * Load Default Attack Signatures
  *===========================================================================*/
 void ids_load_default_signatures(void) {
-    /* NOTE: These signatures are loaded but NEVER checked against packets.
-     * See SECURITY DOCUMENTATION (AUDIT 8E) above for details. */
+    /* Every enabled entry here is scanned against each inbound IP payload by
+     * ids_inspect_payload(). Adding one costs a memcmp pass per packet. */
 
     static uint8_t shellcode_pattern1[] = {0x90, 0x90, 0x90, 0x90, 0x31, 0xc0};
     ids_signature_t sig1 = {
@@ -367,5 +421,6 @@ void ids_print_status(void) {
     kprintf("Alerts generated:    %llu\n", stats.alerts_generated);
     kprintf("IPs blocked:         %llu\n", stats.ips_blocked);
     kprintf("Signatures loaded:   %u\n", stats.signatures_loaded);
+    kprintf("Signature matches:   %llu\n", stats.signature_matches);
     kprintf("\n");
 }

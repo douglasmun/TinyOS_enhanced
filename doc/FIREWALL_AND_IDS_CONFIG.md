@@ -148,16 +148,36 @@ Add another `ids_signature_t` and `ids_add_signature(&sig)` call inside
 `ids_load_default_signatures()` in `src/ids.c`, then rebuild. C API:
 `ids_add_signature(&sig)`, `ids_remove_signature(id)`, `ids_get_stats(&stats)`.
 
-### ⚠️ Known limitation — signatures are not matched against traffic
+### Signature matching (AUDIT 8E — fixed)
 
-The signature **database loads** at boot (you'll see `[IDS] Loaded N attack
-signatures`), but TinyOS does **not** currently run a packet-inspection engine
-that tests those byte patterns against live traffic. The signature table is
-effectively informational. This gap is documented in the source
-(`src/ids.c`, "AUDIT 8E: IDS Pattern Matching Gap") and in the security audit
-([`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECURITY_AUDIT_2026.md)).
-Anomaly/behavioral detection lives in the EDR subsystem, not here. Treat the IDS
-as a teaching scaffold, not an operational detector.
+Signatures **are** matched against live traffic. `ids_inspect_payload()` scans the
+payload of every inbound IP packet against each enabled signature; a hit raises an
+alert, and a `IDS_ACTION_BLOCK` signature also drops the packet. The hook is
+`ids_analyze_packet()` in `handle_ip()` (`src/net.c`), which runs before L4
+demultiplexing — so a packet is inspected whether or not anything is listening on
+its port.
+
+`secstatus` reports the match count next to the signature count:
+
+```
+IDS ................. 1 signatures, 0 matches, 0 alerts, 0 IPs blocked
+```
+
+Both numbers matter. For as long as only the *loaded* count was displayed, an IDS
+that never compared a byte was indistinguishable from one on a quiet network — that
+was AUDIT 8E, and it is why the match count is now on the same line.
+
+**What this is not.** The scan is a naive O(n·m) `memcmp` walk, not Aho-Corasick, and
+there is **no content normalization** — no URL or HTTP decoding — so an attacker who
+encodes the payload evades it. It is also only as good as the one six-byte signature
+loaded by default. Anomaly and behavioral detection live in the EDR subsystem, not
+here, and the IDS's own **host-based** detectors (`ids_analyze_syscall`,
+`ids_register_login_attempt`, `ids_check_fork_bomb`) are still empty stubs with no
+callers. Treat the IDS as a teaching scaffold that now genuinely detects the case it
+claims to, not as an operational detector.
+
+Regression harness: `verify-ids-signature.sh` (sends a matching and a non-matching
+datagram, asserts the counter moves for exactly one of them).
 
 ### Viewing IDS state
 
@@ -200,10 +220,12 @@ already exist to support runtime management. Natural near-term improvements:
   `firewall_set_rule_enabled()` / `firewall_get_stats()` API so rules can be
   managed live without a rebuild. (A good first contribution — the kernel side is
   already done; it only needs a shell front-end.)
-- **Wire up the IDS pattern-matching engine** — close the AUDIT 8E gap so loaded
-  signatures are actually tested against packet payloads (and the
-  port-scan / SYN-flood / brute-force detectors are fed real traffic), turning the
-  signature table from informational into operational.
+- **Give the host-based detectors a body** — `ids_analyze_syscall()`,
+  `ids_register_login_attempt()` and `ids_check_fork_bomb()` are empty stubs. Note
+  the order that matters: implement first, wire second. Calling them as they stand
+  would move counters and detect nothing, which is the AUDIT 8E failure mode again.
+- **Improve the matcher** — Aho-Corasick instead of the current O(n·m) scan, and
+  content normalization (URL/HTTP decoding), without which encoded payloads evade it.
 - **An `ids` shell command** — list/enable/disable signatures and show recent
   alerts at runtime.
 - **Persistent rules** — load firewall rules / IDS signatures from a file on the

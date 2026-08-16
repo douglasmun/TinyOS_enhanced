@@ -108,10 +108,23 @@ between records and a compacted index skips a task when an earlier one exits; an
 visibility check must read the fields in the **same** critical section that passed it,
 or a reused slot copies another user's name out. Harness: `verify-ring3-ps.sh`.
 
+**AUDIT-8E is closed for the network half.** `ids_inspect_payload()` (in `ids.c`, called
+at the end of `ids_analyze_packet`) now scans every inbound IP payload against the
+signature table, and `secstatus` reports a **match count** next to the signature count —
+a loaded count alone is what let the gap read as protection for so long. Two things not
+to undo: the bounds check rejects `pattern_len > len` **before** the `len - pattern_len`
+subtraction (both `size_t`; the wrap is a remote OOB read, and the fix sketch that used
+to sit in `ids.c` had exactly that bug), and the inner loop **breaks on first match** so
+one NOP sled cannot flood the alert ring. Harness: `verify-ids-signature.sh`.
+The host-based detectors (`ids_analyze_syscall`, `ids_register_login_attempt`,
+`ids_check_fork_bomb`) are **still empty stubs with no callers** — marked as such in
+place. Give them a body before giving them a call site: wiring them in as-is would move
+counters, detect nothing, and recreate AUDIT-8E's exact shape.
+
 Open, in rough priority order:
 
-- **AUDIT-8E IDS-not-wired gap.**
 - **`shell_system.c`** — ~222 `kprintf` conversions before it can move to ring 3.
+- **IDS host-based detectors** — the three stubs above.
 
 ## Not compiled (don't audit/fix)
 

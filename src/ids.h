@@ -153,6 +153,12 @@ typedef struct {
     uint64_t ips_blocked;           /* IPs blocked by IDS */
     uint64_t processes_killed;      /* Processes terminated */
     uint32_t signatures_loaded;     /* Active signatures */
+    /* Signature hits. Reported separately from alerts_generated because
+     * "signatures loaded" on its own is what made AUDIT-8E readable as
+     * protection while nothing was ever compared against them: a loaded count
+     * with no match count cannot distinguish a quiet network from a matcher
+     * that is not running. */
+    uint64_t signature_matches;     /* Payload bytes matched a signature */
 } ids_stats_t;
 
 /*=============================================================================
