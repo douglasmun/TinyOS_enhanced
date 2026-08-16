@@ -323,6 +323,11 @@ void ramfs_list(const char* path);
 ramfs_node_t* ramfs_get_root(void);
 
 /* Permission operations */
+
+/* ramfs_chmod() refusal for a non-root, non-owner caller. Deliberately not
+ * -EPERM: EPERM is 1, and -1 is already ramfs_chmod's "file not found". */
+#define RAMFS_CHMOD_EPERM (-3)
+
 int ramfs_chmod(const char* path, uint16_t mode);
 bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint8_t access);
 

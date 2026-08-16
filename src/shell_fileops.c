@@ -207,6 +207,13 @@ void cmd_chmod(int argc, char** argv) {
     if (result < 0) {
         if (result == -1) {
             kprintf("chmod: cannot access '%s': No such file or directory\n", path);
+        } else if (result == RAMFS_CHMOD_EPERM) {
+            /* Deliberately distinct from the not-found message above: the file
+             * demonstrably exists (ramfs_chmod found it), and its existence is
+             * already observable via ls, so "not permitted" leaks nothing that
+             * a directory listing does not. This differs from the ps/kill
+             * policy, where hiding existence IS the point. */
+            kprintf("chmod: changing permissions of '%s': Operation not permitted\n", path);
         } else if (result == -2) {
             kprintf("chmod: invalid mode\n");
         } else {
@@ -220,7 +227,12 @@ void cmd_chmod(int argc, char** argv) {
     if (node) {
         char perm_str[10];
         ramfs_format_permissions(node->mode, perm_str);
-        kprintf("chmod: '%s' -> %s (%03o)\n", path, perm_str, node->mode);
+        /* kprintf implements c s d i u x X p and %% — there is no 'o'
+         * conversion, so the old "(%03o)" here printed the literal text
+         * "(%o)" on the console. Show the mode as three octal digits built
+         * by hand rather than growing the shared formatter for one caller. */
+        kprintf("chmod: '%s' -> %s (%d%d%d)\n", path, perm_str,
+                (node->mode >> 6) & 7, (node->mode >> 3) & 7, node->mode & 7);
     }
 }
 
