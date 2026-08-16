@@ -8,6 +8,9 @@
 #include "pit.h"
 #include "critical.h"
 #include "util.h"
+#include "time.h"
+#include "user.h"
+#include <stdarg.h>
 
 /*=============================================================================
  * Global State
@@ -21,6 +24,17 @@ static int alert_count = 0;
 
 static traffic_baseline_t baseline;
 static ids_stats_t stats;
+
+/* Bounded format into an alert description. There is no ksnprintf in this
+ * tree -- kprintf.h exposes only vsnprintf_impl -- and alert descriptions can
+ * carry attacker-controlled substrings, so every formatted alert goes through
+ * this rather than through any unbounded string building. */
+static void ids_format_desc(char* buf, size_t size, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf_impl(buf, size, fmt, args);
+    va_end(args);
+}
 
 /*=============================================================================
  * Helper Functions - String Names
@@ -263,21 +277,31 @@ bool ids_analyze_packet(const ip_header_t* ip_header, size_t packet_len) {
 }
 
 /*=============================================================================
- * Host IDS - Syscall Analysis
+ * Host IDS - Syscall Analysis: REMOVED, not unimplemented
+ *=============================================================================
+ * ids_analyze_syscall() used to live here as a stub that incremented
+ * "Syscalls analyzed" and returned true for every input. It is gone rather
+ * than implemented, because the detector it promised already exists and is
+ * enforcing: edr_behavioral_check() (edr_behavioral.c) occupies the exact call
+ * site this would have used -- syscall.c's dispatcher, mandatory and
+ * unbypassable -- and implements the whole advertised list with real per-task
+ * state: edr_detect_rop_chain(), edr_detect_syscall_flood(),
+ * edr_detect_privilege_escalation(), edr_detect_shellcode(),
+ * edr_detect_data_exfiltration(), plus a decaying anomaly score and automated
+ * termination.
+ *
+ * A second detector on that hook would not be defence in depth. It would be a
+ * competing score and a competing alert ring for the same event, and it would
+ * add per-syscall work and output to a path ring 3 reaches on every keystroke
+ * -- which this tree bans outright. IDS_SYSCALL_ANOMALY_THRESHOLD would be
+ * recomputing what EDR_RAPID_SYSCALL_THRESHOLD already computes.
+ *
+ * The "Syscalls analyzed" status line went with it. Nothing else incremented
+ * that counter, so keeping the line would have printed a hardcoded 0 forever
+ * -- a status field that cannot move is the AUDIT-8E failure shape again, just
+ * inverted. Syscall-level detection is reported by the EDR status commands,
+ * which is where it actually happens.
  *===========================================================================*/
-/* STUB -- detects nothing, and has no callers. Kept because the header
- * advertises it and removing it would change the public API, but note that
- * wiring it into the syscall dispatcher as it stands would be worse than
- * leaving it out: it would cost a call on every syscall, raise
- * "Syscalls analyzed" off zero, and still return true for every input. That
- * misleading counter is the same shape of bug AUDIT-8E named. Give it a real
- * body before giving it a call site. */
-bool ids_analyze_syscall(uint32_t syscall_num, const task_t* task) {
-    stats.syscalls_analyzed++;
-    (void)syscall_num;
-    (void)task;
-    return true;
-}
 
 /*=============================================================================
  * Signature Management
@@ -300,24 +324,203 @@ int ids_remove_signature(int sig_id) {
 }
 
 /*=============================================================================
- * Convenience Functions
+ * Host IDS - Horizontal Credential Attack Detection
+ *=============================================================================
+ * WHAT THIS COVERS THAT user.c DOES NOT.
+ *
+ * user.c already locks an account after USER_MAX_LOGIN_ATTEMPTS (3) failures
+ * within USER_LOCKOUT_DURATION (60s), audit-logged, enforced. That guard is
+ * keyed on the ACCOUNT: it counts into user->failed_attempts. It is a complete
+ * answer to a vertical attack -- many passwords against one username.
+ *
+ * It is structurally blind to the horizontal one. An attacker spraying a single
+ * likely password ("password123") across fifty usernames leaves every account
+ * at 1/3 failures, so nothing ever reaches the lockout threshold and nothing is
+ * ever logged as an attack. Each individual event looks like an ordinary typo.
+ * The attack is only visible in the aggregate across DIFFERENT accounts, which
+ * is a place no per-account counter can see by construction.
+ *
+ * Worse, user_authenticate_for() returns -2 for an unknown username before any
+ * counter exists at all -- a spray against guessed names touches no
+ * failed_attempts field anywhere. That branch is the least observed path in the
+ * whole auth system and it is the one a spray spends most of its time in.
+ *
+ * So this detector keys on USERNAME DIVERSITY, not attempt count: how many
+ * DISTINCT usernames have failed inside one decay window. Counting raw failures
+ * instead would just duplicate user.c and fire on one user fat-fingering their
+ * password four times.
+ *
+ * WHY NOT src_ip. The old stub took a uint32_t src_ip. Every login path in this
+ * kernel is local -- console login, su, and the ring-3 credential syscalls;
+ * SSH is excluded from the build and there is no telnet -- so every caller
+ * would have passed 0, and a per-source-IP table keyed on 0 collapses to a
+ * single global bucket while presenting itself as per-source attribution. That
+ * is precisely the AUDIT-8E shape: a field that reads as evidence and is not.
+ * The parameter is gone rather than passed a placeholder.
+ *
+ * WINDOW SIZING. The window is deliberately LONGER than USER_LOCKOUT_DURATION.
+ * A spray is slow by design -- staying under the per-account threshold is the
+ * whole point of it -- so a window shorter than the lockout period would let an
+ * attacker evade this by pacing just slowly enough, while still being fast
+ * enough to matter.
+ *
+ * SEVERITY is MEDIUM, not HIGH, on purpose: ids_generate_alert() blocks the
+ * source IP at HIGH, and with src_ip 0 (local, as all logins here are) there is
+ * nothing meaningful to block. Raising it to HIGH would only ever produce a
+ * no-op block attempt against address 0.
+ *
+ * NOT A LOCKOUT. This alerts and audits; it does not deny. Denying on username
+ * diversity is a self-inflicted DoS -- one attacker could lock the console for
+ * everyone by failing five names. The enforcement answer to credential attacks
+ * stays where it is, per-account in user.c.
  *===========================================================================*/
-/* STUB -- no callers, no state, always "not a brute force". The login path
- * does its own throttling; this would need a per-source-IP attempt table with
- * a decay window before it is worth calling. See ids_analyze_syscall(). */
-bool ids_register_login_attempt(uint32_t src_ip, const char* username) {
-    (void)src_ip;
-    (void)username;
-    return false;
+#define IDS_SPRAY_WINDOW_SECONDS  300u   /* 5 min; > USER_LOCKOUT_DURATION (60) */
+#define IDS_SPRAY_MAX_TRACKED     16u    /* Distinct usernames remembered */
+
+/* THRESHOLD: distinct usernames in one window before alerting.
+ *
+ * Deliberately NOT IDS_BRUTEFORCE_THRESHOLD (5), which is the network-side
+ * constant. shell_login_prompt() allows max_attempts = 3 and then halts the
+ * system outright, so a console spray can produce at most THREE distinct failed
+ * usernames per boot. A threshold of 5 would be unreachable from the only path
+ * that calls this -- a detector that cannot fire, which is the exact placebo
+ * this file's AUDIT-8E note exists to prevent.
+ *
+ * 3 is therefore both the ceiling of what the login path can produce and the
+ * point at which a spray is distinguishable from a typo: user.c's own lockout
+ * fires at 3 failures against ONE account, so 3 failures against three
+ * DIFFERENT accounts is the same amount of evidence pointed at the pattern
+ * per-account counting cannot see. Raise this if a remote login path is ever
+ * added, since that would lift the max_attempts ceiling. */
+#define IDS_SPRAY_THRESHOLD       3u
+
+typedef struct {
+    char username[USER_MAX_USERNAME];
+    uint32_t last_seen;              /* Uptime seconds of most recent failure */
+} ids_failed_login_t;
+
+static ids_failed_login_t spray_table[IDS_SPRAY_MAX_TRACKED];
+static uint32_t spray_window_start = 0;
+static bool spray_alerted = false;
+
+bool ids_register_login_failure(const char* username) {
+    if (!username || username[0] == '\0') {
+        return false;
+    }
+
+    uint32_t now = time_get_uptime_seconds();
+    bool threshold_crossed = false;
+    uint32_t distinct = 0;
+
+    /* The table is touched from the login path, which is task context, but the
+     * alert ring this may feed is also written from the network ISR. Keep the
+     * table update itself atomic and do the alerting outside, matching
+     * ids_generate_alert()'s own discipline of not holding interrupts across
+     * audit_log(). */
+    CRITICAL_SECTION_ENTER();
+
+    /* Expire the whole window at once rather than per entry. A spray is judged
+     * on how many distinct names failed TOGETHER; sliding each entry
+     * independently would let an attacker hold a rolling set of 4 names alive
+     * indefinitely and never assemble a 5th inside one window. */
+    if (spray_window_start == 0 || (now - spray_window_start) > IDS_SPRAY_WINDOW_SECONDS) {
+        memset(spray_table, 0, sizeof(spray_table));
+        spray_window_start = now;
+        spray_alerted = false;
+    }
+
+    int free_slot = -1;
+    bool already_known = false;
+
+    for (uint32_t i = 0; i < IDS_SPRAY_MAX_TRACKED; i++) {
+        if (spray_table[i].username[0] == '\0') {
+            if (free_slot < 0) {
+                free_slot = (int)i;
+            }
+            continue;
+        }
+        distinct++;
+        if (strcmp(spray_table[i].username, username) == 0) {
+            spray_table[i].last_seen = now;
+            already_known = true;
+        }
+    }
+
+    if (!already_known) {
+        if (free_slot >= 0) {
+            safe_strcpy(spray_table[free_slot].username, username,
+                        sizeof(spray_table[free_slot].username));
+            spray_table[free_slot].last_seen = now;
+            distinct++;
+        } else {
+            /* Table full. Every slot full already means distinct >=
+             * IDS_SPRAY_MAX_TRACKED, which is far past the threshold, so the
+             * alert has fired; dropping the name loses nothing. Deliberately
+             * NOT evicting: eviction would let a spray of more than 16 names
+             * recycle slots and keep `distinct` pinned just under the cap. */
+            distinct = IDS_SPRAY_MAX_TRACKED;
+        }
+    }
+
+    /* One alert per window. Without this, every subsequent failure past the
+     * threshold generates another alert and one spray floods the ring, evicting
+     * the earlier alerts that identify it -- the same "break on first match"
+     * lesson ids_inspect_payload() records. */
+    if (distinct >= IDS_SPRAY_THRESHOLD && !spray_alerted) {
+        spray_alerted = true;
+        threshold_crossed = true;
+    }
+
+    CRITICAL_SECTION_EXIT();
+
+    if (threshold_crossed) {
+        /* The username is attacker-controlled, so it goes through a bounded
+         * format into a fixed buffer; ids_generate_alert() truncates again into
+         * the alert slot. */
+        char desc[128];
+        ids_format_desc(desc, sizeof(desc),
+                        "Credential spray: %u distinct usernames failed login "
+                        "within %us (most recent '%s')",
+                        (unsigned)distinct,
+                        (unsigned)IDS_SPRAY_WINDOW_SECONDS, username);
+        ids_generate_alert(IDS_ALERT_BRUTEFORCE, IDS_SEVERITY_MEDIUM, 0, desc);
+
+        /* Surfaced on the console explicitly.
+         *
+         * ids_generate_alert() routes to audit_log() at AUDIT_WARN for anything
+         * below IDS_SEVERITY_HIGH, and audit_log_raw() only echoes >= AUDIT_ERROR
+         * to serial -- so without this line the detection would be recorded in
+         * the audit ring and visible to nobody watching the machine. A detector
+         * whose output never surfaces is the same class of bug as one that never
+         * runs.
+         *
+         * Raising the alert to HIGH would surface it but also trip
+         * firewall_block_ip() on src_ip 0, which is meaningless for a local
+         * login and would put a junk entry in the block list.
+         *
+         * kprintf is correct here and does not violate the no-chatter rule: this
+         * is a once-per-window security event on the login path, not a
+         * per-operation print on a path ring 3 reaches. */
+        kprintf("[IDS] %s\n", desc);
+    }
+
+    return threshold_crossed;
 }
 
-/* STUB -- no callers, always false. Note the actual defence against task-slot
- * exhaustion is the per-uid live-task cap in task_create_user_argv(), which is
- * enforced, tested, and does not depend on this. */
-bool ids_check_fork_bomb(uint32_t pid) {
-    (void)pid;
-    return false;
-}
+/*=============================================================================
+ * ids_check_fork_bomb(): REMOVED, not unimplemented
+ *=============================================================================
+ * This was a stub that always returned false. It is deleted rather than given a
+ * body because the defence it names is already enforced at the only point where
+ * enforcement is possible: the per-uid live-task cap (USER_MAX_CONCURRENT_TASKS)
+ * plus the root slot reserve in task_create_user_argv(), which REFUSES the
+ * allocation and returns -EAGAIN.
+ *
+ * A detector here could only observe after the fact, and after the fact there is
+ * nothing left to decide -- the cap already denied the task. Its only effect
+ * would be a second opinion about an event that was already prevented, and a
+ * FORK_BOMB counter that moves when nothing got through.
+ *===========================================================================*/
 
 void ids_establish_baseline(void) {
     if (!baseline.established) {
@@ -380,9 +583,14 @@ bool ids_is_traffic_anomalous(uint64_t current_rate) {
  * so an attacker who encodes the payload evades it. That is acceptable for one
  * six-byte signature on a teaching kernel; it would not be with a real ruleset.
  *
- * NOT covered by this fix -- the host-based detectors remain empty stubs:
- * ids_analyze_syscall(), ids_register_login_attempt(), ids_check_fork_bomb().
- * They count and return; they detect nothing. See ids_analyze_syscall().
+ * The host-based side, which this fix did NOT cover, has since been resolved --
+ * by subtraction as much as by addition. ids_register_login_failure() detects a
+ * horizontal credential spray (see its block comment above);
+ * ids_analyze_syscall() and ids_check_fork_bomb() were DELETED rather than
+ * implemented, because edr_behavioral_check() and the per-uid live-task cap
+ * already own those and enforce rather than merely observe. Deleting a stub is
+ * a legitimate answer to this class of gap: the bug AUDIT-8E named is a claim
+ * of protection that nothing backs, and an honest absence makes no claim.
  *===========================================================================*/
 
 /*=============================================================================
@@ -417,7 +625,6 @@ void ids_get_stats(ids_stats_t* out_stats) {
 void ids_print_status(void) {
     kprintf("\n=== IDS Status ===\n");
     kprintf("Packets analyzed:    %llu\n", stats.packets_analyzed);
-    kprintf("Syscalls analyzed:   %llu\n", stats.syscalls_analyzed);
     kprintf("Alerts generated:    %llu\n", stats.alerts_generated);
     kprintf("IPs blocked:         %llu\n", stats.ips_blocked);
     kprintf("Signatures loaded:   %u\n", stats.signatures_loaded);

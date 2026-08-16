@@ -183,3 +183,5 @@ idssig.log
 idssig-trace.log
 sysredirect.log
 sysredirect-trace.log
+spray-pos.log
+spray-neg.log

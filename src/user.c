@@ -11,6 +11,7 @@
 #include "sha256.h"  /* Changed from SHA-512 to SHA-256 */
 #include "audit.h"
 #include "crypto.h"   /* For CSPRNG salt generation (global_csprng) */
+#include "ids.h"      /* ids_register_login_failure: horizontal spray detection */
 #include <stddef.h>
 
 /*=============================================================================
@@ -897,6 +898,13 @@ int user_authenticate_for(const char* username, const char* password,
         /* Audit: failure - user not found */
         audit_log(fail_event, AUDIT_WARN, 0,
                   "%s failed: user '%s' not found", verb, username);
+
+        /* This branch is the reason the spray detector exists. There is no
+         * account here, so there is no failed_attempts field to increment and
+         * no lockout that can ever trigger -- a spray against guessed usernames
+         * would otherwise be the least-observed path in the auth system. */
+        ids_register_login_failure(username);
+
         return -2;  /* User not found */
     }
 
@@ -977,6 +985,11 @@ int user_authenticate_for(const char* username, const char* password,
                       username, (unsigned long)user->failed_attempts, USER_MAX_LOGIN_ATTEMPTS);
         }
         mutex_unlock(&user_db_mutex);
+
+        /* Outside the mutex deliberately: this takes a critical section of its
+         * own and can reach audit_log(), and nesting that inside user_db_mutex
+         * would hold the credential database across unrelated I/O. */
+        ids_register_login_failure(username);
 
         return -5;  /* Wrong password */
     }
