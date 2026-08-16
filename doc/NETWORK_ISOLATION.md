@@ -346,6 +346,18 @@ the majority of it.
 
 Design the harness before the code.
 
+**Design written: `doc/NETDAEMON_DESIGN.md`** (design only, no code). Measuring the
+actual coupling changed the shape of the item — see that document, but two points
+belong here because they correct the sketch above:
+
+- The parser's *entire* kernel-service dependency on the receive path is
+  `e1000_send()`. No allocator, no page tables, no scheduler. The packet-path
+  boundary is **two syscalls**, and the line count was never the hard part.
+- The hard part is the **socket API**: 23 functions across six compiled callers,
+  plus the `my_ip`/`my_mac`/`gateway_ip`/`subnet_mask` globals. Moving the parser
+  moves `tcp_connections[]` with it, and every kernel-side caller is then reaching
+  for state that is no longer in its address space.
+
 ## Sequencing
 
 1. ~~**Item 2**~~ — **done**, `verify-rxdrop-counters.sh`.
@@ -355,6 +367,9 @@ Design the harness before the code.
 3. ~~**Item 3**~~ — **done**, `verify-dma-guard.sh`.
 4. **Item 4** — its own roadmap entry, now unblocked (1–3 have landed), with its
    harness designed up front. **Next up**, and the only multi-PR item of the four.
+   Design landed as `doc/NETDAEMON_DESIGN.md`; it proposes four PRs (audit → packet
+   syscalls → socket API → move to ring 3) and leaves four questions open, the
+   sharpest being whether `firewall.c`/`ids.c` belong on the ring-3 side at all.
 
 ## Corrections to the first-pass assessment
 
@@ -380,3 +395,16 @@ Recorded so the reasoning is auditable:
   where that call is the whole point, and so reported the fix as the bug. The guard is
   now scoped to `e1000_poll_rx()` with a staleness check, so renaming that function
   fails loudly instead of matching nothing and passing.
+- Item 4 was framed as "~5,000 lines change trust domain at once", i.e. as a problem
+  of scale. Measurement disagrees: the receive-path parser's only kernel dependency
+  is `e1000_send()`, so the packet-path boundary is two syscalls. The real weight is
+  the **socket API** (23 functions, six callers) and the config globals — none of
+  which is parser code. Sizing this item by parser line count mis-estimates both how
+  hard it is and *which part* is hard.
+- `ssh.c` appears in a naive grep for network consumers but is **not in `SRCS`** —
+  it is gitignored and not compiled. Counting it inflates the boundary by ~129 KB of
+  source that no longer exists as far as the build is concerned.
+- The item-4 sweep also flagged `task_create_user_argv` in `ids.c`, which would have
+  been a remotely-reachable parser calling process creation. It is a **false
+  positive**: the text is inside the comment explaining why `ids_check_fork_bomb` was
+  removed. Grepping for call syntax matches prose that quotes call syntax.
