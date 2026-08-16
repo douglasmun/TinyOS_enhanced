@@ -54,6 +54,12 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   `net_drop_ethertype`, `rx_drop_errors`, `rx_drop_badlen`). Count, don't print, and don't
   reach for `stream_printf` here either: interrupt context has no current user stream.
   Harness: `verify-rxdrop-counters.sh`; rationale in `doc/NETWORK_ISOLATION.md`.
+  **That sweep covered the RX loops and so missed `icmp.c`**, which had three more
+  (`icmp_echo_replies_rx`, `icmp_echo_requests_rx`, `icmp_replies_dropped` now).
+  The echo-*reply* one was unbounded — its branch returns before the rate limiter,
+  and the identifier it gates on is cleartext in every outbound ping, so an on-path
+  attacker drove one line per packet. When looking for this class of bug, sweep the
+  protocol files too, not just the loops. Harness: `verify-icmp-counters.sh`.
 - **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
   `critical_section_exit()` only touches `IF` when `__interrupt_context_depth == 0`, and
   that clause is deliberate (a `popfl` mid-ISR would corrupt the preempted thread's
