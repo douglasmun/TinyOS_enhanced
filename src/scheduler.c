@@ -13,6 +13,7 @@
 #include "critical.h"
 #include "pit.h"
 #include "audit.h"      /* SECURITY FIX (AUDIT 3A): For audit_log() before panic */
+#include "stdio.h"      /* scheduler_stats() reports through the caller's stream */
 #include <stddef.h>
 
 /*=============================================================================
@@ -897,31 +898,49 @@ void scheduler_stats(void) {
      *
      * FIX: Take a consistent snapshot of all state under critical section
      *=======================================================================*/
-    kprintf("\n=== SCHEDULER STATISTICS ===\n");
+    /*=========================================================================
+     * NOTHING IS PRINTED INSIDE THE CRITICAL SECTION.
+     *
+     * This used to print seven of its lines between ENTER and EXIT, which was
+     * survivable only while the output went to kprintf. It now goes to
+     * stream_printf, which on a redirected stream reaches ramfs_write -- that
+     * blocks, can take a mutex, and must never run with interrupts masked.
+     *
+     * So the critical section is now purely a SNAPSHOT: every value the report
+     * needs is copied to locals (including the two strings, by value -- holding
+     * `current` and dereferencing it after EXIT would race a task that exits in
+     * between), and all formatting happens afterwards. This is the same shape
+     * as env_list()/alias_list() in env.c and for the same reason.
+     *
+     * Do not "simplify" this back into one pass. The snapshot is what makes the
+     * report internally consistent AND the printing safe; the two properties
+     * are in tension and this is where they are reconciled.
+     *=======================================================================*/
+    stream_context_t* ctx = get_current_streams();
+
+    bool enabled;
+    uint32_t switches;
+    bool have_current;
+    uint32_t cur_pid = 0;
+    char cur_name[TASK_NAME_LEN];
+    uint32_t cur_slice = 0, cur_remaining = 0, cur_total = 0;
+    int task_count = 0;
 
     CRITICAL_SECTION_ENTER();
 
-    /* Snapshot all volatile state atomically */
-    bool enabled = scheduler_enabled;
-    uint32_t switches = total_context_switches;
+    enabled = scheduler_enabled;
+    switches = total_context_switches;
+
     task_t* current = (task_t*)current_running_task;
-
-    kprintf("Enabled: %s\n", enabled ? "YES" : "NO");
-    kprintf("Total context switches: %u\n", switches);
-
-    if (current) {
-        kprintf("Current task: PID=%d '%s'\n",
-                current->pid,
-                current->name);
-        kprintf("  Time slice: %u ticks\n", current->time_slice);
-        kprintf("  Remaining: %u ticks\n", current->ticks_remaining);
-        kprintf("  Total CPU: %u ticks\n", current->total_ticks);
-    } else {
-        kprintf("Current task: NONE\n");
+    have_current = (current != NULL);
+    if (have_current) {
+        cur_pid = current->pid;
+        safe_strcpy(cur_name, current->name, sizeof(cur_name));
+        cur_slice = current->time_slice;
+        cur_remaining = current->ticks_remaining;
+        cur_total = current->total_ticks;
     }
 
-    /* Count tasks in ready queue */
-    int task_count = 0;
     if (ready_queue_head) {
         task_t* t = (task_t*)ready_queue_head;
         do {
@@ -932,8 +951,21 @@ void scheduler_stats(void) {
 
     CRITICAL_SECTION_EXIT();
 
-    kprintf("Tasks in ready queue: %d\n", task_count);
-    kprintf("============================\n\n");
+    stream_printf(ctx, "\n=== SCHEDULER STATISTICS ===\n");
+    stream_printf(ctx, "Enabled: %s\n", enabled ? "YES" : "NO");
+    stream_printf(ctx, "Total context switches: %u\n", switches);
+
+    if (have_current) {
+        stream_printf(ctx, "Current task: PID=%d '%s'\n", cur_pid, cur_name);
+        stream_printf(ctx, "  Time slice: %u ticks\n", cur_slice);
+        stream_printf(ctx, "  Remaining: %u ticks\n", cur_remaining);
+        stream_printf(ctx, "  Total CPU: %u ticks\n", cur_total);
+    } else {
+        stream_printf(ctx, "Current task: NONE\n");
+    }
+
+    stream_printf(ctx, "Tasks in ready queue: %d\n", task_count);
+    stream_printf(ctx, "============================\n\n");
 }
 
 /*=============================================================================

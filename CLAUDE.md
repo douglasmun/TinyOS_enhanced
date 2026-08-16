@@ -130,16 +130,21 @@ prints via `kprintf` because its own `AUDIT_WARN` never reaches serial; and
 
 `shell_system.c` is **converted** (~220 sites → `stream_printf`), so `mem > f` now
 writes the report to `f` instead of printing it to the console and leaving `f` empty.
-`cmd_shutdown`/`cmd_reboot`/`cmd_sectest`'s banners deliberately stay on `kprintf` —
-each is commented in place; don't "finish the job" on them. `env_list`/`alias_list`
+`cmd_shutdown`/`cmd_reboot`'s banners deliberately stay on `kprintf` — each is
+commented in place; don't "finish the job" on them. `env_list`/`alias_list`
 moved too, and their locking became per-slot because `stream_printf` can reach
 `ramfs_write`, which must not run with interrupts masked. Harness:
 `verify-sysredirect.sh`; rationale in `doc/RING3_MIGRATION.md`.
 
-Open, in rough priority order:
-
-- **`security_tests.c`** — ~162 `kprintf`, the last console-only block; converting it
-  is what lets `cmd_sectest`'s banner follow its output.
+`security_tests.c` is **converted** (161 sites) — the last console-only block, so
+`cmd_sectest`'s banner now follows its output and **no console-only blocks remain**.
+Two things easy to undo: the suite's report comes from **three** files, since
+`scheduler_stats()` (scheduler.c) and `arp_security_self_test()` (net.c) have this
+suite as their only caller — leaving either on `kprintf` drops 17 lines of results on
+the console while the report still looks complete; and `scheduler_stats()` printed
+**inside** its critical section, so it now snapshots under the lock and prints after
+(the `env.c` pattern), a redirected stream reaching `ramfs_write`. Harness:
+`verify-sectest-redirect.sh`.
 
 ## Not compiled (don't audit/fix)
 

@@ -51,11 +51,12 @@
 #                 if the marker showed up early, whatever appears later after
 #                 the cat proves nothing about where it came from.
 #
-#   3. CONTROL    `sectest`'s banner is deliberately NOT converted (the suite it
-#                 announces, security_tests.c, is still console-only, so a
-#                 redirected banner would abandon its own output in a file).
-#                 We do not assert on it here -- it is named so the next person
-#                 does not "fix" it and quietly break the reasoning above.
+#   3. (HISTORICAL) `sectest`'s banner used to be deliberately left on kprintf,
+#                 because the suite it announces was still console-only and a
+#                 redirected banner would have abandoned its own output. That
+#                 no longer applies: security_tests.c was converted and the
+#                 banner now follows its output. Nothing here asserts on it --
+#                 verify-sectest-redirect.sh owns that property now.
 #
 #   4. Zero triple faults.
 #

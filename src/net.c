@@ -6,6 +6,7 @@
 #include "net.h"
 #include "kernel.h"
 #include "kprintf.h"
+#include "stdio.h"  // arp_security_self_test() reports through the caller's stream
 #include "paging.h" // Gives access to map_mmio()
 #include "util.h"   // Includes strlen, memset, memcpy (if standard library isn't available)
 #include "dns.h"
@@ -463,6 +464,12 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
 }
 
 bool arp_security_self_test(void) {
+    /* Reports through the caller's stream, not the console: its only caller is
+     * the security test suite, and `sectest > report.txt` must capture these
+     * seven results with the rest of the suite rather than splitting them off
+     * to the kernel console where the redirect cannot see them. */
+    stream_context_t* ctx = get_current_streams();
+
     arp_cache_entry_t saved_cache[ARP_CACHE_SIZE];
     arp_pending_request_t saved_pending[ARP_MAX_PENDING_REQUESTS];
     uint8_t saved_my_ip[4];
@@ -508,7 +515,7 @@ bool arp_security_self_test(void) {
     bool gateway_learned = (gateway_index >= 0 &&
                             memcmp(arp_cache[gateway_index].mac, gateway_mac, 6) == 0 &&
                             !arp_pending_request_matches(test_gateway));
-    kprintf("[ARP] Pending gateway reply learned: %s\n",
+    stream_printf(ctx, "[ARP] Pending gateway reply learned: %s\n",
             gateway_learned ? "PASSED" : "FAILED");
     passed = passed && gateway_learned;
 
@@ -516,7 +523,7 @@ bool arp_security_self_test(void) {
     gateway_index = arp_cache_find_index(test_gateway);
     bool gateway_poison_rejected = (gateway_index >= 0 &&
                                     memcmp(arp_cache[gateway_index].mac, gateway_mac, 6) == 0);
-    kprintf("[ARP] Unsolicited gateway change rejected: %s\n",
+    stream_printf(ctx, "[ARP] Unsolicited gateway change rejected: %s\n",
             gateway_poison_rejected ? "PASSED" : "FAILED");
     passed = passed && gateway_poison_rejected;
 
@@ -524,7 +531,7 @@ bool arp_security_self_test(void) {
     int local_index = arp_cache_find_index(local_ip);
     bool local_learned = (local_index >= 0 &&
                           memcmp(arp_cache[local_index].mac, local_mac, 6) == 0);
-    kprintf("[ARP] Passive local peer learned: %s\n",
+    stream_printf(ctx, "[ARP] Passive local peer learned: %s\n",
             local_learned ? "PASSED" : "FAILED");
     passed = passed && local_learned;
 
@@ -532,7 +539,7 @@ bool arp_security_self_test(void) {
     local_index = arp_cache_find_index(local_ip);
     bool local_poison_rejected = (local_index >= 0 &&
                                   memcmp(arp_cache[local_index].mac, local_mac, 6) == 0);
-    kprintf("[ARP] Unsolicited local change rejected: %s\n",
+    stream_printf(ctx, "[ARP] Unsolicited local change rejected: %s\n",
             local_poison_rejected ? "PASSED" : "FAILED");
     passed = passed && local_poison_rejected;
 
@@ -544,13 +551,13 @@ bool arp_security_self_test(void) {
     bool pending_local_change_allowed = (local_index >= 0 &&
                                          memcmp(arp_cache[local_index].mac, moved_local_mac, 6) == 0 &&
                                          !arp_pending_request_matches(local_ip));
-    kprintf("[ARP] Pending local change allowed: %s\n",
+    stream_printf(ctx, "[ARP] Pending local change allowed: %s\n",
             pending_local_change_allowed ? "PASSED" : "FAILED");
     passed = passed && pending_local_change_allowed;
 
     arp_cache_update(off_subnet_ip, local_mac);
     bool off_subnet_rejected = (arp_cache_find_index(off_subnet_ip) < 0);
-    kprintf("[ARP] Off-subnet sender rejected: %s\n",
+    stream_printf(ctx, "[ARP] Off-subnet sender rejected: %s\n",
             off_subnet_rejected ? "PASSED" : "FAILED");
     passed = passed && off_subnet_rejected;
 
@@ -558,7 +565,7 @@ bool arp_security_self_test(void) {
     local_index = arp_cache_find_index(local_ip);
     bool invalid_mac_rejected = (local_index >= 0 &&
                                  memcmp(arp_cache[local_index].mac, moved_local_mac, 6) == 0);
-    kprintf("[ARP] Invalid sender MAC rejected: %s\n",
+    stream_printf(ctx, "[ARP] Invalid sender MAC rejected: %s\n",
             invalid_mac_rejected ? "PASSED" : "FAILED");
     passed = passed && invalid_mac_rejected;
 

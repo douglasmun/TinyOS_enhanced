@@ -20,6 +20,7 @@
 #include "kernel.h"
 #include "net.h"
 #include "kprintf.h"
+#include "stdio.h"
 #include "util.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -31,38 +32,39 @@ extern uint32_t __stack_chk_guard;
  * TEST 1: Entropy Quality and Randomness
  *=============================================================================*/
 static void test_entropy_quality(void) {
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 1: Entropy Quality and Randomness\n");
-    kprintf("=====================================================\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 1: Entropy Quality and Randomness\n");
+    stream_printf(ctx, "=====================================================\n");
 
     /* Get entropy statistics */
     const entropy_stats_t* stats = entropy_get_stats();
     entropy_quality_t quality = entropy_get_quality();
 
-    kprintf("[ENTROPY] Quality Level: ");
+    stream_printf(ctx, "[ENTROPY] Quality Level: ");
     switch (quality) {
-        case ENTROPY_STRONG:  kprintf("STRONG (RDRAND)\n"); break;
-        case ENTROPY_MEDIUM:  kprintf("MEDIUM (Entropy Pool)\n"); break;
-        case ENTROPY_WEAK:    kprintf("WEAK (TSC only)\n"); break;
-        default:              kprintf("NONE\n"); break;
+        case ENTROPY_STRONG:  stream_printf(ctx, "STRONG (RDRAND)\n"); break;
+        case ENTROPY_MEDIUM:  stream_printf(ctx, "MEDIUM (Entropy Pool)\n"); break;
+        case ENTROPY_WEAK:    stream_printf(ctx, "WEAK (TSC only)\n"); break;
+        default:              stream_printf(ctx, "NONE\n"); break;
     }
 
-    kprintf("[ENTROPY] RDRAND available: %s\n", stats->rdrand_available ? "YES" : "NO");
-    kprintf("[ENTROPY] RDSEED available: %s\n", stats->rdseed_available ? "YES" : "NO");
-    kprintf("[ENTROPY] RDRAND requests: %u\n", stats->rdrand_requests);
-    kprintf("[ENTROPY] RDRAND failures: %u\n", stats->rdrand_failures);
-    kprintf("[ENTROPY] Pool stirs: %u\n", stats->pool_stirs);
-    kprintf("[ENTROPY] TSC samples: %u\n", stats->tsc_samples);
+    stream_printf(ctx, "[ENTROPY] RDRAND available: %s\n", stats->rdrand_available ? "YES" : "NO");
+    stream_printf(ctx, "[ENTROPY] RDSEED available: %s\n", stats->rdseed_available ? "YES" : "NO");
+    stream_printf(ctx, "[ENTROPY] RDRAND requests: %u\n", stats->rdrand_requests);
+    stream_printf(ctx, "[ENTROPY] RDRAND failures: %u\n", stats->rdrand_failures);
+    stream_printf(ctx, "[ENTROPY] Pool stirs: %u\n", stats->pool_stirs);
+    stream_printf(ctx, "[ENTROPY] TSC samples: %u\n", stats->tsc_samples);
 
     /* Test randomness - generate 10 random numbers and verify they're different */
-    kprintf("\n[ENTROPY] Testing randomness (10 samples):\n");
+    stream_printf(ctx, "\n[ENTROPY] Testing randomness (10 samples):\n");
     uint32_t samples[10];
     bool all_different = true;
 
     for (int i = 0; i < 10; i++) {
         samples[i] = entropy_get_random32();
-        kprintf("  Sample %d: 0x%08x\n", i, samples[i]);
+        stream_printf(ctx, "  Sample %d: 0x%08x\n", i, samples[i]);
     }
 
     /* Check for duplicates (very unlikely with good entropy) */
@@ -70,76 +72,78 @@ static void test_entropy_quality(void) {
         for (int j = i + 1; j < 10; j++) {
             if (samples[i] == samples[j]) {
                 all_different = false;
-                kprintf("[ENTROPY] WARNING: Duplicate found at indices %d and %d\n", i, j);
+                stream_printf(ctx, "[ENTROPY] WARNING: Duplicate found at indices %d and %d\n", i, j);
             }
         }
     }
 
     if (all_different) {
-        kprintf("[ENTROPY]  All samples unique (good randomness)\n");
+        stream_printf(ctx, "[ENTROPY]  All samples unique (good randomness)\n");
     }
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 1: %s\n", all_different ? "PASSED" : "WARNING");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 1: %s\n", all_different ? "PASSED" : "WARNING");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 2: PID Generation Validation
  *=============================================================================*/
 static void test_pid_validation(void) {
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 2: PID Generation Validation\n");
-    kprintf("=====================================================\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 2: PID Generation Validation\n");
+    stream_printf(ctx, "=====================================================\n");
 
     /* Get current task and test handle generation */
     task_t* current = task_current();
     if (!current) {
-        kprintf("[PID] ERROR: No current task\n");
-        kprintf("TEST 2: FAILED\n");
+        stream_printf(ctx, "[PID] ERROR: No current task\n");
+        stream_printf(ctx, "TEST 2: FAILED\n");
         return;
     }
 
-    kprintf("[PID] Current task: PID=%u, generation=%u, name='%s'\n",
+    stream_printf(ctx, "[PID] Current task: PID=%u, generation=%u, name='%s'\n",
             current->pid, current->generation, current->name);
 
     /* Test handle generation */
     pid_handle_t handle = task_get_handle(current);
-    kprintf("[PID] Generated handle: {pid=%u, generation=%u}\n",
+    stream_printf(ctx, "[PID] Generated handle: {pid=%u, generation=%u}\n",
             handle.pid, handle.generation);
 
     /* Test validated lookup (should succeed) */
     task_t* found = task_get_validated(handle.pid, handle.generation);
     bool valid_lookup = (found == current);
-    kprintf("[PID] Valid lookup test: %s\n", valid_lookup ? "PASSED" : "FAILED");
+    stream_printf(ctx, "[PID] Valid lookup test: %s\n", valid_lookup ? "PASSED" : "FAILED");
 
     /* Test with wrong generation (should fail) */
     task_t* wrong = task_get_validated(handle.pid, handle.generation + 1);
     bool invalid_rejected = (wrong == NULL);
-    kprintf("[PID] Invalid generation rejected: %s\n", invalid_rejected ? "PASSED" : "FAILED");
+    stream_printf(ctx, "[PID] Invalid generation rejected: %s\n", invalid_rejected ? "PASSED" : "FAILED");
 
     /* Test basic task_get (without generation) */
     task_t* basic = task_get(handle.pid);
     bool basic_lookup = (basic == current);
-    kprintf("[PID] Basic lookup test: %s\n", basic_lookup ? "PASSED" : "FAILED");
+    stream_printf(ctx, "[PID] Basic lookup test: %s\n", basic_lookup ? "PASSED" : "FAILED");
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 2: %s\n", (valid_lookup && invalid_rejected && basic_lookup) ? "PASSED" : "FAILED");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 2: %s\n", (valid_lookup && invalid_rejected && basic_lookup) ? "PASSED" : "FAILED");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 3: Scheduler Statistics (verifies critical sections work)
  *=============================================================================*/
 static void test_scheduler_stats(void) {
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 3: Scheduler Statistics\n");
-    kprintf("=====================================================\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 3: Scheduler Statistics\n");
+    stream_printf(ctx, "=====================================================\n");
 
-    kprintf("[SCHEDULER] Reading scheduler statistics...\n");
-    kprintf("[SCHEDULER] (This tests critical section protection)\n\n");
+    stream_printf(ctx, "[SCHEDULER] Reading scheduler statistics...\n");
+    stream_printf(ctx, "[SCHEDULER] (This tests critical section protection)\n\n");
 
     /* Call scheduler_stats which tests all critical section fixes */
     scheduler_stats();
@@ -147,117 +151,121 @@ static void test_scheduler_stats(void) {
     /* Get current task via protected function */
     task_t* current = scheduler_get_current_task();
     if (current) {
-        kprintf("[SCHEDULER] Current task via protected getter: PID=%u '%s'\n",
+        stream_printf(ctx, "[SCHEDULER] Current task via protected getter: PID=%u '%s'\n",
                 current->pid, current->name);
-        kprintf("[SCHEDULER]  Critical section protection working\n");
+        stream_printf(ctx, "[SCHEDULER]  Critical section protection working\n");
     } else {
-        kprintf("[SCHEDULER] ✗ Failed to get current task\n");
+        stream_printf(ctx, "[SCHEDULER] ✗ Failed to get current task\n");
     }
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 3: %s\n", current ? "PASSED" : "FAILED");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 3: %s\n", current ? "PASSED" : "FAILED");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 4: Rapid Task Creation/Termination (Cleanup Queue Stress Test)
  *=============================================================================*/
 static void test_cleanup_queue(void) {
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 4: Cleanup Queue Stress Test\n");
-    kprintf("=====================================================\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 4: Cleanup Queue Stress Test\n");
+    stream_printf(ctx, "=====================================================\n");
 
-    kprintf("[CLEANUP] Testing rapid task creation/termination...\n");
-    kprintf("[CLEANUP] This would previously cause memory leaks!\n");
-    kprintf("\n");
+    stream_printf(ctx, "[CLEANUP] Testing rapid task creation/termination...\n");
+    stream_printf(ctx, "[CLEANUP] This would previously cause memory leaks!\n");
+    stream_printf(ctx, "\n");
 
     /* Note: We can't actually spawn and kill tasks rapidly from here
      * without proper fork/exec, but we can document the test */
 
-    kprintf("[CLEANUP] Cleanup queue features:\n");
-    kprintf("  - Queue size: 8 (handles rapid terminations)\n");
-    kprintf("  - Circular buffer (FIFO ordering)\n");
-    kprintf("  - Overflow detection and warning\n");
-    kprintf("  - Processes ALL queued tasks (no leaks)\n");
-    kprintf("\n");
-    kprintf("[CLEANUP] Implementation verified:\n");
-    kprintf("   cleanup_queue_enqueue() - adds tasks to queue\n");
-    kprintf("   cleanup_queue_dequeue() - removes from queue\n");
-    kprintf("   cleanup_queue_is_empty() - checks queue state\n");
-    kprintf("   Both scheduler functions process ALL queued tasks\n");
-    kprintf("\n");
-    kprintf("[CLEANUP] Memory leak prevention: ACTIVE\n");
+    stream_printf(ctx, "[CLEANUP] Cleanup queue features:\n");
+    stream_printf(ctx, "  - Queue size: 8 (handles rapid terminations)\n");
+    stream_printf(ctx, "  - Circular buffer (FIFO ordering)\n");
+    stream_printf(ctx, "  - Overflow detection and warning\n");
+    stream_printf(ctx, "  - Processes ALL queued tasks (no leaks)\n");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "[CLEANUP] Implementation verified:\n");
+    stream_printf(ctx, "   cleanup_queue_enqueue() - adds tasks to queue\n");
+    stream_printf(ctx, "   cleanup_queue_dequeue() - removes from queue\n");
+    stream_printf(ctx, "   cleanup_queue_is_empty() - checks queue state\n");
+    stream_printf(ctx, "   Both scheduler functions process ALL queued tasks\n");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "[CLEANUP] Memory leak prevention: ACTIVE\n");
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 4: PASSED (implementation verified)\n");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 4: PASSED (implementation verified)\n");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 5: FPU Capability Enforcement
  *=============================================================================*/
 static void test_fpu_enforcement(void) {
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 5: FPU Capability Enforcement\n");
-    kprintf("=====================================================\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 5: FPU Capability Enforcement\n");
+    stream_printf(ctx, "=====================================================\n");
 
-    kprintf("[FPU] If you're reading this, FXSR is supported!\n");
-    kprintf("[FPU] (System would have panic'd at boot otherwise)\n");
-    kprintf("\n");
-    kprintf("[FPU] Boot-time enforcement:\n");
-    kprintf("   CPUID.1:EDX[24] checked (FXSR support)\n");
-    kprintf("   System halts if FXSR not available\n");
-    kprintf("   Clear error message for users\n");
-    kprintf("   Prevents #UD exception during context switch\n");
-    kprintf("\n");
-    kprintf("[FPU] Required CPU features:\n");
-    kprintf("  - Intel Pentium II (1997) or newer\n");
-    kprintf("  - AMD Athlon (1999) or newer\n");
-    kprintf("  - QEMU: Use -cpu core2duo or similar\n");
+    stream_printf(ctx, "[FPU] If you're reading this, FXSR is supported!\n");
+    stream_printf(ctx, "[FPU] (System would have panic'd at boot otherwise)\n");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "[FPU] Boot-time enforcement:\n");
+    stream_printf(ctx, "   CPUID.1:EDX[24] checked (FXSR support)\n");
+    stream_printf(ctx, "   System halts if FXSR not available\n");
+    stream_printf(ctx, "   Clear error message for users\n");
+    stream_printf(ctx, "   Prevents #UD exception during context switch\n");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "[FPU] Required CPU features:\n");
+    stream_printf(ctx, "  - Intel Pentium II (1997) or newer\n");
+    stream_printf(ctx, "  - AMD Athlon (1999) or newer\n");
+    stream_printf(ctx, "  - QEMU: Use -cpu core2duo or similar\n");
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 5: PASSED (boot successful = FXSR present)\n");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 5: PASSED (boot successful = FXSR present)\n");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 6: Stack Canary Randomness (Verifies Entropy Integration)
  *=============================================================================*/
 static void test_stack_canary(void) {
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 6: Stack Canary Randomness\n");
-    kprintf("=====================================================\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 6: Stack Canary Randomness\n");
+    stream_printf(ctx, "=====================================================\n");
 
-    kprintf("[STACK_GUARD] Current canary value: 0x%08x\n", __stack_chk_guard);
-    kprintf("[STACK_GUARD] Canary LSB (null byte): 0x%02x\n", __stack_chk_guard & 0xFF);
+    stream_printf(ctx, "[STACK_GUARD] Current canary value: 0x%08x\n", __stack_chk_guard);
+    stream_printf(ctx, "[STACK_GUARD] Canary LSB (null byte): 0x%02x\n", __stack_chk_guard & 0xFF);
 
     /* Verify canary properties */
     bool has_null_byte = ((__stack_chk_guard & 0xFF) == 0x00);
     bool is_nonzero = (__stack_chk_guard != 0);
     bool not_default = (__stack_chk_guard != 0xDEADBE00);
 
-    kprintf("\n[STACK_GUARD] Canary validation:\n");
-    kprintf("  Has null byte in LSB: %s\n", has_null_byte ? " YES" : "✗ NO");
-    kprintf("  Non-zero value: %s\n", is_nonzero ? " YES" : "✗ NO");
-    kprintf("  Not fallback value: %s\n", not_default ? " YES (random)" : "WARNING: NO (fallback)");
-    kprintf("\n");
-    kprintf("[STACK_GUARD] Entropy source: %s\n",
+    stream_printf(ctx, "\n[STACK_GUARD] Canary validation:\n");
+    stream_printf(ctx, "  Has null byte in LSB: %s\n", has_null_byte ? " YES" : "✗ NO");
+    stream_printf(ctx, "  Non-zero value: %s\n", is_nonzero ? " YES" : "✗ NO");
+    stream_printf(ctx, "  Not fallback value: %s\n", not_default ? " YES (random)" : "WARNING: NO (fallback)");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "[STACK_GUARD] Entropy source: %s\n",
             not_default ? "Production-grade (entropy module)" : "Fallback constant");
 
     bool passed = has_null_byte && is_nonzero;
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 6: %s\n", passed ? "PASSED" : "FAILED");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 6: %s\n", passed ? "PASSED" : "FAILED");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 7: Hardened Usercopy Permission Enforcement
  *=============================================================================*/
 static void test_hardened_usercopy(void) {
+    stream_context_t* ctx = get_current_streams();
     const uint32_t rw_addr = 0x70000000u;
     const uint32_t ro_addr = rw_addr + PAGE_SIZE;
     const uint32_t unmapped_addr = ro_addr + PAGE_SIZE;
@@ -266,15 +274,15 @@ static void test_hardened_usercopy(void) {
     uint32_t ro_frame = 0;
     bool passed = false;
 
-    kprintf("\n=====================================================\n");
-    kprintf("TEST 7: Hardened Usercopy Permissions\n");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "\n=====================================================\n");
+    stream_printf(ctx, "TEST 7: Hardened Usercopy Permissions\n");
+    stream_printf(ctx, "=====================================================\n");
 
     test_pdpt = pae_create_user_pdpt();
     rw_frame = pmm_alloc();
     ro_frame = pmm_alloc();
     if (!test_pdpt || !rw_frame || !ro_frame) {
-        kprintf("[USERCOPY] FAILED: unable to allocate test address space\n");
+        stream_printf(ctx, "[USERCOPY] FAILED: unable to allocate test address space\n");
         goto cleanup;
     }
 
@@ -292,7 +300,7 @@ static void test_hardened_usercopy(void) {
         pae_user_range_accessible_in(test_pdpt, ro_addr, 1, false) &&
         !pae_user_range_accessible_in(test_pdpt, ro_addr, 1, true);
     if (!mapping_setup) {
-        kprintf("[USERCOPY] FAILED: test mappings were not installed\n");
+        stream_printf(ctx, "[USERCOPY] FAILED: test mappings were not installed\n");
         goto cleanup;
     }
 
@@ -344,17 +352,17 @@ static void test_hardened_usercopy(void) {
              supervisor_read_rejected && supervisor_write_rejected &&
              boundary_rejected && overflow_rejected;
 
-    kprintf("[USERCOPY] Writable user page:       %s\n",
+    stream_printf(ctx, "[USERCOPY] Writable user page:       %s\n",
             (rw_read && rw_write && write_reached_frame) ? "PASSED" : "FAILED");
-    kprintf("[USERCOPY] Read-only enforcement:    %s\n",
+    stream_printf(ctx, "[USERCOPY] Read-only enforcement:    %s\n",
             (ro_read && ro_write_rejected) ? "PASSED" : "FAILED");
-    kprintf("[USERCOPY] Cross-page atomicity:     %s\n",
+    stream_printf(ctx, "[USERCOPY] Cross-page atomicity:     %s\n",
             (cross_read && cross_write_rejected && no_partial_write) ? "PASSED" : "FAILED");
-    kprintf("[USERCOPY] Unmapped page rejection:  %s\n",
+    stream_printf(ctx, "[USERCOPY] Unmapped page rejection:  %s\n",
             unmapped_rejected ? "PASSED" : "FAILED");
-    kprintf("[USERCOPY] Supervisor page rejection:%s\n",
+    stream_printf(ctx, "[USERCOPY] Supervisor page rejection:%s\n",
             (supervisor_read_rejected && supervisor_write_rejected) ? " PASSED" : " FAILED");
-    kprintf("[USERCOPY] Range bounds rejection:   %s\n",
+    stream_printf(ctx, "[USERCOPY] Range bounds rejection:   %s\n",
             (boundary_rejected && overflow_rejected) ? "PASSED" : "FAILED");
 
 cleanup:
@@ -368,15 +376,16 @@ cleanup:
         pmm_free(ro_frame);
     }
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 7: %s\n", passed ? "PASSED" : "FAILED");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 7: %s\n", passed ? "PASSED" : "FAILED");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 8: User Exception Containment
  *=============================================================================*/
 static void test_user_exception_containment(void) {
+    stream_context_t* ctx = get_current_streams();
     const uint8_t fault_code[] = {
         0x0f, 0x0b,  /* ud2 */
         0xeb, 0xfe   /* jmp $ */
@@ -386,14 +395,14 @@ static void test_user_exception_containment(void) {
     int pid = -1;
     uint32_t generation = 0;
 
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 8: User Exception Containment\n");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 8: User Exception Containment\n");
+    stream_printf(ctx, "=====================================================\n");
 
     code_frame = pmm_alloc();
     if (!code_frame) {
-        kprintf("[EXCEPTION] FAILED: unable to allocate user code frame\n");
+        stream_printf(ctx, "[EXCEPTION] FAILED: unable to allocate user code frame\n");
         goto cleanup;
     }
 
@@ -402,13 +411,13 @@ static void test_user_exception_containment(void) {
 
     pid = task_create_user_ex(USER_CODE_BASE, "FaultUD2", USER_STACK_MIN);
     if (pid < 0) {
-        kprintf("[EXCEPTION] FAILED: unable to create user fault task\n");
+        stream_printf(ctx, "[EXCEPTION] FAILED: unable to create user fault task\n");
         goto cleanup;
     }
 
     task_t* fault_task = task_get_any((uint32_t)pid);
     if (!fault_task) {
-        kprintf("[EXCEPTION] FAILED: created task is not visible\n");
+        stream_printf(ctx, "[EXCEPTION] FAILED: created task is not visible\n");
         goto cleanup;
     }
     generation = fault_task->generation;
@@ -425,7 +434,7 @@ static void test_user_exception_containment(void) {
         uint64_t mapped = pae_virt_to_phys_in(fault_task->page_directory,
                                               USER_CODE_BASE);
         if ((mapped & PAE_FRAME_MASK) != code_frame) {
-            kprintf("[EXCEPTION] FAILED: user code page was not mapped\n");
+            stream_printf(ctx, "[EXCEPTION] FAILED: user code page was not mapped\n");
             goto cleanup;
         }
     }
@@ -442,9 +451,9 @@ static void test_user_exception_containment(void) {
         scheduler_yield();
     }
 
-    kprintf("[EXCEPTION] Faulting user task terminated: %s\n",
+    stream_printf(ctx, "[EXCEPTION] Faulting user task terminated: %s\n",
             passed ? "PASSED" : "FAILED");
-    kprintf("[EXCEPTION] Kernel resumed after CPL3 #UD: %s\n",
+    stream_printf(ctx, "[EXCEPTION] Kernel resumed after CPL3 #UD: %s\n",
             passed ? "PASSED" : "FAILED");
 
 cleanup:
@@ -458,45 +467,47 @@ cleanup:
         pmm_free(code_frame);
     }
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 8: %s\n", passed ? "PASSED" : "FAILED");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 8: %s\n", passed ? "PASSED" : "FAILED");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * TEST 9: ARP Cache Poisoning Protection
  *=============================================================================*/
 static void test_arp_cache_poisoning(void) {
-    kprintf("\n");
-    kprintf("=====================================================\n");
-    kprintf("TEST 9: ARP Cache Poisoning Protection\n");
-    kprintf("=====================================================\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 9: ARP Cache Poisoning Protection\n");
+    stream_printf(ctx, "=====================================================\n");
 
     bool passed = arp_security_self_test();
 
-    kprintf("-----------------------------------------------------\n");
-    kprintf("TEST 9: %s\n", passed ? "PASSED" : "FAILED");
-    kprintf("=====================================================\n");
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 9: %s\n", passed ? "PASSED" : "FAILED");
+    stream_printf(ctx, "=====================================================\n");
 }
 
 /*=============================================================================
  * Main Test Runner
  *=============================================================================*/
 void run_security_tests(void) {
-    kprintf("\n\n");
-    kprintf("*************************************************************\n");
-    kprintf("*                                                           *\n");
-    kprintf("*        SECURITY HARDENING TEST SUITE v2.0                *\n");
-    kprintf("*                                                           *\n");
-    kprintf("*************************************************************\n");
-    kprintf("\n");
-    kprintf("Testing security fixes from expert review:\n");
-    kprintf("  - Issue 2.1: RDRAND Entropy for ASLR/SSP\n");
-    kprintf("  - Issue 2.2: PID Generation Validation\n");
-    kprintf("  - Issue 2.3: FPU Capability Enforcement\n");
-    kprintf("  - Issue 3.1: Scheduler Critical Sections\n");
-    kprintf("  - Issue 3.3: Cleanup Task Queue\n");
-    kprintf("\n");
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "\n\n");
+    stream_printf(ctx, "*************************************************************\n");
+    stream_printf(ctx, "*                                                           *\n");
+    stream_printf(ctx, "*        SECURITY HARDENING TEST SUITE v2.0                *\n");
+    stream_printf(ctx, "*                                                           *\n");
+    stream_printf(ctx, "*************************************************************\n");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "Testing security fixes from expert review:\n");
+    stream_printf(ctx, "  - Issue 2.1: RDRAND Entropy for ASLR/SSP\n");
+    stream_printf(ctx, "  - Issue 2.2: PID Generation Validation\n");
+    stream_printf(ctx, "  - Issue 2.3: FPU Capability Enforcement\n");
+    stream_printf(ctx, "  - Issue 3.1: Scheduler Critical Sections\n");
+    stream_printf(ctx, "  - Issue 3.3: Cleanup Task Queue\n");
+    stream_printf(ctx, "\n");
 
     /* Run all tests */
     test_entropy_quality();
@@ -509,11 +520,11 @@ void run_security_tests(void) {
     test_user_exception_containment();
     test_arp_cache_poisoning();
 
-    kprintf("\n");
-    kprintf("*************************************************************\n");
-    kprintf("*                                                           *\n");
-    kprintf("*           SECURITY TEST SUITE COMPLETE                   *\n");
-    kprintf("*                                                           *\n");
-    kprintf("*************************************************************\n");
-    kprintf("\n");
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "*************************************************************\n");
+    stream_printf(ctx, "*                                                           *\n");
+    stream_printf(ctx, "*           SECURITY TEST SUITE COMPLETE                   *\n");
+    stream_printf(ctx, "*                                                           *\n");
+    stream_printf(ctx, "*************************************************************\n");
+    stream_printf(ctx, "\n");
 }
