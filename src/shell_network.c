@@ -178,6 +178,15 @@ void cmd_ifconfig(void) {
     kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited\n",
             icmp_replies, icmp_requests, icmp_limited);
 
+    /* SYS_NETRX/SYS_NETTX traffic (doc/NETDAEMON_DESIGN.md PR B). These read 0
+     * on a stock boot: the boundary exists, but the parser has not moved to
+     * ring 3 yet, so nothing calls it. That zero is the baseline
+     * verify-netd-boundary.sh asserts against before it drives the syscalls
+     * itself — "networking works" is exactly what a bypassed boundary shows. */
+    uint32_t netd_rx = 0, netd_tx = 0;
+    net_get_syscall_stats(&netd_rx, &netd_tx);
+    kprintf("  netd sysc:    %u rx-frames, %u tx-frames\n", netd_rx, netd_tx);
+
     /* DMA region placement (doc/NETWORK_ISOLATION.md item 3). Printed with the
      * live present/absent state of each guard rather than just the addresses:
      * the addresses only show where the guards were MEANT to go, whereas the

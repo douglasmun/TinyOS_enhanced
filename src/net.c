@@ -1687,6 +1687,32 @@ void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx) {
     if (irq_ctx) *irq_ctx = net_parse_irq;
 }
 
+/*=============================================================================
+ * SYSCALL-BOUNDARY ACCOUNTING (doc/NETDAEMON_DESIGN.md, item 4 PR B)
+ *=============================================================================
+ * Frames that crossed the ring boundary via SYS_NETRX / SYS_NETTX.
+ *
+ * These exist for the same reason as the parse counters above: "networking
+ * still works" is what a build with the syscalls bypassed ALSO shows, so it
+ * proves nothing about the boundary. A nonzero rx count is the only evidence a
+ * harness can read that a frame actually travelled through the syscall rather
+ * than around it.
+ *
+ * In PR B they read 0 during normal operation, because nothing calls the
+ * syscalls yet -- knetd still parses in the kernel. That is the honest baseline
+ * and the harness asserts against it explicitly.
+ *===========================================================================*/
+static uint32_t net_syscall_rx = 0;
+static uint32_t net_syscall_tx = 0;
+
+void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames) {
+    if (rx_frames) *rx_frames = net_syscall_rx;
+    if (tx_frames) *tx_frames = net_syscall_tx;
+}
+
+void net_count_syscall_rx(void) { net_syscall_rx++; }
+void net_count_syscall_tx(void) { net_syscall_tx++; }
+
 /**
  * @brief Main packet reception handler.
  * @param data Pointer to received Ethernet frame.

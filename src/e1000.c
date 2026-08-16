@@ -390,6 +390,55 @@ void e1000_rx_softirq_run(void) {
     }
 }
 
+/*=============================================================================
+ * FUNCTION: e1000_rx_dequeue  (the SYS_NETRX half of the ring-3 boundary)
+ *
+ * Copies one frame out of the software ring into a KERNEL buffer and advances
+ * the tail. Same producer/consumer discipline as e1000_rx_softirq_run() above;
+ * this is that function's body with handle_packet() replaced by "give it to the
+ * caller". See doc/NETDAEMON_DESIGN.md (item 4, PR B).
+ *
+ * Returns bytes copied, 0 if the ring is empty, or -1 if the frame does not fit
+ * in out_len. In the -1 case the frame IS consumed: a frame too large for the
+ * caller's buffer would otherwise sit at the tail forever and wedge the queue
+ * for every subsequent frame, which is a remote denial of service via a single
+ * oversized frame. Losing it is the lesser failure, and the caller learns from
+ * the return value that it happened.
+ *
+ * The caller must NOT be holding E1000_LOCK(). The copy to the user buffer
+ * happens in the syscall layer, outside the lock, because copy_to_user can
+ * fault and faulting with interrupts masked is how a page fault becomes a
+ * double fault.
+ *===========================================================================*/
+int e1000_rx_dequeue(uint8_t* out, uint16_t out_len) {
+    uint16_t length;
+
+    if (!out) {
+        return 0;
+    }
+
+    E1000_LOCK();
+    if (rx_softirq_tail == rx_softirq_head) {
+        E1000_UNLOCK();
+        return 0;
+    }
+    length = rx_softirq_ring[rx_softirq_tail].length;
+    if (length > RX_BUF_SIZE) {
+        length = RX_BUF_SIZE;
+    }
+    if (length > out_len) {
+        /* Consume it anyway — see the head comment. */
+        rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+        E1000_UNLOCK();
+        return -1;
+    }
+    memcpy(out, rx_softirq_ring[rx_softirq_tail].data, length);
+    rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+    E1000_UNLOCK();
+
+    return (int)length;
+}
+
 /* Bounded spin cap for the TX descriptor-done (DD) wait in e1000_send().
  * Large enough to ride out a saturated link, finite so a wedged NIC can't
  * hang the kernel with interrupts disabled. ~10M iterations of a tight MMIO

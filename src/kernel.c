@@ -34,6 +34,7 @@
 #include "producer_elf_data.h"
 #include "counter_elf_data.h"
 #include "credprobe_elf_data.h"
+#include "netprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -859,6 +860,23 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(credprobe_fd, credprobe_elf_data, credprobe_elf_data_len);
             ramfs_close(credprobe_fd);
             ramfs_chmod("/credprobe.elf", 0755);
+        }
+    }
+
+    /* netprobe.elf drives SYS_NETRX/SYS_NETTX straight through int 0x80
+     * (doc/NETDAEMON_DESIGN.md item 4, PR B). Nothing in the kernel calls those
+     * syscalls yet — the parser has not moved to ring 3 — so the boundary is
+     * unreachable from any shell command, and "networking still works" is what
+     * a build with the boundary bypassed shows too. Only a ring-3 caller can
+     * demonstrate frames traversing the pair. 0755 for the same uid-1000 reason
+     * as spawner.elf above; the syscalls themselves are root-only, which is
+     * half of what this probe exists to assert. */
+    {
+        int netprobe_fd = ramfs_open("/netprobe.elf", RAMFS_FLAG_WRITE);
+        if (netprobe_fd >= 0) {
+            ramfs_write(netprobe_fd, netprobe_elf_data, netprobe_elf_data_len);
+            ramfs_close(netprobe_fd);
+            ramfs_chmod("/netprobe.elf", 0755);
         }
     }
 

@@ -28,6 +28,7 @@
 #include "util.h"      // MAX_PATH
 #include "shell_redir.h" // SYS_PIPE: pipe_buffer_t and pipe_init/destroy
 #include "pmm.h"       // SYS_PIPE: frames for the pipe buffer
+#include "net.h"       // SYS_NETRX/SYS_NETTX: e1000_rx_dequeue, e1000_send
 #include "paging.h"    // SYS_PIPE: map those frames before touching them
 #include "shell_user.h" // SYS_CRED: the passwd/useradd/userdel implementations
 
@@ -1345,6 +1346,104 @@ int sys_kill(int pid) {
     }
 
     return result;
+}
+
+/*=============================================================================
+ * SYS_NETRX / SYS_NETTX — the packet-path boundary for the ring-3 daemon.
+ *
+ * doc/NETDAEMON_DESIGN.md, item 4 PR B. The parser has NOT moved yet; these
+ * exist so the boundary can be proven to carry traffic before it does.
+ *
+ * ROOT ONLY. Raw frame access in either direction is a serious primitive: RX
+ * hands over traffic addressed to other services on the host, and TX forges any
+ * source MAC or IP it likes, so ARP poisoning and DHCP spoofing are one call
+ * away. The daemon runs as root and is the entire intended population.
+ *
+ * The euid check is FIRST in both, before any argument validation, so an
+ * unprivileged caller cannot use the errno to distinguish a valid buffer from
+ * an invalid one -- the same reasoning that makes SYS_KILL collapse "invisible"
+ * and "absent" into one answer.
+ *
+ * A staging buffer sits between the ring and user memory in both directions.
+ * It is static, not a local: RX_BUF_SIZE is 2 KB and this is the kernel task
+ * stack, which the whole exec chain shares (CLAUDE.md's stack budget rule).
+ * Single CPU with no blocking between fill and use, so one shared buffer per
+ * direction is safe; if either call ever learns to block, that stops being
+ * true and they need per-task storage.
+ *===========================================================================*/
+/* The driver's RX_BUF_SIZE is private to e1000.c. This does not need to match
+ * it: e1000_rx_dequeue clamps to its own buffer size and refuses anything that
+ * does not fit the out_len it is handed, so a mismatch costs frames, never
+ * memory safety. 2048 is the driver's current value. */
+#define NETD_FRAME_MAX 2048
+static uint8_t netrx_staging[NETD_FRAME_MAX];
+static uint8_t nettx_staging[NETD_FRAME_MAX];
+
+int sys_netrx(void* user_buf, size_t len) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (self->euid != 0) {
+        return -EPERM;
+    }
+    if (!user_buf || len == 0) {
+        return -EINVAL;
+    }
+    if (len > sizeof(netrx_staging)) {
+        len = sizeof(netrx_staging);
+    }
+
+    /* Dequeue into kernel memory first. copy_to_user can fault, and
+     * e1000_rx_dequeue runs with interrupts masked -- faulting there is how a
+     * page fault becomes a double fault. The two steps stay separate. */
+    int got = e1000_rx_dequeue(netrx_staging, (uint16_t)len);
+    if (got == 0) {
+        return -EAGAIN;   /* ring empty; caller polls and yields */
+    }
+    if (got < 0) {
+        /* Frame did not fit and was consumed -- see e1000_rx_dequeue. The
+         * caller is told rather than left to infer it from a gap. */
+        return -EMSGSIZE;
+    }
+
+    if (copy_to_user(user_buf, netrx_staging, (size_t)got) < 0) {
+        return -EFAULT;
+    }
+
+    net_count_syscall_rx();
+    return got;
+}
+
+int sys_nettx(const void* user_buf, size_t len) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (self->euid != 0) {
+        return -EPERM;
+    }
+    if (!user_buf || len == 0) {
+        return -EINVAL;
+    }
+    /* Rejected, not truncated. A silently shortened frame is a corrupt frame
+     * on the wire, and the caller would have no way to know. */
+    if (len > sizeof(nettx_staging)) {
+        return -EMSGSIZE;
+    }
+    /* Below the Ethernet minimum there is no header to send. The NIC pads to
+     * 60 bytes on the wire; this only rejects what cannot be a frame at all. */
+    if (len < 14) {
+        return -EINVAL;
+    }
+
+    if (copy_from_user(nettx_staging, user_buf, len) < 0) {
+        return -EFAULT;
+    }
+
+    e1000_send(nettx_staging, len);
+    net_count_syscall_tx();
+    return (int)len;
 }
 
 int sys_chdir(const char* user_path) {
@@ -2838,6 +2937,16 @@ static void syscall_dispatch(struct cpu_state* state) {
         case SYS_KILL:
             /* arg1 = target pid */
             ret = sys_kill((int)arg1);
+            break;
+
+        case SYS_NETRX:
+            /* arg1 = user buffer, arg2 = buffer length */
+            ret = sys_netrx((void*)arg1, (size_t)arg2);
+            break;
+
+        case SYS_NETTX:
+            /* arg1 = user buffer, arg2 = frame length */
+            ret = sys_nettx((const void*)arg1, (size_t)arg2);
             break;
 
         case SYS_REDIRECT:

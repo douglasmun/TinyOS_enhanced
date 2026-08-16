@@ -15,7 +15,8 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 
 # User programs to build
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
-            producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf
+            producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
+            netprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -89,6 +90,15 @@ credprobe.elf: credprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c credprobe.c -o credprobe.o
 	$(LD) $(LDFLAGS) -o credprobe.elf crt0.o credprobe.o libc.o -lgcc
 	@echo "Built credprobe.elf"
+
+# netprobe.elf drives SYS_NETRX/SYS_NETTX straight through int 0x80. Nothing in
+# the kernel calls them yet (the parser has not moved to ring 3), so this is the
+# only way to show the boundary carries frames rather than that networking
+# happens to still work — see verify-netd-boundary.sh.
+netprobe.elf: netprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c netprobe.c -o netprobe.o
+	$(LD) $(LDFLAGS) -o netprobe.elf crt0.o netprobe.o libc.o -lgcc
+	@echo "Built netprobe.elf"
 
 # slotbomb.elf spawns /slothold.elf in a tight loop without reaping, to prove the
 # per-user concurrent task cap engages (see verify-slotcap.sh). It has to be a

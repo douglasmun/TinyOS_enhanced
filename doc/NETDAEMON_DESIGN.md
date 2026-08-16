@@ -101,9 +101,41 @@ has never been reached by a hostile ring-3 process, only by hostile packets. Aud
 first, land fixes as their own commits, and let the exposure PR come after.
 
 **PR B — the two packet-path syscalls, daemon still in ring 0.** Introduce
-receive/transmit and route the existing in-kernel parser through them. Proves the
-boundary carries real traffic before anything changes trust domain. Fully
-revertable; nothing is exposed yet.
+receive/transmit and prove the boundary carries real traffic before anything
+changes trust domain. Fully revertable; nothing is exposed yet.
+
+*As built, PR B deviates from the plan above in one way worth recording.* The
+plan said "route the existing in-kernel parser through them". It does not. The
+parser still runs in the kernel and does not call the syscalls at all, so in
+normal operation both counters read **zero**.
+
+The reason is that routing the in-kernel parser through the pair would have made
+the syscalls a detour: kernel code calling a syscall wrapper to hand a frame back
+to kernel code, with `copy_to_user`/`copy_from_user` replaced by plain copies
+because there is no user address space involved. That exercises the counters and
+the ring buffer, but it does **not** exercise the ring transition, the euid gate,
+or the user-pointer validation — which are the three things that have to be right
+before PR D, and the only three the detour cannot test.
+
+So the boundary is driven by `userspace/netprobe.c` instead: a root-only ring-3
+program that goes straight to `int 0x80`. It costs one embedded binary and proves
+the property the detour would have faked. The zero baseline is then an asset
+rather than an embarrassment — `verify-netd-boundary.sh` asserts on it explicitly,
+so any frame the counters report is unambiguously one that crossed the ring.
+
+Root-only, and non-blocking. Raw TX forges any source MAC or IP (ARP poisoning,
+DHCP spoofing) and raw RX exposes traffic addressed to every other service on the
+host, so ring 3 needs a privilege check before it needs anything else. Blocking
+receive is deferred because it requires an ISR-driven wait queue, and a lost
+wakeup there is a silently wedged network stack — that belongs in the PR that
+actually needs it, not in the one that opens the boundary.
+
+Not covered by the harness, and deliberately: the `-EMSGSIZE` path where a queued
+frame is larger than the caller's buffer. The frame is **consumed** in that case
+(a retained oversized frame at the tail wedges the queue for every later frame —
+a remote DoS from one packet), so the caller loses it and learns only from the
+return value. Reaching it needs a frame larger than the probe's buffer, which the
+socket netdev cannot produce on demand; it is asserted by reading, not by running.
 
 **PR C — socket API across the boundary.** The 23 functions. Largest and least
 glamorous PR; likely splits further.
@@ -111,9 +143,13 @@ glamorous PR; likely splits further.
 **PR D — move the parser to ring 3.** Only after A–C. This is the PR where the
 trust domain actually changes.
 
-`MAX_SYSCALL_NUM` is currently 34 (`SYS_KILL`). Every PR that adds a syscall must
-bump it — CLAUDE.md records this exact bug: it sat at 16 while `SYS_SLEEP` (17)
-and `SYS_WAITPID` (18) had working dispatcher cases, silently rejecting both.
+`MAX_SYSCALL_NUM` is **36** as of PR B (`SYS_NETRX` 35, `SYS_NETTX` 36); it was 34
+(`SYS_KILL`) before. Every PR that adds a syscall must bump it — CLAUDE.md records
+this exact bug: it sat at 16 while `SYS_SLEEP` (17) and `SYS_WAITPID` (18) had
+working dispatcher cases, silently rejecting both. `verify-netd-boundary.sh`'s
+source guard now compares the two numerically rather than trusting a reading, on
+the grounds that a stale bound makes the dispatcher cases unreachable while
+leaving every line of the diff looking correct.
 
 ## PR A — audit findings
 

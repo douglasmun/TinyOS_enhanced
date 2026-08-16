@@ -237,6 +237,14 @@ bool pci_find_e1000(uint32_t* mmio_base);
 // E1000 Driver Functions
 void e1000_init(uint32_t base);
 void e1000_send(void* data, size_t len);
+
+/* The SYS_NETRX/SYS_NETTX packet-path boundary (doc/NETDAEMON_DESIGN.md PR B).
+ * e1000_rx_dequeue returns bytes copied, 0 if empty, -1 if the frame did not
+ * fit (and was consumed). */
+int e1000_rx_dequeue(uint8_t* out, uint16_t out_len);
+void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames);
+void net_count_syscall_rx(void);
+void net_count_syscall_tx(void);
 void e1000_poll_rx(void);
 void e1000_set_packet_dump(bool enable);
 void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count);
