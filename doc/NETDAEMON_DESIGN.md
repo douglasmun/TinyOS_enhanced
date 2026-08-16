@@ -193,20 +193,72 @@ looking like a regression report for this change. The TCP client path is
 consequently not covered end-to-end; that gap is stated in the harness header
 rather than papered over.
 
-**C1/C2 (not started) — the remaining 20.** Split proposed as C1 = the read-only
-state queries (`tcp_available`, `tcp_is_connected`, `tcp_get_state`,
-`dns_is_resolved`, `dns_get_resolved_ip`, `dhcp_is_configured`,
-`dhcp_get_client_info`, plus `my_ip`/`my_mac`/`gateway_ip`/`subnet_mask` as one
-query), which carry no write surface and so land with a much smaller audit; C2 =
-the data path (`tcp_socket`/`tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close`).
-Fixing TCP-over-NAT first would be sensible, since C2 cannot be verified
-end-to-end while a handshake cannot complete.
+**C1 (landed) — the read-only state queries, as one syscall.** `SYS_NETSTAT`
+(37) covers all seven accessors (`tcp_available`, `tcp_is_connected`,
+`tcp_get_state`, `dns_is_resolved`, `dns_get_resolved_ip`, `dhcp_is_configured`,
+`dhcp_get_client_info`) plus the interface addresses, behind five subcommands.
+One entry point rather than seven: each separate syscall needs its own
+credential check and its own bounds check, and seven of those is seven chances
+to omit one.
+
+Three decisions worth keeping:
+
+*It is not euid-gated, unlike `SYS_NETRX`/`SYS_NETTX`.* Those hand over raw
+frames — the whole segment's traffic — so they are root-only. These report the
+caller's **own** sockets, so the access control is ownership, not privilege.
+Gating on euid would make the ring-3 shell unable to see its own connections,
+which is the point of the syscall.
+
+*The audit found the socket table unowned.* `tcp_connection_t` had no uid field
+and a `sockfd` is a bare index into a global array, so exporting the queries
+as-is would have handed any user a read oracle over every other user's
+connections: peer address, state, and `tcp_available` as a traffic side channel.
+Fixed in the **primitive** — `tcp_socket()` stamps `owner_uid`, and one
+predicate (`tcp_owner_visible`) is consulted by `tcp_snapshot()` — rather than
+in the syscall, per the `ramfs_chmod` lesson. Same shape as
+`task_visible_to_current()`: euid for privilege, real uid for ownership, root
+sees all. A socket the caller cannot see is `-EBADF`, never `-EPERM`, or the
+errno alone enumerates the table (the `cmd_kill`/`sys_waitpid` policy).
+
+*The individual accessors take no lock.* Harmless while the only caller was the
+kernel shell; not once ring 3 can ask, since those reads race `tcp_handle_packet`
+on `knetd`. Calling three in a row can report a state from before a segment
+arrived beside a byte count from after it, and `rx_head`/`rx_tail` are worse —
+`tcp_rx_available()` subtracts them, so a torn pair returns a wildly wrong
+length. `tcp_snapshot()` reads everything the caller sees in one `TCP_LOCK()`.
+
+**What the C1 harness does NOT prove.** The socket bitmap reads 0 for root *and*
+for the unprivileged caller, because the TCP table is empty on a stock boot:
+DHCP and DNS use raw UDP and never call `tcp_socket()`, and `tcp_tests.c` is
+compiled but reachable from no shell command. A negative control confirmed the
+consequence — replacing the ownership comparison with `return true` left every
+call site intact, so all other source guards passed, the probe printed
+byte-identical output, and the harness returned **PASS** against a build where
+any user could read every socket. The runtime half structurally cannot catch
+this; the source guard asserting on the comparison itself is what stands in the
+way, and it is commented as load-bearing. C2 can prove it end-to-end, because C2
+can open a socket. Stated rather than implied, because a zero that looks like
+evidence is exactly the O_TRUNC/`cat` trap.
+
+`dhcp_get_client_info()` returns a pointer **into** kernel state; it is read
+field-by-field and never handed across. The copied struct also omits the DHCP
+transaction id, which is the value needed to forge a reply into an in-flight
+exchange and is no business of an unprivileged caller.
+
+The syscall ABI carries three registers (`ebx`/`ecx`/`edx`) and this call wants
+four values, so subcommand and sockfd share arg1 (`NETSTAT_ARG`). Widening the
+ABI to a fourth register would touch the asm entry path and every existing
+syscall — not this PR's job.
+
+**C2 (not started) — the data path** (`tcp_socket`/`tcp_connect`/`tcp_send`/
+`tcp_recv`/`tcp_close`). Fixing TCP-over-NAT first would be sensible, since C2
+cannot be verified end-to-end while a handshake cannot complete.
 
 **PR D — move the parser to ring 3.** Only after A–C. This is the PR where the
 trust domain actually changes.
 
-`MAX_SYSCALL_NUM` is **36** as of PR B (`SYS_NETRX` 35, `SYS_NETTX` 36); it was 34
-(`SYS_KILL`) before. Every PR that adds a syscall must bump it — CLAUDE.md records
+`MAX_SYSCALL_NUM` is **37** as of PR C1 (`SYS_NETRX` 35, `SYS_NETTX` 36,
+`SYS_NETSTAT` 37); it was 34 (`SYS_KILL`) before PR B. Every PR that adds a syscall must bump it — CLAUDE.md records
 this exact bug: it sat at 16 while `SYS_SLEEP` (17) and `SYS_WAITPID` (18) had
 working dispatcher cases, silently rejecting both. `verify-netd-boundary.sh`'s
 source guard now compares the two numerically rather than trusting a reading, on

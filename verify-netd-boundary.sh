@@ -1,8 +1,16 @@
 #!/bin/bash
 #=============================================================================
-# verify-netd-boundary.sh — SYS_NETRX / SYS_NETTX carry real frames
+# verify-netd-boundary.sh — the ring-3 network boundary
 #
-# doc/NETDAEMON_DESIGN.md item 4, PR B.
+# doc/NETDAEMON_DESIGN.md item 4: PR B (SYS_NETRX/SYS_NETTX carry real frames)
+# and PR C1 (SYS_NETSTAT answers read-only queries, filtered by socket owner).
+#
+# Both halves share one boot and one probe binary, so they live in one harness.
+# Their polarities are OPPOSITE, which is the thing to keep straight when
+# editing: SYS_NETRX/SYS_NETTX are root-only, so an unprivileged -EPERM is the
+# pass. SYS_NETSTAT is ownership-gated, so an unprivileged caller must be
+# SERVED and what must be empty is the set of sockets it can see. Copying an
+# assertion from one half to the other inverts it.
 #
 # WHAT THIS PROVES, AND WHY THE OBVIOUS TEST WOULD NOT
 #
@@ -105,6 +113,69 @@ grep -q "net_get_syscall_stats" src/shell_network.c \
 grep -q "euid != 0" src/syscall.c \
     || guard_fail "src/syscall.c has no euid check at all; the root-only gate is absent"
 
+#---------------------------------------------------------------------------
+# SOURCE GUARD — PR C1 (SYS_NETSTAT)
+#
+# The read-only query half. Its gate is ownership rather than euid, so the
+# checks here are about the PRIMITIVE holding the policy: an owner field that
+# tcp_socket actually stamps, and one predicate the syscall consults. A
+# SYS_NETSTAT that compiles without those is a read oracle over every user's
+# sockets, and the runtime half below would still pass as root.
+#---------------------------------------------------------------------------
+grep -q "define SYS_NETSTAT" src/syscall.h \
+    || guard_fail "src/syscall.h has no SYS_NETSTAT; tree predates PR C1"
+
+NETSTAT_NUM=$(sed -n 's/^#define SYS_NETSTAT *\([0-9][0-9]*\).*/\1/p' src/syscall.h | tail -1)
+[ -n "$NETSTAT_NUM" ] \
+    || guard_fail "could not read SYS_NETSTAT from src/syscall.h"
+[ "$MAXNUM" -ge "$NETSTAT_NUM" ] \
+    || guard_fail "MAX_SYSCALL_NUM=$MAXNUM does not cover SYS_NETSTAT=$NETSTAT_NUM;
+  the range check rejects it before the dispatcher, so every query returns
+  -ENOSYS while the dispatcher case sits there looking correct"
+
+grep -q "case SYS_NETSTAT" src/syscall.c \
+    || guard_fail "src/syscall.c has no SYS_NETSTAT dispatcher case"
+
+# The ownership field and the single predicate. Checked in the primitive
+# (tcp.c), not in the syscall: a check written only in sys_netstat leaves the
+# next caller of tcp_snapshot() ungated, which is the chmod lesson in CLAUDE.md.
+grep -q "owner_uid" src/tcp.h \
+    || guard_fail "tcp_connection_t has no owner_uid; sockets are unowned and a
+  bare sockfd index would let any caller read every other user's connections"
+grep -q "conn->owner_uid = tcp_current_owner_uid()" src/tcp.c \
+    || guard_fail "tcp_socket() does not stamp owner_uid; the field exists but
+  every socket would carry uid 0 and the ownership filter would be inert"
+grep -q "bool tcp_owner_visible" src/tcp.c \
+    || guard_fail "src/tcp.c has no tcp_owner_visible predicate"
+
+# The predicate must actually COMPARE the owner against the caller. This exact
+# check was added because a negative control proved the runtime half cannot
+# catch its absence: replacing the comparison with `return true` left every
+# call site intact, so all the other source guards passed, the probe printed
+# the same two lines, and the harness returned PASS against a build where any
+# user could read every socket. With the socket table empty on a stock boot, an
+# inert filter and a working one are indistinguishable at runtime -- this line
+# is the only thing standing between that regression and a green run.
+grep -q "owner_uid == (uint32_t)self->uid" src/tcp.c \
+    || guard_fail "tcp_owner_visible() never compares owner_uid to the caller's
+  uid. The predicate exists and is called, but it does not discriminate, so
+  every socket is visible to every user. NOTE: the runtime half of this
+  harness CANNOT catch this -- the TCP table is empty on a stock boot, so an
+  inert filter produces byte-identical probe output. Do not weaken this guard."
+
+# tcp_snapshot must consult it. Without this line the struct is filled for any
+# sockfd the caller names, and the bitmap below would be the only thing
+# filtering -- which a caller can simply ignore by asking for sockets directly.
+grep -q "tcp_owner_visible(sockfd)" src/tcp.c \
+    || guard_fail "tcp_snapshot() does not call tcp_owner_visible(); the
+  per-socket query is unfiltered even though the socket list is filtered"
+
+# The errno must not distinguish "not yours" from "not there".
+grep -q "EBADF" src/syscall.c \
+    || guard_fail "sys_netstat does not return -EBADF; if a foreign socket
+  answers -EPERM while an absent one answers -EBADF, the error code alone
+  enumerates other users' live sockets"
+
 echo "==> Building kernel + userspace + ISO..."
 (cd userspace && make) >/dev/null || exit 1
 
@@ -134,6 +205,14 @@ PROBE_MARKERS=$(strings "$ISO" | grep -c "PROBE VERDICT")
 if [ "$PROBE_MARKERS" -eq 0 ]; then
     guard_fail "the ISO does not contain netprobe.elf; nothing would drive the
   boundary and both counters would read zero for the wrong reason"
+fi
+# The probe embedded in the ISO must be the one that knows about SYS_NETSTAT.
+# A stale netprobe.elf still prints PROBE VERDICT, so the check above passes
+# while every C1 assertion below silently finds no line to match.
+NETSTAT_MARKERS=$(strings "$ISO" | grep -c "PROBE NETSTAT VERDICT")
+if [ "$NETSTAT_MARKERS" -eq 0 ]; then
+    guard_fail "the embedded netprobe.elf predates PR C1 (no 'PROBE NETSTAT
+  VERDICT' string), so the SYS_NETSTAT half would be silently untested"
 fi
 
 echo "==> Copying pristine disk.img -> $RUN_DISK"
@@ -327,10 +406,158 @@ for dead in "sys_netrx" "sys_nettx" "NETRX" "NETTX"; do
     fi
 done
 
+#===========================================================================
+# PR C1 — SYS_NETSTAT: the read-only query half
+#
+# The polarity here is the OPPOSITE of the RX/TX half above, and that is the
+# point. Those two are root-only, so an unprivileged -EPERM is the pass. These
+# are ownership-gated: an unprivileged caller MUST be served, and what must be
+# empty is the set of sockets it can see. A -EPERM here would be a bug.
+#===========================================================================
+NS_ROOT=$(grep -a "PROBE NETSTAT VERDICT" "$SERIAL" | tr -d '\r' | sed -n '1p')
+NS_UNPRIV=$(grep -a "PROBE NETSTAT VERDICT" "$SERIAL" | tr -d '\r' | sed -n '2p')
+echo "  netstat verdicts: root='${NS_ROOT:-none}' unpriv='${NS_UNPRIV:-none}'"
+
+case "$NS_ROOT" in
+    *ok) ;;
+    *) fail_with "root's SYS_NETSTAT verdict was '${NS_ROOT:-none}', expected 'ok'" \
+        "The query syscall did not answer correctly for root. Check the" \
+        "dispatcher case and MAX_SYSCALL_NUM: a stale bound returns -ENOSYS" \
+        "for every subcommand while the code below looks complete." ;;
+esac
+
+case "$NS_UNPRIV" in
+    *scoped) ;;
+    *leaked_mask)
+        fail_with "an unprivileged caller could see sockets it does not own" \
+            "tcp_socket() stamps owner_uid and tcp_owner_visible() is meant to" \
+            "filter on it. A nonzero visible_mask means a bare sockfd index is" \
+            "once again a read oracle: peer address, connection state, and" \
+            "rx_available as a traffic side channel on another user's session." \
+            "This is the finding, not a test failure." ;;
+    *leaked_errno*)
+        fail_with "a foreign socket answered with an errno other than -EBADF ($NS_UNPRIV)" \
+            "The socket is correctly hidden from the listing, but the" \
+            "per-socket query distinguishes 'exists but not yours' from" \
+            "'does not exist'. That difference alone enumerates the live" \
+            "socket table for an unprivileged caller -- the same leak closed" \
+            "in cmd_kill and sys_waitpid. Return -EBADF for both." ;;
+    *) fail_with "unprivileged SYS_NETSTAT verdict was '${NS_UNPRIV:-none}'" \
+            "Expected 'scoped'. Note the polarity: unlike SYS_NETRX/NETTX," \
+            "this syscall must SUCCEED for an unprivileged caller and return" \
+            "an empty socket set. A refusal here means it was euid-gated by" \
+            "mistake, which makes the ring-3 shell unable to see its own" \
+            "connections." ;;
+esac
+
+# --- The socket bitmap: WHAT THIS DOES AND DOES NOT PROVE ------------------
+#
+# READ THIS BEFORE STRENGTHENING THE ASSERTION BELOW.
+#
+# The first version of this harness asserted "unprivileged mask == 0" and
+# called that proof of the ownership filter. It is not. Both masks read 0 on
+# this boot because the TCP socket table is EMPTY at probe time -- DHCP and DNS
+# use raw UDP and never call tcp_socket(), and tcp_tests.c is compiled but
+# reachable from no shell command. An unowned, entirely ungated build produces
+# exactly the same two lines. That assertion passed against the hypothesis it
+# was meant to test, which is the same false pass as the cat-based O_TRUNC
+# harness in CLAUDE.md.
+#
+# Creating a socket from ring 3 needs SYS_NETSTAT's write-side counterpart
+# (tcp_socket/connect/close), which is deliberately PR C2 -- this PR adds no
+# write surface at all. So the runtime evidence available here is:
+#
+#   - both masks are 0, consistent with an empty table (asserted below), and
+#   - the per-socket query refuses every descriptor identically.
+#
+# The filter's LOGIC is covered by the source guard above (owner_uid stamped in
+# tcp_socket, tcp_owner_visible consulted by tcp_snapshot) and its truth table
+# was checked directly: root sees all, a user sees only its own, kernel-owned
+# sockets are invisible to non-root. What is NOT covered end-to-end is a live
+# foreign socket being hidden from a real unprivileged caller. PR C2 can prove
+# that, because it can open one; until then this is stated rather than implied.
+NS_MASK_ROOT=$(grep -a "PROBE netstat_socklist" "$SERIAL" | tr -d '\r' \
+    | sed -n '1s/.*mask=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+NS_MASK_UNPRIV=$(grep -a "PROBE netstat_socklist" "$SERIAL" | tr -d '\r' \
+    | sed -n '2s/.*mask=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+echo "  socket bitmaps: root=${NS_MASK_ROOT:-none} unpriv=${NS_MASK_UNPRIV:-none} (table is empty this boot)"
+
+# An unprivileged caller must never see MORE than root. That much is real
+# regardless of how many sockets exist, and it is the direction the leak would
+# go if the filter were inverted or absent.
+if [ -n "$NS_MASK_ROOT" ] && [ -n "$NS_MASK_UNPRIV" ]; then
+    if [ "$NS_MASK_UNPRIV" -gt "$NS_MASK_ROOT" ]; then
+        fail_with "the unprivileged socket bitmap ($NS_MASK_UNPRIV) exceeds root's ($NS_MASK_ROOT)" \
+            "A non-root caller can see sockets root cannot, so the ownership" \
+            "comparison is inverted."
+    fi
+fi
+if [ -n "$NS_MASK_UNPRIV" ] && [ "$NS_MASK_UNPRIV" -ne 0 ]; then
+    fail_with "the unprivileged socket bitmap was $NS_MASK_UNPRIV, expected 0" \
+        "No task-owned socket exists on this boot, so a non-root caller must" \
+        "see an empty set. A nonzero value means the filter is reporting" \
+        "sockets that either do not exist or belong to the kernel."
+fi
+
+# --- Argument validation, from the probe's own lines -----------------------
+#
+# A wrong-sized buffer must be refused rather than short-filled: a truncated
+# copy hands back a struct whose tail is whatever the caller left there, and
+# the caller cannot tell. Asserted on the exact errno.
+NS_BADLEN=$(grep -a "PROBE netstat_badlen" "$SERIAL" | tr -d '\r' \
+    | sed -n '1s/.*rc=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+if [ "${NS_BADLEN:-0}" != "-22" ]; then
+    fail_with "a wrong-sized SYS_NETSTAT buffer returned rc=${NS_BADLEN:-none}, expected -22 (-EINVAL)" \
+        "The length must match the subcommand's struct exactly. Accepting a" \
+        "short buffer means copying fewer bytes than the caller believes it" \
+        "received; accepting a long one means the tail is uninitialised."
+fi
+
+NS_BADCMD=$(grep -a "PROBE netstat_badcmd" "$SERIAL" | tr -d '\r' \
+    | sed -n '1s/.*rc=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+if [ "${NS_BADCMD:-0}" != "-22" ]; then
+    fail_with "an unknown SYS_NETSTAT subcommand returned rc=${NS_BADCMD:-none}, expected -22 (-EINVAL)" \
+        "An unrecognised subcommand must fall through to a default that" \
+        "refuses, not to a branch that copies out whatever the staging union" \
+        "happens to hold."
+fi
+
+# --- Out-of-range and foreign sockets answer identically -------------------
+NS_OOB=$(grep -a "PROBE netstat_sock_oob" "$SERIAL" | tr -d '\r' \
+    | sed -n '2s/.*rc=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+NS_SOCK0=$(grep -a "PROBE netstat_sock0" "$SERIAL" | tr -d '\r' \
+    | sed -n '2s/.*rc=\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+if [ -n "$NS_OOB" ] && [ -n "$NS_SOCK0" ] && [ "$NS_OOB" != "$NS_SOCK0" ]; then
+    fail_with "a nonexistent socket (rc=$NS_OOB) and a foreign one (rc=$NS_SOCK0) gave different errnos" \
+        "The two must be indistinguishable. If a live socket owned by another" \
+        "user answers differently from one that was never allocated, a caller" \
+        "enumerates the socket table through the error code alone -- the same" \
+        "leak closed in cmd_kill and sys_waitpid."
+fi
+
+# --- No per-call console output on the query path either -------------------
+#
+# Matched against the probe's OWN lines removed first: netprobe prints
+# "PROBE NETSTAT VERDICT" and "PROBE netstat_*" by design, and grepping for a
+# bare "netstat" would count those and fail every run regardless of the kernel.
+for dead in "sys_netstat" "netstat_query" "NETSTAT:"; do
+    HITS=$(grep -av "^PROBE " "$SERIAL" | grep -ca "$dead")
+    if [ "$HITS" -ne 0 ]; then
+        fail_with "the console printed \"$dead\" $HITS time(s)" \
+            "The ring-3 shell will call this once per netstat invocation, and" \
+            "CLAUDE.md rules out per-operation prints on any path ring 3" \
+            "reaches -- the shell's output and the kernel console are one" \
+            "serial stream."
+    fi
+done
+
 echo ""
 echo "RESULT: PASS"
-echo "  Root's ring-3 SYS_NETTX crossed the boundary exactly once (tx +1) from a"
-echo "  zero baseline, with a short frame refused as -EINVAL; the unprivileged"
-echo "  caller was refused with both counters unmoved, and neither syscall"
-echo "  printed to the console."
+echo "  PR B: root's ring-3 SYS_NETTX crossed the boundary exactly once (tx +1)"
+echo "  from a zero baseline, with a short frame refused as -EINVAL; the"
+echo "  unprivileged caller was refused with both counters unmoved."
+echo "  PR C1: SYS_NETSTAT served the unprivileged caller (not euid-gated) while"
+echo "  showing it an empty socket set; wrong lengths and unknown subcommands"
+echo "  were refused as -EINVAL, and absent and foreign sockets answered alike."
+echo "  Neither path printed to the console."
 exit 0

@@ -15,6 +15,8 @@
 #include "critical.h"  /* For proper nested critical section support */
 #include "crypto.h"    /* For CSPRNG ISN generation (global_csprng) */
 #include "sha256.h"    /* For RFC 6528 ISN PRF */
+#include "process.h"   /* task_t, for socket ownership */
+#include "scheduler.h" /* scheduler_get_current_task */
 
 /*=============================================================================
  * CONCURRENCY PROTECTION (Global Interrupt Disable - Coarse-Grained Locking)
@@ -1041,6 +1043,35 @@ void tcp_init(void) {
     kprintf("[NET] TCP: initialized (%d max conns) [OK]\n", TCP_MAX_CONNECTIONS);
 }
 
+/*=============================================================================
+ * SOCKET OWNERSHIP
+ *
+ * Sockets became nameable from ring 3 with SYS_NETSTAT (doc/NETDAEMON_DESIGN.md
+ * PR C1). A sockfd is a bare index into tcp_connections[], so without an owner
+ * a caller could walk the whole table: peer address, connection state, and
+ * bytes-pending as a traffic side channel on another user's session.
+ *
+ * The policy mirrors task_visible_to_current() in shell_monitor.c -- one
+ * predicate, applied in the primitive rather than re-written per caller, using
+ * euid for privilege and the real uid for ownership. Root sees every socket;
+ * everyone else sees only their own. Kernel-owned sockets (boot DHCP/DNS, which
+ * run before any task exists) are visible to root alone.
+ *===========================================================================*/
+static uint32_t tcp_current_owner_uid(void) {
+    task_t* self = scheduler_get_current_task();
+    return self ? (uint32_t)self->uid : TCP_SOCKET_OWNER_KERNEL;
+}
+
+bool tcp_owner_visible(int sockfd) {
+    if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return false;
+
+    task_t* self = scheduler_get_current_task();
+    if (!self) return true;          /* kernel context: boot paths, tcp_tick */
+    if (self->euid == 0) return true;
+
+    return tcp_connections[sockfd].owner_uid == (uint32_t)self->uid;
+}
+
 /**
  * @brief Create a TCP socket
  */
@@ -1054,6 +1085,7 @@ int tcp_socket(void) {
             conn->state = TCP_CLOSED;
             conn->rcv_wnd = TCP_RX_BUFFER_SIZE;
             conn->local_port = 0; // Will be assigned on connect/bind
+            conn->owner_uid = tcp_current_owner_uid();
             // kprintf("TCP: Socket %d created\n", i);  // Commented for less verbosity
             TCP_UNLOCK();
             return i;
@@ -1393,6 +1425,60 @@ int tcp_available(int sockfd) {
     tcp_connection_t* conn = &tcp_connections[sockfd];
     if (!conn->in_use) return 0;
     return tcp_rx_available(conn);
+}
+
+/**
+ * @brief Snapshot one socket's observable state for SYS_NETSTAT.
+ *
+ * Everything the caller sees is read in ONE critical section. The individual
+ * accessors above (tcp_get_state, tcp_available, tcp_is_connected) each take no
+ * lock, which was harmless while the only caller was the kernel shell but is
+ * not once ring 3 can ask: those reads race tcp_handle_packet on knetd, so
+ * calling three of them in a row can report a state from before a segment
+ * arrived alongside a byte count from after it. rx_head/rx_tail are the sharp
+ * edge -- tcp_rx_available() subtracts them, and reading a torn pair across an
+ * update returns a wildly wrong length.
+ *
+ * Returns false if the sockfd is out of range, unused, or not visible to the
+ * caller. The caller cannot distinguish those three, by design.
+ */
+bool tcp_snapshot(int sockfd, tcp_snapshot_t* out) {
+    if (!out) return false;
+    if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return false;
+
+    TCP_LOCK();
+    tcp_connection_t* conn = &tcp_connections[sockfd];
+    if (!conn->in_use || !tcp_owner_visible(sockfd)) {
+        TCP_UNLOCK();
+        return false;
+    }
+
+    out->state       = (uint32_t)conn->state;
+    out->connected   = (conn->state == TCP_ESTABLISHED) ? 1u : 0u;
+    out->available   = tcp_rx_available(conn);
+    out->local_port  = conn->local_port;
+    out->remote_port = conn->remote_port;
+    memcpy(out->remote_ip, conn->remote_ip, 4);
+    TCP_UNLOCK();
+
+    return true;
+}
+
+/**
+ * @brief Bitmap of in-use sockets visible to the calling task.
+ */
+uint32_t tcp_visible_mask(void) {
+    uint32_t mask = 0;
+
+    TCP_LOCK();
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        if (tcp_connections[i].in_use && tcp_owner_visible(i)) {
+            mask |= (1u << i);
+        }
+    }
+    TCP_UNLOCK();
+
+    return mask;
 }
 
 /*=============================================================================

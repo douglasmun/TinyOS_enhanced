@@ -20,10 +20,42 @@
 
 #define SYS_NETRX 35
 #define SYS_NETTX 36
+#define SYS_NETSTAT 37
 
 #define EPERM     1
 #define EAGAIN    11
 #define EINVAL    22
+#define EBADF     9
+
+/* SYS_NETSTAT subcommands and its packed first argument -- see syscall.h. */
+#define NETSTAT_IFACE    0
+#define NETSTAT_DHCP     1
+#define NETSTAT_DNS      2
+#define NETSTAT_SOCKET   3
+#define NETSTAT_SOCKLIST 4
+#define NETSTAT_ARG(subcmd, sockfd) \
+    (((uint32_t)(subcmd) & 0xFFFFu) | (((uint32_t)(sockfd) & 0xFFFFu) << 16))
+
+typedef struct {
+    uint8_t ip[4];
+    uint8_t netmask[4];
+    uint8_t gateway[4];
+    uint8_t mac[6];
+    uint8_t _pad[2];
+} netstat_iface_t;
+
+typedef struct {
+    uint32_t visible_mask;
+} netstat_socklist_t;
+
+typedef struct {
+    uint32_t state;
+    uint32_t connected;
+    uint32_t available;
+    uint8_t  remote_ip[4];
+    uint16_t local_port;
+    uint16_t remote_port;
+} netstat_socket_t;
 
 /* A minimal, deliberately inert frame: broadcast destination, a locally
  * administered source MAC that belongs to nobody, and an EtherType the stack
@@ -43,6 +75,79 @@ static int netrx(void* buf, unsigned int len) {
 
 static int nettx(const void* buf, unsigned int len) {
     return syscall3(SYS_NETTX, (uint32_t)(uintptr_t)buf, (uint32_t)len, 0);
+}
+
+static int netstat(unsigned int subcmd, int sockfd, void* buf, unsigned int len) {
+    return syscall3(SYS_NETSTAT, NETSTAT_ARG(subcmd, sockfd),
+                    (uint32_t)(uintptr_t)buf, (uint32_t)len);
+}
+
+/*=============================================================================
+ * SYS_NETSTAT probe (PR C1).
+ *
+ * Unlike the RX/TX pair above, this one must succeed for an UNPRIVILEGED
+ * caller -- these are read-only queries gated on socket ownership, not on
+ * euid, so a -EPERM here would be the bug rather than the proof.
+ *
+ * The socket bitmap reads 0 for BOTH root and the unprivileged caller on a
+ * stock boot, and that is not evidence of filtering: the TCP table is simply
+ * empty, because DHCP and DNS use raw UDP and never call tcp_socket(). Opening
+ * a socket from ring 3 needs the write half (PR C2), which this PR
+ * deliberately does not add. See the long note in verify-netd-boundary.sh
+ * before reading the zero as proof of anything.
+ *===========================================================================*/
+static int netstat_probe(int uid) {
+    netstat_iface_t iface;
+    netstat_socklist_t list;
+    netstat_socket_t sock;
+    int rc;
+
+    rc = netstat(NETSTAT_IFACE, 0, &iface, sizeof(iface));
+    printf("PROBE netstat_iface rc=%d ip=%d.%d.%d.%d gw=%d.%d.%d.%d\n",
+           rc, iface.ip[0], iface.ip[1], iface.ip[2], iface.ip[3],
+           iface.gateway[0], iface.gateway[1], iface.gateway[2], iface.gateway[3]);
+
+    /* A size the kernel did not expect must be refused outright. Truncating
+     * would hand back a struct whose tail is whatever the caller had there. */
+    rc = netstat(NETSTAT_IFACE, 0, &iface, sizeof(iface) - 1);
+    printf("PROBE netstat_badlen rc=%d\n", rc);
+
+    rc = netstat(99, 0, &iface, sizeof(iface));
+    printf("PROBE netstat_badcmd rc=%d\n", rc);
+
+    rc = netstat(NETSTAT_SOCKLIST, 0, &list, sizeof(list));
+    printf("PROBE netstat_socklist rc=%d mask=%d\n", rc, (int)list.visible_mask);
+
+    /* An out-of-range descriptor and a live-but-foreign one must be reported
+     * identically (-EBADF), or the errno enumerates other users' sockets. */
+    rc = netstat(NETSTAT_SOCKET, 31, &sock, sizeof(sock));
+    printf("PROBE netstat_sock_oob rc=%d\n", rc);
+
+    rc = netstat(NETSTAT_SOCKET, 0, &sock, sizeof(sock));
+    printf("PROBE netstat_sock0 rc=%d\n", rc);
+
+    if (uid != 0) {
+        /* An empty set, and a per-socket query that refuses identically
+         * whether the descriptor is foreign or absent. The empty set is weak
+         * evidence on its own (see the note above); the identical errno is
+         * not, since it is what stops the error code enumerating the table. */
+        if (list.visible_mask != 0) {
+            printf("PROBE NETSTAT VERDICT leaked_mask\n");
+            return 1;
+        }
+        /* Distinct verdict: an errno that separates "not yours" from "not
+         * there" is the enumeration leak, and it needs its own name so the
+         * harness reports the actual finding rather than a generic refusal. */
+        if (rc != -EBADF) {
+            printf("PROBE NETSTAT VERDICT leaked_errno rc=%d\n", rc);
+            return 1;
+        }
+        printf("PROBE NETSTAT VERDICT scoped\n");
+        return 0;
+    }
+
+    printf("PROBE NETSTAT VERDICT ok\n");
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -84,21 +189,24 @@ int main(int argc, char** argv) {
     }
     printf("PROBE netrx frames=%d last_rc_eagain_after=%d\n", received, i);
 
+    /* Reported on its own line, and deliberately NOT folded into the verdict
+     * below. The two cover unrelated gates -- the RX/TX euid check and the
+     * SYS_NETSTAT ownership filter -- and combining them made a NETSTAT errno
+     * leak print "PROBE VERDICT leaked", which reads as a raw-frame
+     * escalation and sends the reader to the wrong subsystem. Each gate
+     * reports its own finding; the exit status carries both. */
+    int netstat_bad = netstat_probe(uid);
+    int rxtx_bad;
+
     if (uid != 0) {
         /* The whole point of running unprivileged. Both must be refused, and
          * refused identically, so the errno leaks nothing about the ring. */
-        if (tx_rc == -EPERM && received == 0) {
-            printf("PROBE VERDICT denied\n");
-            return 0;
-        }
-        printf("PROBE VERDICT leaked\n");
-        return 1;
+        rxtx_bad = !(tx_rc == -EPERM && received == 0);
+        printf("PROBE VERDICT %s\n", rxtx_bad ? "leaked" : "denied");
+    } else {
+        rxtx_bad = !(tx_rc == (int)sizeof(probe_frame) && tx_short == -EINVAL);
+        printf("PROBE VERDICT %s\n", rxtx_bad ? "broken" : "ok");
     }
 
-    if (tx_rc == (int)sizeof(probe_frame) && tx_short == -EINVAL) {
-        printf("PROBE VERDICT ok\n");
-        return 0;
-    }
-    printf("PROBE VERDICT broken\n");
-    return 1;
+    return (rxtx_bad || netstat_bad) ? 1 : 0;
 }

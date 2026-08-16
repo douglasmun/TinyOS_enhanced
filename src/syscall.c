@@ -29,6 +29,9 @@
 #include "shell_redir.h" // SYS_PIPE: pipe_buffer_t and pipe_init/destroy
 #include "pmm.h"       // SYS_PIPE: frames for the pipe buffer
 #include "net.h"       // SYS_NETRX/SYS_NETTX: e1000_rx_dequeue, e1000_send
+#include "tcp.h"       // SYS_NETSTAT: socket state + tcp_owner_visible
+#include "dns.h"       // SYS_NETSTAT: dns_is_resolved/dns_get_resolved_ip
+#include "dhcp.h"      // SYS_NETSTAT: dhcp lease state
 #include "paging.h"    // SYS_PIPE: map those frames before touching them
 #include "shell_user.h" // SYS_CRED: the passwd/useradd/userdel implementations
 
@@ -1444,6 +1447,114 @@ int sys_nettx(const void* user_buf, size_t len) {
     e1000_send(nettx_staging, len);
     net_count_syscall_tx();
     return (int)len;
+}
+
+/*=============================================================================
+ * SYS_NETSTAT -- read-only network state (doc/NETDAEMON_DESIGN.md PR C1)
+ *
+ * See syscall.h for why this is one syscall rather than seven, and why it is
+ * ownership-gated rather than euid-gated.
+ *===========================================================================*/
+
+/* The snapshot struct crosses the boundary verbatim. If either side gains a
+ * field, this fails the build rather than silently shipping a short read or
+ * leaking the bytes past the end of the smaller struct. */
+_Static_assert(sizeof(netstat_socket_t) == sizeof(tcp_snapshot_t),
+               "netstat_socket_t and tcp_snapshot_t must stay layout-compatible");
+
+int sys_netstat(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+    if (!user_buf || len == 0) {
+        return -EINVAL;
+    }
+
+    /* Staging is a union of the payloads, so the copy_to_user below always has
+     * a kernel source and no accessor runs with a user pointer live. Every
+     * branch checks len against its OWN struct: a caller asking for the small
+     * struct must not receive the large one's tail. */
+    union {
+        netstat_iface_t    iface;
+        netstat_dhcp_t     dhcp;
+        netstat_dns_t      dns;
+        netstat_socket_t   sock;
+        netstat_socklist_t list;
+    } out;
+    memset(&out, 0, sizeof(out));
+    size_t want = 0;
+
+    switch (subcmd) {
+    case NETSTAT_IFACE: {
+        want = sizeof(out.iface);
+        if (len != want) return -EINVAL;
+        memcpy(out.iface.ip,      my_ip,       4);
+        memcpy(out.iface.netmask, subnet_mask, 4);
+        memcpy(out.iface.gateway, gateway_ip,  4);
+        memcpy(out.iface.mac,     my_mac,      6);
+        break;
+    }
+
+    case NETSTAT_DHCP: {
+        want = sizeof(out.dhcp);
+        if (len != want) return -EINVAL;
+        /* By value, field by field. dhcp_get_client_info() returns a pointer
+         * INTO kernel state -- it is read here and never handed across. The
+         * transaction id is deliberately not among the fields copied. */
+        const dhcp_client_t* c = dhcp_get_client_info();
+        if (c) {
+            out.dhcp.configured  = dhcp_is_configured() ? 1u : 0u;
+            out.dhcp.state       = (uint32_t)dhcp_get_state();
+            out.dhcp.lease_time  = c->lease_time;
+            out.dhcp.lease_start = c->lease_start;
+            out.dhcp.renewal_time = c->renewal_time;
+            memcpy(out.dhcp.server_ip,  c->server_ip,  4);
+            memcpy(out.dhcp.dns_server, c->dns_server, 4);
+        }
+        break;
+    }
+
+    case NETSTAT_DNS: {
+        want = sizeof(out.dns);
+        if (len != want) return -EINVAL;
+        /* dns_get_resolved_ip leaves the buffer untouched when it returns
+         * false, and out was zeroed, so an unresolved query reports 0.0.0.0
+         * rather than whatever was last on the stack. */
+        out.dns.resolved = dns_get_resolved_ip(out.dns.ip) ? 1u : 0u;
+        break;
+    }
+
+    case NETSTAT_SOCKET: {
+        want = sizeof(out.sock);
+        if (len != want) return -EINVAL;
+        tcp_snapshot_t snap;
+        /* Not visible and not present are the same answer. Returning -EPERM
+         * for a live socket owned by someone else would let a caller
+         * enumerate other users' sockets from the error code alone -- the
+         * same leak closed in cmd_kill and sys_waitpid. */
+        if (!tcp_snapshot(sockfd, &snap)) {
+            return -EBADF;
+        }
+        memcpy(&out.sock, &snap, sizeof(out.sock));
+        break;
+    }
+
+    case NETSTAT_SOCKLIST: {
+        want = sizeof(out.list);
+        if (len != want) return -EINVAL;
+        out.list.visible_mask = tcp_visible_mask();
+        break;
+    }
+
+    default:
+        return -EINVAL;
+    }
+
+    if (copy_to_user(user_buf, &out, want) < 0) {
+        return -EFAULT;
+    }
+    return (int)want;
 }
 
 int sys_chdir(const char* user_path) {
@@ -2947,6 +3058,17 @@ static void syscall_dispatch(struct cpu_state* state) {
         case SYS_NETTX:
             /* arg1 = user buffer, arg2 = frame length */
             ret = sys_nettx((const void*)arg1, (size_t)arg2);
+            break;
+
+        case SYS_NETSTAT:
+            /* The dispatcher carries three registers (ebx/ecx/edx), and this
+             * call wants four values, so subcmd and sockfd share arg1 -- see
+             * NETSTAT_ARG in syscall.h. Widening the syscall ABI to a fourth
+             * register would touch the asm entry path and every existing
+             * syscall, which is not this PR's job.
+             * arg1 = subcmd | sockfd << 16, arg2 = buffer, arg3 = length */
+            ret = sys_netstat(NETSTAT_SUBCMD(arg1), NETSTAT_SOCKFD(arg1),
+                              (void*)arg2, (size_t)arg3);
             break;
 
         case SYS_REDIRECT:
