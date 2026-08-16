@@ -656,11 +656,9 @@ Each is commented in place, because a later mechanical sweep would otherwise
   the RAM, and leave the user watching a console that says nothing before it stops.
   The argument errors and the permission refusal above them *are* converted — at that
   point the command has not committed to halting.
-- **`cmd_sectest`'s banner.** `run_security_tests()` in `security_tests.c` is ~162
-  console-only calls and out of scope here. Routing only the banner would make
-  `sectest > report.txt` produce a file containing the banner and nothing else, with
-  the results still on the console. A banner that follows its output is less wrong
-  than one that abandons it. Convert this line when `security_tests.c` is converted.
+`cmd_sectest`'s banner was in this list until `security_tests.c` was converted; see
+"`security_tests.c`: the report had three authors" below for why it was held back and
+what releasing it required.
 
 ### `env.c`: the locking had to change with the routing
 
@@ -672,6 +670,42 @@ drop the lock, and print outside it. The table is never read unlocked and no I/O
 happens inside the critical section. The trade is that a variable added mid-listing
 may or may not appear — acceptable for a listing, unlike the torn name/value read the
 lock actually exists to prevent.
+
+### `security_tests.c`: the report had three authors
+
+161 call sites, the last console-only block in the tree, and the reason
+`cmd_sectest`'s banner sat on `kprintf` for two PRs. Converting the file was the easy
+part; two things about it were not mechanical.
+
+**The suite does not print all of its own output.** Two functions it calls are defined
+in other files and have *exactly one caller each* — this suite:
+
+| Function | File | Lines of output |
+|---|---|---|
+| `scheduler_stats()` | `scheduler.c` | 10 (TEST 3) |
+| `arp_security_self_test()` | `net.c` | 7 (TEST 9) |
+
+Convert only `security_tests.c` and `sectest > report.txt` yields a file with the
+banner, all nine test headers and all nine verdicts — structurally complete, and
+missing 17 lines of the actual security results, which went to the console instead.
+This is the failure a positive-only harness passes, so `verify-sectest-redirect.sh`
+asserts on all three sources independently. It was validated against exactly this
+half-done state: suite body and ARP passed, `scheduler_stats` failed.
+
+**`scheduler_stats()` printed inside its critical section.** Seven of its ten lines
+sat between `CRITICAL_SECTION_ENTER()` and `EXIT()`. That is survivable for `kprintf`
+and not for `stream_printf`, for the same `ramfs_write` reason as `env.c` above — and
+`sectest > f` is precisely the redirected case. It now snapshots every value the
+report needs into locals under the lock (including `current->name` **by value**;
+holding the pointer and dereferencing it after `EXIT` would race a task that exits in
+between) and formats afterwards. The snapshot is what makes the report internally
+consistent *and* the printing safe; those two properties are in tension and this is
+where they get reconciled, so it should not be folded back into one pass.
+
+Worth noting that `-Werror` catches a partial revert here for free: drop the
+`stream_printf` calls from `scheduler_stats` and `ctx` becomes unused. That is defence
+in depth, not a substitute for the harness — it only fires when a function loses its
+*last* `stream_printf`, and says nothing about the other two files.
 
 ### A pre-existing `%f` bug fell out of the conversion
 

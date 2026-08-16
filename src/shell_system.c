@@ -1225,17 +1225,14 @@ void cmd_sectest(int argc, char* argv[]) {
         return;
     }
 
-    /* kprintf deliberately, unlike everything else in this file. The suite
-     * itself (security_tests.c, ~162 call sites) is still console-only and is
-     * out of scope here, so routing just this banner to the stream would make
+    /* Now on the stream, following its output. This line was held on kprintf on
+     * purpose while security_tests.c was console-only -- a banner routed to the
+     * stream while the results went to the console would have made
      * `sectest > report.txt` produce a file containing the banner and nothing
-     * else -- the results would still land on the console. A banner that follows
-     * its output is less wrong than one that abandons it. Convert this line when
-     * security_tests.c is converted, not before.
-     *
-     * The argument errors and the permission refusal above DO belong on the
-     * user's stream: those are this command's own output, not the suite's. */
-    kprintf("Starting security test suite...\n");
+     * else. The suite (and scheduler_stats()/arp_security_self_test(), its two
+     * out-of-file reporters) now writes to the stream too, so the banner
+     * follows its output instead of abandoning it. */
+    stream_printf(get_current_streams(), "Starting security test suite...\n");
     run_security_tests();
 }
 

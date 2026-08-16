@@ -185,3 +185,5 @@ sysredirect.log
 sysredirect-trace.log
 spray-pos.log
 spray-neg.log
+sectest-redirect.log
+sectest-redirect-trace.log
