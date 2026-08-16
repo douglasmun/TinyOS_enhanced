@@ -79,6 +79,17 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   stalled `knetd`); and ring overflow is **drop-newest**, counted, because drop-oldest
   lets a fast sender evict frames already accepted. `ifconfig`'s `irq-ctx` count must
   read **0**. Harness: `verify-rx-thread-context.sh`.
+- **`irq-ctx` and `cpl3` are different questions — don't let one stand in for the
+  other.** `knetd` runs with `IF=1` *and* at CPL 0, so a kernel where nothing has moved
+  to ring 3 still reports a perfectly healthy `RX parsed: N thread-ctx, 0 irq-ctx`.
+  Interrupt state and privilege level are independent axes. `handle_packet()` therefore
+  also witnesses the ring from `%cs` (`RX ring: N cpl0, M cpl3`), read from the hardware
+  and **never from a software flag** — a flag records what the code believes about
+  itself, and the point of the counter is to catch a build whose belief is wrong.
+  `cpl3` must read **0** until the PR D parser move lands; that pinned zero is the
+  pre-move baseline the move has to invert, which is why the witness was built before
+  the move rather than after. Harness: `verify-netd-ring3.sh` (flip with
+  `TINYOS_EXPECT_CPL3=1`); rationale in `doc/NETDAEMON_DESIGN.md`.
 - **The e1000 DMA buffers are a guarded PMM region, not `.bss`.**
   `e1000_dma_region_init()` carves 38 contiguous pages with an **unmapped guard page at
   each end**; `rx_bufs/tx_bufs/rx_ring/tx_ring` are pointers into it. Three things to

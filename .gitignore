@@ -189,6 +189,8 @@ rxdrop.log
 rxdrop-trace.log
 rxctx.log
 rxctx-trace.log
+ring3.log
+ring3-trace.log
 dmaguard.log
 dmaguard-trace.log
 icmpctr.log

@@ -267,6 +267,13 @@ void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype);
  * item 1. This is what verify-rx-thread-context.sh asserts on. */
 void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx);
 
+/* Ring accounting (doc/NETDAEMON_DESIGN.md item 4, PR D). Distinct from the pair
+ * above: knetd runs with IF=1 at CPL 0, so a healthy thread-ctx count says
+ * nothing about which ring parsed the frame. cpl3 reads 0 until the parser
+ * actually moves; that zero is the pre-move baseline verify-netd-ring3.sh
+ * records, so the move has to be witnessed rather than asserted. */
+void net_get_parse_ring_stats(uint32_t* cpl0, uint32_t* cpl3);
+
 /* DMA region layout (doc/NETWORK_ISOLATION.md item 3). The guard addresses are
  * reported so `netdma` and verify-dma-guard.sh can assert they are genuinely
  * not present, rather than trusting that the unmap was called. */
