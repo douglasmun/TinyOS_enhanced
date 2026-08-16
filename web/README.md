@@ -56,20 +56,29 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is built from `main` at **PR #56** (`d712cad`), and matches the
-signed `v2.4` release asset. It is a pinned image, not a rolling build of `main`:
+The committed ISO is built from `main` at **PR #67** (`209729b`), and matches the
+signed `v2.5` release asset. It is a pinned image, not a rolling build of `main`:
 it only moves when someone runs the steps above, so expect it to fall behind
 again as work lands.
 
 **Login now drops straight into the ring-3 shell** (PR #51), which is what the
-demo shows. That shell has ~16 builtins against the kernel shell's ~70 — type
+demo shows. That shell has ~25 builtins against the kernel shell's ~70 — type
 `kshell` to hand over to the kernel shell for the privileged and introspection
-commands (`pae`, `mem`, `wxaudit`, `auditlog`, `top`, networking), and `exit` to
-log out. This image also carries FAT32 subdirectories, ring-3 redirection and
-pipelines, the ring-3 credential commands, and the credential-syscall hardening
-from PRs #42–#55.
+commands (`pae`, `mem`, `wxaudit`, `auditlog`, networking), and `exit` to log
+out. Note that the nine privileged commands are gated on **euid 0**, so a
+non-root user reaching the kernel shell still cannot run them.
 
-SHA-256 `d106bd2ea5c9dc96f0f78c904043c14349e5922a917e49cc75fb15cb5a415859` as of
+Since the previous image (v2.4, PR #56) this adds: `cp`/`mv`/`touch` and the
+`open(O_TRUNC)` fix underneath them (#67), `ps`/`kill`/`top` from ring 3 via
+`SYS_PSINFO`/`SYS_KILL` (#62) with the own-only visibility policy (#61), a
+per-uid task-slot cap (#60), `require_root` on the machine-state commands (#58),
+IDS payload-signature matching and credential-spray detection (#63, #65), and
+the `kprintf`→`stream_printf` conversion that makes redirection work for the
+system and security-test reports (#64, #66). It keeps FAT32 subdirectories,
+ring-3 redirection and pipelines, the ring-3 credential commands, and the
+credential-syscall hardening from PRs #42–#55.
+
+SHA-256 `ccf25da0d436466d739db85212fd03afdec8b1cad6495ace584eb1b5a9c7fc4d` as of
 2026-08-16. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs — this hash identifies
 the committed artifact, it is not reproducible from source.
