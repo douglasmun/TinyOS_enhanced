@@ -12,6 +12,7 @@ re-reads the whole serial file each poll (it's small).
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 
@@ -211,6 +212,10 @@ def main():
     #    harness to run `jobs`/`ps` while a backgrounded child is still alive.
     #    Each may carry its own expect via "cmd=>expected text".
     #
+    #    A step of the form ">NAME" types nothing and instead runs the host
+    #    command in $TINYOS_HOOK_NAME -- see the implementation below for why
+    #    the command lives in an env var rather than inline.
+    #
     #    A line prefixed with '!' is sent WITHOUT the echo check. That is for
     #    input read by something other than the shell's readline — a password
     #    prompt echoes '*' per keystroke, so verifying the characters back would
@@ -231,6 +236,37 @@ def main():
         for item in followups.split(";"):
             item = item.strip()
             if not item:
+                continue
+            # A step of the form ">NAME" runs the HOST command in the
+            # environment variable TINYOS_HOOK_NAME instead of typing anything
+            # into the guest, then continues with the next step.
+            #
+            # This exists for harnesses that must perturb the guest from
+            # OUTSIDE it -- verify-ids-signature.sh injects UDP datagrams to
+            # prove the IDS matches packet payloads, and there is no way to
+            # make the guest send itself a packet carrying attack bytes
+            # without also testing the sending path.
+            #
+            # The command lives in an env var rather than inline because ';'
+            # is this list's separator, so any shell snippet with a ';' in it
+            # would be silently torn into fragments and half-executed.
+            if item.startswith(">"):
+                hookname = item[1:].strip()
+                hookcmd = os.environ.get("TINYOS_HOOK_" + hookname)
+                if hookcmd is None:
+                    print(f"typist: no TINYOS_HOOK_{hookname} in the "
+                          f"environment", file=sys.stderr)
+                    return 2
+                print(f"typist: host hook {hookname}: {hookcmd}")
+                rc = subprocess.call(hookcmd, shell=True)
+                if rc != 0:
+                    # Not a warning. A hook that failed to fire leaves the
+                    # guest unperturbed, and the assertion it was meant to set
+                    # up then measures nothing -- which for a negative control
+                    # looks exactly like a pass.
+                    print(f"typist: host hook {hookname} exited {rc}",
+                          file=sys.stderr)
+                    return 3
                 continue
             capture = None
             if "@" in item:

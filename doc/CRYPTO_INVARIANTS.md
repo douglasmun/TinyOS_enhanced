@@ -100,4 +100,6 @@ The latest pass is the **Layer 5 multi-agent audit (June 2026)** in
 full security-mechanism reference (17 mechanisms) is `doc/SECURITY_HARDENING.md`.
 
 `doc/FIREWALL_AND_IDS_CONFIG.md` notes that firewall/IDS are compile-time only (no
-runtime CLI) and records the **AUDIT-8E IDS-not-wired gap, which is still open**.
+runtime CLI). The **AUDIT-8E signature-matching gap is closed** — `ids_inspect_payload()`
+scans inbound payloads and `secstatus` reports the match count; see
+`verify-ids-signature.sh`. The IDS **host-based** detectors remain empty stubs.

@@ -1228,8 +1228,11 @@ void cmd_secstatus(int argc, char* argv[]) {
     kprintf("    Attacks detected .... %llu SYN-flood, %llu port-scan\n",
             (unsigned long long)fw.syn_floods_detected,
             (unsigned long long)fw.port_scans_detected);
-    kprintf("    IDS ................. %u signatures, %llu alerts, %llu IPs blocked\n",
+    /* The match count belongs next to the signature count: a loaded count on
+     * its own was what made AUDIT-8E read as protection for as long as it did. */
+    kprintf("    IDS ................. %u signatures, %llu matches, %llu alerts, %llu IPs blocked\n",
             ids.signatures_loaded,
+            (unsigned long long)ids.signature_matches,
             (unsigned long long)ids.alerts_generated,
             (unsigned long long)ids.ips_blocked);
 
