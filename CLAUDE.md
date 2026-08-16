@@ -73,6 +73,17 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   stalled `knetd`); and ring overflow is **drop-newest**, counted, because drop-oldest
   lets a fast sender evict frames already accepted. `ifconfig`'s `irq-ctx` count must
   read **0**. Harness: `verify-rx-thread-context.sh`.
+- **The e1000 DMA buffers are a guarded PMM region, not `.bss`.**
+  `e1000_dma_region_init()` carves 38 contiguous pages with an **unmapped guard page at
+  each end**; `rx_bufs/tx_bufs/rx_ring/tx_ring` are pointers into it. Three things to
+  know before touching it: allocation **must stay after `pae_init()`**, whose identity-map
+  sweep panics on any not-present page, so unmapping guards earlier is a boot panic;
+  `TDLEN`/`RDLEN` must be computed from the **element count**, never `sizeof(ring)` —
+  the rings are pointers now, so `sizeof` is 4 and the NIC would be told its ring is one
+  dword long (a clean `-Werror` build, caught only by clang-tidy); and raising
+  `NUM_RX_DESC`/`RX_BUF_SIZE` grows the payload, which the init-time bounds check
+  catches. Guard pages do **not** contain a malicious bus master — no IOMMU does that
+  here; they turn our own overruns into faults. Harness: `verify-dma-guard.sh`.
 - **Route user-facing output through `stream_printf(get_current_streams())`**, not
   `kprintf` — the latter goes to the kernel console, which a shell session doesn't show.
 - **`MAX_SYSCALL_NUM` must cover the highest syscall number**, not the highest in its own

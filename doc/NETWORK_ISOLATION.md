@@ -270,7 +270,7 @@ Two things the run established that are worth keeping:
 `ifconfig` is where the counters surface. Note `e1000_get_stats()` had **no callers**
 before this — surfacing new counters through it alone would have left them invisible.
 
-### 3. Constrain DMA by placement
+### 3. Constrain DMA by placement — **DONE**
 
 **Why:** contained, driver-local, no cross-subsystem risk.
 
@@ -282,6 +282,49 @@ NIC, because nothing short of an IOMMU can. It converts a descriptor-driven over
 from silent neighbouring-data corruption into a page fault. That is a real
 improvement in *diagnosability* and a partial one in containment; the doc and commit
 message should not claim more.
+
+#### How it was resolved
+
+`e1000_dma_region_init()` allocates the whole region with `pmm_alloc_contiguous()` at
+`e1000_init()` time and hands out pointers; the four objects are no longer link-time
+arrays. Layout, 38 pages total:
+
+```
+[ guard ][ rx_bufs 128K ][ tx_bufs 16K ][ rx_ring ][ tx_ring ][ guard ]
+```
+
+`rx_bufs` sits against the low guard because it is the object the NIC fills from
+remote input. Payload pages are mapped `PAE_PAGE_KERNEL_DATA` (NX); the two guards are
+`pae_unmap_page`'d. Observed at boot: 148 KB at `0x00357000`, guards `0x00356000` and
+`0x0037c000`.
+
+- **Ordering is load-bearing.** `pae_init()` sweeps the identity map and *panics* on
+  any not-present page ("would fault in memset later"). Allocating and unmapping after
+  that sweep — `pmm_init` (353) → `pae_init` (371) → `net_init` (522) — is what makes
+  deliberate holes safe rather than a boot panic. `pae_wx_audit` skips non-present
+  pages, so the guards do not register as W^X violations either.
+- **`TDLEN`/`RDLEN` were a real trap.** They program the descriptor-ring length *in
+  bytes* and read `sizeof(tx_ring)`. Once the rings became pointers that silently
+  evaluates to 4 — the NIC would be told its ring is one dword long. The build stayed
+  clean and the source still read plausibly. Now computed from the element count, and
+  asserted permanently by the harness's source guard.
+
+**Harness: `verify-dma-guard.sh`,** three-sided: placement asserted against the
+*linked binary* with `nm` (all four symbols must be ≤8 bytes, i.e. pointers, not
+arrays), both guards must report `unmapped` from a live `pae_get_pte()` query at every
+reading, and frames must still DMA through the relocated region.
+
+Each half alone is insufficient. The negative control — guards left mapped, region
+still allocated, used and correctly DMA'd into — keeps *placement* and *function*
+passing and fails only on `MAPPED(!)`. A harness asserting "the buffers moved" would
+have passed that build, and the `ifconfig` output looks healthy at a glance either
+way, since the guard addresses print regardless and only the mapping state differs.
+
+**What this does not prove:** that touching a guard address actually faults.
+`ifconfig` reads the PTE rather than dereferencing, because a shell command that reads
+arbitrary kernel addresses is exactly the read primitive PR #58 gated behind root —
+adding one to test a hardening feature would be a poor trade. The assertion is one
+inference step short of a demonstrated `#PF`, and is labelled as such in the harness.
 
 ### 4. Ring-3 network daemon (the reachable ProxyVM analogue)
 
@@ -309,8 +352,9 @@ Design the harness before the code.
 2. ~~**Item 1**~~ — **done**, `verify-rx-thread-context.sh` (+ `verify-ids-signature.sh`
    for the DHCP/boot-drain path). The boot-path question was the sharp edge as
    predicted; it is resolved with an explicit drain in `kernel.c`'s DHCP loop.
-3. **Item 3** — independent of both; can land in any order. **Next up.**
-4. **Item 4** — its own roadmap entry, after 1–3, with its harness designed up front.
+3. ~~**Item 3**~~ — **done**, `verify-dma-guard.sh`.
+4. **Item 4** — its own roadmap entry, now unblocked (1–3 have landed), with its
+   harness designed up front. **Next up**, and the only multi-PR item of the four.
 
 ## Corrections to the first-pass assessment
 
@@ -328,6 +372,9 @@ Recorded so the reasoning is auditable:
   Item 1's negative control later put a number on it: with the in-ISR call restored,
   exactly `E1000_RX_PACKET_BUDGET` (16) frames were parsed with `IF=0` before the
   budget spilled — the budget bounds which *loop* runs, never the interrupt-off time.
+- Item 3's `sizeof(tx_ring)` → `4` trap (above) is the sharpest reminder that a clean
+  `-Werror` build proves nothing about a value programmed into hardware. It was caught
+  by clang-tidy's `bugprone-sizeof-expression`, not by the compiler or by any test.
 - Item 1's first harness run was **INCONCLUSIVE from a harness bug, not a kernel one**:
   a whole-file `grep handle_packet src/e1000.c` source guard matched the bottom half,
   where that call is the whole point, and so reported the fix as the bug. The guard is

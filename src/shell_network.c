@@ -10,6 +10,7 @@
 #include "dhcp.h"
 #include "icmp.h"
 #include "kernel.h"  /* For get_timer_ticks() */
+#include "paging.h"  /* pae_get_pte() to read the DMA guard mapping state */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -124,6 +125,15 @@ static bool safe_parse_int(const char* str, int* result) {
 /*=============================================================================
  * COMMAND: ifconfig - Display network configuration
  *=============================================================================*/
+/* Reads the LIVE mapping state of a guard page. Deliberately queries the page
+ * tables rather than a "we called unmap" flag: the property worth reporting is
+ * that the page is actually absent, and a flag would still read "unmapped"
+ * after something remapped the address underneath us. */
+static bool guard_is_present(uint32_t virt) {
+    pae_pte_t* pte = pae_get_pte(virt);
+    return pte && (*pte & PAE_PRESENT);
+}
+
 void cmd_ifconfig(void) {
     kprintf("\nNetwork Configuration:\n");
     kprintf("  MAC Address:  %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -158,6 +168,17 @@ void cmd_ifconfig(void) {
     /* irq-ctx must read 0. Nonzero means the parser ran inside an ISR, i.e.
      * doc/NETWORK_ISOLATION.md item 1 has been undone. */
     kprintf("  RX parsed:    %u thread-ctx, %u irq-ctx\n", parse_thread, parse_irq);
+
+    /* DMA region placement (doc/NETWORK_ISOLATION.md item 3). Printed with the
+     * live present/absent state of each guard rather than just the addresses:
+     * the addresses only show where the guards were MEANT to go, whereas the
+     * mapping state is the property that actually contains an overrun. */
+    uint32_t dma_base = 0, dma_bytes = 0, g_lo = 0, g_hi = 0;
+    e1000_get_dma_layout(&dma_base, &dma_bytes, &g_lo, &g_hi);
+    kprintf("  DMA region:   %u KB at 0x%08x\n", dma_bytes / 1024, dma_base);
+    kprintf("  DMA guards:   0x%08x %s, 0x%08x %s\n",
+            g_lo, guard_is_present(g_lo) ? "MAPPED(!)" : "unmapped",
+            g_hi, guard_is_present(g_hi) ? "MAPPED(!)" : "unmapped");
     kprintf("\n");
 }
 

@@ -8,6 +8,8 @@
 #include "util.h"
 #include "tcp.h"  // For tcp_get_time_ms() - link status debounce
 #include "critical.h"  /* For proper nested critical section support */
+#include "pmm.h"       /* pmm_alloc_contiguous() for the guarded DMA region */
+#include "paging.h"    /* pae_map_page/pae_unmap_page for the guard pages */
 
 /*=============================================================================
  * E1000 REGISTER OFFSETS
@@ -133,10 +135,55 @@ struct rx_desc {
 /*=============================================================================
  * STATIC VARIABLES
  *============================================================================*/
-static struct tx_desc tx_ring[NUM_TX_DESC] __attribute__((aligned(16)));
-static struct rx_desc rx_ring[NUM_RX_DESC] __attribute__((aligned(16)));
-static uint8_t tx_bufs[NUM_TX_DESC][RX_BUF_SIZE] __attribute__((aligned(16)));
-static uint8_t rx_bufs[NUM_RX_DESC][RX_BUF_SIZE] __attribute__((aligned(16)));
+/*=============================================================================
+ * DMA REGION (doc/NETWORK_ISOLATION.md item 3)
+ *
+ * These four objects are the only memory the NIC writes to by bus-mastering.
+ * They used to be .bss arrays, which put attacker-influenced DMA targets
+ * immediately adjacent to unrelated kernel data: a descriptor-driven overrun
+ * corrupted whatever the linker happened to place next, silently.
+ *
+ * They now live in one page-aligned region carved out of physical memory at
+ * init, with an UNMAPPED GUARD PAGE either side, so an overrun off either end
+ * takes a page fault at the boundary instead of scribbling on a neighbour.
+ *
+ * BE HONEST ABOUT WHAT THIS BUYS. It does not constrain a fully
+ * attacker-controlled NIC — nothing short of an IOMMU can, and TinyOS has no
+ * IOMMU support (see the Qubes section of the doc). A malicious bus master can
+ * still target any physical address it likes; the guard pages are not in its
+ * way. What this converts is the realistic case: a length/index bug on OUR
+ * side, or a NIC writing past a descriptor it was handed, turns from silent
+ * neighbouring-data corruption into an immediate, diagnosable fault.
+ *
+ * WHY POINTERS RATHER THAN ARRAYS: the region's address is not known until
+ * pmm_alloc_contiguous() runs, so these cannot be link-time objects. Every use
+ * site is unchanged — rx_bufs[i] still indexes a 2048-byte frame — because the
+ * pointer types preserve the original element sizes.
+ *
+ * IDENTITY MAPPING: PAE identity-maps all RAM (pae.c verifies no holes at
+ * boot), so the physical base doubles as the virtual address and the values
+ * programmed into RDBAL/TDBAL are the same expressions as before.
+ *===========================================================================*/
+#define E1000_DMA_PAYLOAD_BYTES  (sizeof(struct tx_desc) * NUM_TX_DESC + \
+                                  sizeof(struct rx_desc) * NUM_RX_DESC + \
+                                  (uint32_t)RX_BUF_SIZE * NUM_TX_DESC +  \
+                                  (uint32_t)RX_BUF_SIZE * NUM_RX_DESC)
+#define E1000_DMA_PAGE_SIZE      4096u
+#define E1000_DMA_PAYLOAD_PAGES  ((E1000_DMA_PAYLOAD_BYTES + E1000_DMA_PAGE_SIZE - 1) \
+                                  / E1000_DMA_PAGE_SIZE)
+/* +2: one unmapped guard page below the payload and one above. */
+#define E1000_DMA_TOTAL_PAGES    (E1000_DMA_PAYLOAD_PAGES + 2u)
+
+static struct tx_desc* tx_ring = 0;
+static struct rx_desc* rx_ring = 0;
+static uint8_t (*tx_bufs)[RX_BUF_SIZE] = 0;
+static uint8_t (*rx_bufs)[RX_BUF_SIZE] = 0;
+
+/* Base of the payload (i.e. just past the low guard page), and the two guard
+ * page addresses, kept for the `netdma` report and for teardown. */
+static uint32_t dma_payload_base = 0;
+static uint32_t dma_guard_lo = 0;
+static uint32_t dma_guard_hi = 0;
 
 /*=============================================================================
  * SECURITY: Volatile MMIO Pointer for E1000 Registers
@@ -936,6 +983,99 @@ void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
 
 /*=============================================================================
  * FUNCTION: e1000_init
+ * PURPOSE: Carve the guarded DMA region out of physical memory.
+ * RETURN:  true on success; false if the region could not be allocated.
+ *
+ * Runs at e1000_init time, which is well after pae_init(): that ordering is
+ * load-bearing. pae_init() sweeps the whole identity map and PANICS on any
+ * not-present page ("would fault in memset later"), so unmapping guard pages
+ * before it ran would turn this hardening into a boot panic. Allocating here,
+ * after the sweep, is what makes deliberate holes safe.
+ *
+ * LAYOUT — the two large, attacker-driven buffer arrays are placed against the
+ * guard pages, because they are the objects an overrun actually starts from:
+ *
+ *   [ guard ][ rx_bufs (128K) ][ tx_bufs (16K) ][ rx_ring ][ tx_ring ][ guard ]
+ *
+ * rx_bufs sits at the low end because it is the one the NIC writes to from
+ * remote input, so a backwards overrun hits the low guard immediately. The
+ * descriptor rings are small and sit inboard, where a run off either end is
+ * still contained by the payload rather than reaching kernel data.
+ *============================================================================*/
+static bool e1000_dma_region_init(void) {
+    uint32_t phys = pmm_alloc_contiguous(E1000_DMA_TOTAL_PAGES);
+    if (!phys) {
+        kprintf("[E1000] FATAL: no contiguous run of %u pages for the DMA region\n",
+                E1000_DMA_TOTAL_PAGES);
+        return false;
+    }
+
+    dma_guard_lo = phys;
+    dma_payload_base = phys + E1000_DMA_PAGE_SIZE;
+    dma_guard_hi = dma_payload_base + E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE;
+
+    /* Carve the payload. Order matches the layout comment above; each object
+     * is placed at its natural alignment, which page alignment of the base
+     * plus the fixed sizes already guarantees. */
+    uint32_t cursor = dma_payload_base;
+    rx_bufs = (uint8_t (*)[RX_BUF_SIZE])(uintptr_t)cursor;
+    cursor += (uint32_t)RX_BUF_SIZE * NUM_RX_DESC;
+    tx_bufs = (uint8_t (*)[RX_BUF_SIZE])(uintptr_t)cursor;
+    cursor += (uint32_t)RX_BUF_SIZE * NUM_TX_DESC;
+    rx_ring = (struct rx_desc*)(uintptr_t)cursor;
+    cursor += sizeof(struct rx_desc) * NUM_RX_DESC;
+    tx_ring = (struct tx_desc*)(uintptr_t)cursor;
+    cursor += sizeof(struct tx_desc) * NUM_TX_DESC;
+
+    /* The cursor must not have run past the payload into the high guard. This
+     * is a build-time-constant relationship, but assert it at runtime too:
+     * NUM_RX_DESC and RX_BUF_SIZE are the kind of constants that get raised
+     * later, and the failure mode otherwise is the NIC DMAing into an
+     * unmapped page on the first burst rather than at init. */
+    if (cursor > dma_guard_hi) {
+        kprintf("[E1000] FATAL: DMA payload (%u bytes) overruns its %u pages\n",
+                (uint32_t)E1000_DMA_PAYLOAD_BYTES, E1000_DMA_PAYLOAD_PAGES);
+        return false;
+    }
+
+    /* The region is handed to the NIC, which never executes it. Mark the
+     * payload NX so a descriptor-driven write cannot become executable kernel
+     * memory. Interrupts are not yet enabled for this device, so no DMA can
+     * land while the mapping is being adjusted. */
+    for (uint32_t off = 0; off < E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE;
+         off += E1000_DMA_PAGE_SIZE) {
+        uint32_t page = dma_payload_base + off;
+        pae_map_page(page, page, PAE_PAGE_KERNEL_DATA);
+    }
+
+    /* Punch the guards. This is the actual mechanism: with these unmapped, an
+     * overrun off either end of the region faults instead of corrupting a
+     * neighbour silently. */
+    pae_unmap_page(dma_guard_lo);
+    pae_unmap_page(dma_guard_hi);
+
+    memset((void*)(uintptr_t)dma_payload_base, 0,
+           E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE);
+
+    kprintf("[E1000] DMA region: %u KB at 0x%08x, guards 0x%08x / 0x%08x [OK]\n",
+            (E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE) / 1024,
+            dma_payload_base, dma_guard_lo, dma_guard_hi);
+    return true;
+}
+
+/*=============================================================================
+ * Report the DMA region layout. Used by `netdma` and by the item 3 harness,
+ * which needs the guard addresses to assert they are genuinely not present.
+ *============================================================================*/
+void e1000_get_dma_layout(uint32_t* payload_base, uint32_t* payload_bytes,
+                          uint32_t* guard_lo, uint32_t* guard_hi) {
+    if (payload_base)  *payload_base  = dma_payload_base;
+    if (payload_bytes) *payload_bytes = E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE;
+    if (guard_lo)      *guard_lo      = dma_guard_lo;
+    if (guard_hi)      *guard_hi      = dma_guard_hi;
+}
+
+/*=============================================================================
  * PURPOSE: Initialize E1000 NIC with interrupt support
  *============================================================================*/
 void e1000_init(uint32_t base) {
@@ -948,6 +1088,15 @@ void e1000_init(uint32_t base) {
      * a memory-mapped I/O operation, not a normal memory access.
      *=======================================================================*/
     e1000 = (volatile uint32_t*)base;
+
+    /* Must happen before any ring or buffer is touched below — until this
+     * runs, tx_ring/rx_ring/tx_bufs/rx_bufs are all NULL. Failure is fatal:
+     * continuing would dereference NULL while programming the descriptor
+     * rings, and a NIC left half-initialised is worse than a clear panic. */
+    if (!e1000_dma_region_init()) {
+        kernel_panic("E1000: could not allocate the guarded DMA region");
+    }
+
     rx_tail = 0;
     packet_tx_count = 0;
     packet_rx_count = 0;
@@ -1029,7 +1178,11 @@ void e1000_init(uint32_t base) {
      *=======================================================================*/
     e1000[E1000_TDBAH / 4] = 0;  /* High 32 bits = 0 (32-bit mode) */
     e1000[E1000_TDBAL / 4] = (uint32_t)(uintptr_t)tx_ring;
-    e1000[E1000_TDLEN / 4] = sizeof(tx_ring);
+    /* Ring length in BYTES. Must be computed from the element count, not
+     * sizeof(tx_ring): tx_ring is a pointer into the DMA region now, so
+     * sizeof would be 4 and the NIC would be told the ring is one dword
+     * long. */
+    e1000[E1000_TDLEN / 4] = sizeof(struct tx_desc) * NUM_TX_DESC;
     e1000[E1000_TDH / 4] = 0;
     e1000[E1000_TDT / 4] = 0;
 
@@ -1077,7 +1230,8 @@ void e1000_init(uint32_t base) {
      *=======================================================================*/
     e1000[E1000_RDBAH / 4] = 0;  /* High 32 bits = 0 (32-bit mode) */
     e1000[E1000_RDBAL / 4] = (uint32_t)(uintptr_t)rx_ring;
-    e1000[E1000_RDLEN / 4] = sizeof(rx_ring);
+    /* Ring length in BYTES — see the TDLEN note above. */
+    e1000[E1000_RDLEN / 4] = sizeof(struct rx_desc) * NUM_RX_DESC;
     e1000[E1000_RDH / 4] = 0;
     e1000[E1000_RDT / 4] = NUM_RX_DESC - 1;  // All descriptors available
 

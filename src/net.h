@@ -256,3 +256,9 @@ void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype);
  * handle_packet() ran inside an ISR again, undoing doc/NETWORK_ISOLATION.md
  * item 1. This is what verify-rx-thread-context.sh asserts on. */
 void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx);
+
+/* DMA region layout (doc/NETWORK_ISOLATION.md item 3). The guard addresses are
+ * reported so `netdma` and verify-dma-guard.sh can assert they are genuinely
+ * not present, rather than trusting that the unmap was called. */
+void e1000_get_dma_layout(uint32_t* payload_base, uint32_t* payload_bytes,
+                          uint32_t* guard_lo, uint32_t* guard_hi);

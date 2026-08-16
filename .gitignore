@@ -185,6 +185,8 @@ rxdrop.log
 rxdrop-trace.log
 rxctx.log
 rxctx-trace.log
+dmaguard.log
+dmaguard-trace.log
 sysredirect.log
 sysredirect-trace.log
 spray-pos.log
