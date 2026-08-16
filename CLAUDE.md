@@ -115,9 +115,18 @@ count alone is what let the gap read as protection. Two things not to undo: the 
 check rejects `pattern_len > len` **before** the `len - pattern_len` subtraction (both
 `size_t`; the wrap is a remote OOB read), and the inner loop **breaks on first match**
 so one NOP sled cannot flood the alert ring. Harness: `verify-ids-signature.sh`.
-The host-based detectors (`ids_analyze_syscall`, `ids_register_login_attempt`,
-`ids_check_fork_bomb`) are **still empty stubs with no callers** — give them a body
-before giving them a call site, or they move counters while detecting nothing.
+**The host-based stubs are resolved** — one implemented, two deleted.
+`ids_register_login_failure()` counts **distinct usernames** per window (a horizontal
+spray; `user.c`'s per-account lockout structurally cannot see it) and is called from
+**both** failure branches of `user_authenticate_for`, including user-not-found. Four
+things not to undo: the threshold is `IDS_SPRAY_THRESHOLD` (3), **not** the
+network-side `IDS_BRUTEFORCE_THRESHOLD` (5) — `shell_login_prompt()` halts after
+`max_attempts = 3`, so 5 is unreachable from the only path that calls it; it alerts
+and never denies (denying on username diversity is a self-inflicted console DoS); it
+prints via `kprintf` because its own `AUDIT_WARN` never reaches serial; and
+`ids_analyze_syscall`/`ids_check_fork_bomb` were **removed, not implemented** —
+`edr_behavioral_check()` and the per-uid task cap already enforce those. Harness:
+`verify-ids-spray.sh`; rationale in `doc/FIREWALL_AND_IDS_CONFIG.md`.
 
 `shell_system.c` is **converted** (~220 sites → `stream_printf`), so `mem > f` now
 writes the report to `f` instead of printing it to the console and leaving `f` empty.
@@ -131,7 +140,6 @@ Open, in rough priority order:
 
 - **`security_tests.c`** — ~162 `kprintf`, the last console-only block; converting it
   is what lets `cmd_sectest`'s banner follow its output.
-- **IDS host-based detectors** — the three stubs above.
 
 ## Not compiled (don't audit/fix)
 

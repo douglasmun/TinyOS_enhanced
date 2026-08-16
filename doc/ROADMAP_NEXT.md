@@ -103,13 +103,16 @@ Known, low-severity, from the PR #1 audit (see memory `exec-failure-path-leaks`)
 - ~~AUDIT-8E gap: IDS exists but isn't wired to anything at runtime~~ DONE for
   the network half — `ids_inspect_payload()` matches inbound payloads against
   the signature table, and `secstatus` reports match count alongside signature
-  count so a dead matcher is distinguishable from a quiet network. The
-  host-based detectors (`ids_analyze_syscall`, `ids_register_login_attempt`,
-  `ids_check_fork_bomb`) are still empty stubs and deliberately still have no
-  callers. Harness: `verify-ids-signature.sh`.
+  count so a dead matcher is distinguishable from a quiet network. Harness:
+  `verify-ids-signature.sh`. The host half is now closed too, but by
+  *subtraction* as much as addition: `ids_register_login_failure()` was written
+  to catch a horizontal credential spray (distinct usernames per window — the
+  case `user.c`'s per-account lockout cannot see), while
+  `ids_analyze_syscall()` and `ids_check_fork_bomb()` were **deleted**, since
+  `edr_behavioral_check()` and the per-uid task cap already own those and
+  enforce rather than observe. Harness: `verify-ids-spray.sh`.
 
 ## Recommendation
 1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
-dependencies (spawn, waitpid, file syscalls) are now all in place. AUDIT-8E's
-signature-matching half is closed and was independent of that work; what
-remains of it is the three host-based detector stubs.
+dependencies (spawn, waitpid, file syscalls) are now all in place. AUDIT-8E is
+closed on both halves and was independent of that work.

@@ -153,6 +153,36 @@ def main():
     end = wait_for("Root password set successfully!", timeout=240, since=end)
     print("typist: root password set")
 
+    # 2a) OPTIONAL: failed logins before the real one.
+    #
+    #     Set TINYOS_PRELOGIN_USERS to a comma-separated list of usernames to
+    #     type at the login prompt with a wrong password, each expected to fail.
+    #     Defaults to empty, so every existing harness is unaffected.
+    #
+    #     This is the only way to reach user_authenticate()'s "user not found"
+    #     branch: `su` rejects a nonexistent user in the shell before it ever
+    #     calls the auth path, so the login prompt is the sole vehicle.
+    prelogin = os.environ.get("TINYOS_PRELOGIN_USERS", "")
+    if prelogin:
+        for name in [u for u in prelogin.split(",") if u]:
+            end = wait_for("TinyOS login:", timeout=120, since=end)
+            print(f"typist: pre-login failure attempt as '{name}'")
+            type_verified(sock, name + "\n", timeout=60)
+            end = wait_for("Password:", timeout=60, since=end)
+            type_str(sock, "wrongpassword\n")
+            # "Login incorrect" covers both auth failure branches (-2 user not
+            # found, -5 bad password). NOT "Login failed", which is only the
+            # `default` case of that switch and would never appear here.
+            end = wait_for("Login incorrect", timeout=240, since=end)
+
+        # TINYOS_PRELOGIN_ONLY: stop here. shell_login_prompt() halts the
+        # machine after max_attempts failures, so a harness that spends the
+        # whole budget on failures has no session to go on to -- waiting for a
+        # login prompt that will never be redrawn would just burn the timeout.
+        if os.environ.get("TINYOS_PRELOGIN_ONLY", "") == "1":
+            print("typist: pre-login failures done (PRELOGIN_ONLY), stopping")
+            return
+
     # 2) Login as root (username echoes -> verify)
     end = wait_for("TinyOS login:", timeout=120, since=end)
     type_verified(sock, "root\n")

@@ -147,7 +147,11 @@ typedef struct {
  *===========================================================================*/
 typedef struct {
     uint64_t packets_analyzed;      /* Total packets analyzed */
-    uint64_t syscalls_analyzed;     /* Total syscalls analyzed */
+    /* No syscalls_analyzed: the only thing that incremented it was the removed
+     * ids_analyze_syscall() stub. Keeping the field would have printed a
+     * hardcoded 0 forever, which reads as "no suspicious syscalls" rather than
+     * "nobody is counting" -- the AUDIT-8E failure shape inverted. Syscall
+     * analysis is reported by EDR, where it actually happens. */
     uint64_t alerts_generated;      /* Total alerts */
     uint64_t alerts_by_type[IDS_ALERT_MAX];
     uint64_t ips_blocked;           /* IPs blocked by IDS */
@@ -186,19 +190,12 @@ void ids_init(void);
  */
 bool ids_analyze_packet(const ip_header_t* ip_header, size_t packet_len);
 
-/**
- * @brief Analyze system call for suspicious behavior
- *
- * @param syscall_num System call number
- * @param task Pointer to calling task
- * @return true if syscall is clean, false if suspicious
- *
- * Detects:
- * - Privilege escalation attempts
- * - Fork bombs
- * - Unusual syscall patterns
- */
-bool ids_analyze_syscall(uint32_t syscall_num, const task_t* task);
+/* NOTE: ids_analyze_syscall() was removed, not left unimplemented. Syscall-level
+ * behavioural detection is owned by edr_behavioral_check() (edr_behavioral.h),
+ * which is already wired into the syscall dispatcher as a mandatory hook and
+ * implements ROP, flood, privilege-escalation, shellcode and exfiltration
+ * detection with real per-task state. Do not reintroduce a second detector on
+ * that path. See the block comment in ids.c. */
 
 /**
  * @brief Add attack signature to IDS
@@ -265,21 +262,31 @@ bool ids_is_traffic_anomalous(uint64_t current_rate);
  *===========================================================================*/
 
 /**
- * @brief Register brute-force attempt
+ * @brief Record a failed login and detect horizontal credential attacks.
  *
- * @param src_ip Source IP attempting login
- * @param username Username attempted
- * @return true if threshold exceeded (block IP)
+ * Complements the per-account lockout in user.c rather than duplicating it.
+ * user.c counts failures per ACCOUNT and so cannot see a spray of one password
+ * across many usernames: each account stays below its threshold. This keys on
+ * how many DISTINCT usernames failed within one window and alerts at
+ * IDS_SPRAY_THRESHOLD (defined in ids.c, which explains why that is not the
+ * network-side IDS_BRUTEFORCE_THRESHOLD).
+ *
+ * Call on every authentication failure, including "user not found" -- that
+ * branch returns before user.c has any counter to touch, and it is where a
+ * spray against guessed names spends most of its time.
+ *
+ * Alerts and audits only; it does not deny. Denying on username diversity
+ * would let one attacker lock out the console for everyone.
+ *
+ * @param username Username whose authentication just failed
+ * @return true if this failure crossed the spray threshold (alert raised)
  */
-bool ids_register_login_attempt(uint32_t src_ip, const char* username);
+bool ids_register_login_failure(const char* username);
 
-/**
- * @brief Check for fork bomb
- *
- * @param pid Process ID
- * @return true if fork bomb detected
- */
-bool ids_check_fork_bomb(uint32_t pid);
+/* NOTE: ids_check_fork_bomb() was removed, not left unimplemented. Task-slot
+ * exhaustion is denied at allocation time by the per-uid live-task cap and root
+ * slot reserve in task_create_user_argv(). A detector could only observe an
+ * event that was already refused. See the block comment in ids.c. */
 
 /**
  * @brief Load default attack signatures

@@ -171,13 +171,50 @@ was AUDIT 8E, and it is why the match count is now on the same line.
 there is **no content normalization** — no URL or HTTP decoding — so an attacker who
 encodes the payload evades it. It is also only as good as the one six-byte signature
 loaded by default. Anomaly and behavioral detection live in the EDR subsystem, not
-here, and the IDS's own **host-based** detectors (`ids_analyze_syscall`,
-`ids_register_login_attempt`, `ids_check_fork_bomb`) are still empty stubs with no
-callers. Treat the IDS as a teaching scaffold that now genuinely detects the case it
+here. Treat the IDS as a teaching scaffold that now genuinely detects the cases it
 claims to, not as an operational detector.
 
 Regression harness: `verify-ids-signature.sh` (sends a matching and a non-matching
 datagram, asserts the counter moves for exactly one of them).
+
+## Host-based detection: credential spray
+
+`ids_register_login_failure()` is the IDS's one host-based detector, called from
+`user_authenticate_for()` on **both** failure branches.
+
+It exists because `user.c`'s lockout is keyed on the **account**
+(`user->failed_attempts`, 3 failures / 60s). That is a complete answer to a
+*vertical* attack — many passwords against one username — and structurally blind to
+the *horizontal* one: spraying a single likely password across many usernames leaves
+every account at 1/3 and trips nothing. The "user not found" branch is worse still —
+it returns before any counter exists, so a spray against guessed names touches
+nothing at all.
+
+So this detector keys on **username diversity**, not attempt count: how many distinct
+usernames failed inside one window (`IDS_SPRAY_WINDOW_SECONDS`, 300s). Counting raw
+failures instead would just duplicate `user.c` and fire on one user mistyping their
+password.
+
+Two things not to undo:
+
+- **The threshold is `IDS_SPRAY_THRESHOLD` (3), not the network-side
+  `IDS_BRUTEFORCE_THRESHOLD` (5).** `shell_login_prompt()` allows `max_attempts = 3`
+  and then halts the machine, so a console spray can produce at most three distinct
+  failed usernames per boot. A threshold of 5 would be **unreachable from the only
+  path that calls this** — a detector that cannot fire.
+- **It alerts; it does not deny.** Denying on username diversity is a self-inflicted
+  DoS: one attacker could lock the console for everyone by failing three names.
+  Enforcement stays per-account in `user.c`.
+
+It also prints its alert with `kprintf`, deliberately: `ids_generate_alert()` logs at
+`AUDIT_WARN` for anything below `IDS_SEVERITY_HIGH`, and `audit_log_raw()` only echoes
+`>= AUDIT_ERROR` to serial — so without that line the detection would reach nobody
+watching the machine. Raising it to HIGH instead would trip `firewall_block_ip()` on
+`src_ip` 0, which is meaningless for a local login.
+
+Regression harness: `verify-ids-spray.sh` (3 failures across 3 distinct usernames must
+alert exactly once; 3 failures against **one** username must not alert at all — that
+negative is the half that separates this from a duplicate of `user.c`).
 
 ### Viewing IDS state
 
@@ -220,10 +257,16 @@ already exist to support runtime management. Natural near-term improvements:
   `firewall_set_rule_enabled()` / `firewall_get_stats()` API so rules can be
   managed live without a rebuild. (A good first contribution — the kernel side is
   already done; it only needs a shell front-end.)
-- **Give the host-based detectors a body** — `ids_analyze_syscall()`,
-  `ids_register_login_attempt()` and `ids_check_fork_bomb()` are empty stubs. Note
-  the order that matters: implement first, wire second. Calling them as they stand
-  would move counters and detect nothing, which is the AUDIT 8E failure mode again.
+- ~~Give the host-based detectors a body~~ — **done, and two of the three were
+  deleted rather than implemented.** `ids_register_login_failure()` (above) replaced
+  `ids_register_login_attempt()`, whose `src_ip` parameter had no source: every login
+  path here is local, so every caller would have passed 0 and a per-source-IP table
+  keyed on 0 collapses to one global bucket presenting itself as per-source
+  attribution. `ids_analyze_syscall()` and `ids_check_fork_bomb()` were removed
+  because the detectors they promised already exist and enforce —
+  `edr_behavioral_check()` on the syscall dispatcher, and the per-uid live-task cap
+  in `task_create_user_argv()` respectively. A second opinion about an event that
+  was already denied is not defence in depth. See the block comments in `ids.c`.
 - **Improve the matcher** — Aho-Corasick instead of the current O(n·m) scan, and
   content normalization (URL/HTTP decoding), without which encoded payloads evade it.
 - **An `ids` shell command** — list/enable/disable signatures and show recent
