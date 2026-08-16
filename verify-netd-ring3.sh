@@ -25,6 +25,31 @@
 # rewriting the assertions, that is a signal the counters moved with the code
 # rather than measuring it.
 #
+# WITH ONE KNOWN EXCEPTION, DECIDED 2026-08-17 -- READ BEFORE FLIPPING THE FLAG
+#
+# The first parser move (D1) carries ICMP/DNS/DHCP to ring 3 and deliberately
+# leaves TCP in ring 0, because tcp_connections[] has a THIRD mutator besides the
+# RX path and the socket API: tcp_tick() (interrupts.c:111) forcibly closes
+# connections on the SYN_SENT/SYN_RECEIVED timeout. A ring-3 parser holding a
+# reference to a record that a ring-0 timer can free is not fixable with a wider
+# lock -- TCP_LOCK() is a kernel critical section and ring 3 cannot take it.
+#
+# So after D1, TCP frames legitimately keep parsing at CPL 0, and the post-move
+# branch below -- which fails when cpl0 is nonzero, on the grounds that a parser
+# in both rings is a partial move -- becomes WRONG. It must be replaced by
+# PER-PROTOCOL counters asserting "no ICMP/DNS/DHCP frame at CPL 0" and "no TCP
+# frame at CPL 3".
+#
+# That replacement belongs in the PR BEFORE the move, not the PR that does it:
+# an assertion rewritten in the same commit as the code it grades is not an
+# independent check. The global pair stays as a total; the per-protocol counters
+# supplement it, so the PR #74 baseline remains comparable.
+#
+# Do NOT simply set EXPECT_CPL3=1 after D1 and call it green. The post-move
+# branch as written today only describes a move that carried EVERYTHING, which
+# is not the move that was decided on. See doc/NETDAEMON_DESIGN.md, "Settled:
+# what moves first".
+#
 # WHY A SEPARATE COUNTER FROM irq-ctx AT ALL
 #
 # verify-rx-thread-context.sh already asserts the parser runs in TASK context
@@ -334,6 +359,27 @@ if [ "$EXPECT_CPL3" -eq 0 ]; then
 else
     # ---------------- POST-MOVE (after PR D's parser move) ----------------
     #
+    # Refuse to grade a D1-shaped move with a whole-parser-shaped assertion.
+    # D1 leaves TCP in ring 0 on purpose, so "cpl0 must be 0" below would fail a
+    # correct build -- and worse, someone would then "fix" it by deleting the
+    # assertion, leaving nothing. If the per-protocol counters are absent, this
+    # branch has gone stale relative to the decided design. See the header.
+    if ! grep -q "net_parse_proto_cpl" src/net.c 2>/dev/null; then
+        echo "RESULT: INCONCLUSIVE — EXPECT_CPL3=1 but src/net.c has no"
+        echo "  per-protocol ring counters (net_parse_proto_cpl*)."
+        echo ""
+        echo "  The post-move branch below asserts cpl0 == 0, which describes a move"
+        echo "  that carried the WHOLE parser. The decided first move (D1) carries"
+        echo "  ICMP/DNS/DHCP and deliberately leaves TCP in ring 0, so TCP frames"
+        echo "  legitimately keep parsing at CPL 0 and that assertion would fail a"
+        echo "  correct build."
+        echo ""
+        echo "  Land the per-protocol counters BEFORE the move, then rewrite this"
+        echo "  branch to assert: no ICMP/DNS/DHCP frame at CPL 0, no TCP frame at"
+        echo "  CPL 3. See doc/NETDAEMON_DESIGN.md, 'Settled: what moves first'."
+        exit 3
+    fi
+
     # Same two halves, read the other way round.
     if [ "$DELTA3" -eq 0 ]; then
         fail_with "cpl3 did not rise; the parser is NOT executing in ring 3" \
