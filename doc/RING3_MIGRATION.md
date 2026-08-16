@@ -476,10 +476,8 @@ no refusal.
 They are **NOT one group**:
 
 - `ps`/`kill`/`top` are **DONE** — see the next section.
-- `pae`/`mem`/`wxaudit`/`auditlog`/`shutdown` live in `shell_system.c`, which has
-  ~222 `kprintf` and zero `stream_printf`: reaching those from ring 3 means the
-  same conversion done for the three credential commands, but two orders of
-  magnitude larger. Do not convert it wholesale on the way to something else.
+- `pae`/`mem`/`wxaudit`/`auditlog`/`shutdown` live in `shell_system.c`. That file's
+  ~220 `kprintf` calls are now **converted** — see the section below.
 
 ## `ps`/`kill`/`top` in ring 3 — DONE
 
@@ -632,3 +630,76 @@ apart, and early runs of this harness passed while the RATE limiter did the
 refusing at a count that looked exactly right. It therefore requires the cap's
 own message *and* the absence of the rate limiter's, and finishes by proving
 root can still create a task while the attacker sits at their cap.
+
+## `shell_system.c` stream routing — DONE
+
+The file's ~220 `kprintf` calls became `stream_printf(get_current_streams(), ...)`.
+This is a prerequisite for moving `mem`/`pae`/`wxaudit`/`auditlog` to ring 3, but it
+fixes a bug that was already visible from the kernel shell: the shell has bound `>` to
+`stdout_stream` since the redirection PR, so `mem > /m.txt` opened the file, printed
+the whole report to the console anyway, and left an empty file behind. Binding a
+stream does nothing for a command that never reads it.
+
+That is also why the bug survived so long. `verify-redirect.sh` proved redirection
+worked — it drives `exec /hello.elf > /out.txt`, and the *child* honours the stream
+because `sys_write` routes through the task's `stream_context_t`. Every builtin in
+this file bypassed that path entirely. A harness that only ever redirects a child
+cannot see it.
+
+### The three deliberate `kprintf` survivors
+
+Each is commented in place, because a later mechanical sweep would otherwise
+"finish the job" and reintroduce a defect:
+
+- **`cmd_shutdown`'s banner and `cmd_reboot`'s notice.** The machine halts a few
+  lines later. `shutdown > log` would put the notice in a ramfs file that dies with
+  the RAM, and leave the user watching a console that says nothing before it stops.
+  The argument errors and the permission refusal above them *are* converted — at that
+  point the command has not committed to halting.
+- **`cmd_sectest`'s banner.** `run_security_tests()` in `security_tests.c` is ~162
+  console-only calls and out of scope here. Routing only the banner would make
+  `sectest > report.txt` produce a file containing the banner and nothing else, with
+  the results still on the console. A banner that follows its output is less wrong
+  than one that abandons it. Convert this line when `security_tests.c` is converted.
+
+### `env.c`: the locking had to change with the routing
+
+`env_list()` and `alias_list()` printed from inside a `CRITICAL_SECTION` held across
+the whole listing. `kprintf` tolerates that; `stream_printf` on a redirected stream
+reaches `ramfs_write`, which is far too much work to run with interrupts masked and
+can take a mutex of its own. Both now take the lock **per slot**, copy one entry out,
+drop the lock, and print outside it. The table is never read unlocked and no I/O
+happens inside the critical section. The trade is that a variable added mid-listing
+may or may not appear — acceptable for a listing, unlike the torn name/value read the
+lock actually exists to prevent.
+
+### A pre-existing `%f` bug fell out of the conversion
+
+`cmd_aslr` printed `"%.4f"` and `"%.2f"`. Neither `kprintf` nor `vsnprintf_impl`
+implements float conversion at all, so an unknown specifier is echoed **literally
+and its argument is never consumed** — the four characters `%.4f` appeared in the
+output and every following vararg in that call was shifted by one. Both quantities
+were exact integers; they are now printed as the `1 in N` they actually are. Not a
+regression from this work, but this is the PR that read those lines closely enough
+to notice.
+
+### Harness: `verify-sysredirect.sh`
+
+Boundary: the **kernel shell**, deliberately. These are kernel-shell builtins with no
+ring-3 equivalent yet, and the property under test is "the command reads its stream",
+which is where the command lives. The shell's own `>` handling is held constant — it
+was already working, which is exactly why the empty-file bug was invisible.
+
+The assertion is **positional, not presence-based**: `Memory Usage:` appears in the
+serial log in both the passing and the failing run. Only its line number relative to
+the `cat` distinguishes "arrived from the file" from "was printed to the console while
+the file stayed empty". The negative control is evaluated first and suppresses the
+positive — if the marker showed up before the `cat`, nothing appearing after it proves
+anything about where it came from.
+
+The staleness guard disassembles `cmd_mem` and requires that *it* calls
+`stream_printf`, rather than checking whether the symbol exists in `kernel.elf` —
+stdio.c defines it in every build ever made, converted or not, so the obvious check
+is one that cannot fail. Validated by actually reverting `cmd_mem`: the guard refused
+to boot the wrong kernel, and with the guard bypassed the runtime negative control
+tripped on the line-number comparison.
