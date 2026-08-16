@@ -15,47 +15,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/*=============================================================================
- * HELPER: May the calling session see this task?
- *
- * POLICY: an unprivileged user sees ONLY their own processes; root sees all.
- *
- * The alternative -- everyone sees everything, as on a stock Unix -- leaks what
- * root is running to any logged-in user: process NAMES and argv are visible in
- * `ps`, so a root-run recovery or maintenance command becomes an announcement.
- * On a single-user teaching kernel that is a poor default, and own-only is the
- * conservative direction: it can be relaxed later without breaking anyone,
- * whereas tightening it afterwards would.
- *
- * Matches the existing kill/waitpid rule (shell_system.c cmd_kill,
- * syscall.c sys_waitpid), so what you can SEE and what you can SIGNAL are the
- * same set -- a `ps` listing a process you may not kill, or a `kill` refusing a
- * PID `ps` never showed, are both worse than one consistent rule.
- *
- * euid for the privilege decision, real uid for ownership -- the convention
- * used throughout this kernel. euid is what a setuid program drops to give up
- * authority; real uid is the account that owns the resource.
- *
- * KERNEL TASKS are hidden from unprivileged users along with everything else:
- * they are uid 0. That is deliberate -- the EDR daemon's presence and the idle
- * task's timing are exactly the sort of machine state this policy withholds.
- *===========================================================================*/
-static bool task_visible_to_current(const task_t* task) {
-    if (!task) {
-        return false;
-    }
-
-    task_t* self = scheduler_get_current_task();
-    if (!self) {
-        return true;  /* No session context: kernel-internal caller, show all */
-    }
-
-    if (self->euid == 0) {
-        return true;  /* root sees everything */
-    }
-
-    return task->uid == self->uid;
-}
+/* task_visible_to_current() -- the process-visibility policy -- now lives in
+ * process.c so that SYS_PSINFO applies the identical rule. See process.h. */
 
 /*=============================================================================
  * HELPER: Get task state string

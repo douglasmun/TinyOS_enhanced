@@ -12,8 +12,10 @@
 # it can be relaxed later without breaking anyone, whereas tightening it
 # afterwards would.
 #
-# Implemented as task_visible_to_current() in shell_monitor.c, shared by `ps`
-# and `top` so the two cannot drift apart.
+# Implemented as task_visible_to_current() in process.c, shared by `ps`, `top`,
+# `kill` and SYS_PSINFO/SYS_KILL so none of them can drift apart. It lives in
+# process.c rather than shell_monitor.c precisely so the syscalls can reach it
+# without the syscall layer depending on a shell module.
 #
 # WHY THE PROBE NEEDS A LIVE CHILD
 #
@@ -147,6 +149,21 @@ fail_with() {
     exit 1
 }
 
+# region_has REGION PATTERN -- true if PATTERN occurs in REGION.
+#
+# NOT `printf ... | grep -q`: under `set -o pipefail` (line 59) grep -q exits at
+# the first match and SIGPIPEs the writer, and pipefail promotes that 141 to the
+# pipeline's status -- so a match reads as a MISS. It bites when the match is
+# EARLY and output continues after it, which is precisely a serial log ("Idle"
+# near the top of a ps table, kilobytes of boot chatter following). On the
+# `&& fail_with` assertions below that inverts a real policy violation into a
+# silent pass. grep -c reads all input, so there is no SIGPIPE to promote.
+region_has() {
+    local n
+    n=$(printf '%s\n' "$1" | grep -c "$2")
+    [ "$n" -gt 0 ]
+}
+
 # --- Guard: we actually became the test user -----------------------------
 #
 # Every assertion below is about what an UNPRIVILEGED session sees. If the su
@@ -168,7 +185,7 @@ ROOT_REGION=$(head -n "$SU_LINE" "$SERIAL")
 USER_REGION=$(tail -n +"$SU_LINE" "$SERIAL")
 
 # --- Control: root sees the kernel tasks ---------------------------------
-printf '%s\n' "$ROOT_REGION" | grep -q "Idle" || fail_with \
+region_has "$ROOT_REGION" "Idle" || fail_with \
     "root's own ps did not show the Idle task" \
     "This is the control, not the policy: if root cannot see the kernel" \
     "tasks then ps is broken outright and the checks below prove nothing."
@@ -177,7 +194,7 @@ printf '%s\n' "$ROOT_REGION" | grep -q "Idle" || fail_with \
 #
 # Paired positive. Without this, a kernel whose ps showed an unprivileged user
 # NOTHING AT ALL would pass every remaining assertion while being plainly wrong.
-printf '%s\n' "$USER_REGION" | grep -q "slothold" || fail_with \
+region_has "$USER_REGION" "slothold" || fail_with \
     "the unprivileged user could not see their OWN process" \
     "$TESTUSER started slothold.elf and must see it in their own ps." \
     "Showing them an empty table is not the policy -- own-only means they" \
@@ -187,9 +204,9 @@ printf '%s\n' "$USER_REGION" | grep -q "slothold" || fail_with \
 #
 # The policy itself. Anchored on a specific always-live uid-0 task rather than
 # a row count: "fewer rows than root" is also true of a ps that truncated.
-printf '%s\n' "$USER_REGION" | grep -q "Idle" && fail_with \
+region_has "$USER_REGION" "Idle" && fail_with \
     "the unprivileged user could see the root-owned Idle task" \
-    "task_visible_to_current() in shell_monitor.c should hide every task" \
+    "task_visible_to_current() in process.c should hide every task" \
     "whose uid differs from the caller's when the caller's euid is not 0." \
     "Idle is uid 0 and always live, so it is the canonical thing to hide."
 
@@ -226,7 +243,7 @@ fi
 # PID 1 is not the test user's. "permission denied" would confirm it is live
 # and owned by someone else -- exactly the existence ps withholds, and enough
 # to enumerate every live PID. It must read as a nonexistent process.
-printf '%s\n' "$USER_REGION" | grep -q "permission denied (not owner" && fail_with \
+region_has "$USER_REGION" "permission denied (not owner" && fail_with \
     "kill told an unprivileged user that a foreign PID exists" \
     "cmd_kill should answer exactly as it does for a nonexistent PID, so" \
     "that ps and kill withhold the same thing. Reporting 'not owner'" \

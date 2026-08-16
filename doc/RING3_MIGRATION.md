@@ -475,18 +475,71 @@ no refusal.
 
 They are **NOT one group**:
 
-- `ps`/`kill`/`top` live in `shell_monitor.c`, which is already **stream-routed**
-  (16 `stream_printf` vs 10 `kprintf`). Exposing them was a **policy** question —
-  what may an unprivileged process see and signal — and that policy is now
-  **decided and enforced**; see below. What remains is a syscall to carry the
-  listing to ring 3.
+- `ps`/`kill`/`top` are **DONE** — see the next section.
 - `pae`/`mem`/`wxaudit`/`auditlog`/`shutdown` live in `shell_system.c`, which has
   ~222 `kprintf` and zero `stream_printf`: reaching those from ring 3 means the
   same conversion done for the three credential commands, but two orders of
-  magnitude larger.
+  magnitude larger. Do not convert it wholesale on the way to something else.
 
-Do `ps`/`kill` first if this is picked up; do not convert `shell_system.c`
-wholesale on the way.
+## `ps`/`kill`/`top` in ring 3 — DONE
+
+`SYS_PSINFO` (33) and `SYS_KILL` (34) carry the listing across the boundary.
+`MAX_SYSCALL_NUM` went 32 → 34 with them (it has silently swallowed new syscalls
+before — see the `SYS_SLEEP`/`SYS_WAITPID` note).
+
+**The policy is enforced kernel-side, not by the shell.** `task_visible_to_current()`
+moved out of `shell_monitor.c` (it was `static` there) into `process.c` so both the
+kernel shell and the two syscalls decide from one predicate. A ring-3 shell that
+filtered its own output would be filtering data it had already been given.
+
+Three things in `sys_psinfo` that look like they could be simplified and cannot:
+
+- **It walks raw task slots (`task_get_slot`), not `task_get_all`.** `task_get_all`
+  **compacts**: its output is dense. The loop drops the lock between records —
+  `copy_to_user` touches a ring-3 page and can fault, which must not happen with
+  interrupts masked — so if a task exits mid-walk, every live task after it shifts
+  down one position and an index-based walk **skips a process outright**. A raw slot
+  denotes the same task on every iteration. `scheduler_get_all_tasks` has the same
+  problem plus a second one: it returns a pointer to a **shared static array**
+  (`all_tasks_array`) that a concurrent caller refills underneath you.
+- **The visibility check and the field reads are in the SAME critical section.** A
+  task can terminate and its slot be reused between the two, so a record that passed
+  as the caller's own would be copied out carrying the name and PID of whatever took
+  the slot — the exact leak the filter exists to prevent, through the back door.
+- **`psinfo_t` is zeroed in full before use.** It is a stack local; its padding and
+  unused name bytes would otherwise carry whatever the last iteration left there into
+  ring 3. The ABI (sizeof 64, `uid` at 24, `name` at 32) is pinned by `_Static_assert`
+  on **both** sides of the boundary — kernel and `userspace/libc.h`.
+
+`sys_kill` answers **-ESRCH, never -EPERM**, for a PID the caller cannot see.
+Distinguishing "does not exist" from "exists but is not yours" would make `kill` an
+existence oracle that hands back exactly the table `ps` withheld. Its lookup and both
+checks are one critical section; `task_terminate` runs outside it.
+
+`top`'s `%CPU` denominator at ring 3 is the ticks in the **visible** listing, whereas
+the kernel shell's `cmd_top` keeps a system-wide one. This is deliberate: a system-wide
+denominator would let an unprivileged user infer total system activity from their own
+rows. The consequence is that the percentages a user sees are shares of what they can
+see, not of the machine.
+
+Harness: `verify-ring3-ps.sh`, which measures inside a ring-3 shell (the kernel shell
+never calls these syscalls, so running it there would prove nothing). Two paired
+positives carry it: the user must **see** their own `slothold.elf`, and must be able to
+**kill** it. Without the first, a `sys_psinfo` returning an empty table passes every
+leak assertion; without the second, a `sys_kill` that refuses everything answers "no
+such process" to all requests and passes the existence-leak check while being entirely
+broken.
+
+Two traps this harness hit, both worth remembering:
+
+- **A re-logged-in ring-3 session never receives keyboard input.** Logging out and back
+  in as the test user was the obvious route and it does reach a ring-3 shell — which
+  then ignores every keystroke. Open, recorded in `doc/KERNEL_BUGS.md`; the harness
+  routes `kshell` → `su` → `exec /shell.elf` around it.
+- **The typist's echo verification is unsound at ring 3.** The ring-3 shell does not
+  echo to serial (the kernel echoes in the keyboard IRQ, to VGA only), so the
+  per-character check was passing on coincidental matches in kernel chatter — a guard
+  that could not fail. Those commands are sent with `!` and checked on their *result*.
 
 ## Process visibility policy — DECIDED
 

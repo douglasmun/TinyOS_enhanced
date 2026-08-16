@@ -277,3 +277,50 @@ backgrounded child must run as its user just as a foreground one does.
 Latent for the usual reason — while the only interesting user was the uid-1000
 default, "hardcoded 1000" and "inherited" were indistinguishable. It became
 observable the moment a harness created a user with a different uid.
+
+## OPEN: a re-logged-in ring-3 session never receives keyboard input
+
+Found while building `verify-ring3-ps.sh` (2026-08-16). The harness needed an
+unprivileged ring-3 shell, and the obvious route — `logout` from the ring-3
+shell, then log back in as the test user — reaches one. The session starts
+correctly: `shell.elf` is loaded, ECDSA-verified, the process is created, and it
+prints its banner and prompt. Then it ignores input entirely.
+
+Reproduced twice, deterministically: 15 keystrokes sent over ~2.7s produced not
+one echoed character, and the serial log ends exactly at the `D:/ $ ` prompt with
+the shell parked in `read()`. The same keystrokes work in the *first* ring-3
+session of the same boot, so this is specific to a session reached through
+logout + login, not to ring-3 input generally.
+
+Not diagnosed further, because it is not on the path the ps/kill/top work
+touches. What is known:
+
+- it is not the typist's per-character echo verification. That check is itself
+  unsound in the ring-3 shell (see below) and the failure reproduces with the
+  commands sent unverified, waiting only on their results;
+- the second session is a normally-created user task — the ELF load and process
+  creation log lines are identical to the first session's;
+- so the suspicion is keyboard/stream routing: whatever binds the console input
+  stream to the foreground session is not re-bound after the first ring-3 shell
+  exits and login runs again.
+
+`verify-ring3-ps.sh` works around it by reaching the unprivileged shell through
+`kshell` → `su` → `exec /shell.elf` instead, which lands in a second ring-3 shell
+that has inherited the test user's credentials. The workaround is documented at
+the sequence in that script so it is not mistaken for an arbitrary choice.
+
+### Corollary: the typist's echo verification is unsound in the ring-3 shell
+
+`type_verified()` checks that each typed character appears, in order, anywhere in
+the serial stream after a mark. The ring-3 shell does not echo keystrokes to
+serial at all — the kernel echoes them in the keyboard IRQ, which reaches the VGA
+console only; the shell echoes the *accepted line* after `readline()` returns.
+Those per-character checks were therefore passing on coincidental matches in the
+surrounding kernel chatter: `p`, `s`, and the letters of `useradd r3user` all
+occur constantly in boot output. `/slothold.elf` was simply the first command
+containing a character (`.`) rare enough not to appear by luck, which is how a
+check that had never actually verified anything finally announced itself.
+
+Ring-3 commands should be sent with the `!` (unverified) prefix and an expect on
+their **result**, which is a stronger check than a per-character echo that
+unrelated output can satisfy.

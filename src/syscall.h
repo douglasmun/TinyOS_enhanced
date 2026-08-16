@@ -122,6 +122,53 @@
  * to them, not a second copy of the policy. */
 #define SYS_CRED       32   // passwd / useradd / userdel, prompts kernel-side
 
+/* SYS_PSINFO — read the process table, filtered by the visibility policy.
+ *
+ * Returns an ARRAY OF RECORDS, not formatted text. The kernel decides WHAT the
+ * caller may see; ring 3 decides how to print it. Returning preformatted lines
+ * would put ps/top's column layout in the kernel and force every future format
+ * change through a syscall change.
+ *
+ * THE FILTER IS THE POINT. The same rule ps and top apply in the kernel shell
+ * (task_visible_to_current, in process.c so both callers share one copy) is
+ * applied HERE, before anything is copied out: an unprivileged caller sees only their own tasks, root sees
+ * all. Filtering in the kernel rather than in the ring-3 shell is what makes it
+ * a policy instead of a convention -- a userspace filter is advice that any
+ * program linking its own syscall stub can decline to follow.
+ *
+ * WHAT IS DELIBERATELY NOT IN THE RECORD: kernel/user stack addresses, page
+ * directory physicals, the EDR anomaly score, the syscall-filter bitmap. Those
+ * are in task_t and none of them belong in ring 3 -- the stack and page-table
+ * addresses defeat ASLR outright (the same reason pae/mem/aslr/wxaudit became
+ * root-only), and the EDR fields tell a probing process how close it is to
+ * tripping detection. This struct is an allow-list, not task_t minus secrets.
+ *
+ * The count is bounded by what fits in the caller's buffer; a caller wanting
+ * the whole table sizes it at MAX_TASKS. Returns BYTES written, like
+ * SYS_READDIR, so a short buffer truncates rather than failing. */
+#define SYS_PSINFO     33   // Process listing, filtered by visibility policy
+
+/* SYS_KILL — terminate a process.
+ *
+ * Ring 3 previously had NO way to kill anything: `kill` existed only as a
+ * kernel-shell command. Adding it alongside SYS_PSINFO is not optional --
+ * a `ps` you can read but cannot act on would push users back to `kshell`,
+ * and the two commands have to agree about which processes exist.
+ *
+ * SAME VISIBILITY RULE, SAME ANSWER. A PID the caller may not see is
+ * reported as -ESRCH, exactly as a PID that does not exist. If this returned
+ * -EPERM instead, `kill` would become the existence oracle that filtering
+ * `ps` was meant to close: a user could sweep the PID space and learn every
+ * live process from the errno alone.
+ *
+ * CAP_UNKILLABLE is enforced here as it is in the kernel shell, and
+ * separately again in task_terminate -- the shell command is a convenience,
+ * the syscall is the boundary, and neither is trusted to be the only check.
+ *
+ * No signal number: this kernel has no signals. The argument is a PID and the
+ * action is unconditional termination. */
+#define SYS_KILL       34   // Terminate a process, subject to the same policy
+
 /*=============================================================================
  * PHASE 2: Capability-Based Privilege Operations (v1.14)
  *
@@ -213,7 +260,43 @@
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  32  // Highest valid syscall number (SYS_CRED)
+#define MAX_SYSCALL_NUM  34  // Highest valid syscall number (SYS_KILL)
+
+/*-----------------------------------------------------------------------------
+ * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
+ * why this is an allow-list rather than a redacted task_t.
+ *
+ * Fixed-width fields and a fixed name length so the layout is identical on both
+ * sides of the ring boundary without a packing attribute: 4-byte members first,
+ * then the 2-byte pair, then the char array. uid is included because `ps -l`
+ * shows an owner column and root needs it to be useful; an unprivileged caller
+ * only ever receives records whose uid is already their own.
+ *---------------------------------------------------------------------------*/
+#define PSINFO_NAME_LEN 32
+
+typedef struct {
+    uint32_t pid;
+    uint32_t ppid;
+    uint32_t state;          /* task_state_t, widened for a stable ABI */
+    uint32_t total_ticks;
+    uint32_t time_slice;
+    uint32_t capabilities;   /* CAP_* -- ps prints the [PROTECT] marker */
+    uint16_t uid;
+    uint16_t priority;
+    uint8_t  is_kernel_task;
+    uint8_t  reserved[3];    /* Explicit: keeps the struct 4-byte aligned and
+                              * zeroed rather than leaking padding to ring 3. */
+    char     name[PSINFO_NAME_LEN];
+} psinfo_t;
+
+/* The layout is an ABI: userspace/libc.h declares a byte-identical copy and the
+ * kernel memcpys records straight into a ring-3 buffer. Nothing at runtime
+ * checks the two agree, so a field added on one side only would silently shift
+ * every subsequent field in the listing. These assertions turn that into a
+ * build failure; update libc.h and these numbers together, never separately. */
+_Static_assert(sizeof(psinfo_t) == 64, "psinfo_t layout changed: update userspace/libc.h to match");
+_Static_assert(offsetof(psinfo_t, uid) == 24, "psinfo_t.uid moved: update userspace/libc.h to match");
+_Static_assert(offsetof(psinfo_t, name) == 32, "psinfo_t.name moved: update userspace/libc.h to match");
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -369,6 +452,34 @@ int sys_unlink(const char* user_path);
  * @return Bytes written excluding the NUL, -ERANGE if the cwd does not fit
  */
 int sys_getcwd(char* user_buf, uint32_t size);
+
+/**
+ * @brief Read the process table, filtered by the visibility policy.
+ *
+ * Fills user_buf with psinfo_t records for the tasks the CALLER may see:
+ * their own if unprivileged, all of them if euid 0. Terminated slots are
+ * always skipped.
+ *
+ * @param user_buf Destination array of psinfo_t in the caller's address space
+ * @param size     Size of user_buf in BYTES (not records)
+ * @return Bytes written (a whole multiple of sizeof(psinfo_t)), or -EINVAL /
+ *         -EFAULT / -ESRCH. A buffer too small to hold every visible task
+ *         truncates rather than failing.
+ */
+int sys_psinfo(void* user_buf, uint32_t size);
+
+/**
+ * @brief Terminate a process, subject to the visibility policy.
+ *
+ * A PID the caller may not see is reported as -ESRCH, identically to a PID
+ * that does not exist, so kill cannot be used to enumerate live PIDs that
+ * SYS_PSINFO hides.
+ *
+ * @param pid Target process ID
+ * @return 0 on success, -ESRCH if absent or not visible, -EPERM if the target
+ *         holds CAP_UNKILLABLE, -EINVAL for a non-positive pid
+ */
+int sys_kill(int pid);
 
 /**
  * @brief Change the caller's cwd.

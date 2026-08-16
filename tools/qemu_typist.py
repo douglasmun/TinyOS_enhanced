@@ -10,6 +10,7 @@ Designed for slow TCG boots: every wait has a generous timeout and the typist
 re-reads the whole serial file each poll (it's small).
 """
 import os
+import re
 import socket
 import sys
 import time
@@ -64,11 +65,19 @@ def mon_connect(timeout=30):
 
 
 def mon_cmd(sock, cmd):
-    sock.sendall((cmd + "\n").encode())
+    # BrokenPipeError here means QEMU is gone, which on a normal run means the
+    # harness already computed its verdict and ran cleanup while this process
+    # was mid-sendkey. Raising SystemExit rather than letting the traceback
+    # through keeps a PASSING log free of a Python stack trace -- noise that
+    # trains a reader to skim past the real ones.
+    try:
+        sock.sendall((cmd + "\n").encode())
+    except (BrokenPipeError, ConnectionResetError):
+        raise SystemExit("typist: QEMU monitor closed (VM exited)")
     time.sleep(0.05)
     try:
         sock.recv(65536)
-    except socket.timeout:
+    except (socket.timeout, ConnectionResetError):
         pass
 
 
@@ -208,13 +217,30 @@ def main():
     #    always fail. The '!' is stripped before typing; an expect still applies,
     #    which is how such a line stays checked at all (on the prompt or result
     #    that follows it, rather than on its own echo).
+    #    A trailing "@NAME=<regex>" captures group 1 of <regex> from the output
+    #    this command produced, binding it to NAME. Later commands substitute it
+    #    as "{NAME}". This exists because some assertions need a value only the
+    #    running system knows -- a PID, above all. A harness that must prove
+    #    "the user CAN kill their own process" cannot hardcode the PID, and
+    #    without the paired positive, a kill that refuses everything satisfies
+    #    every "does not leak" assertion while being entirely broken.
     followups = os.environ.get("TINYOS_FOLLOWUP_CMDS", "")
     followup_timeout = int(os.environ.get("TINYOS_FOLLOWUP_TIMEOUT", "240"))
+    captures = {}
     if followups.strip():
         for item in followups.split(";"):
             item = item.strip()
             if not item:
                 continue
+            capture = None
+            if "@" in item:
+                item, capspec = item.rsplit("@", 1)
+                item = item.strip()
+                if "=" not in capspec:
+                    print(f"typist: bad capture spec '{capspec}'", file=sys.stderr)
+                    return 2
+                capname, cappat = capspec.split("=", 1)
+                capture = (capname.strip(), cappat.strip())
             if "=>" in item:
                 cmd, want = item.split("=>", 1)
                 cmd, want = cmd.strip(), want.strip()
@@ -223,6 +249,13 @@ def main():
             unverified = cmd.startswith("!")
             if unverified:
                 cmd = cmd[1:]
+            for k, v in captures.items():
+                cmd = cmd.replace("{" + k + "}", v)
+                if want:
+                    want = want.replace("{" + k + "}", v)
+            if "{" in cmd and "}" in cmd:
+                print(f"typist: unresolved substitution in '{cmd}'", file=sys.stderr)
+                return 2
             time.sleep(1)
             print(f"typist: sending '{'*' * len(cmd) if unverified else cmd}'")
             mark = len(read_serial())
@@ -248,6 +281,24 @@ def main():
                 except SystemExit as e:
                     print(str(e), file=sys.stderr)
                     return 3
+            if capture:
+                capname, cappat = capture
+                m = re.search(cappat, read_serial()[mark:])
+                if not m:
+                    print(f"typist: capture '{capname}' found no match for "
+                          f"{cappat!r}", file=sys.stderr)
+                    return 3
+                val = m.group(1)
+                if not val:
+                    # An empty group substitutes as "" and the command silently
+                    # becomes something else -- "kill {MYPID}" typed as "kill ",
+                    # which the shell reads as PID 0. Refuse rather than run a
+                    # different command than the harness asked for.
+                    print(f"typist: capture '{capname}' matched an EMPTY group "
+                          f"for {cappat!r}", file=sys.stderr)
+                    return 3
+                captures[capname] = val
+                print(f"typist: captured {capname}={val}")
     return 0
 
 

@@ -22,6 +22,11 @@
 #define E_SUCCESS       0    /* Operation completed successfully */
 
 /* Argument errors */
+/* EPERM and ESRCH are MIRRORED in userspace/libc.h as ELIBC_EPERM/ELIBC_ESRCH:
+ * ring 3 cannot include this header, and the ring-3 shell branches on both to
+ * decide what `kill` prints. Renumber either one and the two files must change
+ * together -- nothing at build time will catch it, because each side is
+ * self-consistent. */
 #define EPERM           1    /* Operation not permitted */
 #define ENOENT          2    /* No such file or directory */
 #define ESRCH           3    /* No such process */
