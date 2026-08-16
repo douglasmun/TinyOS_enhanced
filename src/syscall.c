@@ -1557,6 +1557,138 @@ int sys_netstat(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
     return (int)want;
 }
 
+/*=============================================================================
+ * SYS_TCPSOCK -- the socket data path (doc/NETDAEMON_DESIGN.md PR C2)
+ *
+ * See syscall.h for the gating rationale. The short version: ownership, not
+ * euid, and the check lives here rather than in the TCP primitives because the
+ * kernel's own callers have no current task to check.
+ *===========================================================================*/
+
+/* One staging buffer for both directions, sized by TCPSOCK_MAX_IO. Static for
+ * the reason CLAUDE.md gives: the kernel task stack is 128 KB and shared with
+ * the whole exec chain, so a kilobyte of locals here is a kilobyte that chain
+ * no longer has. Serialized by the same argument that protects netrx_staging --
+ * one syscall runs at a time on this single-CPU kernel, and no path here
+ * yields between the copy and its use. */
+static uint8_t tcpsock_staging[TCPSOCK_MAX_IO];
+
+/* Every subcommand that names an existing socket funnels through this. It
+ * answers the one question the primitives cannot: may THIS caller touch this
+ * descriptor? Absent and foreign are the same answer (-EBADF) so the errno
+ * cannot enumerate the table. */
+static int tcpsock_check_owner(int sockfd) {
+    if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) {
+        return -EBADF;
+    }
+    if (!tcp_owner_visible(sockfd)) {
+        return -EBADF;
+    }
+    return 0;
+}
+
+int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return -ESRCH;
+    }
+
+    switch (subcmd) {
+    case TCPSOCK_SOCKET: {
+        /* No buffer, no sockfd. tcp_socket() stamps owner_uid from the calling
+         * task, which is why this needs no explicit credential handling. */
+        int fd = tcp_socket();
+        if (fd < 0) {
+            return -EMFILE;
+        }
+        return fd;
+    }
+
+    case TCPSOCK_CONNECT: {
+        int rc = tcpsock_check_owner(sockfd);
+        if (rc < 0) return rc;
+        if (!user_buf || len != sizeof(tcpsock_connect_t)) {
+            return -EINVAL;
+        }
+        tcpsock_connect_t req;
+        if (copy_from_user(&req, user_buf, sizeof(req)) < 0) {
+            return -EFAULT;
+        }
+        if (req.remote_port == 0) {
+            return -EINVAL;
+        }
+        /* tcp_connect returns -1 for every failure (bad state, SYN-flood cap,
+         * unresolved MAC). It is reported as -EHOSTUNREACH rather than
+         * mapped per-cause: the causes are kernel-side resource state, and
+         * distinguishing them here would tell an unprivileged caller how full
+         * the half-open table is. */
+        if (tcp_connect(sockfd, req.remote_ip, req.remote_port) < 0) {
+            return -EHOSTUNREACH;
+        }
+        return 0;
+    }
+
+    case TCPSOCK_SEND: {
+        int rc = tcpsock_check_owner(sockfd);
+        if (rc < 0) return rc;
+        if (!user_buf || len == 0) {
+            return -EINVAL;
+        }
+        /* Refused, not truncated: a short write the caller believes was a full
+         * one corrupts its own protocol framing. */
+        if (len > sizeof(tcpsock_staging)) {
+            return -EMSGSIZE;
+        }
+        if (copy_from_user(tcpsock_staging, user_buf, len) < 0) {
+            return -EFAULT;
+        }
+        int sent = tcp_send(sockfd, tcpsock_staging, len);
+        if (sent < 0) {
+            return -ENOTCONN;
+        }
+        return sent;
+    }
+
+    case TCPSOCK_RECV: {
+        int rc = tcpsock_check_owner(sockfd);
+        if (rc < 0) return rc;
+        if (!user_buf || len == 0) {
+            return -EINVAL;
+        }
+        if (len > sizeof(tcpsock_staging)) {
+            len = sizeof(tcpsock_staging);
+        }
+        /* Into kernel memory first, then out to the user. tcp_recv runs under
+         * TCP_LOCK (interrupts masked); copy_to_user can fault, and a page
+         * fault taken with interrupts masked is how this becomes a double
+         * fault. The two steps stay separate -- same rule as sys_netrx. */
+        int got = tcp_recv(sockfd, tcpsock_staging, len);
+        if (got < 0) {
+            return -ENOTCONN;
+        }
+        if (got == 0) {
+            return 0;
+        }
+        if (copy_to_user(user_buf, tcpsock_staging, (size_t)got) < 0) {
+            return -EFAULT;
+        }
+        return got;
+    }
+
+    case TCPSOCK_CLOSE: {
+        int rc = tcpsock_check_owner(sockfd);
+        if (rc < 0) return rc;
+        if (tcp_close(sockfd) < 0) {
+            return -EBADF;
+        }
+        return 0;
+    }
+
+    default:
+        return -EINVAL;
+    }
+}
+
 int sys_chdir(const char* user_path) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -3068,6 +3200,13 @@ static void syscall_dispatch(struct cpu_state* state) {
              * syscall, which is not this PR's job.
              * arg1 = subcmd | sockfd << 16, arg2 = buffer, arg3 = length */
             ret = sys_netstat(NETSTAT_SUBCMD(arg1), NETSTAT_SOCKFD(arg1),
+                              (void*)arg2, (size_t)arg3);
+            break;
+
+        case SYS_TCPSOCK:
+            /* Same three-register packing as SYS_NETSTAT above.
+             * arg1 = subcmd | sockfd << 16, arg2 = buffer, arg3 = length */
+            ret = sys_tcpsock(TCPSOCK_SUBCMD(arg1), TCPSOCK_SOCKFD(arg1),
                               (void*)arg2, (size_t)arg3);
             break;
 

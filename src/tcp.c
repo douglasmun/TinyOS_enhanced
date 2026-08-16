@@ -1118,6 +1118,15 @@ int tcp_socket(void) {
                     conn->state = TCP_CLOSED;
                     conn->rcv_wnd = TCP_RX_BUFFER_SIZE;
                     conn->local_port = 0;
+                    /* Must stamp the owner here too, not just on the fast path
+                     * above. memset() zeroes owner_uid, and uid 0 is root -- so
+                     * a socket allocated via the eviction retry came back
+                     * root-owned: invisible to the unprivileged caller that
+                     * asked for it, and visible to every root query. Latent
+                     * while tcp_socket() was kernel-only; a live bug the moment
+                     * SYS_TCPSOCK let ring 3 drive the allocator into
+                     * TIME_WAIT pressure. */
+                    conn->owner_uid = tcp_current_owner_uid();
                     TCP_UNLOCK();
                     return i;
                 }
@@ -1287,17 +1296,24 @@ int tcp_send(int sockfd, const void* data, size_t len) {
 int tcp_recv(int sockfd, void* buffer, size_t len) {
     if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return -1;
     tcp_connection_t* conn = &tcp_connections[sockfd];
-    if (!conn->in_use) return -1;
-    
-    // Check if connection closed
-    if (conn->state == TCP_CLOSED) return -1;
-    if (conn->state == TCP_CLOSE_WAIT && tcp_rx_available(conn) == 0) return 0;
-    
+
+    /* in_use/state/rx_head/rx_tail are all mutated by the IRQ-path receiver, so
+     * every one of these reads belongs INSIDE the lock. They used to sit above
+     * it: tcp_rx_available() subtracts rx_head and rx_tail, and a pair torn by
+     * an arriving segment returns a length near TCP_RX_BUFFER_SIZE for an
+     * almost-empty buffer -- which then drove the copy loop below. Kernel-only
+     * callers made that a rare glitch; with SYS_TCPRECV the remote peer chooses
+     * the arrival timing and the caller chooses when to race it. */
     TCP_LOCK();
 
-    // Read available data
+    if (!conn->in_use || conn->state == TCP_CLOSED) {
+        TCP_UNLOCK();
+        return -1;
+    }
+
     uint16_t available = tcp_rx_available(conn);
     if (available == 0) {
+        /* Peer closed and the buffer is drained: EOF, not "try again". */
         TCP_UNLOCK();
         return 0;
     }
