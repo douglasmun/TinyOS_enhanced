@@ -168,6 +168,12 @@ void cmd_ifconfig(void) {
     /* irq-ctx must read 0. Nonzero means the parser ran inside an ISR, i.e.
      * doc/NETWORK_ISOLATION.md item 1 has been undone. */
     kprintf("  RX parsed:    %u thread-ctx, %u irq-ctx\n", parse_thread, parse_irq);
+    /* Ring accounting, deliberately a separate line from the context pair above:
+     * they answer different questions and conflating them is the false pass PR D
+     * has to avoid. cpl3 reads 0 until the parser actually moves to ring 3. */
+    uint32_t parse_cpl0 = 0, parse_cpl3 = 0;
+    net_get_parse_ring_stats(&parse_cpl0, &parse_cpl3);
+    kprintf("  RX ring:      %u cpl0, %u cpl3\n", parse_cpl0, parse_cpl3);
 
     /* ICMP RX counters. Same reasoning as the drop counters above: these
      * replaced per-packet prints a remote host drove. The echo-reply count in

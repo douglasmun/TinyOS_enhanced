@@ -1685,9 +1685,52 @@ void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype) {
 static uint32_t net_parse_thread = 0;  /* frames parsed with IF enabled  */
 static uint32_t net_parse_irq = 0;     /* frames parsed in an ISR (== 0) */
 
+/*
+ * Ring accounting (doc/NETDAEMON_DESIGN.md, item 4 PR D).
+ *
+ * The two counters above answer "was IF enabled", which is a different question
+ * from "which ring was executing". Both are 0/nonzero assertions and it is easy
+ * to assume one implies the other: it does not. knetd runs with IF=1 and at
+ * CPL 0, so a build where nothing has moved reports a perfectly healthy
+ * `thread-ctx` count. That is exactly the false pass the PR D harness exists to
+ * prevent -- the design doc names the weak version ("ping still works") as
+ * something that passes against a kernel where the parser never moved.
+ *
+ * So the ring is witnessed directly, from %cs, at the same site and on the same
+ * "counted before any early return" rule as the context pair. Today every frame
+ * lands in net_parse_cpl0 and net_parse_cpl3 reads 0; that zero is the baseline
+ * the harness records BEFORE the parser moves, so that when it does move the
+ * counters have to swap and a build that only claims to have moved cannot show
+ * it. Recording the baseline first is the whole point: a harness written after
+ * the move has nothing to compare against.
+ */
+static uint32_t net_parse_cpl0 = 0;    /* frames parsed in ring 0 */
+static uint32_t net_parse_cpl3 = 0;    /* frames parsed in ring 3 (0 until PR D lands) */
+
+/*
+ * Read the current privilege level out of %cs. The low two bits of the segment
+ * selector are the CPL -- this is the same idiom kernel.c:273 uses to report the
+ * boot code segment. It is deliberately NOT derived from a software flag: a flag
+ * records what the code believes about itself, and the entire purpose of this
+ * counter is to catch a build whose belief is wrong.
+ */
+static inline uint32_t net_current_cpl(void) {
+    /* %cs is a 16-bit selector, so the destination must be 16-bit too. Written
+     * as uint32_t it builds but warns under -Wasm-operand-widths (operand size
+     * does not match the constraint), and this tree is -Werror. */
+    uint16_t cs_val;
+    __asm__ volatile("mov %%cs, %0" : "=r"(cs_val));
+    return (uint32_t)(cs_val & 3u);
+}
+
 void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx) {
     if (thread_ctx) *thread_ctx = net_parse_thread;
     if (irq_ctx) *irq_ctx = net_parse_irq;
+}
+
+void net_get_parse_ring_stats(uint32_t* cpl0, uint32_t* cpl3) {
+    if (cpl0) *cpl0 = net_parse_cpl0;
+    if (cpl3) *cpl3 = net_parse_cpl3;
 }
 
 /*=============================================================================
@@ -1746,6 +1789,14 @@ void handle_packet(uint8_t* data, size_t len) {
         net_parse_irq++;
     } else {
         net_parse_thread++;
+    }
+
+    /* Same rule, same site: counted before any early return, because a runt
+     * frame is still a frame and the ring it was parsed in is the assertion. */
+    if (net_current_cpl() == 3) {
+        net_parse_cpl3++;
+    } else {
+        net_parse_cpl0++;
     }
 
     if (len < sizeof(eth_header_t)) {

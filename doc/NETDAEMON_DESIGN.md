@@ -310,6 +310,82 @@ network bug, run the reproducer for the **direction** in question.
 **PR D — move the parser to ring 3.** Only after A–C. This is the PR where the
 trust domain actually changes.
 
+**D is not one PR, and measuring it is what established that.** The first step
+of D was counting what the four parser files actually call out to, the same way
+the first step of C was discovering the 23 was really 20:
+
+| Callee | Sites | Why it blocks a clean move |
+|---|---|---|
+| `kprintf` | 144 | ring-0 primitive, on code that would run at CPL 3 |
+| `scheduler_yield` | 8 | ring-0 primitive |
+| `csprng_random_bytes` | 7 | feeds TCP ISN generation — exposing it to ring 3 **is** an ISN-prediction primitive |
+| `e1000_send` | 4 | raw TX; forges any source MAC/IP, which is exactly why `SYS_NETTX` is euid-gated |
+| `scheduler_get_current_task` | 2 | ring-0 primitive |
+| `sha256`, `firewall_allow_port`, `task_visible_to_current` | 1 each | ring-0 primitives |
+
+Each becomes a new syscall or a daemon-side reimplementation. Two of them —
+`e1000_send` and `csprng_random_bytes` — are precisely the primitives that
+cannot be handed to ring 3 unguarded, so they need the same gating treatment
+`SYS_NETTX` got, not a mechanical port.
+
+Three further constraints, all measured rather than assumed:
+
+1. **`tcp_connections[]` gets two writers in two rings.** The RX parser mutates
+   it, and since PR C2 so does `SYS_TCPSOCK` from ring 3 via kernel calls. Open
+   question 2 below is framed as "shared buffer ownership", but the frame buffer
+   is the easy half — the hard half is this table. `tcp_send_segment`'s standing
+   DANGEROUS INVARIANT comment already names "socket API syscalls that call TCP
+   directly" as what breaks its unlocked `static uint8_t packet[1514]`.
+2. **17 external call sites** — 12 in `syscall.c`, 5 in `kernel.c` — reach into
+   the parser files. The `kernel.c` ones include the boot DHCP path, which runs
+   before any ring-3 daemon could exist (open question 3, still unanswered).
+3. **Finding A3's `uint8_t buf[1514]`** (`icmp.c:254`) was flagged for this PR
+   because ring 3 has a different stack budget. It stays flagged; it is not
+   reachable until the move it is waiting on.
+
+**What landed instead: the CPL witness.** The one piece of D with no design
+ambiguity, and the only piece that *must* be built before the move rather than
+after. `handle_packet()` now reads the low two bits of `%cs` at the same site and
+on the same "counted before any early return" rule as the interrupt-context pair,
+surfaced by `ifconfig` as `RX ring: N cpl0, M cpl3`.
+
+The reason it goes first is that a harness written *after* the parser moves has
+nothing to compare against — it can only observe the post-move state and declare
+it correct. Recording the baseline against a kernel whose ring is known means the
+move has to invert two numbers that are currently pinned the other way.
+
+**Why this is a separate counter from `irq-ctx`, and why that is not pedantry.**
+`knetd` runs with `IF=1` **and** at CPL 0. So a build in which nothing has moved
+reports a perfectly healthy `RX parsed: N thread-ctx, 0 irq-ctx`. Interrupt state
+and privilege level are independent axes; item 1 pinned the first and says
+nothing about the second. This document already names the weak version of the D
+harness ("ping still works") as something that passes against a kernel where the
+parser never moved — "thread-ctx is healthy" is the same false pass in better
+disguise, and more dangerous because it looks like evidence.
+
+The witness reads `%cs`, **not** a software flag such as "am I on the knetd
+task". A flag records what the code believes about itself; the entire purpose of
+the counter is to catch a build whose belief is wrong. `verify-netd-ring3.sh`
+has a source guard on that specific shape, because a flag-based rewrite is a
+plausible-looking "simplification" that silently destroys the property.
+
+**Negative controls, both run.** The instrument being new is the argument for
+controlling it, and both halves of the assertion were confirmed falsifiable:
+
+- **NC1 — hollow the witness** (`net_current_cpl()` body → `return 3;`, keeping the
+  `%cs` read so the source guard stays green): harness **FAILED** correctly with
+  `cpl3 delta=20`, caught on reading #2. Without this control the runtime
+  assertion would have been decorative in exactly the way PR C1's was.
+- **NC2 — delete the increment block**: harness **FAILED** correctly with
+  `cpl0 delta=0`. This is the instructive one — `cpl3 == 0` was *true* under NC2,
+  and a one-sided harness would have reported PASS. Zero of nothing is zero; the
+  positive half is what gives the zero meaning.
+
+Baseline recorded: 20 injected frames, `cpl0 delta=20`, `cpl3 == 0` across all
+readings. `verify-netd-ring3.sh` flips via `TINYOS_EXPECT_CPL3=1` when the move
+lands; if the move requires rewriting the assertions rather than flipping that
+flag, the counters moved with the code instead of measuring it.
+
 `MAX_SYSCALL_NUM` is **38** as of PR C2 (`SYS_NETRX` 35, `SYS_NETTX` 36,
 `SYS_NETSTAT` 37, `SYS_TCPSOCK` 38); it was 34 (`SYS_KILL`) before PR B. Every PR that adds a syscall must bump it — CLAUDE.md records
 this exact bug: it sat at 16 while `SYS_SLEEP` (17) and `SYS_WAITPID` (18) had
