@@ -1311,6 +1311,43 @@ int ramfs_chmod(const char* path, uint16_t mode) {
     }
 
     /*=========================================================================
+     * SECURITY: Ownership check — only root or the owner may change a mode
+     *
+     * This was missing entirely until it was caught by a runtime probe: an
+     * unprivileged user in the kernel shell could `chmod 666` a root-owned
+     * 0600 file and then read it. Permissions are otherwise enforced
+     * correctly (ramfs_check_permission gates open/create/unlink), which is
+     * exactly what made this exploitable — the mode bits are load-bearing,
+     * so the ability to rewrite them at will defeats the whole scheme.
+     *
+     * The check lives HERE rather than in cmd_chmod so that the primitive
+     * itself is guarded: a future SYS_CHMOD inherits it for free, instead of
+     * re-opening the hole the moment a second caller appears.
+     *
+     * Boot-time callers (the 14 ramfs_chmod calls in kernel.c that set up the
+     * .elf files) still pass: ramfs_get_current_credentials() returns uid 0
+     * when there is no current task, which is the same mechanism every other
+     * ramfs operation already relies on during initialization.
+     *
+     * Note this is a *stricter* rule than ramfs_check_permission(WRITE) —
+     * write access to a file does not entitle you to re-permission it. Group
+     * and other bits are deliberately not consulted.
+     *
+     * Returns RAMFS_CHMOD_EPERM (-3), NOT -EPERM: EPERM is 1, so -EPERM is -1,
+     * which is this function's existing "file not found" sentinel. Returning
+     * that would make the refusal indistinguishable from a missing file, and
+     * dead code at every caller that tests for -1 first — which is exactly
+     * what the first version of this fix did.
+     *=======================================================================*/
+    uint16_t uid, gid;
+    ramfs_get_current_credentials(&uid, &gid);
+    (void)gid;
+
+    if (uid != 0 && uid != node->uid) {
+        return RAMFS_CHMOD_EPERM;
+    }
+
+    /*=========================================================================
      * PHASE 3: SECURITY - Enforce NO setuid/sgid/sticky bits
      *
      * DEFENSE IN DEPTH: Mask out ANY high bits to ensure only standard
