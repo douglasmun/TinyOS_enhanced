@@ -32,6 +32,25 @@
 #include "shell_user.h" // SYS_CRED: the passwd/useradd/userdel implementations
 
 /*-----------------------------------------------------------------------------
+ * Maximum single-syscall transfer size.
+ *
+ * At file scope on purpose. This used to be #define'd INSIDE sys_write and
+ * again inside sys_read, which is not the scoping it looks like: a #define is
+ * textual and has no block scope, so the first one stayed live for the rest of
+ * the file and the second was a plain redefinition of an already-defined macro.
+ * It compiled only because both expanded to the same token sequence -- change
+ * one of them and the build breaks on -Wmacro-redefined, which is -Werror here.
+ *
+ * The real hazard was the two later users, sys_pipe_read and sys_psinfo, which
+ * referenced MAX_IO_SIZE without defining it and got the correct 1 MB purely
+ * because they happen to sit BELOW sys_write in the file. Moving either function
+ * up -- an ordinary refactor with no reason to suspect it -- would turn their
+ * bounds check into an undefined identifier. A cap that depends on function
+ * ordering to exist is not a cap.
+ *---------------------------------------------------------------------------*/
+#define MAX_IO_SIZE (1024 * 1024)  /* 1 MB */
+
+/*-----------------------------------------------------------------------------
  * CPU State Structure (matches syscall stub stack frame)
  * Stack layout from syscall_stub in syscall.S (ESP points to top):
  * 1. pusha pushes: EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI (EDI is on top)
@@ -354,7 +373,6 @@ int sys_write(int fd, const char* buf, size_t len) {
      * DEFENSE: Cap maximum read/write size to reasonable limit (1MB)
      * before any address arithmetic or copy operations.
      *=======================================================================*/
-    #define MAX_IO_SIZE (1024 * 1024)  /* 1 MB */
     if (len > MAX_IO_SIZE) {
         kprintf("[SYSCALL] sys_write: size %u exceeds maximum %u\n",
                 (unsigned int)len, (unsigned int)MAX_IO_SIZE);
@@ -537,7 +555,6 @@ int sys_read(int fd, char* buf, size_t len) {
      * DEFENSE: Cap maximum read/write size to reasonable limit (1MB)
      * before any address arithmetic or copy operations.
      *=======================================================================*/
-    #define MAX_IO_SIZE (1024 * 1024)  /* 1 MB */
     if (len > MAX_IO_SIZE) {
         kprintf("[SYSCALL] sys_read: size %u exceeds maximum %u\n",
                 (unsigned int)len, (unsigned int)MAX_IO_SIZE);

@@ -5,6 +5,7 @@
 #include "util.h"
 #include "kprintf.h"
 #include "critical.h"
+#include "stdio.h"  /* stream_printf / get_current_streams */
 #include <stddef.h>
 
 /*=============================================================================
@@ -307,24 +308,37 @@ void env_list(bool exported_only) {
      * - Partial reads of multi-word fields (name, value)
      * - TOCTOU: env_table[i].in_use could change between check and use
      *=========================================================================*/
-    CRITICAL_SECTION_ENTER();
-
+    /* The lock is taken and dropped once per slot rather than held across the
+     * whole listing, because the printing now goes through stream_printf: on a
+     * redirected stream that reaches ramfs_write, which is far too much work to
+     * run with interrupts masked and can take a mutex of its own. One entry is
+     * copied out under the lock and printed after it, so the table is never read
+     * unlocked and no I/O happens inside the critical section. The trade is that
+     * a variable added mid-listing may or may not appear -- acceptable for a
+     * listing, unlike the torn name/value read the lock is actually there for. */
+    stream_context_t* ctx = get_current_streams();
+    env_var_t entry;
     int count = 0;
 
     for (int i = 0; i < ENV_MAX_VARS; i++) {
-        if (env_table[i].in_use) {
-            if (!exported_only || env_table[i].exported) {
-                kprintf("%s=%s\n", env_table[i].name, env_table[i].value);
-                count++;
-            }
+        bool show;
+
+        CRITICAL_SECTION_ENTER();
+        show = env_table[i].in_use && (!exported_only || env_table[i].exported);
+        if (show) {
+            entry = env_table[i];
+        }
+        CRITICAL_SECTION_EXIT();
+
+        if (show) {
+            stream_printf(ctx, "%s=%s\n", entry.name, entry.value);
+            count++;
         }
     }
 
     if (count == 0) {
-        kprintf("(no variables)\n");
+        stream_printf(ctx, "(no variables)\n");
     }
-
-    CRITICAL_SECTION_EXIT();
 }
 
 /*=============================================================================
@@ -630,23 +644,34 @@ void alias_list(void) {
      * CRITICAL: Iterates over global alias_table without locking.
      * Race condition if another thread modifies alias_table during iteration.
      *=========================================================================*/
-    CRITICAL_SECTION_ENTER();
-
+    /* Per-slot locking, printing outside the lock -- same reasoning as
+     * env_list() above. */
+    stream_context_t* ctx = get_current_streams();
+    char name[ALIAS_MAX_NAME_LEN];
+    char command[ALIAS_MAX_CMD_LEN];
     int count = 0;
 
     /* SECURITY FIX: Use size_t for loop counter (consistent with other loops) */
     for (size_t i = 0; i < ALIAS_MAX_COUNT; i++) {
-        if (alias_table[i].in_use) {
-            kprintf("alias %s='%s'\n", alias_table[i].name, alias_table[i].command);
+        bool show;
+
+        CRITICAL_SECTION_ENTER();
+        show = alias_table[i].in_use;
+        if (show) {
+            memcpy(name, alias_table[i].name, sizeof(name));
+            memcpy(command, alias_table[i].command, sizeof(command));
+        }
+        CRITICAL_SECTION_EXIT();
+
+        if (show) {
+            stream_printf(ctx, "alias %s='%s'\n", name, command);
             count++;
         }
     }
 
     if (count == 0) {
-        kprintf("(no aliases)\n");
+        stream_printf(ctx, "(no aliases)\n");
     }
-
-    CRITICAL_SECTION_EXIT();
 }
 
 bool alias_exists(const char* name) {

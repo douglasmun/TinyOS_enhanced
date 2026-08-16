@@ -181,3 +181,5 @@ ring3ps.log
 ring3ps-trace.log
 idssig.log
 idssig-trace.log
+sysredirect.log
+sysredirect-trace.log
