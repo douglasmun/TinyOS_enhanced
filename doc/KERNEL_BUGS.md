@@ -364,3 +364,65 @@ a standing demonstration that they cannot fail.
 
 Generalises: when a bug's symptom is metadata, assert on metadata. A content check
 that passes with the fix removed is not a weak test, it is not a test.
+
+---
+
+## FIXED: `chmod` did not check ownership — any user could re-permission any file
+
+`ramfs_chmod` masked setuid/sgid/sticky (`mode &= RAMFS_PERM_MASK`) but never
+compared the caller to `node->uid`, and `cmd_chmod` (`shell_fileops.c`) did not
+check either. Every other ramfs mutation routes through
+`ramfs_check_permission()` — open, create, unlink — and chmod was the single
+one that did not.
+
+That gap is reachable because `kshell` is deliberately ungated (`shell.c:1119`):
+the ring-3 shell has no privileged commands, so a user who needs `passwd` or
+`useradd` types `kshell`. From there, any user could rewrite the mode of any
+file. Confirmed at runtime before the fix:
+
+```
+$ id                     uid=1002(chmoduser) gid=100 euid=1002 egid=100
+$ cat /secret.txt        cat: /secret.txt: No such file or directory   <- 0600, denied
+$ chmod 666 /secret.txt  chmod: '/secret.txt' -> rw-rw-rw-
+$ cat /secret.txt        ROOTONLYDATA                                  <- escalated
+```
+
+The first `cat` is the point: permissions **are** enforced on the read path, so
+the mode bits are load-bearing, and the ability to rewrite them at will defeats
+the entire scheme. The bug was not that chmod was unchecked — it was that
+everything *else* was checked.
+
+The fix goes in `ramfs_chmod`, not `cmd_chmod`, so the primitive is guarded and
+a future `SYS_CHMOD` inherits it. The 14 boot-time calls in `kernel.c` still
+pass because `ramfs_get_current_credentials()` returns uid 0 when there is no
+current task — the same boot-init mechanism the rest of ramfs relies on. Note
+the rule is *stricter* than `ramfs_check_permission(WRITE)`: write access to a
+file does not entitle you to re-permission it, so group/other bits are not
+consulted.
+
+**Two traps this one produced, both worth keeping.**
+
+*`-EPERM` collided with an existing sentinel.* `EPERM` is 1, so `-EPERM` is
+`-1` — which is already `ramfs_chmod`'s "file not found". The first version of
+the fix returned `-EPERM`, and `cmd_chmod`'s `result == -1` branch caught it
+first: the refusal printed "No such file or directory" and the new branch was
+dead code. The kernel was correct and the observable behaviour was a lie. Hence
+`RAMFS_CHMOD_EPERM` (-3). Before adding an errno return to a function that
+already uses small negative sentinels, check whether they overlap.
+
+*"Denied" and "absent" are the same string.* Two harness revisions passed
+against a file that was simply not there. `cmd_chmod` runs its argument through
+`resolve_path()`, which has no drive-letter awareness — `D:/secret.txt` does not
+start with `/`, so it is treated as relative and becomes `/D:/secret.txt`, which
+never exists, while `cat` resolves `D:` correctly through the VFS. The two
+commands disagree about the same string, and chmod failed with "No such file or
+directory" regardless of ownership. (That resolve_path/VFS mismatch is a
+separate pre-existing chmod limitation.) `verify-chmod-owner.sh` therefore
+asserts a **positive control** first: root must create, chmod *and read back*
+the file at the same path before privileges drop. A file that does not exist
+refuses everybody equally.
+
+Generalises, and complements the `O_TRUNC` lesson above: a negative control
+proves the harness can fail; a **positive control** proves it is testing the
+thing it names. A denial is only evidence when you have shown the resource was
+there to deny.

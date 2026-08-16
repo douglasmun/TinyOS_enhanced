@@ -68,6 +68,18 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
 - **Making a path reachable from ring 3 turns latent bugs into corruption primitives.**
   This recurred in PRs #45, #47, #54, #55 — every time, dead or kernel-only code carried
   serious bugs. Audit the path in the same PR that exposes it.
+- **Enforce permissions in the ramfs primitive, not the command.** `ramfs_chmod` had no
+  ownership check, so any user — `kshell` is ungated on purpose — could `chmod 666` a
+  root-owned file and read it. Every other ramfs mutation routes through
+  `ramfs_check_permission()`; that is what made this one exploitable, since the mode
+  bits are only load-bearing *because* the rest is enforced. Putting the check in
+  `cmd_chmod` would have left the primitive open to the next caller (a future
+  `SYS_CHMOD`). Boot-time callers pass because `ramfs_get_current_credentials()`
+  returns uid 0 with no current task. Harness: `verify-chmod-owner.sh`.
+- **Check sentinel collisions before returning an errno.** `EPERM` is 1, so `-EPERM`
+  is `-1` — already `ramfs_chmod`'s "file not found". Returning it made the refusal
+  print "No such file or directory" and the new branch dead code, with the kernel
+  behaving correctly the whole time. Use a distinct constant (`RAMFS_CHMOD_EPERM`).
 
 ## Stack budgets (important)
 
