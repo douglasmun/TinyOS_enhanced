@@ -134,6 +134,21 @@ void cmd_ifconfig(void) {
             subnet_mask[0], subnet_mask[1], subnet_mask[2], subnet_mask[3]);
     kprintf("  Gateway:      %d.%d.%d.%d\n",
             gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3]);
+
+    /* RX drop counters. These replaced five per-packet kprintf sites that any
+     * host on the segment could flood from the ISR — see
+     * doc/NETWORK_ISOLATION.md item 2. Reported here so the events stay
+     * visible under load, which a suppressed print would not be. */
+    uint32_t tx_count = 0, rx_count = 0;
+    uint32_t err_drops = 0, badlen_drops = 0, runt_drops = 0, ethertype_drops = 0;
+    e1000_get_stats(&tx_count, &rx_count);
+    e1000_get_drop_stats(&err_drops, &badlen_drops);
+    net_get_drop_stats(&runt_drops, &ethertype_drops);
+
+    kprintf("  RX packets:   %u\n", rx_count);
+    kprintf("  TX packets:   %u\n", tx_count);
+    kprintf("  RX dropped:   %u hw-error, %u bad-length, %u runt, %u unsupported-ethertype\n",
+            err_drops, badlen_drops, runt_drops, ethertype_drops);
     kprintf("\n");
 }
 

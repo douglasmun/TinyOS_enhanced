@@ -48,6 +48,19 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   by default and **must stay that way** (`readline()` costs one syscall per keystroke).
   Same for routine FS errors: a failed `rmdir` is a userspace error the caller already
   reports on its own stream.
+- **The RX path is stricter still: no per-packet `kprintf` at all.** Those sites need no
+  local account — any host on the segment drives them, from the ISR, before the firewall.
+  Five such prints were replaced by counters surfaced in `ifconfig` (PR: `net_drop_runt`,
+  `net_drop_ethertype`, `rx_drop_errors`, `rx_drop_badlen`). Count, don't print, and don't
+  reach for `stream_printf` here either: interrupt context has no current user stream.
+  Harness: `verify-rxdrop-counters.sh`; rationale in `doc/NETWORK_ISOLATION.md`.
+- **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
+  `critical_section_exit()` only touches `IF` when `__interrupt_context_depth == 0`, and
+  that clause is deliberate (a `popfl` mid-ISR would corrupt the preempted thread's
+  flags). So `e1000_poll_rx`'s mid-loop unlocks and its post-budget "process with
+  interrupts RE-ENABLED" block are depth decrements only — the whole parser runs with
+  `IF=0`, and `E1000_RX_PACKET_BUDGET` does not bound interrupt-off time the way its
+  comments claim. Don't trust those comments; see `doc/NETWORK_ISOLATION.md`.
 - **Route user-facing output through `stream_printf(get_current_streams())`**, not
   `kprintf` — the latter goes to the kernel console, which a shell session doesn't show.
 - **`MAX_SYSCALL_NUM` must cover the highest syscall number**, not the highest in its own

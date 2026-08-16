@@ -1638,6 +1638,34 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
     }
 }
 
+/*=============================================================================
+ * RX DROP COUNTERS (see doc/NETWORK_ISOLATION.md, item 2)
+ *
+ * These two drops used to kprintf one line per packet. Both are reachable
+ * BEFORE the firewall by anyone on the segment — no local account needed — and
+ * both execute in the ISR with interrupts disabled, so serial console output
+ * turned a malformed frame into a remote amplification primitive. CLAUDE.md's
+ * "no per-operation kprintf on a ring-3-reachable path" rule applies here with
+ * more force, because this path does not even require ring 3.
+ *
+ * A counter is strictly better than a rate-limited print: it survives the
+ * flood and stays accurate, where a suppressed print loses the count. Surfaced
+ * via net_get_drop_stats() in `ifconfig`.
+ *
+ * Not converted to stream_printf: this is interrupt context, there is no
+ * current user stream to route to.
+ *
+ * uint32_t wrap is acceptable and deliberate — these are diagnostic counters,
+ * not quota enforcement, and a wrap is visible as a count that went backwards.
+ *===========================================================================*/
+static uint32_t net_drop_runt = 0;       /* frame shorter than an Ethernet header */
+static uint32_t net_drop_ethertype = 0;  /* EtherType we do not handle */
+
+void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype) {
+    if (runt) *runt = net_drop_runt;
+    if (ethertype) *ethertype = net_drop_ethertype;
+}
+
 /**
  * @brief Main packet reception handler.
  * @param data Pointer to received Ethernet frame.
@@ -1649,7 +1677,7 @@ void handle_packet(uint8_t* data, size_t len) {
     // kprintf("[NET_DEBUG] handle_packet called (count=%u, len=%zu)\n", pkt_count, len);
 
     if (len < sizeof(eth_header_t)) {
-        kprintf("NET: Received packet too short (%zu bytes). Dropping.\n", len);
+        net_drop_runt++;
         return;
     }
 
@@ -1684,7 +1712,7 @@ void handle_packet(uint8_t* data, size_t len) {
                       len - sizeof(eth_header_t));               // IP packet length
             break;
         default:
-            kprintf("NET: Unhandled EtherType 0x%x. Dropping packet.\n", ethertype);
+            net_drop_ethertype++;
             break;
     }
 }

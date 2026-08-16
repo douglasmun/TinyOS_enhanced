@@ -171,6 +171,14 @@ static uint32_t rx_tail = 0;  // Track which descriptor we're processing
 static uint32_t packet_tx_count = 0;
 static uint32_t packet_rx_count = 0;
 
+/* Frames dropped for hardware-detected errors (CRC/checksum/symbol/...).
+ * Counted rather than printed — see doc/NETWORK_ISOLATION.md item 2. */
+static uint32_t rx_drop_errors = 0;
+
+/* Frames dropped for an implausible descriptor length (over RX_BUF_SIZE, or
+ * zero). Same reasoning: per-packet and remotely driven. */
+static uint32_t rx_drop_badlen = 0;
+
 // Packet dump control (set to 1 to enable, 0 to disable)
 static int enable_packet_dump = 0;  // Disabled to reduce verbosity
 
@@ -558,8 +566,7 @@ void e1000_poll_rx(void) {
          * over-read when we pass data to handle_packet().
          *===================================================================*/
         if (length > RX_BUF_SIZE) {
-            kprintf("E1000: RX packet length (%d) exceeds buffer size (%d). Dropping.\n",
-                    length, RX_BUF_SIZE);
+            rx_drop_badlen++;
             // Clear descriptor and continue
             rx_ring[rx_tail].status = 0;
             __asm__ volatile("sfence" ::: "memory");  // DMA coherence
@@ -571,7 +578,7 @@ void e1000_poll_rx(void) {
 
         // Additional sanity check: reject zero-length packets
         if (length == 0) {
-            kprintf("E1000: RX packet with zero length. Dropping.\n");
+            rx_drop_badlen++;
             rx_ring[rx_tail].status = 0;
             __asm__ volatile("sfence" ::: "memory");  // DMA coherence
             uint32_t old_tail = rx_tail;
@@ -616,19 +623,11 @@ void e1000_poll_rx(void) {
         uint8_t errors = rx_ring[rx_tail].errors;
 
         if (errors != 0) {
-            /* Packet has hardware-detected errors - SECURITY CRITICAL DROP */
-            const char* error_type = "UNKNOWN";
-
-            if (errors & E1000_RXD_ERR_CE)   error_type = "CRC/Alignment";
-            else if (errors & E1000_RXD_ERR_IPE)  error_type = "IP Checksum";
-            else if (errors & E1000_RXD_ERR_TCPE) error_type = "TCP/UDP Checksum";
-            else if (errors & E1000_RXD_ERR_SE)   error_type = "Symbol";
-            else if (errors & E1000_RXD_ERR_SEQ)  error_type = "Sequence";
-            else if (errors & E1000_RXD_ERR_CXE)  error_type = "Carrier Extension";
-            else if (errors & E1000_RXD_ERR_RXE)  error_type = "RX Data";
-
-            kprintf("E1000: SECURITY - Dropping packet with %s error (errors=0x%02x)\n",
-                    error_type, errors);
+            /* Packet has hardware-detected errors - SECURITY CRITICAL DROP.
+             * Counted, not printed: an attacker sets the rate directly by
+             * sending frames with bad CRCs, and this runs in the ISR. See
+             * doc/NETWORK_ISOLATION.md item 2. */
+            rx_drop_errors++;
 
             /* Log to IDS BEFORE dropping - records evasion attempt */
             // TODO: Call ids_log_malformed_packet(rx_bufs[rx_tail], length, error_type)
@@ -716,6 +715,7 @@ void e1000_poll_rx(void) {
 
             // Validate length
             if (length > RX_BUF_SIZE || length == 0) {
+                rx_drop_badlen++;
                 rx_ring[rx_tail].status = 0;
                 __asm__ volatile("sfence" ::: "memory");  // DMA coherence
                 uint32_t old_tail = rx_tail;
@@ -728,13 +728,7 @@ void e1000_poll_rx(void) {
             /* Validate NIC checksum (same as primary loop) */
             uint8_t errors = rx_ring[rx_tail].errors;
             if (errors != 0) {
-                const char* error_type = "UNKNOWN";
-                if (errors & E1000_RXD_ERR_CE)   error_type = "CRC/Alignment";
-                else if (errors & E1000_RXD_ERR_IPE)  error_type = "IP Checksum";
-                else if (errors & E1000_RXD_ERR_TCPE) error_type = "TCP/UDP Checksum";
-
-                kprintf("E1000: SECURITY - Dropping packet with %s error (errors=0x%02x)\n",
-                        error_type, errors);
+                rx_drop_errors++;
 
                 rx_ring[rx_tail].status = 0;
                 __asm__ volatile("sfence" ::: "memory");  // DMA coherence
@@ -797,6 +791,15 @@ void e1000_set_packet_dump(bool enable) {
 void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count) {
     if (tx_count) *tx_count = packet_tx_count;
     if (rx_count) *rx_count = packet_rx_count;
+}
+
+/*=============================================================================
+ * FUNCTION: e1000_get_drop_stats
+ * PURPOSE: Report frames dropped for hardware-detected errors
+ *============================================================================*/
+void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count) {
+    if (err_count) *err_count = rx_drop_errors;
+    if (badlen_count) *badlen_count = rx_drop_badlen;
 }
 
 /*=============================================================================

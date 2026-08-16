@@ -181,6 +181,8 @@ ring3ps.log
 ring3ps-trace.log
 idssig.log
 idssig-trace.log
+rxdrop.log
+rxdrop-trace.log
 sysredirect.log
 sysredirect-trace.log
 spray-pos.log

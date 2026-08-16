@@ -240,3 +240,8 @@ void e1000_send(void* data, size_t len);
 void e1000_poll_rx(void);
 void e1000_set_packet_dump(bool enable);
 void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count);
+
+/* RX drop counters — see doc/NETWORK_ISOLATION.md item 2. These replaced
+ * per-packet kprintf sites that any host on the segment could flood. */
+void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count);
+void net_get_drop_stats(uint32_t* runt, uint32_t* ethertype);
