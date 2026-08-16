@@ -175,3 +175,5 @@ privcmd-guard.log
 privcmd-guard-trace.log
 slotcap.log
 slotcap-trace.log
+psvis.log
+psvis-trace.log

@@ -1551,8 +1551,14 @@ int sys_waitpid(int pid) {
             return -ECHILD;
         }
         if (self->euid != 0 && target->uid != self->uid) {
+            /* -ECHILD, the same answer a nonexistent PID gets above: -EPERM
+             * would confirm the PID is live and owned by someone else, which
+             * is the existence `ps` deliberately withholds from unprivileged
+             * users (shell_monitor.c task_visible_to_current). -ECHILD is also
+             * the honest answer to the question actually asked -- that process
+             * is not this caller's child. */
             CRITICAL_SECTION_EXIT();
-            return -EPERM;
+            return -ECHILD;
         }
         generation = target->generation;
     }
