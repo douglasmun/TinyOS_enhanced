@@ -539,10 +539,15 @@ interfaces or add a purpose-built read-only one.
 Not rhetorical; each changes the design and none should be answered by whoever
 writes the code without saying so.
 
-1. **Does the daemon dying take networking down?** A ring-3 parser can crash or be
-   killed. Restart policy, and what happens to `tcp_connections[]` across a
-   restart, is unresolved. "It cannot happen" is not an answer — the entire point
-   is that it now can.
+1. ~~**Does the daemon dying take networking down?**~~ **In scope — decided by the
+   maintainer, 2026-08-17.** Restart policy is a first-class requirement of the
+   parser move, not a follow-up. See "Settled: what moves first" below for what
+   that costs, and note the finding that made it expensive: **the kernel has no
+   supervision machinery of any kind.** `grep` for respawn/restart/watchdog across
+   `src/` returns nothing but unrelated matches, and `task_knetd()` is a `while(1)`
+   that cannot exit. So this is new subsystem work — a supervisor that can observe
+   a task's death and re-create it — rather than a policy flag on an existing
+   mechanism.
 2. **Shared buffer ownership.** Item 1 established that a deferred parser **must
    copy** the frame before RDT advances, because the NIC refills the descriptor
    and a retained pointer is an attacker-timed UAF. A ring-3 shared buffer has the
@@ -552,6 +557,13 @@ writes the code without saying so.
    daemon plausibly exists. Item 1 already hit this: `kernel.c`'s boot DHCP loop
    needs its explicit `e1000_rx_softirq_run()` drain because `knetd` does not
    exist yet. The same ordering problem, one ring further out.
+   **Partly forced by the D1 split below:** DHCP is in the moving set, so the boot
+   lease must either complete in ring 0 before the daemon starts (a two-phase
+   parser, ring 0 until handoff) or the daemon must start earlier than the lease.
+   The former is strongly preferred — it keeps the existing boot drain exactly as
+   item 1 left it, and CLAUDE.md records that a "did it run" flag was tried there
+   and reverted because it masks a stalled `knetd`. Still open only in the sense
+   that the handoff mechanism is unwritten; the shape is decided.
 4. ~~**Is `firewall.c`/`ids.c` on the ring-3 side?**~~ **Settled — they stay in
    ring 0.** See below; this reshaped the split, as predicted.
 
@@ -597,3 +609,103 @@ and the switch in `net.c` below line 1553. `firewall.c` and `ids.c` are *out* of
 the exposure audit, because they are not being exposed. They stay in scope for the
 separate question of whether they remain correct when their caller is no longer
 the same-privilege code that follows them.
+
+## Settled: what moves first, and what the restart policy costs
+
+Decided by the maintainer, 2026-08-17, after PR #74 landed the CPL witness and
+the scope measurement above. These answer open questions 1 and 3.
+
+### D1 — TCP stays in ring 0; ICMP/DNS/DHCP move first
+
+The deciding fact is in the code, not in the preference: `tcp_connections[]` has
+**three independent mutators**, not the two the "two writers in two rings" note
+above assumed.
+
+1. `tcp_handle_packet()` — the RX path, i.e. the code PR D moves
+2. the socket API — `tcp_connect/send/recv/close`, driven from ring 3 via
+   `SYS_TCPSOCK` since PR C2
+3. `tcp_tick()` — the timer path (`interrupts.c:111`, deferred onto `ktimerd`),
+   which **forcibly closes** connections on the SYN_SENT / SYN_RECEIVED timeout:
+   `conn->state = TCP_CLOSED; conn->in_use = false;`
+
+Mutator 3 is what makes TCP unmovable in this increment. Move the TCP parser to
+ring 3 while the timer stays in ring 0 and a connection record can be freed by a
+ring-0 timeout while a ring-3 parser holds a reference to it. That is not fixable
+with a wider lock: `TCP_LOCK()` is a kernel critical section (`critical.h`), and a
+ring-3 daemon cannot take it. The real options are to move the timer as well, or
+to build an IPC-serialised ownership model where exactly one side may mutate a
+record. Both are larger than the PR that first crosses the boundary, and both are
+much easier to get right once a daemon exists to host them.
+
+ICMP, DNS and DHCP have no equivalent hazard: request/response, no long-lived
+table that a ring-0 timer mutates behind the parser's back.
+
+**State the cost plainly: this is the smaller half of the attack surface.** TCP is
+the largest and most stateful parser in the set. D1 is the right first increment
+because it is the one that can be made correct, not because it finishes the job.
+Ring-0 L4 surface after D1 is reduced, not eliminated.
+
+**Consequence for `verify-netd-ring3.sh`, which must be handled before D1 lands.**
+The harness's post-move branch currently fails when `cpl0` is nonzero, on the
+grounds that a parser running in *both* rings is a partial move. After D1 that
+assertion is wrong: TCP frames legitimately keep parsing at CPL 0. The counters
+must therefore become **per-protocol** — the assertion is "no ICMP/DNS/DHCP frame
+parsed at CPL 0" and "no TCP frame parsed at CPL 3", not a single global pair.
+
+That change belongs in the PR *before* the move, for the same reason the witness
+itself did: an assertion rewritten in the same commit as the code it grades is not
+an independent check. Note also that the current global `cpl0`/`cpl3` pair remains
+correct and useful as a total; the per-protocol counters supplement it rather than
+replacing it, so the PR #74 baseline stays comparable.
+
+### D2 — restart policy is in scope
+
+Requested explicitly, and it is the half that makes the daemon model meaningful:
+a ring-3 parser that cannot be restarted converts every parser crash into a
+permanent loss of networking, which is *worse* than the monolithic arrangement it
+replaces. "The daemon can die" is the entire premise; a design that has no answer
+for the death has not moved the fault-tolerance needle at all.
+
+**The finding that sets the price: there is no supervision machinery in this
+kernel.** A sweep of `src/` for respawn / restart / watchdog / supervisor turns up
+nothing but unrelated matches (`supervisor` in the paging sense, a `serial.c`
+comment noting the absence of a watchdog). `task_knetd()` is:
+
+```c
+void task_knetd(void) {
+    kprintf("[KNETD] RX bottom-half task started [OK]\n");
+    while (1) { e1000_rx_softirq_run(); scheduler_yield(); }
+}
+```
+
+— an infinite loop with no exit path, so nothing has ever had to notice a
+system task dying. D2 is therefore a new subsystem, not a policy flag:
+something must observe task death and re-create the task.
+
+Questions D2 has to answer, none of which should be decided silently by whoever
+writes the code:
+
+- **What owns the restart?** A supervisor task, or the scheduler's exit path. A
+  supervisor is preferable (the scheduler should not know about networking), but
+  it is another always-running task that itself cannot be allowed to die.
+- **What happens to in-flight state?** The softirq ring is kernel-owned and
+  survives, which is an argument for keeping copy-in (open question 2) rather
+  than a shared buffer whose ownership is ambiguous across a restart.
+- **Restart storms.** A parser that crashes on a *specific* attacker-chosen frame
+  restarts, re-reads the ring, and crashes again. The restart policy needs a rate
+  limit and a give-up state, and the give-up state needs to be visible — a
+  silently dead network daemon is the failure item 1's "did it run" flag was
+  reverted for masking.
+- **Does the frame that killed the daemon get dropped?** It must be, or the
+  storm above is guaranteed. That means the ring must record a consumed-but-not-
+  completed position, which is new bookkeeping.
+- **What does the harness assert?** By the standard this document has held to
+  elsewhere: kill the daemon deliberately, prove networking recovers, and prove
+  the counter says it restarted. A negative control that removes the supervisor
+  must fail that assertion — otherwise "networking still works" passes against a
+  build where the daemon never died in the first place.
+
+Sequencing: D2's supervisor is independent of D1's parser move and can be built
+and tested against `knetd` as it exists today (a deliberately-killed `knetd` is a
+complete test case without any ring-3 code). Building it first means D1 lands into
+a kernel that already survives the death of the task it is about to make killable.
