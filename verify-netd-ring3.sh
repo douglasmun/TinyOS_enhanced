@@ -3,27 +3,27 @@
 # verify-netd-ring3.sh — FULLY AUTOMATED check of the RING the inbound parser
 # executes in, via the CPL witness added by doc/NETDAEMON_DESIGN.md item 4 PR D.
 #
-# READ THIS FIRST: WHAT THIS HARNESS PROVES TODAY
-#
-# The parser has NOT moved to ring 3 yet. This harness is deliberately landed
-# BEFORE the move, and today it asserts the PRE-MOVE BASELINE:
+# READ THIS FIRST: WHAT THIS HARNESS PROVES
 #
 #     cpl3 == 0   and   cpl0 rises by the number of frames injected
 #
-# That is not a placeholder. It is the half of the assertion that cannot be
-# written after the fact. A harness authored once the parser is already in ring
-# 3 has nothing to compare against: it can only observe the post-move state and
-# call it correct. By recording the baseline now -- against a kernel whose
-# counters are known-good and whose ring is known -- the eventual move has to
-# SWAP two numbers that are currently pinned in the opposite direction, and a
-# build that merely claims to have moved the parser cannot produce that swap.
+# ORIGINALLY a pre-move baseline, landed deliberately BEFORE a parser move so
+# the move would have to SWAP two numbers pinned in the opposite direction --
+# a build merely claiming to have moved the parser cannot produce that swap.
 #
-# When PR D's parser move lands, exactly two things change here:
-#   * EXPECT_CPL3=1 (below) flips the polarity of the two assertions
-#   * this comment block records the swap and the date
-# Nothing else in this file should need to change. If the move requires
-# rewriting the assertions, that is a signal the counters moved with the code
-# rather than measuring it.
+# THE MOVE WAS WITHDRAWN (2026-08-17), so this is now a STANDING INVARIANT.
+# Scoping D1's DNS step found that DNS, DHCP and ARP each produce a result ring
+# 0 acts on (a resolved address, the four interface globals, the ARP cache).
+# Moving those parsers relocates the parse and then hands the trust back across
+# a syscall, which is a net loss. See doc/NETDAEMON_DESIGN.md, "D1 re-scoped".
+#
+# The assertion is UNCHANGED; only what a failure means has changed. A nonzero
+# cpl3 used to mean "not yet" and now means the witness is broken or something
+# moved that should not have. There is no flag to flip and no PR coming to flip
+# it -- EXPECT_CPL3 is pinned to 0 below.
+#
+# The paragraphs below about TCP staying in ring 0 still stand, and are now the
+# general case rather than an exception.
 #
 # WITH ONE KNOWN EXCEPTION, DECIDED 2026-08-17 -- READ BEFORE FLIPPING THE FLAG
 #
@@ -108,8 +108,9 @@
 #     the realistic shape of a partial PR D, where some protocols moved and
 #     others did not. Only the cpl3 half distinguishes that from a clean state.
 #
-# Post-move the same two halves are simply read the other way round, which is
-# why flipping EXPECT_CPL3 is sufficient.
+# Both halves still matter with the move withdrawn. The second one especially:
+# "cpl0 rose" alone would pass on a build parsing in both rings, which is the
+# shape an accidental partial move would take.
 #
 # NEGATIVE CONTROL (run it; the counters are new and therefore unproven)
 #
@@ -159,8 +160,19 @@ TRACE=ring3-trace.log
 RUN_DISK=/tmp/tinyos-ring3-disk.img
 MON_SOCK=/tmp/tinyos-ring3-mon.sock
 
-# Flip to 1 in the PR that actually moves the parser to ring 3. See the header.
-EXPECT_CPL3=${TINYOS_EXPECT_CPL3:-0}
+# cpl3 == 0 is a STANDING INVARIANT, not a pre-move baseline any more.
+#
+# This was a flip: set TINYOS_EXPECT_CPL3=1 in the PR that moves the parser to
+# ring 3. That PR is not coming. D1's parser move was withdrawn after scoping --
+# DNS, DHCP and ARP all produce results ring 0 acts on, so moving them relocates
+# the parse and hands the trust straight back across a syscall. See
+# doc/NETDAEMON_DESIGN.md, "D1 re-scoped".
+#
+# The consequence for this harness is a polarity change, not a rewrite: a nonzero
+# cpl3 used to mean "not yet", and now means "something is wrong". Kept as a
+# variable rather than inlined so the assertion below reads the same way, but
+# nothing sets it and nothing should.
+EXPECT_CPL3=0
 
 # Exceeds E1000_RX_PACKET_BUDGET (16) so the run crosses into the post-budget
 # drain loop as well as the primary loop.
@@ -364,9 +376,9 @@ if [ "$EXPECT_CPL3" -eq 0 ]; then
                 "cpl3 means the WITNESS is wrong, not that the parser moved." \
                 "Most likely net_current_cpl() no longer reads %cs correctly," \
                 "or the counters were transposed at the increment site." \
-                "If the parser genuinely did move, set TINYOS_EXPECT_CPL3=1 and" \
-                "update the header block -- do not silence this by editing the" \
-                "assertion."
+                "No parser is scheduled to move, so there is no legitimate way" \
+                "for this to be nonzero -- see doc/NETDAEMON_DESIGN.md, 'D1" \
+                "re-scoped'. Do not silence this by editing the assertion."
         fi
     done <<< "$CPL3_LIST"
 
@@ -418,11 +430,12 @@ if [ "$EXPECT_CPL3" -eq 0 ]; then
             "output, so the ISO is stale relative to the source tree."
     fi
 
-    echo "RESULT: PASS — pre-move baseline recorded"
+    echo "RESULT: PASS — ring invariant holds"
     echo "  Parser runs at CPL 0 ($DELTA0 frames), never at CPL 3 across $READINGS readings."
-    echo "  This is the baseline PR D's parser move must invert. Run NC1 (hollow"
-    echo "  net_current_cpl to 'return 3;') and NC2 (delete the increment block) to"
-    echo "  confirm both halves of this assertion can actually fail."
+    echo "  The parser move was withdrawn (doc/NETDAEMON_DESIGN.md, 'D1 re-scoped'),"
+    echo "  so this is a standing invariant, not a baseline awaiting inversion."
+    echo "  Run NC1 (hollow net_current_cpl to 'return 3;') and NC2 (delete the"
+    echo "  increment block) to confirm both halves can actually fail."
     exit 0
 else
     # ---------------- POST-MOVE (after PR D's parser move) ----------------

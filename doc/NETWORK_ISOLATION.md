@@ -328,6 +328,16 @@ inference step short of a demonstrated `#PF`, and is labelled as such in the har
 
 ### 4. Ring-3 network daemon (the reachable ProxyVM analogue)
 
+> **WITHDRAWN 2026-08-17 for the protocols named below.** Scoping the first
+> actual move (DNS) found the criterion this item never applied: *does ring 0
+> consume a result the parser produces, and act on it?* DNS, DHCP and ARP all
+> do, so moving them relocates the parse and hands the trust back across a
+> syscall. TCP was already excluded on a hardware constraint. ICMP's inbound
+> half is the only remaining candidate. The prerequisite work (items 1–3, and
+> PRs #76–#80) is unaffected and still correct. Full reasoning:
+> `doc/NETDAEMON_DESIGN.md`, "D1 re-scoped". The rest of this section is kept as
+> written, because the reasoning that made it look right is worth preserving.
+
 **Why last:** it is the architecturally correct destination and the largest risk.
 
 Keep e1000 MMIO and DMA in ring 0 — they need physical addresses and port access —

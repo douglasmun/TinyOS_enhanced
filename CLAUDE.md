@@ -112,19 +112,30 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   also witnesses the ring from `%cs` (`RX ring: N cpl0, M cpl3`), read from the hardware
   and **never from a software flag** — a flag records what the code believes about
   itself, and the point of the counter is to catch a build whose belief is wrong.
-  `cpl3` must read **0** until the PR D parser move lands; that pinned zero is the
-  pre-move baseline the move has to invert, which is why the witness was built before
-  the move rather than after. The global pair stops being sufficient at D1, because TCP
-  stays ring 0 while ICMP/DNS/DHCP move — a mixed `cpl0`/`cpl3` reading is then correct
-  and says nothing about *which* protocol went where. So `handle_ip()`'s L4 switch also
-  witnesses per protocol (`RX proto-ring: icmp c/c, udp c/c, tcp c/c`), counted **before**
-  any early return. **TCP's polarity is the opposite of the other two**: after D1
-  `tcp_cpl3` must stay **0** while `icmp_cpl3`/`udp_cpl3` must be nonzero — copying an
-  assertion across arms inverts it. DNS and DHCP are not separable here: both ride UDP,
-  and the witness sits at the dispatch switch, so splitting them means instrumenting the
-  port demux in `handle_udp()` — a different seam, classifying by destination port rather
-  than by which ring executed the switch. Harness: `verify-netd-ring3.sh` (flip with
-  `TINYOS_EXPECT_CPL3=1`); rationale in `doc/NETDAEMON_DESIGN.md`.
+  `cpl3` must read **0** — and that is now a **standing invariant, not a baseline
+  awaiting inversion**. The parser move was withdrawn 2026-08-17 (see below), so there
+  is no flag to flip: nonzero `cpl3` on any protocol means the witness is broken or
+  something moved that must not have. `handle_ip()`'s L4 switch also witnesses per
+  protocol (`RX proto-ring: icmp c/c, udp c/c, tcp c/c`), counted **before** any early
+  return, which stays useful for exactly that reason. DNS and DHCP are not separable
+  here: both ride UDP, and the witness sits at the dispatch switch, so splitting them
+  means instrumenting the port demux in `handle_udp()` — a different seam. Harness:
+  `verify-netd-ring3.sh`; rationale in `doc/NETDAEMON_DESIGN.md`.
+- **The ring-3 parser move (D1) is WITHDRAWN — don't restart it without reading
+  "D1 re-scoped" in `doc/NETDAEMON_DESIGN.md`.** The plan asked "can this protocol
+  move?" (privileged instructions, TX path, stack budget) and never asked **"what does
+  moving buy?"** The criterion that decides it: *does ring 0 consume a result this
+  parser produces, and act on it?* DNS (`last_resolved_ip` → `curl`/`dig`), DHCP (all
+  four interface globals → routing, ARP, **TCP ISN generation**) and ARP (`arp_cache` →
+  every TX's destination MAC) all do, so moving them relocates the parse and hands the
+  trust straight back through a syscall a compromised daemon can call at will. Kernel
+  re-validation doesn't rescue DNS: question-name validation walks **compressed labels**
+  and the A-record search walks the answer RRs, so validating honestly means ring 0
+  re-executes essentially the whole parser — ring 3 would do a `memcpy`. ICMP's inbound
+  half is the one honest candidate (it writes only counters); its blocker is the
+  *reply* path, not a trusted result. Four PRs of prerequisites (#76–#80) survived
+  because none of them depended on the answer — they are all still correct and worth
+  keeping.
 - **Four traps around kernel task lifetime**, each of which reads as healthy when
   wrong. `task_create_kernel()` allocates but does **not** enqueue — every caller needs
   `scheduler_add_task()`, or the task is created, listed by `ps`, counted by every
