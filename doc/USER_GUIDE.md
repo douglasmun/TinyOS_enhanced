@@ -142,7 +142,14 @@ $ dhcp
   DNS Server:   10.0.2.3
 $ curl http://google.com
 ... HTTP/1.0 301 Moved Permanently ...
+$ curl 172.66.147.243
+... HTTP/1.1 403 Forbidden ...
 ```
+
+`curl` accepts a literal IPv4 address as well as a name. That path skips DNS
+entirely, which makes it the way to test TCP when name resolution is unavailable
+or deliberately diverted. Previously a dotted-quad was sent to the resolver as if
+it were a hostname and failed with `DNS resolution failed`.
 
 The address is in QEMU's internal **user-mode (NAT) subnet `10.0.2.x`** — this is
 normal and gives full *outbound* networking (DNS, TCP, HTTP). The guest is behind

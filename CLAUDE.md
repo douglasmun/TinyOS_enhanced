@@ -79,6 +79,19 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   stalled `knetd`); and ring overflow is **drop-newest**, counted, because drop-oldest
   lets a fast sender evict frames already accepted. `ifconfig`'s `irq-ctx` count must
   read **0**. Harness: `verify-rx-thread-context.sh`.
+- **`rx_softirq_ring` is single-consumer, and `knetd` is that consumer.** `SYS_NETRX`
+  (`e1000_rx_dequeue`) must pop **`netd_ring`**, never `rx_softirq_ring` — pointing it
+  back at the latter restores a race where each frame goes to whichever consumer reaches
+  the tail first, so a live ring-3 netd steals TCP segments from the kernel parser at
+  random (intermittent, load-dependent, presents as "networking is flaky"). PR B was safe
+  only because `netprobe` runs on demand and never overlaps `knetd`. `knetd` now
+  classifies: ICMP/UDP to `netd_ring`, everything else parsed in place — one `if`/`else`,
+  so no frame is delivered twice or dropped between paths. TCP is **never** routed
+  (`TCP_LOCK` is `cli`; ring 3 has IOPL=0). Routing is gated on `netd_claimed`, inert
+  until claimed and reversible on release — the supervisor needs the release, or a dead
+  netd takes ICMP/UDP down permanently. **The `e1000_rx_dequeue` guard in the harness is
+  load-bearing: no leg drives the syscall side, so nothing else catches that edit.**
+  Harness: `verify-netd-arbitration.sh` (needs `-DTINYOS_FAULT_INJECT` for `netdclaim`).
 - **`irq-ctx` and `cpl3` are different questions — don't let one stand in for the
   other.** `knetd` runs with `IF=1` *and* at CPL 0, so a kernel where nothing has moved
   to ring 3 still reports a perfectly healthy `RX parsed: N thread-ctx, 0 irq-ctx`.

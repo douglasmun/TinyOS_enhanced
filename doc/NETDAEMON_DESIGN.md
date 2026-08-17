@@ -619,6 +619,12 @@ the scope measurement above. These answer open questions 1 and 3.
 
 ### D1 — TCP stays in ring 0; ICMP/DNS/DHCP move first
 
+> **Sequencing note added later.** This section settles *which set* moves, and
+> that is unchanged. It does not settle the order within the set, and D1 turned
+> out not to be one PR: see "PR D1a — ring arbitration" and "D1b — the audit that
+> changed which protocol moves first" at the end of this document. Short version:
+> a ring-arbitration fix has to land first, and DNS moves before ICMP, not after.
+
 The deciding fact is in the code, not in the preference: `tcp_connections[]` has
 **three independent mutators**, not the two the "two writers in two rings" note
 above assumed.
@@ -1044,3 +1050,158 @@ Worth noting for whoever writes it: the object must be *declared* in a way that
 guarantees 4-byte alignment for this to hold — `uint8_t dns_server_ip[4]` at
 `dns.c:25` carries no alignment guarantee of its own, so the commit needs to
 change the declaration, not only the accesses.
+
+## PR D1a — ring arbitration, before any parser moves
+
+D1 was scoped as one PR ("move the parsers, flip the harness flag"). Reading the
+code first turned up four problems with that shape, and the first one is a
+correctness bug that would have shipped inside the parser move where it would
+have been very hard to see.
+
+### The two-consumer race
+
+`rx_softirq_ring` is single-consumer by construction. Two functions pop its tail:
+
+- `e1000_rx_softirq_run()` — knetd, ring 0, calls `handle_packet()`
+- `e1000_rx_dequeue()` — the `SYS_NETRX` half, added in PR B
+
+PR B was safe only by accident of scheduling: `netprobe.elf` runs on demand, and
+knetd is never draining at the same instant. A real ring-3 netd polling
+`SYS_NETRX` in a loop changes that completely. Both consumers advance
+`rx_softirq_tail`, so **each frame is delivered to exactly one of them, chosen by
+whoever gets there first** — meaning TCP segments would be handed to the daemon
+that does not parse TCP and silently dropped, at a rate that varies with load.
+
+That is the worst failure shape available: intermittent, load-dependent, and it
+presents as "networking is flaky" rather than as anything pointing at the ring.
+
+### The fix keeps one consumer per ring
+
+knetd stays the sole consumer of `rx_softirq_ring` and gains a classify step.
+Frames whose L4 protocol is in the moving set (ICMP, UDP) are copied to a second
+ring, `netd_ring`, which only `SYS_NETRX` pops. Everything else — TCP, ARP,
+non-IPv4, malformed — it parses itself exactly as before.
+
+```
+ISR ──> rx_softirq_ring ──> knetd (sole consumer)
+                              │
+                    ┌─────────┴─────────┐
+              TCP / ARP            ICMP / UDP
+           parse in ring 0    ──> netd_ring ──> SYS_NETRX ──> netd (ring 3)
+```
+
+Route or parse, never both and never neither: it is one `if`/`else`, so no frame
+can be delivered twice and none can be dropped between the two paths.
+
+**Why classify in ring 0 rather than let netd filter.** The kernel must parse
+Ethernet and IP headers regardless, because TCP stays in ring 0 permanently
+(finding 2 — `TCP_LOCK` is `cli`, ring 3 has IOPL=0). Given that, classification
+adds no new parsing surface; it reads the two headers the kernel already reads.
+The alternative — netd receives everything and hands TCP back through another
+syscall — makes ring-0 TCP depend on a killable ring-3 task, so every supervisor
+restart window becomes a TCP outage. That trades a bounded ICMP/UDP outage for an
+unbounded TCP one, in the name of a surface reduction the kernel does not get
+anyway.
+
+### The switch is inert until claimed, and reversible
+
+`netd_claimed` gates the whole thing. While false, knetd parses everything and
+the kernel behaves identically to the pre-D1a build — which is what makes this
+PR safe to land before any parser has moved. Deregistration discards whatever is
+queued: those frames predate the new daemon, and handing a restarted netd traffic
+from before the crash is both wrong and a small leak across the restart boundary.
+
+Reversibility is a supervisor requirement, not a nicety. A netd that dies must
+hand its protocols back, or its death takes ICMP and UDP down permanently — which
+is precisely the failure D2 exists to prevent.
+
+### Harness — `verify-netd-arbitration.sh`
+
+Every leg pins one counter while another moves, because "ping still replies"
+passes against a build where the claim never takes effect, and a routing switch
+that silently does nothing looks exactly like a healthy kernel.
+
+| Leg | Claim | Assertion |
+|---|---|---|
+| 1 | off | `routed` pinned at 0 while `icmp_cpl0` **rises** |
+| 2 | on | `routed` **rises** while `icmp_cpl0` is **pinned** |
+| 3 | on | `tcp_cpl0` **rises** — TCP is never routed (no-movement scores FAIL, not pass: `>=` is satisfied by `0 >= 0`) |
+| 4 | off | `routed` pinned again after release |
+
+Legs 1 and 2 are each other's negative control: same traffic, opposite routing
+outcome, and the only difference is the claim. Leg 1c exists because leg 1b
+("routed == 0") passes vacuously on a kernel receiving no traffic at all.
+
+The `netdclaim` lever is `-DTINYOS_FAULT_INJECT`-gated, like `killknetd`, because
+claiming with no daemon running deliberately breaks ICMP/UDP — nothing drains the
+ring. That is the observation leg 2 is built on, and it is not something a
+production path should be able to do.
+
+**Leg 3's driver cannot use DNS, and this follows from the paragraph above.**
+Under the claim, UDP is routed to `netd_ring` with nothing draining it, so a
+guest-side name lookup never completes: `curl example.com` inside the claimed
+window resolves nothing, sends no SYN, and leaves `tcp_cpl0` at 0 — which scores
+FAIL, correctly, but for a reason that has nothing to do with routing TCP. The
+same command in an unclaimed probe boot gives `tcp 5/0`, which is what makes the
+cause unambiguous. The harness therefore resolves its target **on the host** and
+types a raw IP into the guest. Two tempting alternatives are both wrong: the NAT
+gateway (`10.0.2.2`, with or without a port) never answers — measured `tcp 0/0`,
+it drops the SYN without an RST — and a hardcoded literal rots when the CDN
+address behind the name changes.
+
+**One guard carries more weight than any leg**: `e1000_rx_dequeue` must read
+`netd_ring_tail`. If it is ever pointed back at `rx_softirq_ring` the race
+returns, and **no leg here would catch it** — every leg drives the knetd side,
+not the syscall side. The guard is the only thing standing between that edit and
+a silent regression.
+
+## D1b — the audit that changed which protocol moves first
+
+The plan was ICMP first, on the grounds that it is stateless request/response.
+A dependency audit of all three moving handlers says otherwise.
+
+| | `handle_dns_response` | `handle_icmp_with_context` | `handle_dhcp` |
+|---|---|---|---|
+| Needs a TX syscall | **No** | Yes (raw frame) | Yes (raw frame + ARP) |
+| Direct `cli` | No | No | No |
+| **Indirect `cli`** | **None** | **2** (timer, e1000) | **4** (timer, CSPRNG, ARP, e1000) |
+| Writes ring-0 iface config | No | No | **Yes — all four** |
+| `kprintf` sites | 19 (+7 in a callee) | 1 | 20 (+5 in callees) |
+| Largest stack local | 254 B | **1514 B** | 1024 B (in a callee) |
+
+**ICMP is not the easy one.** `handle_icmp_with_context` reaches `cli` twice on
+the reply path — `get_timer_ticks()` (`icmp.c:241`, the rate limiter) and
+`e1000_send()` (`icmp.c:334`) — so *every inbound ping* would #GP at ring 3. It
+also carries a 1514-byte frame buffer, which sets the floor for the ring-3 stack.
+
+**DNS is the clean first mover.** `handle_dns_response` reaches no TX path at
+all: it parses and stores, and the query side (`send_dns_query`) is not on the
+response path. After PR #78 it has no `cli` reach, direct or indirect. Its
+largest local is 254 bytes. Its only ring-3 obstacle is `kprintf`, which is
+shared by all three and has to be solved once regardless.
+
+**DHCP is the hard one, and it is worse than "more of the same."** Its CSPRNG
+dependency (`dhcp.c:542` → `crypto.c:576`) is structural — that critical section
+protects a multi-block mutable keystream and cannot be made lock-free the way
+`dns_server` was. More seriously, `handle_dhcp` writes **all four** interface
+globals (`my_ip`, `subnet_mask`, `gateway_ip` via `set_network_config`, plus
+`dns_server`), and ring-0 code reads every one of them: routing decisions
+(`net.c:204`), ARP frame construction, TCP source-IP selection (`tcp.c:634`) and
+**TCP ISN generation** (`tcp.c:1216`). Moving DHCP to ring 3 makes an untrusted
+daemon the writer of state that ring-0 TCP depends on for its initial sequence
+numbers. Those writes must become a **validating syscall**, not a shared page —
+and that is a security design problem, not a code move.
+
+### Revised sequencing
+
+- **D1a** — ring arbitration (this PR). Nothing moves ring.
+- **D1b** — DNS to ring 3. Needs the `kprintf` answer and a ring-3 netd skeleton;
+  needs no TX syscall and no new locking.
+- **D1c** — ICMP. Needs a raw-frame TX syscall and a timer-read syscall.
+- **D1d** — DHCP. Needs D1c's TX plus a validating ifconfig syscall; the CSPRNG
+  call has to move to the kernel side of that boundary.
+
+The `TINYOS_EXPECT_CPL3=1` flag in `verify-netd-ring3.sh` cannot be a single
+global switch across this sequence. After D1b, `udp_cpl3` is nonzero while
+`icmp_cpl3` is still 0 and `tcp_cpl3` must stay 0 forever. The expectation is
+per protocol, and it changes at each step.

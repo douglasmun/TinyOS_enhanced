@@ -240,8 +240,28 @@ void e1000_send(void* data, size_t len);
 
 /* The SYS_NETRX/SYS_NETTX packet-path boundary (doc/NETDAEMON_DESIGN.md PR B).
  * e1000_rx_dequeue returns bytes copied, 0 if empty, -1 if the frame did not
- * fit (and was consumed). */
+ * fit (and was consumed).
+ *
+ * Since D1a this reads the netd ring, NOT rx_softirq_ring — see the comment on
+ * the definition. knetd is the sole consumer of rx_softirq_ring and routes the
+ * moving protocols here by classification. */
 int e1000_rx_dequeue(uint8_t* out, uint16_t out_len);
+
+/* netd routing switch (doc/NETDAEMON_DESIGN.md PR D1a).
+ *
+ * While unclaimed, knetd parses every frame exactly as it did before D1a, so
+ * the routing path is inert until a daemon opts in. Deregistration DISCARDS
+ * whatever is queued: those frames predate the new daemon, and handing a
+ * restarted netd traffic from before the crash is both wrong and a small leak
+ * across the restart boundary. */
+void net_netd_set_claimed(bool claimed);
+bool net_netd_is_claimed(void);
+
+/* routed = frames handed to netd; dropped = frames discarded because the netd
+ * ring was full. A rising `dropped` with a live netd means the daemon is not
+ * keeping up; with a dead one it is the expected reading. Counted, never
+ * printed — a remote host drives this path. */
+void net_get_netd_stats(uint32_t* routed, uint32_t* dropped, bool* claimed);
 void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames);
 void net_count_tcp_no_connection(void);
 uint32_t net_get_tcp_no_connection(void);

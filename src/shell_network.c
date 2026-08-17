@@ -206,6 +206,22 @@ void cmd_ifconfig(void) {
     net_get_syscall_stats(&netd_rx, &netd_tx);
     kprintf("  netd sysc:    %u rx-frames, %u tx-frames\n", netd_rx, netd_tx);
 
+    /* netd routing (doc/NETDAEMON_DESIGN.md PR D1a). `claimed=no` means knetd
+     * is parsing everything, which is the stock boot reading and identical to
+     * pre-D1a behaviour. `routed` counts frames knetd classified as belonging
+     * to the ring-3 daemon and put on the netd ring; `dropped` counts those the
+     * ring could not hold.
+     *
+     * The pairing that matters to verify-netd-arbitration.sh: with claimed=no,
+     * `routed` must stay pinned at 0 while RX parsing rises. Those are the same
+     * frames counted on two mutually exclusive paths, so a build where routing
+     * fires without a claim shows up as both counters moving together. */
+    uint32_t netd_routed = 0, netd_dropped = 0;
+    bool netd_claimed_now = false;
+    net_get_netd_stats(&netd_routed, &netd_dropped, &netd_claimed_now);
+    kprintf("  netd route:   claimed=%s, %u routed, %u dropped\n",
+            netd_claimed_now ? "yes" : "no", netd_routed, netd_dropped);
+
     /* Segments for no known connection: port scans, stray retransmissions,
      * backscatter. This replaced a per-inbound-SYN kprintf when the passive-open
      * path was removed — a remote host chose how often that one fired. */
@@ -729,14 +745,25 @@ void cmd_curl(int argc, char* argv[]) {
 
     kprintf("Fetching %s%s...\n", hostname, path);
 
-    /* Resolve hostname */
+    /*
+     * A dotted-quad is used as-is. Without this, `curl 10.0.2.2` sends a DNS
+     * query for the literal string "10.0.2.2" and returns at "DNS resolution
+     * failed" before tcp_socket() is ever reached -- so curl could not reach a
+     * host by address at all, and no TCP-driving test could run without working
+     * DNS. `ping` has always accepted an address here (parse_ip, icmp.c).
+     */
     uint8_t server_ip[4];
-    send_dns_query(hostname);
-
-    uint32_t start = tcp_get_time_ms();
     bool resolved = false;
 
-    while ((tcp_get_time_ms() - start) < 5000) {
+    if (parse_ip(hostname, server_ip) == 1) {
+        resolved = true;
+    } else {
+        send_dns_query(hostname);
+    }
+
+    uint32_t start = tcp_get_time_ms();
+
+    while (!resolved && (tcp_get_time_ms() - start) < 5000) {
         if (dns_is_resolved()) {
             if (dns_get_resolved_ip(server_ip)) {
                 kprintf("Resolved to %d.%d.%d.%d\n",

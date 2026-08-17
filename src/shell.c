@@ -8,6 +8,7 @@
 #include "util.h"
 #include "env.h"
 #include "test_tasks.h"   /* knetd_die_now, under TINYOS_FAULT_INJECT */
+#include "net.h"          /* net_netd_set_claimed, under TINYOS_FAULT_INJECT */
 #include "shell_fileops.h"
 #include "shell_search.h"
 #include "shell_monitor.h"
@@ -900,6 +901,24 @@ static void parse_and_execute(char* cmd_line) {
         } else {
             knetd_die_now = 1;
             kprintf("[FAULT] knetd death requested\n");
+        }
+    }
+    /* verify-netd-arbitration.sh only, and gated for the same reason killknetd
+     * is: it exists to drive a state no production path reaches yet.
+     *
+     * Claiming with no ring-3 daemon running is exactly the interesting case
+     * for D1a -- it proves frames stop being parsed in ring 0 and start
+     * accumulating on the netd ring, which is the routing switch working. It
+     * also, deliberately, breaks ICMP/UDP while claimed: nothing is draining
+     * the ring. That is the correct behaviour to observe now, and it is why
+     * this is a fault-injection lever rather than a user-facing command. */
+    else if (strcmp(argv[0], "netdclaim") == 0) {
+        if (argc > 1 && strcmp(argv[1], "off") == 0) {
+            net_netd_set_claimed(false);
+            kprintf("[FAULT] netd claim released\n");
+        } else {
+            net_netd_set_claimed(true);
+            kprintf("[FAULT] netd claim taken\n");
         }
     }
 #endif
