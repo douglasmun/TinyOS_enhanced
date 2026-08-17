@@ -919,3 +919,128 @@ state whose follow-up write never happened). The lock guarantees no torn read;
 it guarantees nothing about a multi-step update abandoned midway. That is the
 open D1 item, and it is answerable by auditing `tcp_handle_packet`'s multi-step
 state transitions for a safe abort point — not by a new mechanism.
+
+**That audit has since been run; the section below supersedes this paragraph.**
+The window it hypothesises does not exist, and the audit found something more
+important on the way to establishing that.
+
+## The `tcp_connections[]` audit — and why D1's split is forced, not chosen
+
+Run 2026-08-17, as the last item gating D1. The question posed was whether a
+ring-3 parser dying between two `TCP_LOCK()` sections could leave
+`tcp_connections[]` structurally valid but semantically half-updated. **The
+answer is no, and the reason turns out to matter more than the answer.**
+
+### Finding 1 — there is no multi-step window to abandon
+
+`tcp_handle_packet()` (`tcp.c:1555–1579`) takes `TCP_LOCK()` once and releases it
+once, with the entire state machine in between: `tcp_find_connection()` and the
+whole of `tcp_process_segment()` execute inside that single critical section.
+`tcp_process_segment` contains no `TCP_LOCK`, no `TCP_UNLOCK`, and no
+`scheduler_yield` on any path — every early return inside it returns with the
+lock still held by the caller, which then unlocks on the single exit.
+
+`TCP_LOCK()` is `CRITICAL_SECTION_ENTER()`, i.e. `cli` (`tcp.c:126`). A task
+holding it has interrupts disabled and therefore **cannot be preempted, cannot be
+descheduled, and cannot be killed** partway through. The half-updated table this
+audit went looking for is not reachable. No safe-abort-point work is needed, and
+no new mechanism.
+
+### Finding 2 — the same fact makes a ring-3 TCP parser impossible
+
+The header comment at `tcp.c:50` lists among the lock's advantages that it "works
+in any context (interrupt, kernel, **future user-mode**)." That is false, and it
+is the one load-bearing false assumption in this area:
+
+- `cli` and `sti` are privileged. They execute at CPL ≤ IOPL.
+- User tasks are created with `eflags = 0x0202` — **IOPL=0** (`process.c:1391`).
+- So `TCP_LOCK()` executed from ring 3 raises **#GP**, immediately.
+
+A ring-3 TCP parser cannot take the only lock protecting the table it parses
+into. It could not be given one either: the whole point of `cli` here is to
+exclude the *other* two writers, and ring 3 cannot be trusted with an instruction
+that disables preemption globally — that is a denial-of-service primitive handed
+to the component most likely to be compromised.
+
+**This is an independent derivation of the D1 split.** PR #75 settled "TCP stays
+ring 0" from the `tcp_tick()` UAF argument — a ring-0 timer freeing a record
+under a ring-3 parser. The lock reaches the same conclusion by a different route,
+and more strongly: even with the UAF solved, TCP could not move, because its
+mutual exclusion is built from an instruction ring 3 may not execute. Two
+independent arguments for the same boundary is a good sign the boundary is real.
+
+It also explains why the per-protocol CPL witness has TCP's polarity inverted
+(`tcp_cpl3` must stay 0 while `icmp_cpl3`/`udp_cpl3` go nonzero). That is not a
+staging decision to be revisited later; it is a hardware constraint. A future
+build reporting a nonzero `tcp_cpl3` is not "further along" — it is a build where
+TCP is #GP-faulting on every segment, and the counter is the thing that would
+catch it.
+
+### What this means for the moving set
+
+ICMP, DNS and DHCP are unaffected by finding 2, because none of them takes
+`TCP_LOCK`. Confirming this is a prerequisite of the move rather than an
+assumption, and it is the natural first commit of D1 proper: sweep the moving
+parsers for every `CRITICAL_SECTION_ENTER` / `cli` / `sti` / `TCP_LOCK` reach,
+directly or through a callee. Any hit is a site that must become a syscall before
+that protocol can move, on exactly the reasoning above.
+
+### D1 is therefore unblocked
+
+Every prerequisite this document recorded is now closed:
+
+| Gate | Status |
+|---|---|
+| Give-up branch harness | Closed — PR #77, `verify-supervisor.sh` step 5 |
+| Per-protocol CPL counters | Closed — PR #77 |
+| Open question 2 (copy-in) | Closed — copy-in, forced by RDT/UAF |
+| Killing-frame bookkeeping | Closed — already drop-on-dequeue; the old claim was inverted |
+| `tcp_connections[]` | Closed — this audit; no window exists, and TCP cannot move regardless |
+
+The remaining work is the move itself, and its first step is the privileged-
+instruction sweep above — not because it is expected to find much, but because
+finding 2 is precisely the kind of thing that is invisible until something
+#GP-faults at ring 3, and the sweep is how it is caught before the move rather
+than during it.
+
+### The sweep, run — and what it found in `dns.c`
+
+Run immediately rather than deferred to D1, because it is three greps and its
+result changes D1's first commit. Sweeping the moving set (`icmp.c`, `dns.c`,
+`dhcp.c`) for `CRITICAL_SECTION_ENTER`/`EXIT`, `TCP_LOCK`, `E1000_LOCK` and raw
+`cli`/`sti`:
+
+- **`icmp.c` — clean.** No privileged instruction, directly or via a callee.
+- **`dhcp.c` — clean.**
+- **`dns.c` — three hits**, all guarding the same 4-byte object,
+  `dns_server_ip[4]` (`dns.c:25`):
+
+| Site | Function | On the moving RX path? |
+|---|---|---|
+| `dns.c:73` | `set_dns_server()` | No — DHCP-side writer |
+| `dns.c:441` | `handle_dns_response()` | **YES** |
+| `dns.c:678` | DNS query send path | No — outbound, task context |
+
+`dns.c:441` is the one that matters: it is inside `handle_dns_response()`, on the
+inbound path that D1 moves. As written, a ring-3 DNS parser would **#GP on the
+first DNS response it handled** — exactly the failure mode finding 2 predicts,
+and exactly the reason to sweep before the move rather than debug it after.
+
+All three protect against the same thing: `dns_server_ip` is written by DHCP and
+read by DNS, and a 4-byte `memcpy` is not atomic, so a torn read yields a query
+sent to a spliced address (the comment at `dns.c:665` works the attack through).
+The protection is real and must not simply be deleted when the code moves.
+
+The fix is not to hand ring 3 a lock. `dns_server_ip` is 4 bytes — one aligned
+32-bit load or store on i386 is atomic with respect to interrupts by hardware,
+with no `cli` required. Replacing the `memcpy`-under-`cli` pattern with a single
+aligned `uint32_t` read/write removes all three critical sections and keeps the
+tear-free property, at ring 3 and ring 0 alike. That is a small, self-contained,
+independently verifiable change and it is **D1's first commit**: it can land and
+be proven before any parser changes ring, and the existing DNS path exercises it
+immediately.
+
+Worth noting for whoever writes it: the object must be *declared* in a way that
+guarantees 4-byte alignment for this to hold — `uint8_t dns_server_ip[4]` at
+`dns.c:25` carries no alignment guarantee of its own, so the commit needs to
+change the declaration, not only the accesses.

@@ -47,7 +47,15 @@
  * Advantages:
  * 1. Simple implementation - no complex spinlock logic
  * 2. Guaranteed atomic access - no race conditions possible
- * 3. Works in any context (interrupt, kernel, future user-mode)
+ * 3. Works in any kernel context (interrupt or task)
+ *    NOT user-mode: cli/sti execute only at CPL <= IOPL, and user tasks get
+ *    IOPL=0 (process.c, eflags = 0x0202), so TCP_LOCK() from ring 3 is a #GP.
+ *    This is why the ring-3 parser move (doc/NETDAEMON_DESIGN.md, PR D1) leaves
+ *    TCP in ring 0 and moves only ICMP/DNS/DHCP -- independently of the
+ *    tcp_tick() UAF argument that first forced that split. Do not "fix" this by
+ *    exposing the lock to ring 3: an instruction that disables preemption
+ *    globally is a DoS primitive in the hands of the component most likely to
+ *    be compromised.
  * 4. Zero overhead for lock acquisition (single instruction)
  *
  * Disadvantages:
