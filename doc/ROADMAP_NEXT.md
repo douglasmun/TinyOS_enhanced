@@ -26,7 +26,7 @@ backgrounded child is still alive when the next shell command runs; with
 `hello.elf` an empty `jobs` would be indistinguishable from a broken
 implementation).
 
-## 2. SYS_SPAWN + pipes
+## 2. SYS_SPAWN + pipes — DONE
 `spawn(path, argv)` syscall so processes can start processes — makes the
 userspace libc more than a demo. Then a pipe object over the existing
 wait-queue machinery gives shell pipelines (`cat file | grep x`).
@@ -134,7 +134,31 @@ Known, low-severity, from the PR #1 audit (see memory `exec-failure-path-leaks`)
   `edr_behavioral_check()` and the per-uid task cap already own those and
   enforce rather than observe. Harness: `verify-ids-spray.sh`.
 
+## Networking / network isolation — CLOSED, and not on this roadmap's terms
+This roadmap predates the network-isolation work entirely, so nothing below was
+ever one of its items. Recorded here only so the roadmap is not read as the
+complete picture of what is outstanding.
+
+The plan lived in `doc/NETWORK_ISOLATION.md` and `doc/NETDAEMON_DESIGN.md`. Its
+prerequisites all landed and are independently correct: RX parsing moved to task
+context on `knetd`, netd arbitration, the CPL witness, `knetd` supervision, and
+per-packet print removal across the RX path, `icmp.c` and `dns.c`.
+
+**Its destination — item 4 there, moving the protocol parsers to ring 3 — was
+withdrawn on 2026-08-17 (PRs #81, #82).** Do not restart it without reading
+"D1 re-scoped" in `doc/NETDAEMON_DESIGN.md`. In short: DNS, DHCP and ARP each
+produce a result ring 0 consumes and acts on, so moving them relocates the parse
+and hands the trust straight back through a syscall the untrusted side can call
+at will; and ICMP, which passes that test, fails a second one — a responder must
+reply, so it needs `SYS_NETTX`, and `e1000_send()` does no source validation, so
+that is unrestricted frame forgery in exchange for ~60 lines of echo parse.
+
+One consequence worth not undoing: `cpl3 == 0` in `verify-netd-ring3.sh` is now a
+**standing invariant**, not a baseline awaiting inversion. Nonzero on any
+protocol means the witness is broken or something moved that must not have.
+
 ## Recommendation
 1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
 dependencies (spawn, waitpid, file syscalls) are now all in place. AUDIT-8E is
-closed on both halves and was independent of that work.
+closed on both halves and was independent of that work. Networking is closed too
+(see above), and likewise never gated item 4.
