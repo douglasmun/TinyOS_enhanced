@@ -548,11 +548,13 @@ writes the code without saying so.
    that cannot exit. So this is new subsystem work — a supervisor that can observe
    a task's death and re-create it — rather than a policy flag on an existing
    mechanism.
-2. **Shared buffer ownership.** Item 1 established that a deferred parser **must
-   copy** the frame before RDT advances, because the NIC refills the descriptor
-   and a retained pointer is an attacker-timed UAF. A ring-3 shared buffer has the
-   same hazard with a second reader. Copy-in remains the default; zero-copy needs
-   a real argument.
+2. ~~**Shared buffer ownership.**~~ **RESOLVED 2026-08-17 — copy-in.** Item 1
+   established that a deferred parser **must copy** the frame before RDT advances,
+   because the NIC refills the descriptor and a retained pointer is an
+   attacker-timed UAF. A ring-3 shared buffer has the same hazard with a second
+   reader. No argument for zero-copy was ever produced, and the copy is forced by
+   hardware rather than chosen. See "Open question 2, resolved" at the end of this
+   document.
 3. **Does DHCP move?** It writes the config globals at boot, before a ring-3
    daemon plausibly exists. Item 1 already hit this: `kernel.c`'s boot DHCP loop
    needs its explicit `e1000_rx_softirq_run()` drain because `knetd` does not
@@ -727,17 +729,18 @@ Three of the five questions above are answered:
   RX counter *rises* across the kill. "Networking still works" was rejected
   exactly as this document warned: it passes when the kill silently failed.
 
-Two are **not** answered, and both are D1 prerequisites rather than D2 omissions:
+Two were **not** answered at D2 time. Both have since been resolved by reading
+the code — neither needed new machinery:
 
-- **What happens to in-flight state** — untouched, because it cannot be settled
-  before open question 2 (copy-in vs shared buffer). The softirq ring is
-  kernel-owned and survives a `knetd` restart today, which is itself an argument
-  for copy-in.
-- **Does the killing frame get dropped** — no consumed-but-not-completed
-  bookkeeping exists. It has no consequence yet: nothing can currently crash the
-  parser, so no frame has ever killed the daemon. It acquires teeth the moment
-  D1 lands, and without it the rate limiter is the *only* thing standing between
-  an attacker-chosen frame and an unbounded restart loop.
+- **What happens to in-flight state** — settled with open question 2: copy-in.
+  The softirq ring is kernel-owned and survives a `knetd` restart today, which
+  was always the argument for it.
+- **Does the killing frame get dropped** — **yes, already.** Both ring consumers
+  advance `rx_softirq_tail` *before* using the frame, so a restarted daemon
+  resumes at the next frame and cannot re-read the one that killed it. The claim
+  previously made here — that the rate limiter was the only thing between an
+  attacker-chosen frame and an unbounded restart loop — was **backwards**; the
+  ordering is fail-safe. Corrected in full at the end of this document.
 
 Corresponding harness gap: `verify-supervisor.sh` only ever asserts `gave-up == 0`,
 proving the limiter does not fire spuriously and nothing more. **D1 must not land
@@ -816,11 +819,11 @@ other reader of the list. The special case additionally now requires
 crashes repeatedly is exactly the trigger, and after D1 a remote host chooses when
 it fires.
 
-Still open, and still D1's to answer: **what happens to in-flight state**
-(open question 2, copy-in vs shared buffer) and **does the killing frame get
-dropped** — the consumed-but-not-completed ring bookkeeping. Without the latter
-the rate limiter is the only thing between an attacker-chosen frame and an
-unbounded restart loop; it now at least demonstrably works.
+Both of the items this section previously left open have since been resolved by
+reading the code rather than the prose — see "Open question 2, resolved" below.
+Copy-in is forced, not chosen; and the killing frame is *already* dropped, which
+inverts what this document used to claim about the restart loop. What remains
+open for D1 is `tcp_connections[]`, the hard half named in constraint 1.
 
 Two pre-existing kernel bugs surfaced while building this; both are fixed here and
 neither is specific to supervision. `task_free_resources()` returned the task's
@@ -830,3 +833,214 @@ not just kernel tasks, and invisible because the panic lands on an unrelated lat
 allocation. And `task_create_kernel()` does not enqueue, so both the restart path
 and the supervisor's own creation needed an explicit `scheduler_add_task()`;
 without it a task is created, listed by `ps`, counted healthy, and never run.
+
+## Open question 2, resolved — and a claim this document had backwards
+
+Settled 2026-08-17 by reading `e1000.c` against the prose above. Both items the
+D2 section left "open for D1" turn out not to be design forks at all. Recording
+the reasoning, because in both cases the document's own framing was the thing
+that made them look open.
+
+### Copy-in: forced, not chosen
+
+Open question 2 was framed as "copy-in vs shared buffer". It is not a choice.
+Item 1 already established that a deferred parser **must** copy the frame before
+RDT advances, because the NIC refills the descriptor and a retained pointer is an
+attacker-timed UAF. A ring-3 shared buffer has that same hazard with a second
+reader, and adds a worse one: the buffer would be writable by the parser whose
+compromise is the entire threat model for moving it out of ring 0.
+
+The document already said "copy-in remains the default; zero-copy needs a real
+argument." No such argument has been produced, and the cost copy-in was suspected
+of — a per-frame `memcpy` — is one the RX path already pays twice (ISR into
+`rx_softirq_ring`, then ring into the parser's frame buffer). Zero-copy would
+have to eliminate a copy that a hardware constraint requires.
+
+**Decided: copy-in.** Reopen only with a measurement showing the copy is a real
+cost, and a scheme where a ring-3 writer cannot reach a buffer the kernel still
+trusts.
+
+### The killing frame is already dropped — the inverted claim
+
+This document stated that no consumed-but-not-completed bookkeeping exists, and
+that without it "the rate limiter is the only thing standing between an
+attacker-chosen frame and an unbounded restart loop." The first half is true.
+The consequence is backwards.
+
+Both ring consumers advance the tail **before** the frame is used, under
+`E1000_LOCK()`:
+
+- `e1000_rx_softirq_run()` (`e1000.c:385`) advances `rx_softirq_tail`, unlocks,
+  and only then calls `handle_packet()` at line 388.
+- `e1000_rx_dequeue()` (`e1000.c:436`) does the same, and its oversize branch at
+  line 431 advances the tail with an explicit "Consume it anyway" comment.
+
+So a frame that kills the parser has already been consumed. A restarted daemon
+resumes at the *next* frame and cannot re-read the one that killed it. The
+current ordering is **fail-safe (drop-on-dequeue)**, not fail-open, and the
+restart loop this document feared is not reachable by replaying one frame — an
+attacker must resend it, which is a different and much weaker primitive that the
+rate limiter already bounds.
+
+The real bookkeeping question at D1 is the *reverse* one, and it is a
+reliability concern rather than a security one: drop-on-dequeue means a parser
+that dies mid-frame loses that frame silently. For a malicious frame that is
+exactly right. For a legitimate frame during an unrelated crash it is a silent
+drop — acceptable for a datagram protocol (ICMP/DNS/DHCP all tolerate loss and
+retry), which is precisely the moving set. **No new bookkeeping is required for
+D1.** It would only be required if a lossless protocol moved, and TCP is staying
+in ring 0.
+
+### What is actually still open: `tcp_connections[]`
+
+Constraint 1 named this "the hard half" and it is the one that survives. TCP
+stays in ring 0 at D1, so the table is not crossing the boundary — but it
+already has three writers, and D1 changes who can be running concurrently with
+them:
+
+| Writer | Context | Since |
+|---|---|---|
+| RX parser (`tcp_handle_packet`) | task, `knetd` | item 1 |
+| `SYS_TCPSOCK` kernel calls | task, syscall from ring 3 | PR C2 |
+| `tcp_tick()` | task, `ktimerd` | pre-existing |
+
+One correction worth recording, because it was briefly believed otherwise while
+writing this: **`tcp_tick()` does not run in the ISR.** `interrupts.c:111` sits
+inside `timer_softirq_run()`, which the timer ISR only flags; `task_ktimerd()`
+drains it in task context, the same top/bottom-half split as `knetd`. All three
+writers are therefore task-context and serialized by `TCP_LOCK()`, which is why
+the table is safe *today*.
+
+What D1 changes is that `knetd` becomes killable and restartable. The question
+to answer before the move is not locking but **interruption**: whether a parser
+that dies between two `TCP_LOCK()` sections can leave `tcp_connections[]`
+structurally valid but semantically half-updated (a connection advanced to a
+state whose follow-up write never happened). The lock guarantees no torn read;
+it guarantees nothing about a multi-step update abandoned midway. That is the
+open D1 item, and it is answerable by auditing `tcp_handle_packet`'s multi-step
+state transitions for a safe abort point — not by a new mechanism.
+
+**That audit has since been run; the section below supersedes this paragraph.**
+The window it hypothesises does not exist, and the audit found something more
+important on the way to establishing that.
+
+## The `tcp_connections[]` audit — and why D1's split is forced, not chosen
+
+Run 2026-08-17, as the last item gating D1. The question posed was whether a
+ring-3 parser dying between two `TCP_LOCK()` sections could leave
+`tcp_connections[]` structurally valid but semantically half-updated. **The
+answer is no, and the reason turns out to matter more than the answer.**
+
+### Finding 1 — there is no multi-step window to abandon
+
+`tcp_handle_packet()` (`tcp.c:1555–1579`) takes `TCP_LOCK()` once and releases it
+once, with the entire state machine in between: `tcp_find_connection()` and the
+whole of `tcp_process_segment()` execute inside that single critical section.
+`tcp_process_segment` contains no `TCP_LOCK`, no `TCP_UNLOCK`, and no
+`scheduler_yield` on any path — every early return inside it returns with the
+lock still held by the caller, which then unlocks on the single exit.
+
+`TCP_LOCK()` is `CRITICAL_SECTION_ENTER()`, i.e. `cli` (`tcp.c:126`). A task
+holding it has interrupts disabled and therefore **cannot be preempted, cannot be
+descheduled, and cannot be killed** partway through. The half-updated table this
+audit went looking for is not reachable. No safe-abort-point work is needed, and
+no new mechanism.
+
+### Finding 2 — the same fact makes a ring-3 TCP parser impossible
+
+The header comment at `tcp.c:50` lists among the lock's advantages that it "works
+in any context (interrupt, kernel, **future user-mode**)." That is false, and it
+is the one load-bearing false assumption in this area:
+
+- `cli` and `sti` are privileged. They execute at CPL ≤ IOPL.
+- User tasks are created with `eflags = 0x0202` — **IOPL=0** (`process.c:1391`).
+- So `TCP_LOCK()` executed from ring 3 raises **#GP**, immediately.
+
+A ring-3 TCP parser cannot take the only lock protecting the table it parses
+into. It could not be given one either: the whole point of `cli` here is to
+exclude the *other* two writers, and ring 3 cannot be trusted with an instruction
+that disables preemption globally — that is a denial-of-service primitive handed
+to the component most likely to be compromised.
+
+**This is an independent derivation of the D1 split.** PR #75 settled "TCP stays
+ring 0" from the `tcp_tick()` UAF argument — a ring-0 timer freeing a record
+under a ring-3 parser. The lock reaches the same conclusion by a different route,
+and more strongly: even with the UAF solved, TCP could not move, because its
+mutual exclusion is built from an instruction ring 3 may not execute. Two
+independent arguments for the same boundary is a good sign the boundary is real.
+
+It also explains why the per-protocol CPL witness has TCP's polarity inverted
+(`tcp_cpl3` must stay 0 while `icmp_cpl3`/`udp_cpl3` go nonzero). That is not a
+staging decision to be revisited later; it is a hardware constraint. A future
+build reporting a nonzero `tcp_cpl3` is not "further along" — it is a build where
+TCP is #GP-faulting on every segment, and the counter is the thing that would
+catch it.
+
+### What this means for the moving set
+
+ICMP, DNS and DHCP are unaffected by finding 2, because none of them takes
+`TCP_LOCK`. Confirming this is a prerequisite of the move rather than an
+assumption, and it is the natural first commit of D1 proper: sweep the moving
+parsers for every `CRITICAL_SECTION_ENTER` / `cli` / `sti` / `TCP_LOCK` reach,
+directly or through a callee. Any hit is a site that must become a syscall before
+that protocol can move, on exactly the reasoning above.
+
+### D1 is therefore unblocked
+
+Every prerequisite this document recorded is now closed:
+
+| Gate | Status |
+|---|---|
+| Give-up branch harness | Closed — PR #77, `verify-supervisor.sh` step 5 |
+| Per-protocol CPL counters | Closed — PR #77 |
+| Open question 2 (copy-in) | Closed — copy-in, forced by RDT/UAF |
+| Killing-frame bookkeeping | Closed — already drop-on-dequeue; the old claim was inverted |
+| `tcp_connections[]` | Closed — this audit; no window exists, and TCP cannot move regardless |
+
+The remaining work is the move itself, and its first step is the privileged-
+instruction sweep above — not because it is expected to find much, but because
+finding 2 is precisely the kind of thing that is invisible until something
+#GP-faults at ring 3, and the sweep is how it is caught before the move rather
+than during it.
+
+### The sweep, run — and what it found in `dns.c`
+
+Run immediately rather than deferred to D1, because it is three greps and its
+result changes D1's first commit. Sweeping the moving set (`icmp.c`, `dns.c`,
+`dhcp.c`) for `CRITICAL_SECTION_ENTER`/`EXIT`, `TCP_LOCK`, `E1000_LOCK` and raw
+`cli`/`sti`:
+
+- **`icmp.c` — clean.** No privileged instruction, directly or via a callee.
+- **`dhcp.c` — clean.**
+- **`dns.c` — three hits**, all guarding the same 4-byte object,
+  `dns_server_ip[4]` (`dns.c:25`):
+
+| Site | Function | On the moving RX path? |
+|---|---|---|
+| `dns.c:73` | `set_dns_server()` | No — DHCP-side writer |
+| `dns.c:441` | `handle_dns_response()` | **YES** |
+| `dns.c:678` | DNS query send path | No — outbound, task context |
+
+`dns.c:441` is the one that matters: it is inside `handle_dns_response()`, on the
+inbound path that D1 moves. As written, a ring-3 DNS parser would **#GP on the
+first DNS response it handled** — exactly the failure mode finding 2 predicts,
+and exactly the reason to sweep before the move rather than debug it after.
+
+All three protect against the same thing: `dns_server_ip` is written by DHCP and
+read by DNS, and a 4-byte `memcpy` is not atomic, so a torn read yields a query
+sent to a spliced address (the comment at `dns.c:665` works the attack through).
+The protection is real and must not simply be deleted when the code moves.
+
+The fix is not to hand ring 3 a lock. `dns_server_ip` is 4 bytes — one aligned
+32-bit load or store on i386 is atomic with respect to interrupts by hardware,
+with no `cli` required. Replacing the `memcpy`-under-`cli` pattern with a single
+aligned `uint32_t` read/write removes all three critical sections and keeps the
+tear-free property, at ring 3 and ring 0 alike. That is a small, self-contained,
+independently verifiable change and it is **D1's first commit**: it can land and
+be proven before any parser changes ring, and the existing DNS path exercises it
+immediately.
+
+Worth noting for whoever writes it: the object must be *declared* in a way that
+guarantees 4-byte alignment for this to hold — `uint8_t dns_server_ip[4]` at
+`dns.c:25` carries no alignment guarantee of its own, so the commit needs to
+change the declaration, not only the accesses.
