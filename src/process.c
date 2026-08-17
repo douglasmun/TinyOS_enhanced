@@ -17,6 +17,7 @@
 #include "errno.h"   /* For -EBADF/-EMFILE from the fd table helpers */
 #include "edr_behavioral.h"  /* EDR Phase 2: Behavioral detection */
 #include "edr_advanced.h"    /* EDR Phase 3: Advanced detection */
+#include "env.h"             /* Per-task environment storage */
 #include "ramfs.h"   /* For ramfs_mkdir() - per-process private /tmp */
 #include "crypto.h"  /* For csprng_random_bytes() - crypto-random tmp names */
 
@@ -1744,6 +1745,10 @@ void task_free_resources(task_t* task) {
         pmm_free((uint32_t)task->edr_advanced);
         task->edr_advanced = NULL;
     }
+
+    /* Free the per-task environment/alias page. Nulls the field itself, so
+     * this is idempotent across the terminate and scheduler-cleanup paths. */
+    env_free_for_task(task);
 }
 
 /*=============================================================================

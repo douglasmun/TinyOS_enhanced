@@ -459,9 +459,15 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     rtc_init();
     time_init();
 
-    /* Initialize environment variables */
-    // TEMPORARILY DISABLED FOR TESTING
-    // env_init();
+    /* Environment variables are initialized PER SHELL SESSION, in shell_task()
+     * after login -- not here. Storage is per-task (task->env), so a boot-time
+     * call would have no task to populate: scheduler_get_current_task() returns
+     * NULL this early and env_init() would allocate nothing.
+     *
+     * This call sat commented out as "TEMPORARILY DISABLED FOR TESTING" from
+     * the initial public release onward, which left the whole subsystem inert:
+     * `env`, `set` and `alias` all reported empty and $VAR expanded to nothing,
+     * while every command that consumed them was wired and working. */
 
     /* Initialize PS/2 keyboard driver */
 #ifdef VERBOSE_DEBUG

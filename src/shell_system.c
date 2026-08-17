@@ -884,8 +884,8 @@ void cmd_alias(int argc, char* argv[]) {
 
     if (!eq) {
         /* Just show one alias: alias name */
-        const char* cmd = alias_get(arg);
-        if (cmd) {
+        char cmd[ALIAS_MAX_CMD_LEN];
+        if (alias_get(arg, cmd, sizeof(cmd))) {
             stream_printf(ctx, "alias %s='%s'\n", arg, cmd);
         } else {
             stream_printf(ctx, "alias: %s: not found\n", arg);

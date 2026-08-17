@@ -6,23 +6,306 @@
 #include "kprintf.h"
 #include "critical.h"
 #include "stdio.h"  /* stream_printf / get_current_streams */
+#include "process.h"
+#include "pmm.h"
+#include "scheduler.h"
 #include <stddef.h>
 
 /*=============================================================================
- * Global Environment Table
+ * Per-Task Storage
+ *
+ * There is no global table any more. Each task owns an env_state_t page,
+ * allocated on first write and freed in task_free_resources().
+ *
+ * env_state() resolves the CALLING task's page. Two cases return NULL and both
+ * are normal, not errors:
+ *   - no current task (boot-time / interrupt context)
+ *   - the task has never written a variable
+ * Every reader treats NULL as "empty", so lookups simply miss. Only the
+ * writers call env_state_alloc(), which is where the page comes from.
  *=============================================================================*/
-static env_var_t env_table[ENV_MAX_VARS];
+
+static env_state_t* env_state(void) {
+    task_t* t = scheduler_get_current_task();
+    return t ? t->env : NULL;
+}
+
+/**
+ * @brief Resolve the current task's env page, allocating it if needed
+ * @return The page, or NULL if there is no current task or no free memory
+ *
+ * The page is NOT zeroed by pmm_alloc(), so it is cleared here. Skipping that
+ * leaves in_use holding whatever the previous owner of the frame wrote, which
+ * presents as a task booting with a table full of garbage variables.
+ */
+static env_state_t* env_state_alloc(void) {
+    task_t* t = scheduler_get_current_task();
+    if (!t) {
+        return NULL;
+    }
+    if (!t->env) {
+        env_state_t* s = (env_state_t*)pmm_alloc();
+        if (!s) {
+            return NULL;
+        }
+        memset(s, 0, sizeof(env_state_t));
+        t->env = s;
+    }
+    return t->env;
+}
 
 /*=============================================================================
- * Alias Table
- *=============================================================================*/
-typedef struct {
-    char name[ALIAS_MAX_NAME_LEN];       /* Alias name */
-    char command[ALIAS_MAX_CMD_LEN];     /* Command to execute */
-    bool in_use;                         /* Slot is occupied */
-} alias_t;
+ * Per-Task Isolation Self-Test
+ *
+ * See env_pertask_self_test() in env.h for why this exists rather than a
+ * shell-driven check.
+ *
+ * The helper task sets ENVSELFTEST to its own marker and records what it saw
+ * of the PARENT's variable. Communication is via these file-scope flags, not
+ * the env tables, which are the thing under test.
+ *===========================================================================*/
+static volatile bool env_selftest_child_done = false;
+static volatile bool env_selftest_child_saw_parent_var = false;
+static volatile bool env_selftest_child_set_ok = false;
 
-static alias_t alias_table[ALIAS_MAX_COUNT];
+static volatile bool env_selftest_heir_done = false;
+static volatile bool env_selftest_heir_saw_exported = false;
+static volatile bool env_selftest_heir_saw_private = false;
+
+/* Second child, used for the INHERITANCE half. It differs from
+ * env_selftest_child only in how it is created: the parent runs
+ * env_inherit_exported() over it first, exactly as sys_spawn and cmd_exec do.
+ * task_create_kernel() itself never inherits, which is precisely why the first
+ * child is a clean isolation probe and this one is not. */
+static void env_selftest_heir(void) {
+    char buf[ENV_MAX_VALUE_LEN];
+
+    /* Must see the EXPORTED variable... */
+    env_selftest_heir_saw_exported =
+        env_get("ENVEXPORTED", buf, sizeof(buf)) && strcmp(buf, "crossed") == 0;
+
+    /* ...and must NOT see the un-exported one. Without this second clause a
+     * copy that ignored the exported flag and cloned the whole table would
+     * pass: "inherited everything" and "inherited what was exported" are the
+     * same observation when you only look at an exported variable. */
+    env_selftest_heir_saw_private = env_get("ENVPRIVATE", buf, sizeof(buf));
+
+    task_t* self = scheduler_get_current_task();
+    uint32_t self_pid = self ? self->pid : 0;
+
+    env_selftest_heir_done = true;
+
+    if (self_pid) {
+        task_terminate(self_pid);
+    }
+    for (;;) {
+        scheduler_yield();
+    }
+}
+
+static void env_selftest_child(void) {
+    char buf[ENV_MAX_VALUE_LEN];
+
+    /* The parent set ENVSELFTEST=parent before spawning us. Under per-task
+     * storage we must NOT see it; under the old global table we would. */
+    env_selftest_child_saw_parent_var = env_get("ENVSELFTEST", buf, sizeof(buf));
+
+    /* And we must be able to set our own, which proves this task really got a
+     * table of its own rather than failing to allocate one (a task that can
+     * see nothing AND set nothing would otherwise pass the check above for
+     * entirely the wrong reason). */
+    env_selftest_child_set_ok = (env_set("ENVSELFTEST", "child") == 0);
+
+    /* Capture the pid BEFORE signalling done, and terminate via
+     * task_terminate(): task_exit() is inert for scheduler-run tasks (it reads
+     * process.c's current_task, set only by task_switch_to). */
+    task_t* self = scheduler_get_current_task();
+    uint32_t self_pid = self ? self->pid : 0;
+
+    env_selftest_child_done = true;
+
+    if (self_pid) {
+        task_terminate(self_pid);
+    }
+    for (;;) {
+        scheduler_yield();
+    }
+}
+
+bool env_pertask_self_test(void) {
+    char buf[ENV_MAX_VALUE_LEN];
+
+    env_selftest_child_done = false;
+    env_selftest_child_saw_parent_var = false;
+    env_selftest_child_set_ok = false;
+
+    if (env_set("ENVSELFTEST", "parent") != 0) {
+        kprintf("[ENV] self-test INCONCLUSIVE: parent could not set a variable\n");
+        return false;
+    }
+
+    int pid = task_create_kernel(env_selftest_child, "envtest");
+    if (pid < 0) {
+        kprintf("[ENV] self-test INCONCLUSIVE: could not create helper task\n");
+        return false;
+    }
+
+    /* task_create_kernel() allocates but does NOT enqueue -- without this the
+     * helper is listed by ps and never runs one instruction, and the test
+     * below would time out reporting a failure that never happened. */
+    task_t* child = task_get((uint32_t)pid);
+    if (!child) {
+        kprintf("[ENV] self-test INCONCLUSIVE: helper task vanished\n");
+        return false;
+    }
+    scheduler_add_task(child);
+
+    /* Bounded wait; the helper is a few instructions of work. */
+    for (int spins = 0; spins < 100000 && !env_selftest_child_done; spins++) {
+        scheduler_yield();
+    }
+
+    if (!env_selftest_child_done) {
+        kprintf("[ENV] self-test INCONCLUSIVE: helper task never ran\n");
+        return false;
+    }
+
+    bool parent_intact = env_get("ENVSELFTEST", buf, sizeof(buf)) &&
+                         strcmp(buf, "parent") == 0;
+
+    bool ok = !env_selftest_child_saw_parent_var &&
+              env_selftest_child_set_ok &&
+              parent_intact;
+
+    kprintf("[ENV] per-task self-test: child saw parent's var: %s | "
+            "child set its own: %s | parent's var intact: %s => %s\n",
+            env_selftest_child_saw_parent_var ? "YES (BAD)" : "no (good)",
+            env_selftest_child_set_ok ? "yes (good)" : "NO (BAD)",
+            parent_intact ? "yes (good)" : "NO (BAD)",
+            ok ? "PASS" : "FAIL");
+
+    /*=====================================================================
+     * Part 2: INHERITANCE. Isolation above and inheritance here are opposite
+     * requirements against the same storage -- a build that shares one page
+     * passes inheritance trivially and fails isolation, and a build that never
+     * copies passes isolation and fails inheritance. Only doing both pins the
+     * design. Reported as its own line so which half broke is unambiguous.
+     *===================================================================*/
+    env_selftest_heir_done = false;
+    env_selftest_heir_saw_exported = false;
+    env_selftest_heir_saw_private = false;
+
+    bool inherit_ok = false;
+
+    if (env_set("ENVEXPORTED", "crossed") != 0 ||
+        env_export("ENVEXPORTED") != 0 ||
+        env_set("ENVPRIVATE", "local") != 0) {
+        kprintf("[ENV] inheritance self-test INCONCLUSIVE: could not stage variables\n");
+        return false;
+    }
+
+    int hpid = task_create_kernel(env_selftest_heir, "envheir");
+    task_t* heir = (hpid >= 0) ? task_get((uint32_t)hpid) : NULL;
+    if (!heir) {
+        kprintf("[ENV] inheritance self-test INCONCLUSIVE: could not create heir task\n");
+        return false;
+    }
+
+    /* The step under test. task_create_kernel() does NOT inherit on its own --
+     * that is what makes the first child a clean isolation probe -- so this
+     * mirrors what sys_spawn and cmd_exec do, and must happen BEFORE the task
+     * is made runnable. */
+    task_t* self_task = scheduler_get_current_task();
+    env_inherit_exported(self_task, heir);
+
+    scheduler_add_task(heir);
+
+    for (int spins = 0; spins < 100000 && !env_selftest_heir_done; spins++) {
+        scheduler_yield();
+    }
+
+    if (!env_selftest_heir_done) {
+        kprintf("[ENV] inheritance self-test INCONCLUSIVE: heir task never ran\n");
+        return false;
+    }
+
+    inherit_ok = env_selftest_heir_saw_exported && !env_selftest_heir_saw_private;
+
+    kprintf("[ENV] inheritance self-test: heir got exported var: %s | "
+            "heir got un-exported var: %s => %s\n",
+            env_selftest_heir_saw_exported ? "yes (good)" : "NO (BAD)",
+            env_selftest_heir_saw_private ? "YES (BAD)" : "no (good)",
+            inherit_ok ? "PASS" : "FAIL");
+
+    /* Leave the caller's table as we found it. sectest runs from an interactive
+     * shell, and three scratch variables surviving in the user's `env` output
+     * is a visible side effect of running a test. */
+    env_unset("ENVSELFTEST");
+    env_unset("ENVEXPORTED");
+    env_unset("ENVPRIVATE");
+
+    return ok && inherit_ok;
+}
+
+void env_inherit_exported(void* parent_task, void* child_task) {
+    task_t* p = (task_t*)parent_task;
+    task_t* c = (task_t*)child_task;
+
+    if (!p || !c || !p->env) {
+        return;
+    }
+
+    /* Allocate the child's page HERE rather than through env_state_alloc(),
+     * which resolves scheduler_get_current_task() -- and the current task at
+     * this point is the PARENT doing the spawning, not the child being built.
+     * Calling it would hand the parent's own page back and copy it onto
+     * itself. */
+    if (!c->env) {
+        env_state_t* s = (env_state_t*)pmm_alloc();
+        if (!s) {
+            return;                     /* Child simply starts with no variables */
+        }
+        memset(s, 0, sizeof(env_state_t));
+        c->env = s;
+    }
+
+    /* Only EXPORTED variables cross, which is the entire point of the flag: a
+     * shell-local `set FOO=x` stays local, an `export FOO` reaches children.
+     *
+     * Aliases are deliberately NOT inherited. They are an interactive
+     * convenience of the shell that defined them and have no meaning to a
+     * spawned binary, which never consults the alias table -- substitution
+     * happens in shell.c before the command is dispatched. bash does not export
+     * them either.
+     *
+     * This is a SNAPSHOT, not a shared page: a later change in either task is
+     * invisible to the other. That is both the Unix contract and what keeps the
+     * per-task isolation the rest of this file establishes -- inheritance that
+     * shared the page would undo it entirely.
+     *
+     * The bound on j is what makes a full parent table safe: a parent with all
+     * ENV_MAX_VARS exported fills the child exactly and stops. */
+    CRITICAL_SECTION_ENTER();
+    for (int i = 0, j = 0; i < ENV_MAX_VARS && j < ENV_MAX_VARS; i++) {
+        if (!p->env->vars[i].in_use || !p->env->vars[i].exported) {
+            continue;
+        }
+        SAFE_STRNCPY(c->env->vars[j].name, p->env->vars[i].name, ENV_MAX_NAME_LEN);
+        SAFE_STRNCPY(c->env->vars[j].value, p->env->vars[i].value, ENV_MAX_VALUE_LEN);
+        c->env->vars[j].exported = true;
+        c->env->vars[j].in_use = true;
+        j++;
+    }
+    CRITICAL_SECTION_EXIT();
+}
+
+void env_free_for_task(void* task) {
+    task_t* t = (task_t*)task;
+    if (t && t->env) {
+        pmm_free((uint32_t)t->env);
+        t->env = NULL;
+    }
+}
 
 /*=============================================================================
  * String Helper Functions
@@ -38,13 +321,13 @@ static alias_t alias_table[ALIAS_MAX_COUNT];
  * @brief Find a variable by name
  * @return Index in env_table, or -1 if not found
  */
-static int env_find(const char* name) {
-    if (!name) {
+static int env_find(env_state_t* s, const char* name) {
+    if (!s || !name) {
         return -1;
     }
 
     for (int i = 0; i < ENV_MAX_VARS; i++) {
-        if (env_table[i].in_use && strcmp(env_table[i].name, name) == 0) {
+        if (s->vars[i].in_use && strcmp(s->vars[i].name, name) == 0) {
             return i;
         }
     }
@@ -56,9 +339,12 @@ static int env_find(const char* name) {
  * @brief Find an empty slot in the environment table
  * @return Index of empty slot, or -1 if table is full
  */
-static int env_find_empty(void) {
+static int env_find_empty(env_state_t* s) {
+    if (!s) {
+        return -1;
+    }
     for (int i = 0; i < ENV_MAX_VARS; i++) {
-        if (!env_table[i].in_use) {
+        if (!s->vars[i].in_use) {
             return i;
         }
     }
@@ -97,20 +383,18 @@ bool env_is_valid_name(const char* name) {
  *=============================================================================*/
 
 void env_init(void) {
-    /* Clear the environment table */
-    for (int i = 0; i < ENV_MAX_VARS; i++) {
-        env_table[i].in_use = false;
-        env_table[i].exported = false;
-        env_table[i].name[0] = '\0';
-        env_table[i].value[0] = '\0';
+    /* Allocate this task's page if it has none, and start from a clean table.
+     * Nothing to do if there is no current task or no memory -- every reader
+     * below treats an absent table as empty, so the shell degrades to "no
+     * variables" rather than faulting. */
+    env_state_t* s = env_state_alloc();
+    if (!s) {
+        return;
     }
 
-    /* Clear the alias table */
-    for (int i = 0; i < ALIAS_MAX_COUNT; i++) {
-        alias_table[i].in_use = false;
-        alias_table[i].name[0] = '\0';
-        alias_table[i].command[0] = '\0';
-    }
+    CRITICAL_SECTION_ENTER();
+    memset(s, 0, sizeof(env_state_t));
+    CRITICAL_SECTION_EXIT();
 
     /* Set default environment variables */
     env_set("PATH", "/bin");
@@ -143,10 +427,20 @@ void env_init(void) {
     env_set("PAGER", "cat");
     env_export("PAGER");
 
-    /* Set up useful default aliases (bash-like) */
+    /* Set up useful default aliases (bash-like).
+     *
+     * TWELVE of ALIAS_MAX_COUNT (16), deliberately -- see ALIAS_DEFAULT_COUNT
+     * in env.h. This list was sixteen, which filled the table exactly to
+     * capacity and left a user's own `alias` with nowhere to go: every such
+     * command failed with "table full" against a table that looked, to the
+     * user, like it held nothing of theirs. Four free slots is the point of
+     * the number, so keep the count below the max if you add one here.
+     *
+     * The four dropped were the redundant ones: `l` (duplicate of `ll`/`la`),
+     * `k` (kill is five characters), `...` (`cd ../..`), and `please`, an
+     * easter egg aliasing a sudo this kernel does not implement. */
     alias_set("ll", "ls -l");
     alias_set("la", "ls -a");
-    alias_set("l", "ls");
     alias_set("cls", "clear");
     alias_set("dir", "ls");
     alias_set("copy", "cp");
@@ -156,10 +450,7 @@ void env_init(void) {
     alias_set("rd", "rm -r");
     alias_set("type", "cat");
     alias_set("..", "cd ..");
-    alias_set("...", "cd ../..");
     alias_set("h", "history");
-    alias_set("k", "kill");
-    alias_set("please", "sudo");  /* Easter egg: sudo isn't implemented but it's fun! */
 }
 
 /*=============================================================================
@@ -188,61 +479,79 @@ int env_set(const char* name, const char* value) {
         return -1;
     }
 
+    /* Allocate outside the critical section: pmm_alloc() must not run with
+     * interrupts masked, and this is the first write for a fresh task. */
+    env_state_t* s = env_state_alloc();
+    if (!s) {
+        return -1;
+    }
+
     CRITICAL_SECTION_ENTER();  /* SECURITY: Protect env table state */
 
     /* Check if variable already exists */
-    int idx = env_find(name);
+    int idx = env_find(s, name);
     if (idx >= 0) {
         /* Update existing variable */
-        SAFE_STRNCPY(env_table[idx].value, value, ENV_MAX_VALUE_LEN);
+        SAFE_STRNCPY(s->vars[idx].value, value, ENV_MAX_VALUE_LEN);
         CRITICAL_SECTION_EXIT();
         return 0;
     }
 
     /* Find empty slot */
-    idx = env_find_empty();
+    idx = env_find_empty(s);
     if (idx < 0) {
         CRITICAL_SECTION_EXIT();
         return -1;  /* Table full */
     }
 
     /* Create new variable */
-    SAFE_STRNCPY(env_table[idx].name, name, ENV_MAX_NAME_LEN);
-    SAFE_STRNCPY(env_table[idx].value, value, ENV_MAX_VALUE_LEN);
+    SAFE_STRNCPY(s->vars[idx].name, name, ENV_MAX_NAME_LEN);
+    SAFE_STRNCPY(s->vars[idx].value, value, ENV_MAX_VALUE_LEN);
 
-    env_table[idx].exported = false;
-    env_table[idx].in_use = true;
+    s->vars[idx].exported = false;
+    s->vars[idx].in_use = true;
 
     CRITICAL_SECTION_EXIT();
     return 0;
 }
 
-const char* env_get(const char* name) {
+bool env_get(const char* name, char* out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+
+    env_state_t* s = env_state();
+
     CRITICAL_SECTION_ENTER();  /* SECURITY: Protect env table reads */
 
-    int idx = env_find(name);
-    const char* result = NULL;
-    if (idx >= 0) {
-        result = env_table[idx].value;
+    int idx = env_find(s, name);
+    bool found = (idx >= 0);
+    if (found) {
+        /* Copy INSIDE the lock. The old version returned s->vars[idx].value
+         * to the caller after unlocking, leaving them reading a slot another
+         * task could rewrite or free. */
+        SAFE_STRNCPY(out, s->vars[idx].value, out_size);
     }
 
     CRITICAL_SECTION_EXIT();
-    return result;
+    return found;
 }
 
 int env_unset(const char* name) {
+    env_state_t* s = env_state();
+
     CRITICAL_SECTION_ENTER();  /* SECURITY: Protect env table state */
 
-    int idx = env_find(name);
+    int idx = env_find(s, name);
     if (idx < 0) {
         CRITICAL_SECTION_EXIT();
         return -1;
     }
 
-    env_table[idx].in_use = false;
-    env_table[idx].exported = false;
-    env_table[idx].name[0] = '\0';
-    env_table[idx].value[0] = '\0';
+    s->vars[idx].in_use = false;
+    s->vars[idx].exported = false;
+    s->vars[idx].name[0] = '\0';
+    s->vars[idx].value[0] = '\0';
 
     CRITICAL_SECTION_EXIT();
     return 0;
@@ -269,15 +578,17 @@ int env_export(const char* name) {
      * All other env_* functions use CRITICAL_SECTION_ENTER/EXIT to protect
      * env_table access. env_export() was the ONLY function missing this.
      *=========================================================================*/
+    env_state_t* s = env_state();
+
     CRITICAL_SECTION_ENTER();  /* SECURITY: Protect env table state */
 
-    int idx = env_find(name);
+    int idx = env_find(s, name);
     if (idx < 0) {
         CRITICAL_SECTION_EXIT();
         return -1;
     }
 
-    env_table[idx].exported = true;
+    s->vars[idx].exported = true;
 
     CRITICAL_SECTION_EXIT();
     return 0;
@@ -289,8 +600,9 @@ bool env_exists(const char* name) {
      * CRITICAL: env_find() accesses global env_table without locking.
      * Race condition if another thread modifies env_table during lookup.
      *=========================================================================*/
+    env_state_t* s = env_state();
     CRITICAL_SECTION_ENTER();
-    bool result = (env_find(name) >= 0);
+    bool result = (env_find(s, name) >= 0);
     CRITICAL_SECTION_EXIT();
     return result;
 }
@@ -317,16 +629,17 @@ void env_list(bool exported_only) {
      * a variable added mid-listing may or may not appear -- acceptable for a
      * listing, unlike the torn name/value read the lock is actually there for. */
     stream_context_t* ctx = get_current_streams();
+    env_state_t* s = env_state();
     env_var_t entry;
     int count = 0;
 
-    for (int i = 0; i < ENV_MAX_VARS; i++) {
+    for (int i = 0; s && i < ENV_MAX_VARS; i++) {
         bool show;
 
         CRITICAL_SECTION_ENTER();
-        show = env_table[i].in_use && (!exported_only || env_table[i].exported);
+        show = s->vars[i].in_use && (!exported_only || s->vars[i].exported);
         if (show) {
-            entry = env_table[i];
+            entry = s->vars[i];
         }
         CRITICAL_SECTION_EXIT();
 
@@ -404,11 +717,12 @@ int env_expand(const char* input, char* output, size_t output_size) {
             var_name[var_idx] = '\0';
 
             /* Look up variable */
-            const char* value = env_get(var_name);
-            if (value) {
+            char value[ENV_MAX_VALUE_LEN];
+            if (env_get(var_name, value, sizeof(value))) {
                 /* Copy variable value to output */
-                while (*value && remaining > 0) {
-                    *dst++ = *value++;
+                const char* v = value;
+                while (*v && remaining > 0) {
+                    *dst++ = *v++;
                     remaining--;
                 }
             }
@@ -446,15 +760,13 @@ int env_find_in_path(const char* command, char* resolved_path, size_t path_size)
         return 0;
     }
 
-    /* Get PATH variable */
-    const char* path = env_get("PATH");
-    if (!path) {
+    /* Get PATH variable. PATH is a colon-separated list of directories; the
+     * copy-out lands straight in the buffer this function was going to make
+     * anyway, so the strtok-style walk below is unchanged. */
+    char path_copy[ENV_MAX_VALUE_LEN];
+    if (!env_get("PATH", path_copy, sizeof(path_copy))) {
         return -1;
     }
-
-    /* PATH is colon-separated list of directories */
-    char path_copy[ENV_MAX_VALUE_LEN];
-    SAFE_STRNCPY(path_copy, path, ENV_MAX_VALUE_LEN);
 
     char* dir = path_copy;
     char* next;
@@ -512,13 +824,13 @@ int env_find_in_path(const char* command, char* resolved_path, size_t path_size)
  * This prevents potential wrap-around if a negative index other than -1
  * were to be used for array access (which would convert to huge unsigned).
  */
-static int alias_find(const char* name) {
-    if (!name) {
+static int alias_find(env_state_t* s, const char* name) {
+    if (!s || !name) {
         return -1;
     }
 
     for (size_t i = 0; i < ALIAS_MAX_COUNT; i++) {
-        if (alias_table[i].in_use && strcmp(alias_table[i].name, name) == 0) {
+        if (s->aliases[i].in_use && strcmp(s->aliases[i].name, name) == 0) {
             return (int)i;  /* Safe: i is always < ALIAS_MAX_COUNT */
         }
     }
@@ -531,9 +843,12 @@ static int alias_find(const char* name) {
  * @return Index of empty slot, or -1 if table is full
  * SECURITY FIX: Use size_t for loop counter (same reasoning as alias_find)
  */
-static int alias_find_empty(void) {
+static int alias_find_empty(env_state_t* s) {
+    if (!s) {
+        return -1;
+    }
     for (size_t i = 0; i < ALIAS_MAX_COUNT; i++) {
-        if (!alias_table[i].in_use) {
+        if (!s->aliases[i].in_use) {
             return (int)i;  /* Safe: i is always < ALIAS_MAX_COUNT */
         }
     }
@@ -557,10 +872,16 @@ int alias_set(const char* name, const char* command) {
         return -1;
     }
 
+    /* Allocate outside the critical section (see env_set). */
+    env_state_t* s = env_state_alloc();
+    if (!s) {
+        return -1;
+    }
+
     CRITICAL_SECTION_ENTER();  /* SECURITY: Protect alias table state */
 
     /* Check if alias already exists */
-    int idx = alias_find(name);
+    int idx = alias_find(s, name);
     if (idx >= 0) {
         /* SECURITY FIX: Explicit bounds validation before array access
          * Even though alias_find should never return idx >= ALIAS_MAX_COUNT,
@@ -571,13 +892,13 @@ int alias_set(const char* name, const char* command) {
             return -1;  /* Invalid index */
         }
         /* Update existing alias */
-        SAFE_STRNCPY(alias_table[idx].command, command, ALIAS_MAX_CMD_LEN);
+        SAFE_STRNCPY(s->aliases[idx].command, command, ALIAS_MAX_CMD_LEN);
         CRITICAL_SECTION_EXIT();
         return 0;
     }
 
     /* Find empty slot */
-    idx = alias_find_empty();
+    idx = alias_find_empty(s);
     if (idx < 0) {
         CRITICAL_SECTION_EXIT();
         return -1;  /* Table full */
@@ -590,35 +911,45 @@ int alias_set(const char* name, const char* command) {
     }
 
     /* Create new alias */
-    SAFE_STRNCPY(alias_table[idx].name, name, ALIAS_MAX_NAME_LEN);
-    SAFE_STRNCPY(alias_table[idx].command, command, ALIAS_MAX_CMD_LEN);
+    SAFE_STRNCPY(s->aliases[idx].name, name, ALIAS_MAX_NAME_LEN);
+    SAFE_STRNCPY(s->aliases[idx].command, command, ALIAS_MAX_CMD_LEN);
 
-    alias_table[idx].in_use = true;
+    s->aliases[idx].in_use = true;
 
     CRITICAL_SECTION_EXIT();
     return 0;
 }
 
-const char* alias_get(const char* name) {
+bool alias_get(const char* name, char* out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+
+    env_state_t* s = env_state();
+
     CRITICAL_SECTION_ENTER();  /* SECURITY: Protect alias table reads */
 
-    int idx = alias_find(name);
-    const char* result = NULL;
+    int idx = alias_find(s, name);
+    bool found = false;
     if (idx >= 0) {
         /* SECURITY FIX: Bounds validation before array access */
         if ((size_t)idx < ALIAS_MAX_COUNT) {
-            result = alias_table[idx].command;
+            /* Copy inside the lock -- see env_get(). */
+            SAFE_STRNCPY(out, s->aliases[idx].command, out_size);
+            found = true;
         }
     }
 
     CRITICAL_SECTION_EXIT();
-    return result;
+    return found;
 }
 
 int alias_unset(const char* name) {
+    env_state_t* s = env_state();
+
     CRITICAL_SECTION_ENTER();  /* SECURITY: Protect alias table state */
 
-    int idx = alias_find(name);
+    int idx = alias_find(s, name);
     if (idx < 0) {
         CRITICAL_SECTION_EXIT();
         return -1;
@@ -630,9 +961,9 @@ int alias_unset(const char* name) {
         return -1;
     }
 
-    alias_table[idx].in_use = false;
-    alias_table[idx].name[0] = '\0';
-    alias_table[idx].command[0] = '\0';
+    s->aliases[idx].in_use = false;
+    s->aliases[idx].name[0] = '\0';
+    s->aliases[idx].command[0] = '\0';
 
     CRITICAL_SECTION_EXIT();
     return 0;
@@ -647,19 +978,20 @@ void alias_list(void) {
     /* Per-slot locking, printing outside the lock -- same reasoning as
      * env_list() above. */
     stream_context_t* ctx = get_current_streams();
+    env_state_t* s = env_state();
     char name[ALIAS_MAX_NAME_LEN];
     char command[ALIAS_MAX_CMD_LEN];
     int count = 0;
 
     /* SECURITY FIX: Use size_t for loop counter (consistent with other loops) */
-    for (size_t i = 0; i < ALIAS_MAX_COUNT; i++) {
+    for (size_t i = 0; s && i < ALIAS_MAX_COUNT; i++) {
         bool show;
 
         CRITICAL_SECTION_ENTER();
-        show = alias_table[i].in_use;
+        show = s->aliases[i].in_use;
         if (show) {
-            memcpy(name, alias_table[i].name, sizeof(name));
-            memcpy(command, alias_table[i].command, sizeof(command));
+            memcpy(name, s->aliases[i].name, sizeof(name));
+            memcpy(command, s->aliases[i].command, sizeof(command));
         }
         CRITICAL_SECTION_EXIT();
 
@@ -680,8 +1012,9 @@ bool alias_exists(const char* name) {
      * CRITICAL: alias_find() accesses global alias_table without locking.
      * Race condition if another thread modifies alias_table during lookup.
      *=========================================================================*/
+    env_state_t* s = env_state();
     CRITICAL_SECTION_ENTER();
-    bool result = (alias_find(name) >= 0);
+    bool result = (alias_find(s, name) >= 0);
     CRITICAL_SECTION_EXIT();
     return result;
 }
