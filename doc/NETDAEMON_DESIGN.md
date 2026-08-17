@@ -743,6 +743,84 @@ Corresponding harness gap: `verify-supervisor.sh` only ever asserts `gave-up == 
 proving the limiter does not fire spuriously and nothing more. **D1 must not land
 without a control that drives `knetd` past the budget and asserts the daemon stays
 dead** — a give-up that still restarts is worse than no limiter at all.
+**Closed by the D1-prerequisite PR below.**
+
+### D1 prerequisites — landed before the move
+
+Two things the sections above required *before* D1, plus one kernel bug the second
+of them found. All in one PR, none of it touching the parser.
+
+**1. Per-protocol CPL counters.** `net_parse_proto_cpl` in `net.c`, incremented in
+`handle_ip()`'s L4 dispatch switch — the exact seam the move falls on — and
+surfaced by `ifconfig` as `RX proto-ring: icmp N/M, udp N/M, tcp N/M (cpl0/cpl3)`.
+The global `cpl0`/`cpl3` pair stays as a running total so the PR #74 baseline
+remains comparable.
+
+`verify-netd-ring3.sh`'s post-move branch is rewritten to the D1 shape: three
+assertions, two of which point in **opposite directions** —
+`icmp_cpl0 == 0 && udp_cpl0 == 0` (the moved set moved), `tcp_cpl3 == 0` (TCP did
+*not*), and `icmp_cpl3 + udp_cpl3 > 0` (the zeros are not vacuous). The opposite
+polarity is the thing most likely to be "cleaned up" by someone making the three
+checks look consistent; `verify-netd-boundary.sh` records that doing exactly that
+has nearly inverted an assertion three times. The pre-move branch now also pins
+every per-protocol `cpl3` field at 0, so the new counters are graded by the PR
+that adds them rather than first exercised by the PR they are meant to grade.
+
+**DNS and DHCP are not counted separately, deliberately.** Both ride UDP, and the
+witness sits at the dispatch switch. Separating them would mean instrumenting the
+port demux inside `handle_udp()` — a later, different seam that classifies a frame
+by its destination port rather than by which ring executed the switch.
+
+**2. The give-up control** (`verify-supervisor.sh` step 5). Three parts:
+`gave-up` becomes 1, the `GIVING UP` line reaches the console, and — the only
+independent one — the daemon **stays dead**, witnessed by injecting frames
+afterwards and asserting the RX counter does **not** move. The first two are the
+supervisor's opinion of itself; a give-up that sets the flag, prints the line and
+restarts anyway passes both and is worse than no limiter, because the operator now
+believes the loop has stopped. Note step 5c asserts the RX counter is pinned while
+step 3 asserts it rises — same counter, opposite directions, on purpose.
+
+The deaths are driven from **inside the guest** (`killknetd 8` sets a countdown
+each restarted `knetd` decrements) rather than by typing the command eight times.
+The budget is 5 deaths in 10 s; eight echo-verified keystrokes under TCG do not
+reliably fit, and missing the window fails *silently* — the supervisor restarts
+each time, the window rolls forward, `gave-up` stays 0, and the run reports
+exactly what a **broken** limiter reports.
+
+Negative control run: raising `SUPERVISOR_MAX_RESTARTS` to 50 so give-up cannot
+fire. Steps 1–3 still pass (the daemon does keep recovering) and step 5a fails
+with 9 restarts and `gave-up 0` — confirming step 5 is the only thing separating a
+working limiter from an absent one.
+
+**3. A scheduler panic on rapid restart, found by that control** — pre-existing,
+not specific to supervision, and the first thing to ever kill the same daemon
+twice in quick succession. The second death halted the kernel with
+`All tasks terminated` while Shell, Idle, `ktimerd`, the supervisor and
+`edr_daemon` were all alive and runnable.
+
+The post-context-switch reaper freed a task's slot (`pid = 0`, state
+`TERMINATED`) **without dequeuing it**, leaving a corpse in the circular ready
+queue. `scheduler_get_next_task()` later rejects such an entry and calls
+`scheduler_remove_task()` — whose `task->next == task` special case nulls **both**
+head and tail. Correct for a genuine single-entry queue; catastrophic for a stale
+self-linked node, because it discards every other live task with it. The next tick
+sees `!ready_queue_head` and panics.
+
+Fixed in the reaper (dequeue before freeing) rather than by teaching the queue to
+tolerate corpses — the invariant worth keeping is *a freed slot is never in the
+ready queue*, and hardening only the remove path leaves the window open for every
+other reader of the list. The special case additionally now requires
+`task == ready_queue_head` before emptying the queue.
+
+**This is squarely a D1 concern, not an incidental fix.** A ring-3 parser that
+crashes repeatedly is exactly the trigger, and after D1 a remote host chooses when
+it fires.
+
+Still open, and still D1's to answer: **what happens to in-flight state**
+(open question 2, copy-in vs shared buffer) and **does the killing frame get
+dropped** — the consumed-but-not-completed ring bookkeeping. Without the latter
+the rate limiter is the only thing between an attacker-chosen frame and an
+unbounded restart loop; it now at least demonstrably works.
 
 Two pre-existing kernel bugs surfaced while building this; both are fixed here and
 neither is specific to supervision. `task_free_resources()` returned the task's
