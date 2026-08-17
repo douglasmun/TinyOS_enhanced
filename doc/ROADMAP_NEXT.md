@@ -108,6 +108,36 @@ into corruption primitives (PRs #45, #47, #54, #55).
 Doing `cp`/`mv`/`touch` also surfaced a live kernel bug in a shipping builtin:
 `open(O_TRUNC)` was a no-op on the RAM disk. See `doc/KERNEL_BUGS.md`.
 
+### The env group is split in two, and the first half is not a migration
+
+`chmod` and `date` were each one PR: the kernel behaviour already existed and
+only had to cross the ring boundary. **`env` is not like that** — the subsystem
+was dead. `env_init()` sat commented out in `kernel.c` ("TEMPORARILY DISABLED
+FOR TESTING") from the initial public release, while every consumer stayed
+wired: alias substitution in `shell.c`, `$VAR` expansion, all six builtins
+dispatched. So the commands existed, ran, and printed `(no variables)` forever
+without erroring. Migrating that to ring 3 would have carried a dead subsystem
+across the boundary and produced a ring-3 shell whose `env` printed nothing —
+indistinguishable from a syscall bug.
+
+Hence **PR A (this one): make it work in the kernel shell.** Re-enable the
+defaults, and settle storage — which had no uid or task concept at all, two
+file-scope 16-entry arrays. Storage is now **per-task**, a `pmm_alloc()`'d page
+hanging off `task_t` (the `edr_advanced` pattern; embedding it would have cost
+~102 KB of `.bss` at `MAX_TASKS 32`, charged to tasks that never touch an
+environment variable). **PR B: the syscall + libc + ring-3 builtins.**
+
+The trap PR A had to work around, and PR B inherits: **per-task isolation is
+not observable from the shell in this build.** `su` changes credentials on the
+*same* task, so both users share one env page; there is no re-login path in the
+typist; and ring 3 has no env syscall yet. "Set FOO, read FOO back" passes
+identically under global, per-uid and per-task storage. The check therefore
+lives in the kernel — `env_pertask_self_test()`, `sectest`'s TEST 10 — and its
+verdict is three-way, because a child whose page allocation *failed* also sees
+none of its parent's variables and would pass a two-way check for the wrong
+reason. Once `SYS_ENV` lands, PR B can assert this from ring 3 and the self-test
+becomes the redundant-but-cheap half.
+
 ## Hygiene (fold into whichever PR comes first)
 Known, low-severity, from the PR #1 audit (see memory `exec-failure-path-leaks`):
 - ~~`unmap_page_range` is a no-op under PAE → failed ELF loads leak PT frames~~

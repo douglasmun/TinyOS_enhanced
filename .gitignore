@@ -156,6 +156,8 @@ ring3date.log
 ring3date-trace.log
 ring3chmod.log
 ring3chmod-trace.log
+envpertask.log
+envpertask-trace.log
 scratchpad/
 argv.log
 argv-trace.log

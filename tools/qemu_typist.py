@@ -35,6 +35,17 @@ KEYMAP = {
     ">": "shift-dot",
     "<": "shift-comma",
     "|": "shift-backslash",
+    "'": "apostrophe",
+    '"': "shift-apostrophe",
+    "\\": "backslash",
+    "[": "bracket_left",
+    "]": "bracket_right",
+    "{": "shift-bracket_left",
+    "}": "shift-bracket_right",
+    "+": "shift-equal",
+    "?": "shift-slash",
+    "~": "shift-grave_accent",
+    "`": "grave_accent",
 }
 for c in "abcdefghijklmnopqrstuvwxyz0123456789":
     KEYMAP[c] = c

@@ -7,6 +7,7 @@
 #include "scheduler.h"
 #include "util.h"
 #include "env.h"
+#include "user.h"
 #include "test_tasks.h"   /* knetd_die_now, under TINYOS_FAULT_INJECT */
 #include "net.h"          /* net_netd_set_claimed, under TINYOS_FAULT_INJECT */
 #include "dns.h"          /* dns_forge_response, under TINYOS_FAULT_INJECT */
@@ -537,8 +538,8 @@ static void parse_and_execute(char* cmd_line) {
     first_word[word_len] = '\0';
 
     /* Check if it's an alias */
-    const char* alias_cmd = alias_get(first_word);
-    if (alias_cmd) {
+    char alias_cmd[ALIAS_MAX_CMD_LEN];
+    if (alias_get(first_word, alias_cmd, sizeof(alias_cmd))) {
         /* Expand alias: replace first word with alias command */
         size_t alias_len = strlen(alias_cmd);
         const char* rest = cmd_copy + word_len;
@@ -1078,6 +1079,12 @@ static int launch_login_shell(void) {
         task->parent_pid = self->pid;
         task->parent_generation = self->generation;
         streams_inherit(&task->streams, get_current_streams());
+
+        /* The ring-3 shell starts with this login session's exported variables
+         * (USER/HOME/PATH/SHELL). It has no env builtins of its own yet -- that
+         * is the follow-up PR -- but the table must already be populated when
+         * they arrive, or the first thing a SYS_ENV read returns is nothing. */
+        env_inherit_exported(self, task);
     }
 
     scheduler_add_task(task);
@@ -1148,6 +1155,32 @@ void shell_task(void) {
             kprintf("\nLogin failed. System halted.\n");
             while (1) {
                 scheduler_yield();  /* Halt task - login failed */
+            }
+        }
+
+        /* Populate this session's environment and aliases.
+         *
+         * Per SESSION, not once at boot. Storage is per-task (task->env), so
+         * there is no global table a boot-time call could fill; and running it
+         * here means a logout/login as a different user starts from the
+         * defaults rather than inheriting the previous user's variables.
+         * env_init() clears before setting, so the re-run on each login is
+         * the reset. */
+        env_init();
+        {
+            /* USER defaults to "root" in env_init(); correct it to whoever
+             * actually logged in, so $USER is not a lie for everyone else.
+             * Resolved from the uid via the account table -- task->name is the
+             * TASK's name ("shell"), not a username. */
+            task_t* self = scheduler_get_current_task();
+            if (self) {
+                user_account_t* acct = user_find_by_uid(self->uid);
+                if (acct) {
+                    env_set("USER", acct->username);
+                    env_export("USER");
+                    env_set("HOME", acct->uid == 0 ? "/" : "/home");
+                    env_export("HOME");
+                }
             }
         }
 

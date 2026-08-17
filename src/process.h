@@ -408,6 +408,19 @@ typedef struct task {
     edr_advanced_state_t* edr_advanced;  /* Advanced detection state (NULL if disabled) */
 
     /*=========================================================================
+     * Per-Task Environment Variables and Aliases
+     *
+     * POINTER, allocated on demand, exactly like edr_advanced above and for
+     * the same reason: env_state_t is ~3 KB, so embedding it would add ~102 KB
+     * of .bss across MAX_TASKS whether or not a task ever sets a variable.
+     * NULL means "no variables", which is a normal state, not an error --
+     * every reader in env.c treats it as an empty table.
+     *
+     * Freed by env_free_for_task() from task_free_resources().
+     *=======================================================================*/
+    struct env_state* env;               /* Per-task env/alias page (NULL until first write) */
+
+    /*=========================================================================
      * SECURITY (v1.11): Per-Process FD Limit Tracking
      *
      * ISSUE: Global FD table (RAMFS_MAX_FDS=16) can be exhausted by a single

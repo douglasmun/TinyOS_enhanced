@@ -737,3 +737,118 @@ stdio.c defines it in every build ever made, converted or not, so the obvious ch
 is one that cannot fail. Validated by actually reverting `cmd_mem`: the guard refused
 to boot the wrong kernel, and with the guard bypassed the runtime negative control
 tripped on the line-number comparison.
+
+## Roadmap item 4, PR A — the env/alias group works, and its storage is per-task
+
+`chmod` and `date` were each one PR: the kernel behaviour already existed and only
+had to cross the ring boundary. **`env` is not like that.** `env_init()` sat
+commented out in `kernel.c` — "TEMPORARILY DISABLED FOR TESTING" — from the initial
+public release onward, while every consumer stayed wired: alias substitution in
+`shell.c`, `$VAR` expansion, all six builtins dispatched. So the commands existed,
+ran, and printed `(no variables)` / `(no aliases)` forever without erroring. That is
+why it survived so long: a check that the `env` command *exists* passes against the
+dead build.
+
+Migrating that to ring 3 first would have carried a dead subsystem across the
+boundary and produced a ring-3 `env` printing nothing, indistinguishable from a
+syscall bug. Hence the split: **PR A makes it work in the kernel shell and settles
+storage; PR B adds the syscall, the libc stubs and the ring-3 builtins.**
+
+### Storage: per-task, inherited on spawn
+
+`env.c` had two file-scope 16-entry arrays with no uid or task concept at all. The
+decision was per-task with inheritance, and the shape follows `task->edr_advanced`:
+`task_t` holds a **pointer** to a lazily `pmm_alloc()`'d page. Embedding
+`env_state_t` directly would add ~102 KB of `.bss` at `MAX_TASKS 32`, charged to
+every task including the ones that never set a variable; a task that never uses env
+now costs four bytes.
+
+Sizing forced two limit changes. At the old `ENV_MAX_VALUE_LEN`/`ALIAS_MAX_CMD_LEN`
+of 256, `env_var_t` is 290 bytes and `alias_t` 289, so the two tables came to 9,264
+bytes — 2.26 pages, i.e. `pmm_alloc_contiguous(3)` with ~3 KB wasted per task. At 64
+they total 3,200 bytes and a plain `pmm_alloc()` works. A `_Static_assert` in `env.h`
+holds the page-fit, and was **negative-controlled** (set the limit to 512, the build
+fails with that exact message) rather than assumed. 256 was never reachable anyway:
+`SHELL_BUFFER_SIZE` is 256 for the *entire* command line, and the longest default
+value in the tree is `"/bin/shell"` at ten characters.
+
+The default alias list went 16 → **12** of 16 slots (`ALIAS_DEFAULT_COUNT`, asserted
+`< ALIAS_MAX_COUNT`). The old list filled the table exactly to capacity, so every
+user `alias` failed "table full" against a table holding nothing of theirs.
+
+Things not to undo, each from a real failure mode:
+
+- `pmm_alloc()` **does not zero**. `env_state_alloc()` must `memset`, or a recycled
+  frame presents as a table full of garbage variables.
+- `env_state_alloc()` is called **outside** the critical section — same discipline
+  as `stream_printf`/`ramfs_write`, since `pmm_alloc` must not run with interrupts
+  masked.
+- `env_get`/`alias_get` **copy out under the lock**. The old versions returned a
+  pointer *into* the table after unlocking: harmless while one global table and one
+  kernel shell existed, a genuine use-after-unlock once the page is freed at task
+  exit.
+- `env_free_for_task()` (from `task_free_resources`) nulls the field, so it is
+  idempotent across the terminate and reaper paths.
+- `env_inherit_exported()` allocates the child's page **directly**, not via
+  `env_state_alloc()` — the latter resolves `scheduler_get_current_task()`, which at
+  spawn time is the *parent*, so it would copy the parent's page onto itself. It runs
+  **before `scheduler_add_task()`** at all three creation sites (`sys_spawn`,
+  `cmd_exec`, the ring-3 shell launch), because the child can run on the next tick.
+  The copy is a **snapshot**: sharing the page would undo the isolation entirely.
+  Aliases deliberately do not cross — substitution happens in `shell.c` before
+  dispatch, so a spawned binary never consults the table.
+
+### Neither property is observable from the shell
+
+This is the part worth remembering. **Per-task isolation cannot be witnessed from
+userspace in this PR**, and the obvious tests all pass vacuously:
+
+- "set FOO=bar, read FOO=bar back" behaves identically under global, per-uid and
+  per-task storage.
+- `su otheruser` changes credentials on the **same task**, so both users share one
+  env page. A "the other user cannot see my variable" leg written that way would
+  *fail* against correct per-task code and pass against per-uid.
+- a logout/login pair needs the typist to re-drive the login sequence, which it does
+  not do — the followup list simply ends.
+- ring 3 has no env syscall yet. That is PR B.
+
+So the check lives in the kernel: `env_pertask_self_test()`, wired in as `sectest`
+TEST 10, which creates real second and third tasks and prints **two** verdict lines.
+
+Isolation is **three-way** — child saw nothing AND child set its own AND parent
+intact — because a child whose page allocation simply *failed* also sees nothing and
+would pass a "saw nothing" check for entirely the wrong reason. Inheritance is
+**two-way** — heir got the exported variable AND did *not* get the un-exported one —
+because a copy that ignored the export flag and cloned the whole table satisfies the
+first clause perfectly.
+
+The two halves also mask each other, which is why both must be asserted: a build
+handing every task one shared page passes inheritance trivially and fails isolation;
+a build that never copies passes isolation and fails inheritance. Neither line alone
+describes the design that was chosen.
+
+Negative-controlled both ways, and **the first attempt at the control was wrong in an
+instructive way**. Redirecting only `env_state_alloc()` — the *allocating* path —
+left the reader `env_state()` returning the child's own NULL, so the child "saw
+nothing" and only the third clause fired; the verdict read `child saw parent's var:
+no (good) | ... | parent's var intact: NO (BAD)`. A shared-storage regression must
+redirect **both** the reader and the allocator, or the control quietly tests less
+than it claims — the same failure mode the three-way verdict itself guards against.
+With both redirected, clauses 1 and 3 both fire.
+
+Two harness traps, neither of them kernel bugs, both of which first presented as one:
+
+- `tools/qemu_typist.py` raises `SystemExit("typist: no keymap for char ...")` for
+  unmapped punctuation. With its stderr sent to `/dev/null` the abort is invisible:
+  half the command lands in the serial log and every leg blames the kernel. Hit on
+  `alias myll='echo ALIASWORKS'` — `'` had no mapping, now added along with
+  `" \ [ ] { } + ? ~` and backtick. Never discard the typist's stderr.
+- `cmd_alias` reads only **`argv[1]`**, so `alias x='echo HI'` tokenizes to
+  `argv[1]="x='echo"` and stores `x -> "echo"`. The alias is created successfully,
+  prints a blank line, and a grep for `HI` fails while looking exactly like an
+  alias-table-capacity failure. Pre-existing shell behaviour; use single-word alias
+  values in harnesses.
+- The serial log is **CRLF**. `grep -q '^root$'` silently fails to match `root\r`;
+  anchored patterns need `\r\?`.
+
+Harness: `verify-env-pertask.sh`.

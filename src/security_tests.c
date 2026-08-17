@@ -8,6 +8,7 @@
  * - Issue 3.3: Cleanup Queue (rapid task termination)
  *=============================================================================*/
 #include "security_tests.h"
+#include "env.h"
 #include "entropy.h"
 #include "process.h"
 #include "scheduler.h"
@@ -490,6 +491,37 @@ static void test_arp_cache_poisoning(void) {
 }
 
 /*=============================================================================
+ * TEST 10: Per-Task Environment Isolation and Export Inheritance
+ *
+ * env_pertask_self_test() spawns two helper kernel tasks: one to check that
+ * tasks do not share an environment table, and one to check that an EXPORTED
+ * variable crosses on spawn while an un-exported one does not. Both are needed
+ * -- they are opposite requirements against the same storage, so each hides the
+ * other's failure.
+ *
+ * It lives here rather than in a shell-driven harness because nothing else in
+ * this build can witness either property: `su` changes credentials on the SAME
+ * task, and ring 3 has no env syscall yet.
+ *
+ * It prints its own detail lines via kprintf (it runs partly in other tasks,
+ * which have their own stream contexts), so only the verdict is echoed here.
+ *=============================================================================*/
+static void test_env_pertask_isolation(void) {
+    stream_context_t* ctx = get_current_streams();
+
+    stream_printf(ctx, "\n");
+    stream_printf(ctx, "=====================================================\n");
+    stream_printf(ctx, "TEST 10: Per-Task Env Isolation + Export Inheritance\n");
+    stream_printf(ctx, "=====================================================\n");
+
+    bool passed = env_pertask_self_test();
+
+    stream_printf(ctx, "-----------------------------------------------------\n");
+    stream_printf(ctx, "TEST 10: %s\n", passed ? "PASSED" : "FAILED");
+    stream_printf(ctx, "=====================================================\n");
+}
+
+/*=============================================================================
  * Main Test Runner
  *=============================================================================*/
 void run_security_tests(void) {
@@ -519,6 +551,7 @@ void run_security_tests(void) {
     test_hardened_usercopy();
     test_user_exception_containment();
     test_arp_cache_poisoning();
+    test_env_pertask_isolation();
 
     stream_printf(ctx, "\n");
     stream_printf(ctx, "*************************************************************\n");

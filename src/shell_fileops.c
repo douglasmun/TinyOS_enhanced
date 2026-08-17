@@ -15,6 +15,7 @@
 #include "stdio.h"
 #include "critical.h"
 #include "syscall.h"   /* For sys_waitpid() — foreground exec blocks on it */
+#include "env.h"       /* For env_inherit_exported() on the exec path */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -1556,6 +1557,13 @@ void cmd_exec(int argc, char* argv[]) {
                 task->gid  = self->gid;
                 task->euid = self->euid;
                 task->egid = self->egid;
+
+                /* Exported variables, inherited for BACKGROUND children too and
+                 * for the same reason the credentials are: env_inherit_exported
+                 * takes a SNAPSHOT into a page of the child's own, so it carries
+                 * none of the shared-fd lifetime problem that restricts the
+                 * stream inheritance above to the foreground path. */
+                env_inherit_exported(self, task);
             }
         }
 

@@ -5,6 +5,7 @@
 #include "kprintf.h"
 #include "kernel.h"
 #include "process.h"
+#include "env.h"   /* env_inherit_exported() on the spawn path */
 #include "paging.h"    // For is_user_address and get_page_table_entry
 #include "memory.h"    // For USER_SPACE_END
 #include "errno.h"     // For POSIX-style error codes
@@ -889,6 +890,12 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
      * carries no lifetime relationship — the parent may chdir away or exit
      * without disturbing the child. */
     safe_strcpy(child->cwd, self->cwd, sizeof(child->cwd));
+
+    /* Exported environment variables, before scheduling for the same reason as
+     * everything above: the child may run on the next tick, and a variable that
+     * arrives after it has started is a variable it never sees. Only EXPORTED
+     * ones cross, and the copy is a snapshot -- see env_inherit_exported(). */
+    env_inherit_exported(self, child);
 
     scheduler_add_task(child);
     return pid;

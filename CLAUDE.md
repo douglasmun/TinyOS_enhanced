@@ -339,6 +339,33 @@ the console while the report still looks complete; and `scheduler_stats()` print
 (the `env.c` pattern), a redirected stream reaching `ramfs_write`. Harness:
 `verify-sectest-redirect.sh`.
 
+**The env/alias subsystem was dead, and its storage is now per-task.** `env_init()`
+sat commented out in `kernel.c` since the initial public release while every
+consumer stayed wired — alias substitution, `$VAR` expansion, all six builtins —
+so the commands ran and printed `(no variables)` forever without erroring. It is
+now called per **shell session** from `shell_task()` after login (no boot-time
+call: storage is per-task, so at boot there is no task to populate). `task_t`
+holds a **pointer** to a lazily `pmm_alloc()`'d page — the `edr_advanced` pattern;
+embedding it would add ~102 KB of `.bss` at `MAX_TASKS 32`. Four things not to
+undo: `pmm_alloc()` **does not zero** (a recycled frame is a table of garbage
+variables); `env_state_alloc()` runs **outside** the critical section;
+`env_get`/`alias_get` **copy out under the lock** (the old borrowed-pointer
+versions are a use-after-unlock once the page is freed at task exit); and
+`env_inherit_exported()` allocates the child's page **directly**, not via
+`env_state_alloc()`, which resolves the *parent* at spawn time and would copy the
+parent's page onto itself. Value limits dropped 256→64 so both tables fit one
+page (`_Static_assert`), and default aliases 16→**12** of 16 slots, because the
+old list filled the table to capacity and made every user `alias` fail.
+And the trap: **neither per-task isolation nor inheritance is observable from the
+shell** — `su` changes credentials on the *same* task, so both users share one env
+page, and "set FOO, read FOO" passes identically under global, per-uid and
+per-task storage. Both are asserted in the kernel instead, by
+`env_pertask_self_test()` (`sectest` TEST 10), whose two verdict lines are
+deliberately multi-clause and mask each other's failures. Full rationale, the
+negative controls, and three harness traps (typist keymap, `cmd_alias` argv[1],
+CRLF anchors) are in `doc/RING3_MIGRATION.md`. Harness:
+`verify-env-pertask.sh`. Ring-3 `env` builtins are the follow-up PR.
+
 ## Not compiled (don't audit/fix)
 
 `kernel_old.c`, `keyboard_old.c`, `tls13_demo.c`, `secure_delete.c` are not in the
