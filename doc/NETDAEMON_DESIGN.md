@@ -1282,3 +1282,115 @@ The `TINYOS_EXPECT_CPL3=1` flag in `verify-netd-ring3.sh` cannot be a single
 global switch across this sequence. After D1b, `udp_cpl3` is nonzero while
 `icmp_cpl3` is still 0 and `tcp_cpl3` must stay 0 forever. The expectation is
 per protocol, and it changes at each step.
+
+## D1 re-scoped — the movability criterion the earlier plan never applied
+
+**This section retracts the sequencing directly above it.** D1b step 1 (the
+`kprintf` sweep, PR #80) stands and was worth landing on its own merits. D1b
+step 2 — moving the DNS parser to ring 3 — was scoped, found unbuildable as
+specified, and is **withdrawn**. So are D1c and D1d in their stated form. What
+follows is why, and what replaces them.
+
+### The criterion
+
+Every earlier gate asked what a protocol *needs* in order to run at ring 3:
+privileged instructions, a TX path, stack budget. Those are real and they were
+answered correctly. They are also the wrong question, because they only decide
+whether the move is *possible*. The question that decides whether it is
+*worthwhile* is the opposite one:
+
+> **Does ring 0 consume a result this parser produces, and act on it?**
+
+If yes, moving the parser does not remove the trust — it relocates the parse and
+then hands the result back across the boundary. A syscall carrying that result is
+a syscall by which a compromised daemon drives the kernel, which is the exact
+capability the move was supposed to cost the attacker.
+
+Applied to the moving set:
+
+| Protocol | Result ring 0 consumes | Acts on it |
+|---|---|---|
+| DNS | `last_resolved_ip`, `dns_resolution_complete` | `curl`/`dig`/`http_test` connect to it; `SYS_NETSTAT` reports it |
+| DHCP | `my_ip`, `subnet_mask`, `gateway_ip`, `dns_server` | routing, ARP, TCP source-IP selection, **TCP ISN generation** (`tcp.c:1216`) |
+| ARP | `arp_cache` | every TX picks its destination MAC from it |
+| ICMP (inbound) | `pings_received` and three counters | **nothing** — statistics only |
+| TCP | connection state | ring 0 permanently; `TCP_LOCK` is `cli` (finding 2) |
+
+Three of the five are load-bearing state. ICMP's inbound half is the only one
+that isn't, and its blocker was never the result — it is the *reply* path.
+
+### Why kernel re-validation does not rescue DNS
+
+The obvious repair is to have ring 3 parse and ring 0 re-check: keep the trust
+decision in the kernel, give the untrusted daemon only the copying. That is the
+right instinct and it fails on this particular protocol, for a structural reason.
+
+DNS's three security checks are not a shell around the parser. They are
+interleaved with it:
+
+- Source-IP and transaction-ID are cheap header comparisons. Separable.
+- **Question-name validation requires walking compressed labels**
+  (`dns_label_to_domain` → `skip_dns_name`), including the compression-pointer
+  loop guard and bounds checks at `dns.c:289`. This is the most attack-prone code
+  in the file.
+- **Finding the A record requires walking the answer resource records**, bounds-
+  checking each RR header and every RDATA length against the packet end.
+
+And ring 0 cannot skip that last step by trusting ring 3's *claimed* address —
+that is the "trusted netd" design, wearing a validator's clothes. To validate
+honestly, ring 0 must re-derive the address from the raw bytes, which means
+re-executing substantially all 193 lines of `handle_dns_response()`, compression
+handling included.
+
+The result: ring 3 performs a `memcpy` and a syscall; ring 0 retains the entire
+attack surface *and* gains a new entry point into it that ring 3 can call at
+will. That is a net loss. A migration whose commit message claimed a privilege
+reduction would be claiming something untrue.
+
+### The error in the earlier scoping, stated plainly
+
+The audit above graded DNS "the clean first mover" on the criteria that blocked
+the other two: no TX path on the response path, zero `cli` reach after PR #78,
+254-byte maximum local. Every one of those findings is correct. All of them are
+irrelevant to the blocker, which is that DNS produces a result the kernel trusts.
+
+The criteria measured cost of moving and never asked what moving would buy. That
+is why the plan survived four PRs of prerequisite work before failing at contact
+with the actual move: nothing in D1a, or in the CPL witness, or in the print
+sweep, depended on the answer.
+
+### What replaces D1
+
+Two things are worth keeping and one is worth abandoning.
+
+**Abandon:** "move ICMP/DNS/DHCP to ring 3" as a unit. DNS and DHCP stay in ring
+0 for the reason above; ARP joins them, having never been examined and having the
+same property.
+
+**Keep — the measuring instruments.** The per-protocol CPL witness (PR #77), the
+ring arbitration (D1a, PR #79) and the RX counters (PRs A1–A3, #80) are all
+independently correct and all still useful. In particular `cpl3` pinned at **0**
+stops being a pre-move baseline and becomes a **standing invariant**: with the
+move withdrawn, any nonzero `cpl3` on any protocol is now a bug report rather
+than progress. `verify-netd-ring3.sh` keeps its assertion and loses its flip;
+`TINYOS_EXPECT_CPL3` should be removed rather than left as a switch nothing sets.
+
+**Keep — ICMP, as the one honest candidate.** Its inbound half writes only
+statistics. A ring-3 ICMP responder is a real privilege reduction: a compromised
+one can forge echo replies, which an on-path attacker can already do, and can
+corrupt a ping counter. It is bounded in a way DNS is not.
+
+It is still not free. It needs a raw-frame TX syscall (which is `SYS_NETTX`,
+already shipped and root-gated), a timer read, and the 1514-byte stack local of
+finding A3 resolved. The two `cli` reaches (`icmp.c:241`, `icmp.c:334`) are both
+on the reply path and both would move to the kernel side of the TX syscall.
+Whether that is worth building is a separate decision and is **not** taken here.
+
+### The general lesson
+
+The prerequisite work was good and the destination was wrong, which is a failure
+mode worth naming: every gate asked "can this move?" and none asked "what does
+moving buy?" A migration plan needs the second question answered *first*, because
+it is the one that can invalidate the whole sequence — and it is cheapest to
+answer at the start, when the answer costs a grep for who reads the parser's
+output rather than four PRs of scaffolding.
