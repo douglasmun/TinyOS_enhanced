@@ -35,6 +35,7 @@
 #include "paging.h"    // SYS_PIPE: map those frames before touching them
 #include "shell_user.h" // SYS_CRED: the passwd/useradd/userdel implementations
 #include "time.h"      // SYS_TIME: time_get_datetime, time_get_uptime_seconds
+#include "ramfs.h"     // SYS_CHMOD: ramfs_chmod + its RAMFS_CHMOD_EPERM sentinel
 
 /*-----------------------------------------------------------------------------
  * Maximum single-syscall transfer size.
@@ -1346,6 +1347,71 @@ int sys_time(void* user_buf, uint32_t size) {
         return -EFAULT;
     }
     return 0;
+}
+
+/*=============================================================================
+ * FUNCTION: sys_chmod
+ *
+ * Thin on purpose. The authorization lives in ramfs_chmod(), which refuses a
+ * caller who is neither root nor the owner -- see the SYS_CHMOD comment in
+ * syscall.h for why the check belongs there and not here, and why that is the
+ * opposite placement to SYS_TCPSOCK's.
+ *
+ * The errno mapping is the only real work, and it is where this could go
+ * quietly wrong. ramfs_chmod's sentinels are its OWN, not errno values:
+ *
+ *   -1  file not found        (NOT -EPERM, though EPERM is 1 -- that collision
+ *                              is exactly why RAMFS_CHMOD_EPERM exists; see
+ *                              ramfs.h)
+ *   -2  invalid mode
+ *   -3  RAMFS_CHMOD_EPERM, the ownership refusal
+ *
+ * Passing those through raw would hand ring 3 a -1 that its libc reads as
+ * -EPERM, inverting the two cases that matter most. Map explicitly, and let
+ * an unrecognised value fall through to -EIO rather than being reinterpreted.
+ *
+ * ENOENT vs EPERM is deliberately NOT hidden here. A file the caller cannot
+ * chmod is still visible to `ls`, so "not permitted" leaks nothing a directory
+ * listing does not -- unlike SYS_KILL/SYS_PSINFO, where concealing existence
+ * IS the policy and a distinguishable errno would enumerate the process table.
+ *===========================================================================*/
+int sys_chmod(const char* user_path, uint32_t mode) {
+    /* Resolved against the caller's cwd and copied into kernel memory before
+     * use, like every other path syscall (TOCTOU). */
+    char path[VFS_MAX_PATH];
+    int rc = syscall_copy_path(path, sizeof(path), user_path);
+    if (rc < 0) {
+        return rc;
+    }
+
+    /* Reject the mode BEFORE touching the filesystem, so a bad mode cannot be
+     * distinguished from a missing file by timing or by which error arrives.
+     * The primitive masks to 0777 anyway; this rejects rather than silently
+     * accepting a caller who asked for setuid and got 0755. */
+    if (mode > 0777) {
+        return -EINVAL;
+    }
+
+    /* task_resolve_path always yields a drive-qualified path, so this test is
+     * total. FAT32 has no permission bits and there is no VFS .chmod op, so
+     * anything off the RAMFS drive is refused rather than silently ignored --
+     * a no-op success here would be a lie a script could not detect. */
+    if (path[0] != VFS_DEFAULT_DRIVE || path[1] != ':') {
+        return -EXDEV;
+    }
+
+    /* Skipping "D:" is safe because the check above proved the prefix.
+     * ramfs_find() walks a plain '/'-rooted path and does not know about
+     * drive letters. */
+    int result = ramfs_chmod(path + 2, (uint16_t)mode);
+
+    switch (result) {
+    case 0:                 return 0;
+    case -1:                return -ENOENT;
+    case -2:                return -EINVAL;
+    case RAMFS_CHMOD_EPERM: return -EPERM;
+    default:                return -EIO;
+    }
 }
 
 int sys_kill(int pid) {
@@ -3236,6 +3302,11 @@ static void syscall_dispatch(struct cpu_state* state) {
         case SYS_TIME:
             /* arg1 = user buffer of systime_t, arg2 = its size in bytes */
             ret = sys_time((void*)arg1, arg2);
+            break;
+
+        case SYS_CHMOD:
+            /* arg1 = path, arg2 = octal mode */
+            ret = sys_chmod((const char*)arg1, arg2);
             break;
 
         case SYS_NETRX:

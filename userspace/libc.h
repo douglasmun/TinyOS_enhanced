@@ -39,6 +39,7 @@
 #define SYS_PSINFO   33
 #define SYS_KILL     34
 #define SYS_TIME     39
+#define SYS_CHMOD    40
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -171,18 +172,32 @@ int  psinfo(void* buf, size_t size);
  * the zeroed struct would render as a plausible timestamp). */
 int  systime(void* buf, size_t size);
 
-/* The two errno values callers actually branch on, named rather than spelled as
+/* The errno values callers actually branch on, named rather than spelled as
  * bare -1/-3 at the use site. Same numbers as src/errno.h; userspace has no
  * errno.h of its own, and a magic number here would silently start meaning
  * something else if the kernel's table were ever renumbered. */
 #define ELIBC_EPERM 1   /* Operation not permitted    (src/errno.h EPERM) */
+#define ELIBC_ENOENT 2  /* No such file or directory  (src/errno.h ENOENT) */
 #define ELIBC_ESRCH 3   /* No such process            (src/errno.h ESRCH) */
+#define ELIBC_EXDEV 18  /* Cross-device link          (src/errno.h EXDEV) */
+#define ELIBC_EINVAL 22 /* Invalid argument           (src/errno.h EINVAL) */
 
 /* Terminate a process. Returns 0, or a negative errno: -ELIBC_ESRCH if no such
  * process OR one this caller may not see -- the two are deliberately the same
  * answer, so kill cannot be used to discover PIDs psinfo() hides.
  * -ELIBC_EPERM means the target is a protected system process. */
 int  kill(int pid);
+
+/* Change a file's permission bits. `mode` is octal 0..0777; the kernel refuses
+ * anything wider. Returns 0, or a negative errno: -ELIBC_EPERM if the caller
+ * neither owns the file nor is root, -ELIBC_ENOENT if it does not exist,
+ * -ELIBC_EXDEV for a path on any drive but the RAM disk (the FAT32 volume has
+ * no ownership model to enforce), -ELIBC_EINVAL for a mode above 0777.
+ *
+ * Unlike kill(), a file this caller cannot chmod is reported as -ELIBC_EPERM,
+ * not folded into -ELIBC_ENOENT: directory listings already reveal the names
+ * and owners, so there is nothing for a merged errno to hide. */
+int  chmod(const char* path, unsigned int mode);
 
 /* Seek origins — same values as VFS_SEEK_* in src/vfs.h, passed straight
  * through without translation so the two cannot drift apart. */

@@ -31,6 +31,7 @@
  *---------------------------------------------------------------------------*/
 static const char* errstr(int err) {
     switch (err) {
+        case -1:  return "operation not permitted";
         case -2:  return "no such file or directory";
         case -11: return "resource limit reached (too many processes)";
         case -13: return "permission denied";
@@ -67,7 +68,8 @@ static void cmd_help(void) {
           "  cd [dir]          change directory (no arg: D:/)\n"
           "  ls [dir]          list a directory (default: .)\n"
           "  cat [file]...     print file contents (no arg: copy stdin)\n"
-          "  stat <path>...    show size and type\n"
+          "  stat <path>...    show size, mode and type\n"
+          "  chmod <mode> <f>  change permission bits (octal; RAM disk only)\n"
           "  mkdir <dir>...    create directories\n"
           "  rmdir <dir>...    remove empty directories\n"
           "  rm <file>...      remove files\n"
@@ -267,8 +269,82 @@ static void cmd_stat(int argc, char** argv) {
             fail("stat", argv[i], err);
             continue;
         }
-        printf("%s  size=%u  %s\n", argv[i], st.size,
+        /* Printed as three separate digits because this printf has no %o.
+         * Adding one would be the tidier fix, but chmod is the only caller
+         * that needs octal and a half-used conversion is a maintenance cost;
+         * the arithmetic below cannot silently render the wrong base.
+         * mode is the ONLY way a ring-3 caller can observe its own chmod --
+         * dirent_t carries it, cmd_stat simply used to drop it. */
+        unsigned m = st.mode & 0777;
+        printf("%s  size=%u  mode=%d%d%d  %s\n", argv[i], st.size,
+               (m >> 6) & 7, (m >> 3) & 7, m & 7,
                st.type == DT_DIR ? "directory" : "file");
+    }
+}
+
+/* Parse an octal mode the way the kernel shell's cmd_chmod does, so "0644",
+ * "0o644" and "644" all mean the same thing in both shells. Returns the mode,
+ * or -1 if the string is not wholly octal -- checked rather than assumed,
+ * because atoi() would read "699" as 699 decimal and hand the kernel a mode
+ * the user never typed.
+ *
+ * The >0777 rejection here makes sys_chmod's identical check unreachable from
+ * THIS shell, which does not make the kernel's copy dead: anything can issue
+ * int 0x80 with whatever mode it likes, and the kernel is the only side that
+ * gets to decide. Don't delete it as redundant. */
+static int parse_octal_mode(const char* s) {
+    const char* p = s;
+    int seen = 0;
+    int mode = 0;
+
+    if (*p == '0') {
+        /* Consume an "0o"/"0O" prefix. A lone leading '0' is a digit, not a
+         * prefix, so only step over it when 'o' follows. */
+        if (p[1] == 'o' || p[1] == 'O') {
+            p += 2;
+        }
+    }
+    while (*p >= '0' && *p <= '7') {
+        mode = mode * 8 + (*p - '0');
+        if (mode > 0777) {
+            return -1;
+        }
+        seen = 1;
+        p++;
+    }
+    if (!seen || *p != '\0') {
+        return -1;
+    }
+    return mode;
+}
+
+/* The authorization for this lives in ramfs_chmod, not here and not in the
+ * syscall -- see the comment at ramfs.c's ownership check (PR #69). This
+ * builtin only parses and reports; a refusal it prints was decided three
+ * layers down. */
+static void cmd_chmod(int argc, char** argv) {
+    if (argc < 3) {
+        print("usage: chmod <mode> <file>...\n"
+              "       mode is octal, e.g. 644 or 755\n");
+        return;
+    }
+
+    int mode = parse_octal_mode(argv[1]);
+    if (mode < 0) {
+        printf("chmod: invalid mode: '%s' (octal, 0-777)\n", argv[1]);
+        return;
+    }
+
+    for (int i = 2; i < argc; i++) {
+        int err = chmod(argv[i], (unsigned int)mode);
+        if (err == -ELIBC_EXDEV) {
+            /* Distinct from the generic errstr text, which describes this
+             * errno in terms of redirection. FAT32 has no owner to check. */
+            printf("chmod: %s: only files on the RAM disk have permissions\n",
+                   argv[i]);
+        } else if (err < 0) {
+            fail("chmod", argv[i], err);
+        }
     }
 }
 
@@ -1151,6 +1227,7 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "ls") == 0)     { cmd_ls(argc, argv);       return 0; }
     if (strcmp(cmd, "cat") == 0)    { cmd_cat(argc, argv);      return 0; }
     if (strcmp(cmd, "stat") == 0)   { cmd_stat(argc, argv);     return 0; }
+    if (strcmp(cmd, "chmod") == 0)  { cmd_chmod(argc, argv);    return 0; }
     if (strcmp(cmd, "write") == 0)  { cmd_write(argc, argv);    return 0; }
     if (strcmp(cmd, "cp") == 0)     { cmd_cp(argc, argv);       return 0; }
     if (strcmp(cmd, "mv") == 0)     { cmd_mv(argc, argv);       return 0; }
