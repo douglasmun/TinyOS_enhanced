@@ -131,11 +131,14 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   trust straight back through a syscall a compromised daemon can call at will. Kernel
   re-validation doesn't rescue DNS: question-name validation walks **compressed labels**
   and the A-record search walks the answer RRs, so validating honestly means ring 0
-  re-executes essentially the whole parser — ring 3 would do a `memcpy`. ICMP's inbound
-  half is the one honest candidate (it writes only counters); its blocker is the
-  *reply* path, not a trusted result. Four PRs of prerequisites (#76–#80) survived
-  because none of them depended on the answer — they are all still correct and worth
-  keeping.
+  re-executes essentially the whole parser — ring 3 would do a `memcpy`. **ICMP passes
+  the result test and still fails**, on a second one DNS never reached: *what capability
+  does the moved component need to do its job?* A responder must reply, so it needs
+  `SYS_NETTX` — and `e1000_send()` does **no source validation**, so that is unrestricted
+  frame forgery (ARP poisoning, DHCP spoofing, TCP injection against the connections
+  that stayed in ring 0). Trading a general actuator for ~60 audited lines of echo parse
+  is a worse deal than DNS, not a better one. Nothing is being moved to ring 3; four PRs
+  of prerequisites (#76–#80) stay correct because none depended on the answer.
 - **Four traps around kernel task lifetime**, each of which reads as healthy when
   wrong. `task_create_kernel()` allocates but does **not** enqueue — every caller needs
   `scheduler_add_task()`, or the task is created, listed by `ps`, counted by every
