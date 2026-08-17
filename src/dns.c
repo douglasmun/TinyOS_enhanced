@@ -67,6 +67,47 @@ static inline void dns_server_set(const uint8_t in[4]) {
     dns_server.word = w;                    /* single aligned store */
 }
 
+/*=============================================================================
+ * RX-PATH COUNTERS (replacing per-packet kprintf)
+ *=============================================================================
+ * handle_dns_response() had 20 kprintf sites, every one of them on a path a
+ * remote host drives, with no local account required. Worse than the icmp.c
+ * case that closed the same way (finding A1): the spoof/TID/injection branches
+ * are exactly the ones an off-path attacker spraying forged responses reaches,
+ * so each forged packet bought several console lines. The question-mismatch
+ * branch additionally printed `question_domain` -- attacker-chosen bytes -- into
+ * the kernel console, which a ring-3 shell shares with the user's own output.
+ *
+ * The grouping is deliberate. Distinct counters for the three *attack*
+ * signatures (source-IP, transaction-ID, question-name), because collapsing
+ * them into one "dropped" total would tell an operator that something is being
+ * rejected while hiding which attack is underway -- and those three are
+ * different attackers with different positions on the network. Malformed and
+ * truncated packets share one counter: they are the same "this is not a
+ * well-formed response" signal and carry no such distinction.
+ *
+ * Counters, not prints, and no stream_printf either: this path runs on knetd
+ * (and moves to ring 3 in D1b), where there is no current user stream.
+ * Surfaced by ifconfig. See doc/NETDAEMON_DESIGN.md.
+ *===========================================================================*/
+static uint32_t dns_responses_rx = 0;       /* accepted, A record found      */
+static uint32_t dns_drop_source_ip = 0;     /* not from our configured server */
+static uint32_t dns_drop_tid = 0;           /* transaction ID mismatch       */
+static uint32_t dns_drop_question = 0;      /* question-name mismatch/absent */
+static uint32_t dns_drop_malformed = 0;     /* short, truncated, bad RCODE   */
+static uint32_t dns_drop_no_answer = 0;     /* well-formed, no A record      */
+
+void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
+                      uint32_t* drop_tid, uint32_t* drop_question,
+                      uint32_t* drop_malformed, uint32_t* drop_no_answer) {
+    if (responses)       *responses       = dns_responses_rx;
+    if (drop_source_ip)  *drop_source_ip  = dns_drop_source_ip;
+    if (drop_tid)        *drop_tid        = dns_drop_tid;
+    if (drop_question)   *drop_question   = dns_drop_question;
+    if (drop_malformed)  *drop_malformed  = dns_drop_malformed;
+    if (drop_no_answer)  *drop_no_answer  = dns_drop_no_answer;
+}
+
 // Storage for last resolved IP address
 static uint8_t last_resolved_ip[4] = {0, 0, 0, 0};
 static bool dns_resolution_complete = false;
@@ -463,7 +504,7 @@ static bool dns_label_to_domain(const uint8_t* packet_start, const uint8_t* pack
 void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* source_ip) {
     // 1. Check minimum length
     if (dns_len < sizeof(dns_header_t)) {
-        kprintf("[DNS] Error: Response too short (%zu bytes).\n", dns_len);
+        dns_drop_malformed++;
         return;
     }
 
@@ -495,10 +536,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
      * provide defense-in-depth against DNS spoofing attacks.
      *=======================================================================*/
     if (memcmp(source_ip, local_dns_server, 4) != 0) {
-        kprintf("[DNS] SECURITY: Response from unexpected IP: %d.%d.%d.%d (expected %d.%d.%d.%d)\n",
-                source_ip[0], source_ip[1], source_ip[2], source_ip[3],
-                local_dns_server[0], local_dns_server[1], local_dns_server[2], local_dns_server[3]);
-        kprintf("[DNS] Possible DNS spoofing attack detected. Dropping response.\n");
+        dns_drop_source_ip++;
         return;
     }
 
@@ -509,9 +547,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
      *=======================================================================*/
     uint16_t response_tid = ntohs(hdr->id);
     if (response_tid != last_dns_tid) {
-        kprintf("[DNS] SECURITY: Transaction ID mismatch! Expected 0x%x, got 0x%x\n",
-                last_dns_tid, response_tid);
-        kprintf("[DNS] Possible DNS cache poisoning attack detected. Dropping response.\n");
+        dns_drop_tid++;
         return;
     }
 
@@ -522,14 +558,14 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
 
     // Check if it's actually a response (QR bit is 1)
     if ((flags & 0x8000) == 0) {
-        kprintf("[DNS] Error: Received DNS message is not a response.\n");
+        dns_drop_malformed++;
         return;
     }
 
     // Check for error code (RCODE - last 4 bits)
     uint8_t rcode = flags & 0x000F;
     if (rcode != 0) {
-        kprintf("[DNS] Error: Non-zero RCODE (%u). DNS failure.\n", rcode);
+        dns_drop_malformed++;
         return;
     }
 
@@ -557,22 +593,21 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
         char question_domain[MAX_DOMAIN_NAME_LEN + 1];
         if (!dns_label_to_domain(dns_data, packet_end, current_ptr,
                                  question_domain, sizeof(question_domain))) {
-            kprintf("[DNS] SECURITY: Failed to parse question name. Dropping response.\n");
+            dns_drop_question++;
             return;
         }
 
         // Compare against our stored query (case-insensitive per DNS RFC)
         if (strcasecmp(question_domain, last_queried_domain) != 0) {
-            kprintf("[DNS] SECURITY: Question name mismatch!\n");
-            kprintf("[DNS] Expected: '%s', Got: '%s'\n", last_queried_domain, question_domain);
-            kprintf("[DNS] Possible DNS response injection attack. Dropping response.\n");
+            /* Never print question_domain: attacker-chosen bytes. */
+            dns_drop_question++;
             return;
         }
 
         // Skip the variable-length domain name
         size_t name_len = skip_dns_name(dns_data, packet_end, current_ptr);
         if (name_len == 0) {
-            kprintf("[DNS] SECURITY: Invalid name in question section. Dropping response.\n");
+            dns_drop_malformed++;
             return;  // Error in skip_dns_name
         }
         current_ptr += name_len;
@@ -588,7 +623,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
          * read 4 bytes past packet end, potentially leaking kernel memory.
          *====================================================================*/
         if (current_ptr + sizeof(dns_question_t) > packet_end) {
-            kprintf("[DNS] SECURITY: Question section truncated. Dropping response.\n");
+            dns_drop_malformed++;
             return;
         }
 
@@ -603,7 +638,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
      * responses always echo our question (qdcount=1).
      *=======================================================================*/
     if (q_count == 0) {
-        kprintf("[DNS] SECURITY: Response has no question section. Dropping.\n");
+        dns_drop_question++;
         return;
     }
 
@@ -613,14 +648,14 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
         // Skip the Name field (often a 2-byte pointer 0xC0 XX)
         size_t name_len = skip_dns_name(dns_data, packet_end, current_ptr);
         if (name_len == 0) {
-            kprintf("[DNS] SECURITY: Invalid name in answer section. Dropping response.\n");
+            dns_drop_malformed++;
             return;  // Error in skip_dns_name
         }
         current_ptr += name_len;
 
         // Ensure we haven't read past the end of the packet for the RR header
         if (current_ptr + sizeof(dns_rr_t) > dns_data + dns_len) {
-            kprintf("[DNS] Warning: Truncated RR in Answer section.\n");
+            dns_drop_malformed++;
             return;
         }
 
@@ -635,7 +670,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
 
         // Ensure the declared RDATA lies entirely within the packet
         if (current_ptr + data_len > packet_end) {
-            kprintf("[DNS] SECURITY: Truncated RDATA. Dropping response.\n");
+            dns_drop_malformed++;
             return;
         }
 
@@ -648,8 +683,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
             memcpy(last_resolved_ip, ip, 4);
             dns_resolution_complete = true;
 
-            kprintf("[DNS] Resolved IP for domain: %d.%d.%d.%d\n",
-                ip[0], ip[1], ip[2], ip[3]);
+            dns_responses_rx++;
 
             return; // Found our answer
         }
@@ -658,7 +692,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
         current_ptr += data_len;
     }
 
-    kprintf("[DNS] Finished parsing response. No A (Type 1) record found.\n");
+    dns_drop_no_answer++;
 }
 
 
@@ -868,3 +902,88 @@ bool dns_get_resolved_ip(uint8_t* ip_out) {
 bool dns_is_resolved(void) {
     return dns_resolution_complete;
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * FUNCTION: dns_forge_response  (verify-dns-rx-counters.sh only)
+ *=============================================================================
+ * Injects a synthetic DNS response directly into handle_dns_response(), one
+ * per drop signature, so each counter can be driven independently.
+ *
+ * It lives HERE rather than in shell.c because the interesting cases need the
+ * live transaction ID and the configured server address, both of which are
+ * file-static -- and they must stay that way. Exposing a TID getter to build a
+ * test would hand every other caller the one value the anti-poisoning check
+ * depends on staying private.
+ *
+ * Each case differs from a VALID response in exactly one respect, which is what
+ * makes the counters separable: if a forged packet tripped two checks at once,
+ * a rise in one counter would not identify which branch ran. The "valid" case
+ * is the positive control -- it must land on dns_responses_rx, proving the
+ * forger builds a well-formed packet and that the drop cases are being dropped
+ * for the single reason named, not because the whole thing is malformed.
+ *===========================================================================*/
+void dns_forge_response(const char* which) {
+    uint8_t pkt[512];
+    uint8_t src[4];
+    dns_server_get(src);
+
+    memset(pkt, 0, sizeof(pkt));
+    dns_header_t* h = (dns_header_t*)pkt;
+
+    /* Echo the domain we last queried, so the question section matches. */
+    uint8_t qname[MAX_DOMAIN_NAME_LEN + 2];
+    size_t qlen = domain_to_dns_label(last_queried_domain, qname, sizeof(qname));
+    if (qlen == 0) {
+        kprintf("[FAULT] dnsforge: no prior query to echo (run `dig` first)\n");
+        return;
+    }
+
+    h->id      = htons(last_dns_tid);
+    h->flags   = htons(0x8180);          /* QR=1, RD=1, RA=1, RCODE=0 */
+    h->qdcount = htons(1);
+    h->ancount = htons(1);
+
+    size_t off = sizeof(dns_header_t);
+    memcpy(pkt + off, qname, qlen);
+    off += qlen;
+    pkt[off++] = 0x00; pkt[off++] = 0x01;   /* QTYPE  = A  */
+    pkt[off++] = 0x00; pkt[off++] = 0x01;   /* QCLASS = IN */
+
+    size_t ans_off = off;
+    pkt[off++] = 0xC0; pkt[off++] = 0x0C;   /* name pointer to offset 12 */
+    pkt[off++] = 0x00; pkt[off++] = 0x01;   /* TYPE  = A  */
+    pkt[off++] = 0x00; pkt[off++] = 0x01;   /* CLASS = IN */
+    pkt[off++] = 0x00; pkt[off++] = 0x00;
+    pkt[off++] = 0x00; pkt[off++] = 0x3C;   /* TTL = 60 */
+    pkt[off++] = 0x00; pkt[off++] = 0x04;   /* RDLENGTH = 4 */
+    pkt[off++] = 203;  pkt[off++] = 0;
+    pkt[off++] = 113;  pkt[off++] = 7;      /* RDATA = 203.0.113.7 (TEST-NET-3) */
+
+    if (strcmp(which, "srcip") == 0) {
+        src[3] ^= 0xFF;                     /* same packet, wrong sender */
+    } else if (strcmp(which, "tid") == 0) {
+        h->id = htons((uint16_t)(last_dns_tid ^ 0xFFFF));
+    } else if (strcmp(which, "question") == 0) {
+        /*
+         * A genuine name MISMATCH, not qdcount=0. Both land on
+         * dns_drop_question, so either would make the counter rise -- but only
+         * this one runs the strcasecmp branch, which is the site that used to
+         * print the attacker's own question_domain bytes. qdcount=0 exits at
+         * the separate "require a question section" guard and would leave that
+         * branch untested while the leg reported OK.
+         */
+        pkt[sizeof(dns_header_t) + 1] = 'z';
+    } else if (strcmp(which, "malformed") == 0) {
+        off = 4;                            /* shorter than a DNS header */
+    } else if (strcmp(which, "noanswer") == 0) {
+        pkt[ans_off + 3] = 0x1C;            /* TYPE = AAAA, so no A record */
+    } else if (strcmp(which, "valid") != 0) {
+        kprintf("[FAULT] dnsforge: valid|srcip|tid|question|malformed|noanswer\n");
+        return;
+    }
+
+    kprintf("[FAULT] dnsforge %s injected\n", which);
+    handle_dns_response(pkt, off, src);
+}
+#endif

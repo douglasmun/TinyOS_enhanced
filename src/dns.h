@@ -52,3 +52,34 @@ bool dns_get_resolved_ip(uint8_t* ip_out);
 bool dns_is_resolved(void);
 
 void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* source_ip);
+
+/**
+ * @brief RX-path counters that replaced handle_dns_response()'s per-packet
+ *        kprintf sites. Surfaced by ifconfig.
+ *
+ * The three drop_* attack signatures are kept apart on purpose: a single
+ * "dropped" total says something is being rejected while hiding which attack
+ * is underway, and these three imply different attacker positions.
+ *
+ * @param responses       Responses accepted with an A record
+ * @param drop_source_ip  Dropped: not from the configured DNS server (spoofing)
+ * @param drop_tid        Dropped: transaction ID mismatch (cache poisoning)
+ * @param drop_question   Dropped: question name mismatched or absent (injection)
+ * @param drop_malformed  Dropped: short, truncated, or non-zero RCODE
+ * @param drop_no_answer  Well-formed responses carrying no A record
+ */
+void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
+                      uint32_t* drop_tid, uint32_t* drop_question,
+                      uint32_t* drop_malformed, uint32_t* drop_no_answer);
+
+#ifdef TINYOS_FAULT_INJECT
+/**
+ * @brief Inject a synthetic DNS response (verify-dns-rx-counters.sh only).
+ * @param which one of: valid, srcip, tid, question, malformed, noanswer
+ *
+ * Each variant differs from `valid` in exactly one respect, so a rise in one
+ * counter identifies which branch ran. Requires a prior query (`dig`) to have
+ * recorded a domain and transaction ID to echo.
+ */
+void dns_forge_response(const char* which);
+#endif

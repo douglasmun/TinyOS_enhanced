@@ -60,6 +60,19 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   and the identifier it gates on is cleartext in every outbound ping, so an on-path
   attacker drove one line per packet. When looking for this class of bug, sweep the
   protocol files too, not just the loops. Harness: `verify-icmp-counters.sh`.
+  **And that sweep in turn only fixed the file it was looking at** —
+  `handle_dns_response()` had **20** more, now six counters via `dns_get_rx_stats()`.
+  Worse than the ICMP case: the sites are the *drop* branches (source-IP, TID,
+  question-name), so a spraying attacker bought more console lines than a legitimate
+  response did, and the question branch printed `question_domain` — the attacker's
+  own bytes — onto a console the ring-3 shell shares with the user. The three attack
+  signatures stay **separate** counters; one "dropped" total hides which attack is
+  underway. `dns.c`'s other 23 prints stay: they are on `send_dns_query` /
+  `domain_to_dns_label`, driven by a local `dig`/`curl` and so bounded by local
+  action — the rule is about what a *remote* host drives, and a file-wide grep here
+  fails on correct code. Harness: `verify-dns-rx-counters.sh` (needs
+  `-DTINYOS_FAULT_INJECT` for `dnsforge`), whose `valid` leg is the positive control
+  — without it every drop leg passes against a forger emitting garbage.
 - **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
   `critical_section_exit()` only touches `IF` when `__interrupt_context_depth == 0`, and
   that clause is deliberate (a `popfl` mid-ISR would corrupt the preempted thread's
