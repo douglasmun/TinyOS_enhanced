@@ -216,6 +216,15 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   `cmd_chmod` would have left the primitive open to the next caller (a future
   `SYS_CHMOD`). Boot-time callers pass because `ramfs_get_current_credentials()`
   returns uid 0 with no current task. Harness: `verify-chmod-owner.sh`.
+  **That future caller has now arrived and the placement paid off**: `SYS_CHMOD`
+  (40) inherited the refusal with no uid test of its own — `sys_chmod` only maps
+  ramfs's private sentinels (`-1` not-found, `-2` bad mode, `RAMFS_CHMOD_EPERM`)
+  onto errnos, and passing them through raw would have handed ring 3 a `-1` its
+  libc reads as `-EPERM`, inverting the two cases that matter. Don't add a second
+  uid check at the boundary. Harness: `verify-ring3-chmod.sh`, whose two adjacent
+  legs are deliberately **opposite** — the same unprivileged user must be refused
+  on root's file and must succeed on their own — because a filter that refuses
+  everything passes the exclusion half alone.
 - **Check sentinel collisions before returning an errno.** `EPERM` is 1, so `-EPERM`
   is `-1` — already `ramfs_chmod`'s "file not found". Returning it made the refusal
   print "No such file or directory" and the new branch dead code, with the kernel
@@ -236,9 +245,9 @@ corrupted the signature hash until `exec_buffer` and `elf_load_process`'s
 ## Current state
 
 The **ring-3 shell is the default login shell** (PR #51), with the kernel shell as a
-fallback (`kshell` hands over; `exit` logs out). It has ~25 builtins against the kernel
-shell's ~70 — redirection, pipelines, the credential commands, `ps`/`kill`/`top` and now
-`cp`/`mv`/`touch` have landed; the machine-state commands (`pae`, `mem`, `wxaudit`,
+fallback (`kshell` hands over; `exit` logs out). It has ~27 builtins against the kernel
+shell's ~70 — redirection, pipelines, the credential commands, `ps`/`kill`/`top`,
+`cp`/`mv`/`touch` and now `date`/`chmod` have landed; the machine-state commands (`pae`, `mem`, `wxaudit`,
 `auditlog`, the networking and security tooling) are still kernel-shell only, and ~20 of
 those stay that way by design (PR #58 gated them: together they are an ASLR defeat).
 

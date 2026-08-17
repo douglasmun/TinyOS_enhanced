@@ -314,6 +314,31 @@
  *---------------------------------------------------------------------------*/
 #define SYS_TIME       39   // Wall clock + uptime; read-only, unprivileged
 
+/*-----------------------------------------------------------------------------
+ * SYS_CHMOD — change a file's permission bits.
+ *
+ * THE AUTHORIZATION IS NOT HERE. ramfs_chmod() itself refuses a caller who is
+ * neither root nor the file's owner, and it was written that way (PR #69)
+ * specifically so that this syscall would inherit the check rather than
+ * re-open the hole the moment a second caller appeared. Do not add a uid test
+ * in this function: a second copy of a policy is a second place for it to
+ * drift, and the primitive is the one both the kernel shell and ring 3 reach.
+ *
+ * This is the OPPOSITE of where SYS_TCPSOCK puts its ownership check. There
+ * the check must sit at the syscall boundary because tcp_tick() and the IRQ
+ * receiver reach the primitives with no current task to attribute. ramfs has
+ * no such caller -- boot-time callers resolve to uid 0 through
+ * ramfs_get_current_credentials() -- so the primitive is the right home here.
+ *
+ * RAMFS ONLY. There is no VFS .chmod op and FAT32 has no permission bits at
+ * all, so a path on any other drive is -EXDEV rather than a silent no-op.
+ *
+ * arg1 = user path, arg2 = mode (masked to 0777 by the primitive; setuid/sgid/
+ * sticky cannot be set through any path). Returns 0, -ENOENT, -EPERM, -EXDEV,
+ * -EINVAL, -EFAULT.
+ *---------------------------------------------------------------------------*/
+#define SYS_CHMOD      40   // Change permission bits; authorization in ramfs
+
 typedef struct {
     uint8_t  remote_ip[4];
     uint16_t remote_port;
@@ -479,7 +504,7 @@ typedef struct {
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  39  // Highest valid syscall number (SYS_TIME)
+#define MAX_SYSCALL_NUM  40  // Highest valid syscall number (SYS_CHMOD)
 
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
@@ -728,6 +753,7 @@ int sys_psinfo(void* user_buf, uint32_t size);
  */
 int sys_kill(int pid);
 int sys_time(void* user_buf, uint32_t size);
+int sys_chmod(const char* user_path, uint32_t mode);
 
 /**
  * SYS_NETRX / SYS_NETTX — raw Ethernet frames across the ring boundary.

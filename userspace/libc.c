@@ -118,6 +118,10 @@ int kill(int pid) {
     return syscall1(SYS_KILL, (uint32_t)pid);
 }
 
+int chmod(const char* path, unsigned int mode) {
+    return syscall3(SYS_CHMOD, (uint32_t)(uintptr_t)path, (uint32_t)mode, 0);
+}
+
 int redirect(int fd, const char* path, int mode) {
     return syscall3(SYS_REDIRECT, (uint32_t)fd, (uint32_t)(uintptr_t)path,
                     (uint32_t)mode);

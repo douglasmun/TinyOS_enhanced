@@ -154,6 +154,8 @@ ring3-pipes.log
 ring3-pipes-trace.log
 ring3date.log
 ring3date-trace.log
+ring3chmod.log
+ring3chmod-trace.log
 scratchpad/
 argv.log
 argv-trace.log
