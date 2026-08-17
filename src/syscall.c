@@ -1421,6 +1421,171 @@ int sys_chmod(const char* user_path, uint32_t mode) {
     }
 }
 
+/*=============================================================================
+ * sys_env - the calling task's environment variables and aliases
+ *
+ * UNGATED BY DESIGN. Storage is per-task (task->env), so every op below can
+ * only reach the caller's own page -- there is no name for another task's
+ * table and no subcommand that takes a pid. Adding a uid check here would be
+ * checking a caller's access to its own memory. See the SYS_ENV block in
+ * syscall.h for why an unprivileged -EPERM would be the bug.
+ *
+ * Every op goes through the SAME copy-in/copy-out record. The record is
+ * memset to 0 before any field is written, so no op can leak the tail of a
+ * previous caller's buffer, and the NUL terminators are forced after every
+ * SAFE_STRNCPY so a full-length kernel value cannot arrive unterminated.
+ *===========================================================================*/
+int sys_env(uint32_t op, void* user_rec, uint32_t size) {
+    /* A size mismatch is -EINVAL rather than a short copy: adding a field to
+     * env_record_t on one side only should be a visible break, not a silently
+     * truncated read. Same convention as the SYS_NETSTAT payloads. */
+    if (size != sizeof(env_record_t)) {
+        return -EINVAL;
+    }
+    if (!user_rec) {
+        return -EFAULT;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+
+    /* Copy IN first for every op. Even the LIST ops need it -- that is where
+     * the requested index arrives. copy_from_user validates the range. */
+    if (copy_from_user(&rec, user_rec, sizeof(rec)) != 0) {
+        return -EFAULT;
+    }
+
+    /* Force termination on the way IN. A caller can hand us 32 non-NUL bytes,
+     * and every consumer below (env_find, strlen, SAFE_STRNCPY) reads these as
+     * C strings. */
+    rec.name[sizeof(rec.name) - 1]   = '\0';
+    rec.value[sizeof(rec.value) - 1] = '\0';
+
+    switch (op) {
+    case ENV_OP_GET: {
+        char value[ENV_MAX_VALUE_LEN];
+        if (!env_get(rec.name, value, sizeof(value))) {
+            return -ENOENT;
+        }
+        memset(&rec, 0, sizeof(rec));
+        SAFE_STRNCPY(rec.value, value, sizeof(rec.value));
+        break;
+    }
+
+    case ENV_OP_SET:
+        /* env_set validates the name itself (env_is_valid_name) and refuses a
+         * full table. -1 covers both, so the distinction a caller can act on
+         * -- "bad name" vs "no room" -- is recovered here rather than passed
+         * through as one opaque code. */
+        if (!env_is_valid_name(rec.name)) {
+            return -EINVAL;
+        }
+        if (env_set(rec.name, rec.value) != 0) {
+            return -ENOSPC;
+        }
+        return 0;
+
+    case ENV_OP_UNSET:
+        return (env_unset(rec.name) == 0) ? 0 : -ENOENT;
+
+    case ENV_OP_EXPORT:
+        return (env_export(rec.name) == 0) ? 0 : -ENOENT;
+
+    case ENV_OP_LIST: {
+        char name[ENV_MAX_NAME_LEN];
+        char value[ENV_MAX_VALUE_LEN];
+        bool exported = false;
+        uint32_t index = rec.index;
+
+        if (index >= ENV_MAX_VARS) {
+            return -EINVAL;
+        }
+
+        memset(&rec, 0, sizeof(rec));
+        rec.index = index;
+
+        /* 0 means "empty slot", not "end of table" -- the caller walks the
+         * whole raw range and skips holes. Returning 0 here rather than an
+         * error keeps a hole cheap and distinguishable from -EINVAL. */
+        if (!env_get_by_index(index, name, sizeof(name),
+                              value, sizeof(value), &exported)) {
+            if (copy_to_user(user_rec, &rec, sizeof(rec)) != 0) {
+                return -EFAULT;
+            }
+            return 0;
+        }
+
+        SAFE_STRNCPY(rec.name, name, sizeof(rec.name));
+        SAFE_STRNCPY(rec.value, value, sizeof(rec.value));
+        rec.exported = exported ? 1u : 0u;
+
+        if (copy_to_user(user_rec, &rec, sizeof(rec)) != 0) {
+            return -EFAULT;
+        }
+        return 1;
+    }
+
+    case ENV_OP_ALIAS_GET: {
+        char cmd[ALIAS_MAX_CMD_LEN];
+        if (!alias_get(rec.name, cmd, sizeof(cmd))) {
+            return -ENOENT;
+        }
+        memset(&rec, 0, sizeof(rec));
+        SAFE_STRNCPY(rec.value, cmd, sizeof(rec.value));
+        break;
+    }
+
+    case ENV_OP_ALIAS_SET:
+        if (rec.name[0] == '\0') {
+            return -EINVAL;
+        }
+        if (alias_set(rec.name, rec.value) != 0) {
+            return -ENOSPC;
+        }
+        return 0;
+
+    case ENV_OP_ALIAS_LIST: {
+        char name[ALIAS_MAX_NAME_LEN];
+        char cmd[ALIAS_MAX_CMD_LEN];
+        uint32_t index = rec.index;
+
+        if (index >= ALIAS_MAX_COUNT) {
+            return -EINVAL;
+        }
+
+        memset(&rec, 0, sizeof(rec));
+        rec.index = index;
+
+        if (!alias_get_by_index(index, name, sizeof(name), cmd, sizeof(cmd))) {
+            if (copy_to_user(user_rec, &rec, sizeof(rec)) != 0) {
+                return -EFAULT;
+            }
+            return 0;
+        }
+
+        SAFE_STRNCPY(rec.name, name, sizeof(rec.name));
+        SAFE_STRNCPY(rec.value, cmd, sizeof(rec.value));
+
+        if (copy_to_user(user_rec, &rec, sizeof(rec)) != 0) {
+            return -EFAULT;
+        }
+        return 1;
+    }
+
+    default:
+        return -EINVAL;
+    }
+
+    /* Shared tail for the two GET ops, which fall out of the switch. The
+     * copy_to_user is deliberately OUTSIDE any critical section: it touches a
+     * ring-3 page and can fault, so the kernel-side getter ran first and
+     * released before we get here. */
+    if (copy_to_user(user_rec, &rec, sizeof(rec)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 int sys_kill(int pid) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -3314,6 +3479,11 @@ static void syscall_dispatch(struct cpu_state* state) {
         case SYS_CHMOD:
             /* arg1 = path, arg2 = octal mode */
             ret = sys_chmod((const char*)arg1, arg2);
+            break;
+
+        case SYS_ENV:
+            /* arg1 = subcommand, arg2 = env_record_t*, arg3 = sizeof it */
+            ret = sys_env(arg1, (void*)arg2, arg3);
             break;
 
         case SYS_NETRX:

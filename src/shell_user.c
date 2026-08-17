@@ -23,6 +23,7 @@
 #include "pit.h"     /* For pit_get_ticks() - used in authentication delay */
 #include "serial.h"  /* For serial debug output */
 #include "stdio.h"   /* For stream_printf() - see cred_printf below */
+#include "env.h"     /* For env_refresh_identity() - su changes identity */
 #include "errno.h"   /* Credential commands return negative errnos to SYS_CRED */
 
 /*=============================================================================
@@ -199,6 +200,13 @@ void shell_cmd_su(const char* args) {
             return;
         }
 
+        /* The identity changed on THIS task, so the env page -- which is
+         * per-task and therefore survives the switch -- still describes the
+         * previous user. Re-point $USER/$HOME before returning, or the new
+         * identity inherits the old one's. Cosmetic while env was kernel-only;
+         * SYS_ENV now hands these to ring 3. */
+        env_refresh_identity();
+
         kprintf("Now running as: ");
         shell_cmd_whoami(NULL);
         return;
@@ -281,6 +289,11 @@ void shell_cmd_su(const char* args) {
         kprintf("su: failed to switch user (kernel error)\n");
         return;
     }
+
+    /* Same reason as the root branch above: the identity changed on this task,
+     * so $USER/$HOME must follow it. Both branches need this -- fixing only the
+     * one the harness happens to drive leaves the other lying. */
+    env_refresh_identity();
 
     kprintf("Switched to user: %s\n", target_username);
 }

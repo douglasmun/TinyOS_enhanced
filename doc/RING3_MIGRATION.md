@@ -810,7 +810,8 @@ userspace in this PR**, and the obvious tests all pass vacuously:
   *fail* against correct per-task code and pass against per-uid.
 - a logout/login pair needs the typist to re-drive the login sequence, which it does
   not do — the followup list simply ends.
-- ring 3 has no env syscall yet. That is PR B.
+- ring 3 had no env syscall yet. That was PR B — and **PR B did not change this
+  conclusion**, because `SYS_ENV` is deliberately own-table-only. See below.
 
 So the check lives in the kernel: `env_pertask_self_test()`, wired in as `sectest`
 TEST 10, which creates real second and third tasks and prints **two** verdict lines.
@@ -848,7 +849,136 @@ Two harness traps, neither of them kernel bugs, both of which first presented as
   prints a blank line, and a grep for `HI` fails while looking exactly like an
   alias-table-capacity failure. Pre-existing shell behaviour; use single-word alias
   values in harnesses.
-- The serial log is **CRLF**. `grep -q '^root$'` silently fails to match `root\r`;
-  anchored patterns need `\r\?`.
+- The serial log is **CRLF**. `grep -q '^root$'` silently fails to match `root\r`.
+  Do **not** fix that with `\r\?` — grep here is ugrep, which rejects it as an
+  empty subexpression. Strip once up front (`tr -d '\r'`) and assert on the
+  stripped copy.
 
 Harness: `verify-env-pertask.sh`.
+
+## Roadmap item 4, PR B — the env/alias group crosses into ring 3 (`SYS_ENV`)
+
+PR A woke the subsystem and made its storage per-task, but left it **kernel-only**:
+the ring-3 shell had no `env`, no `set`, no `$VAR`, no aliases. PR B carries it
+across the boundary.
+
+### `SYS_ENV` (41) — one syscall, eight subcommands
+
+Same shape as `SYS_NETSTAT`/`SYS_TCPSOCK`: a single entry point with an `op`
+selector rather than eight syscall numbers, because the eight operations share one
+fixed-width wire record and differ only in which fields they read.
+
+```c
+ENV_OP_GET / SET / UNSET / EXPORT / LIST
+ENV_OP_ALIAS_GET / ALIAS_SET / ALIAS_LIST
+```
+
+The record is built field by field into an explicit `env_record_t` (32-byte name,
+64-byte value, `index`, `exported`), never `memcpy`'d out of a kernel struct, and
+carries four `_Static_assert`s on `sizeof` and `offsetof` — **mirrored in
+`userspace/libc.h`**, since that is a separate copy that can drift.
+
+`syscall.h` deliberately does **not** include `env.h` (that would pull env into
+every syscall.h consumer), so the tie-back assert — that `ENV_REC_NAME_LEN`/
+`ENV_REC_VALUE_LEN` still match `ENV_MAX_NAME_LEN`/`ENV_MAX_VALUE_LEN` — lives in
+`env.h`, which owns the limits. Both halves are needed: the ones in `syscall.h`
+pin the *layout*, the one in `env.h` pins the *agreement*.
+
+`LIST` enumerates **by index**, one record per call, because `env_list()` and
+`alias_list()` print through `stream_printf` and cannot cross a ring boundary. A
+filled slot returns 1, a hole returns 0, so the client skips holes rather than
+stopping at the first one.
+
+### Gating: UNGATED, and that is not the polarity of its neighbour
+
+`SYS_CHMOD` sits directly above it in the header and is **ownership-gated**.
+`SYS_ENV` is **ungated**, and the reasoning is worth keeping because copying the
+neighbouring assertion would invert it:
+
+> Storage is per-task. A caller can only ever address its own table — there is no
+> foreign object to reach, so there is nothing to authorize. An unprivileged
+> `-EPERM` from any op here is **the bug**, not the policy.
+
+The harness therefore measures every leg as an **unprivileged** user. Running them
+as root would pass against a kernel that had accidentally made `SYS_ENV` root-only.
+
+### Deliberately not exposed
+
+There is **no subcommand that takes a pid**. A "read another task's environment"
+getter would hand straight back the isolation PR A was built to establish. This is
+also why PR B does not make per-task isolation observable from ring 3 — the
+self-test in `sectest` TEST 10 remains the only witness, and PR A's note to that
+effect still stands.
+
+### The syscall alone would have shipped a dead feature
+
+This is the finding that set the PR's scope. A grep established that alias
+substitution (`src/shell.c:542`) and `$VAR` expansion (`src/shell.c:565`) exist
+**only in the kernel shell**. Shipping `SYS_ENV` plus the five builtins would have
+produced a ring-3 shell where `env`, `set` and `alias` all listed their tables
+perfectly and `echo $HOME` printed a literal `$HOME` — **PR A's failure mode
+wearing a different hat**: a subsystem that looks wired and observably does
+nothing.
+
+So PR B also carries the client side, in `userspace/shell.c`:
+
+- `expand_aliases()` — first word only, **single pass**, so `alias ls='ls -l'`
+  cannot loop.
+- `expand_vars()` — `$VAR` and `${VAR}`; an unset variable expands to **nothing**
+  (POSIX), a bare `$` stays literal, an unclosed brace is emitted literally.
+- `cmd_alias` reassembles multi-word values from the remaining argv and strips one
+  layer of quotes — deliberately fixing what the kernel shell's `cmd_alias` gets
+  wrong (it reads `argv[1]` only, the PR A harness trap recorded above).
+
+Legs 5, 6 and 7 of the harness are the ones that would catch the syscall shipping
+without this.
+
+### `$USER` was a lie after `su` — found by the harness's first run
+
+`env_init()` seeds `USER="root"` because it runs before anyone has logged in, so
+every path that establishes **or changes** an identity has to correct it. Login
+always did. **`su` did not**: it changes credentials on the *same task*, so the
+per-task env page survives the switch untouched and the post-su shell went on
+reporting `USER=root`.
+
+Cosmetic while env was kernel-only. `SYS_ENV` makes it reachable from ring 3, where
+a script can branch on `$USER` — the CLAUDE.md rule about exposing a path turning a
+latent bug into a real one, in miniature, and caught the first time the harness ran
+as a non-root user.
+
+Fixed by factoring the login path's correction into `env_refresh_identity()` and
+calling it from **both** `su` branches (the root fast path and the
+password-authenticating one). Fixing only the branch the harness drives would leave
+the other lying. It resolves the name from the task's **real uid** via the account
+table — `task->name` is the *task's* name (`"shell"`), not a username — and does
+nothing silently if there is no current task or no matching account, since this is
+cosmetic state that must not fail an `su` the kernel already committed.
+
+Leg 8 asserts it **both ways**: the new name present *and* `USER=root` gone.
+Presence alone passes against a table holding both.
+
+### Harness traps (`verify-ring3-env.sh`)
+
+- **The prompt echo contains the command.** The shell echoes what it is about to
+  run, so the log holds both `D:/ $ echo MARKER2 $ENVMARK` and the result line. A
+  bare `grep -m1 MARKER2` takes the *echo* — which contains the literal `$ENVMARK`
+  by construction — so the "expanded to its own name" assertion fired on every run,
+  including correct ones. It did exactly that on the first run, against a shell
+  whose output was right. Filter prompt lines before asserting on output.
+- **Alias to a command the ring-3 shell actually has.** The first version aliased
+  to `whoami`, which is a *kernel*-shell builtin. Substitution worked, the shell
+  said `whoami: not found`, and the leg blamed the alias. `id` is the right target:
+  it exists in ring 3, and its output (`uid=…`) is a string the `alias` listing
+  line cannot contain, so the leg stays self-checking.
+- **`grep -q "uid"` for the spawn leg collides with `id`'s output** from the alias
+  leg above and passes without the child ever starting. Anchor on `TinyOS user
+  process`, which only `info.elf` prints.
+- The `env` listing shows four kernel-seeded defaults, so **"`env` printed rows"
+  proves nothing**. Only a round trip separates "the syscall carries *this task's*
+  table" from "something printed four plausible lines": leg 4 sets `ENVMARK=r3only`
+  (a value no default can produce) via `ENV_OP_SET`, and leg 5 reads it back
+  through `ENV_OP_GET` inside `expand_vars()` — a different code path than the
+  write, so a stub faking either one alone fails.
+- Legs 5 and 6 are a **pair on the same variable**, and neither is meaningful
+  alone: "printed nothing" is also what a totally broken expander prints. Leg 5
+  requires the value to appear, leg 6 requires it gone after `unset`.

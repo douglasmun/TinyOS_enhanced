@@ -1167,22 +1167,10 @@ void shell_task(void) {
          * env_init() clears before setting, so the re-run on each login is
          * the reset. */
         env_init();
-        {
-            /* USER defaults to "root" in env_init(); correct it to whoever
-             * actually logged in, so $USER is not a lie for everyone else.
-             * Resolved from the uid via the account table -- task->name is the
-             * TASK's name ("shell"), not a username. */
-            task_t* self = scheduler_get_current_task();
-            if (self) {
-                user_account_t* acct = user_find_by_uid(self->uid);
-                if (acct) {
-                    env_set("USER", acct->username);
-                    env_export("USER");
-                    env_set("HOME", acct->uid == 0 ? "/" : "/home");
-                    env_export("HOME");
-                }
-            }
-        }
+
+        /* USER defaults to "root" in env_init(); correct it to whoever actually
+         * logged in. `su` is the OTHER caller of this helper -- see there. */
+        env_refresh_identity();
 
         /* Display welcome message with ASCII art */
         kprintf("\n");

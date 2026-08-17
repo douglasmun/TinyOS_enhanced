@@ -101,6 +101,18 @@ _Static_assert(sizeof(env_state_t) <= 4096,
                "env_state_t must fit in a single pmm_alloc() page; "
                "reduce ENV_MAX_VALUE_LEN/ALIAS_MAX_CMD_LEN or the slot counts");
 
+/* SYS_ENV's wire record (env_record_t, syscall.h) must be able to carry these
+ * whole. It hardcodes 32/64 rather than including this header, so the tie is
+ * asserted here -- shrinking a table field without shrinking the record is a
+ * silent truncation on the way out to ring 3, which is the hardest failure
+ * mode to see from a shell. Aliases ride the same record, so its name/value
+ * must cover the alias limits too. */
+_Static_assert(ENV_MAX_NAME_LEN == 32 && ENV_MAX_VALUE_LEN == 64,
+               "env_record_t in syscall.h hardcodes 32/64; update both together");
+_Static_assert(ALIAS_MAX_NAME_LEN <= ENV_MAX_NAME_LEN &&
+               ALIAS_MAX_CMD_LEN <= ENV_MAX_VALUE_LEN,
+               "alias fields must fit env_record_t, which they share");
+
 /*=============================================================================
  * Initialization
  *=============================================================================*/
@@ -137,16 +149,41 @@ void env_init(void);
  * export flag and cloned the whole table looks identical to a correct one if
  * you only look at an exported variable.
  *
- * This exists because per-task isolation is not observable any other way in
- * this build: `su` changes credentials on the SAME task (so it shares the
- * page), and ring 3 has no env syscall yet. A single shell setting and reading
- * its own variable behaves identically under global and per-task storage, so
- * without this the property that motivates the whole design would ship
- * untested.
+ * This exists because per-task isolation is not observable from a shell, and
+ * SYS_ENV does not change that. `su` changes credentials on the SAME task, so
+ * both identities share one page; and SYS_ENV is deliberately own-table-only,
+ * with no subcommand that takes a pid, so ring 3 cannot address a second table
+ * to compare against either. A single shell setting and reading its own
+ * variable behaves identically under global, per-uid and per-task storage --
+ * which is exactly what verify-ring3-env.sh can measure and why it does not
+ * claim to test isolation. This self-test remains the only witness.
  *
  * Prints its own result. Returns true if isolation holds.
  */
 bool env_pertask_self_test(void);
+
+/**
+ * @brief Re-point $USER and $HOME at the calling task's CURRENT credentials
+ *
+ * env_init() seeds USER="root" (it runs before anyone has logged in), so every
+ * path that establishes or CHANGES an identity must correct it afterwards or
+ * $USER is a lie for everyone who is not root.
+ *
+ * There are two such paths and they are easy to think of as one: login, and
+ * `su`. Login was handled from the start; `su` was not, because it changes
+ * credentials on the SAME task and so never re-runs env_init(). That left an
+ * unprivileged post-su shell reporting USER=root -- harmless while env was
+ * kernel-only and cosmetic, but SYS_ENV now carries that value to ring 3 where
+ * a script can branch on it.
+ *
+ * Resolved from the task's uid via the account table, NOT from task->name,
+ * which is the TASK's name ("shell") and not a username.
+ *
+ * Silently does nothing if there is no current task or the uid has no account
+ * -- both mean there is no identity to reflect, and this is cosmetic state that
+ * must not fail an su that the kernel already committed.
+ */
+void env_refresh_identity(void);
 
 /**
  * @brief Copy a parent's EXPORTED variables into a freshly-created child
@@ -221,6 +258,32 @@ bool env_get(const char* name, char* out, size_t out_size);
  * @return true if the alias exists, false otherwise
  */
 bool alias_get(const char* name, char* out, size_t out_size);
+
+/**
+ * @brief Copy the variable in RAW SLOT `index` out to the caller
+ *
+ * The enumeration primitive behind SYS_ENV's LIST op. env_list() prints
+ * through stream_printf and so cannot cross the ring boundary; this returns
+ * the data instead and lets the caller format it.
+ *
+ * Walks RAW SLOTS, not a compacted list, so the caller sees holes and must
+ * skip them -- the SYS_PSINFO convention. Compacting would renumber the
+ * remaining entries whenever a slot is freed between two calls, so a caller
+ * iterating 0..N-1 would skip a variable it had not yet seen.
+ *
+ * @param index Slot to read; false if >= ENV_MAX_VARS
+ * @return true if that slot holds a live variable, false if empty/out of range
+ */
+bool env_get_by_index(size_t index, char* name_out, size_t name_size,
+                      char* value_out, size_t value_size, bool* exported_out);
+
+/**
+ * @brief Copy the alias in RAW SLOT `index` out to the caller
+ *
+ * As env_get_by_index(), for the alias table.
+ */
+bool alias_get_by_index(size_t index, char* name_out, size_t name_size,
+                        char* cmd_out, size_t cmd_size);
 
 /**
  * @brief Remove an environment variable

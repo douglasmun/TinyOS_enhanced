@@ -364,7 +364,30 @@ per-task storage. Both are asserted in the kernel instead, by
 deliberately multi-clause and mask each other's failures. Full rationale, the
 negative controls, and three harness traps (typist keymap, `cmd_alias` argv[1],
 CRLF anchors) are in `doc/RING3_MIGRATION.md`. Harness:
-`verify-env-pertask.sh`. Ring-3 `env` builtins are the follow-up PR.
+`verify-env-pertask.sh`.
+
+**The group now crosses to ring 3 via `SYS_ENV` (41)** — one syscall, eight
+subcommands (`GET`/`SET`/`UNSET`/`EXPORT`/`LIST` + three alias ops), a fixed-width
+`env_record_t` mirrored in `userspace/libc.h` with `_Static_assert`s on both
+copies. It is **ungated**, the opposite polarity to `SYS_CHMOD` directly above it:
+storage is per-task, so a caller can only address its own table — there is no
+foreign object, and an unprivileged `-EPERM` here is *the bug*. Measure the harness
+as a non-root user; copying the chmod harness's refusal leg inverts it. There is
+deliberately **no subcommand taking a pid** — that would hand back exactly the
+isolation PR A established, so `sectest` TEST 10 stays the only witness for it.
+Four things not to undo: `LIST` enumerates **by index** (filled slot 1, hole 0)
+because `env_list()` prints through `stream_printf` and cannot cross; `syscall.h`
+must *not* include `env.h`, so the 32/64 field-width tie-back assert lives in
+`env.h` and the layout asserts in `syscall.h` — both halves are load-bearing; the
+syscall **alone ships a dead feature**, since alias substitution and `$VAR`
+expansion live only in the kernel shell (`src/shell.c:542`, `:565`), so
+`expand_aliases`/`expand_vars` in `userspace/shell.c` are part of the same PR —
+without them `env` lists perfectly and `echo $HOME` prints a literal `$HOME`; and
+`env_refresh_identity()` must be called from **both** `su` branches. That last was
+a live bug this PR exposed — `env_init()` seeds `USER="root"`, login corrected it
+and `su` never did (same task, so the env page survives), so every post-`su` shell
+reported `USER=root`. Harness: `verify-ring3-env.sh`; traps and rationale in
+`doc/RING3_MIGRATION.md`.
 
 ## Not compiled (don't audit/fix)
 
