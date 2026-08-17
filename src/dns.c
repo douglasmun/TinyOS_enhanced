@@ -9,7 +9,9 @@
 #include "net.h"
 #include "util.h"
 #include "crypto.h"  // For csprng_random_bytes()
-#include "critical.h"  // SECURITY FIX: For TOCTOU race protection
+/* critical.h deliberately NOT included: this file must contain no cli/sti, so
+ * that handle_dns_response() can run at ring 3 after PR D1. If you find
+ * yourself re-adding it, see the dns_server declaration below first. */
 
 
 // ==============================================================================
@@ -20,9 +22,50 @@
 #define DNS_PORT 53
 #define DNS_FLAGS_QUERY  0x0100 // Network byte order (big endian)
 
-// DNS server will be retrieved from DHCP
-// For external DNS (like 8.8.8.8), we route through the gateway
-uint8_t dns_server_ip[4] = {8, 8, 8, 8};    // Will be set from DHCP
+/*=============================================================================
+ * DNS SERVER ADDRESS — tear-free WITHOUT a critical section
+ *
+ * Written by DHCP, read by the query and response paths. A byte-wise memcpy is
+ * not atomic, so a reader can observe a half-updated address and send its query
+ * to a spliced destination (worked through at the query site below). That used
+ * to be prevented by wrapping all three accesses in CRITICAL_SECTION_ENTER().
+ *
+ * It cannot stay that way. CRITICAL_SECTION_ENTER() is `cli`, which executes
+ * only at CPL <= IOPL, and user tasks run with IOPL=0 (process.c, eflags
+ * 0x0202). handle_dns_response() is on the RX path that PR D1 moves to ring 3,
+ * so the `cli` there would be a #GP on the first DNS response the daemon
+ * handled. See doc/NETDAEMON_DESIGN.md.
+ *
+ * A lock was never needed for a 4-byte object: one naturally-aligned 32-bit
+ * load or store is atomic with respect to interrupts on i386, at any privilege
+ * level. The union gives the alignment the bare uint8_t[4] did not — that
+ * declaration carried no alignment guarantee, so the atomicity argument did not
+ * actually hold for it, which is the easy half of this change to miss.
+ *
+ * Accessors, not a bare global: the address must only ever be touched through
+ * a single aligned word access, and a plain array invites the next caller to
+ * memcpy it back apart.
+ *===========================================================================*/
+static union {
+    uint32_t word;
+    uint8_t  bytes[4];
+} dns_server = { .bytes = {8, 8, 8, 8} };   /* Will be set from DHCP */
+
+static inline void dns_server_get(uint8_t out[4]) {
+    uint32_t w = dns_server.word;           /* single aligned load */
+    out[0] = (uint8_t)(w);
+    out[1] = (uint8_t)(w >> 8);
+    out[2] = (uint8_t)(w >> 16);
+    out[3] = (uint8_t)(w >> 24);
+}
+
+static inline void dns_server_set(const uint8_t in[4]) {
+    uint32_t w = (uint32_t)in[0]
+               | ((uint32_t)in[1] << 8)
+               | ((uint32_t)in[2] << 16)
+               | ((uint32_t)in[3] << 24);
+    dns_server.word = w;                    /* single aligned store */
+}
 
 // Storage for last resolved IP address
 static uint8_t last_resolved_ip[4] = {0, 0, 0, 0};
@@ -59,24 +102,17 @@ typedef struct __attribute__((packed)) {
  *
  * SECURITY FIX: Protected against TOCTOU race condition
  * CRITICAL: This function can be called from interrupt context (DHCP handler
- * via network IRQ), while DNS queries read dns_server_ip from task context.
- * Without atomic protection, a race between memcpy write and DNS query reads
- * can result in corrupted/torn IP addresses (e.g., reading {1,2,8,8} during
- * transition from {1,2,3,4} to {8,8,8,8}).
+ * via network IRQ), while DNS queries read the server address from task
+ * context. Without atomic protection, a race between the write and a concurrent
+ * read can result in corrupted/torn IP addresses (e.g., reading {1,2,8,8}
+ * during transition from {1,2,3,4} to {8,8,8,8}).
+ *
+ * The single aligned store in dns_server_set() provides that atomicity without
+ * a critical section; see the declaration above for why the critical section
+ * had to go.
  */
 void set_dns_server(const uint8_t* server_ip) {
-    /*=========================================================================
-     * SECURITY FIX: Atomic Update of DNS Server IP
-     * Use critical section to prevent torn reads by concurrent DNS queries.
-     * Duration: ~4 memory writes (<10 CPU cycles), negligible latency impact.
-     *=======================================================================*/
-    CRITICAL_SECTION_ENTER();
-    memcpy(dns_server_ip, server_ip, 4);
-    CRITICAL_SECTION_EXIT();
-
-    // kprintf("DNS: Server set to %d.%d.%d.%d\n",
-    //         dns_server_ip[0], dns_server_ip[1],
-    //         dns_server_ip[2], dns_server_ip[3]);
+    dns_server_set(server_ip);
 }
 
 /*=============================================================================
@@ -436,11 +472,11 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
     /*=========================================================================
      * SECURITY FIX: Atomic Read of DNS Server IP for Validation
      * Take a consistent snapshot to prevent TOCTOU during source IP check.
+     * One aligned 32-bit load, no critical section: this function moves to
+     * ring 3 in PR D1, where `cli` is a #GP.
      *=======================================================================*/
     uint8_t local_dns_server[4];
-    CRITICAL_SECTION_ENTER();
-    memcpy(local_dns_server, dns_server_ip, 4);
-    CRITICAL_SECTION_EXIT();
+    dns_server_get(local_dns_server);
 
     /*=========================================================================
      * SECURITY: Validate DNS Source IP Address
@@ -671,13 +707,12 @@ void send_dns_query(const char* domain) {
      * 3. Task continues, reads dns_server_ip[2]=8, dns_server_ip[3]=8
      * 4. Query sent to corrupted IP 1.2.8.8 instead of intended server
      *
-     * FIX: Copy dns_server_ip atomically under critical section, then use
+     * FIX: Read the address as one aligned 32-bit load (atomic w.r.t.
+     * interrupts at any CPL, and no `cli` — see the declaration), then use
      * local copy for all subsequent operations in this function.
      *=======================================================================*/
     uint8_t local_dns_server[4];
-    CRITICAL_SECTION_ENTER();
-    memcpy(local_dns_server, dns_server_ip, 4);
-    CRITICAL_SECTION_EXIT();
+    dns_server_get(local_dns_server);
 
     // Check if DNS server is configured (using local copy)
     if (local_dns_server[0] == 0 && local_dns_server[1] == 0 &&
