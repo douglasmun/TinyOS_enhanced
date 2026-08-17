@@ -884,8 +884,23 @@ static void parse_and_execute(char* cmd_line) {
     /* verify-supervisor.sh only. Not in the command table, so it never appears
      * in `help` -- see the rationale on knetd_die_now in test_tasks.c. */
     else if (strcmp(argv[0], "killknetd") == 0) {
-        knetd_die_now = 1;
-        kprintf("[FAULT] knetd death requested\n");
+        /* With no argument: one death, the original behaviour steps 1-4 use.
+         * With a count: that many deaths back-to-back, each restarted instance
+         * dying immediately, to drive the supervisor past SUPERVISOR_MAX_RESTARTS
+         * inside SUPERVISOR_WINDOW_MS. The repetition has to happen in the guest
+         * rather than as repeated typed commands -- see test_tasks.c. */
+        if (argc > 1) {
+            int n = 0;
+            for (const char* dp = argv[1]; *dp >= '0' && *dp <= '9'; dp++) {
+                n = n * 10 + (*dp - '0');
+                if (n > 100) break;   /* not a real limit, just no runaway */
+            }
+            knetd_die_repeat = n;
+            kprintf("[FAULT] knetd death requested x%d\n", n);
+        } else {
+            knetd_die_now = 1;
+            kprintf("[FAULT] knetd death requested\n");
+        }
     }
 #endif
     else if (strcmp(argv[0], "ping") == 0) {

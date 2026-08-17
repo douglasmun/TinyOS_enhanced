@@ -221,8 +221,23 @@ static void scheduler_remove_task_locked(task_t* task) {
 
     /* CRITICAL SECTION ASSUMED - Caller must already hold it */
 
-    // Special case: only one task in queue (task points to itself)
-    if (task->next == task) {
+    /* Special case: only one task in queue (task points to itself).
+     *
+     * The head check is load-bearing and was missing. `task->next == task` says
+     * the node is self-linked; it does NOT say it is the node this queue is
+     * built around. A task that was dequeued and re-added elsewhere, or a stale
+     * entry left self-linked, satisfies the condition while the real queue still
+     * holds several live tasks -- and this branch would then null head AND tail,
+     * discarding all of them. The next tick sees !ready_queue_head and panics
+     * with "All tasks terminated" while the task table is full of runnable
+     * tasks.
+     *
+     * That is not hypothetical: it is how the kernel died on the second rapid
+     * restart of knetd, found by verify-supervisor.sh's give-up control. The
+     * primary fix is in the reaper (dequeue before freeing the slot), and this
+     * is the belt to that suspenders -- the branch should refuse to empty a
+     * queue it is not actually the sole member of. */
+    if (task->next == task && task == ready_queue_head) {
         ready_queue_head = NULL;
         ready_queue_tail = NULL;
         task->next = NULL;
@@ -1018,6 +1033,38 @@ void scheduler_schedule_from_interrupt(interrupt_regs_t* regs) {
         if (!task_to_cleanup) {
             break;  // Queue empty or error
         }
+
+        /*=====================================================================
+         * Dequeue BEFORE freeing the slot. Found by verify-supervisor.sh's
+         * give-up control (the first thing that ever killed the same daemon
+         * twice in quick succession); pre-existing, and not specific to
+         * supervision.
+         *
+         * task_terminate() removes the task from the ready queue on the paths
+         * that run to completion, but a task that terminates ITSELF defers the
+         * free to this reaper -- and the entry could still be linked when we
+         * arrive here. Zeroing pid and stamping TERMINATED below then leaves a
+         * corpse in a circular list that scheduler_get_next_task() will later
+         * try to reject.
+         *
+         * That rejection is where it turns fatal. scheduler_remove_task_locked()
+         * has a `task->next == task` special case which nulls BOTH head and
+         * tail -- correct for a genuine single-entry queue, catastrophic for a
+         * stale self-linked corpse, because it discards every other live task
+         * along with it. The next tick sees !ready_queue_head and panics with
+         * "All tasks terminated" while five live tasks are sitting in the table.
+         *
+         * Observed exactly that way: knetd died a second time, and the kernel
+         * halted with Shell, Idle, ktimerd, supervisor and edr_daemon all alive
+         * and runnable.
+         *
+         * Fixed HERE rather than by teaching the queue to tolerate corpses,
+         * because the invariant worth keeping is "a freed slot is never in the
+         * ready queue". Hardening the remove path instead would leave the
+         * window open for every other reader of the list. Idempotent:
+         * scheduler_remove_task() returns immediately if the task is not linked.
+         *===================================================================*/
+        scheduler_remove_task_locked(task_to_cleanup);
 
         uint32_t saved_cr3;
         __asm__ volatile("mov %%cr3, %0" : "=r"(saved_cr3));

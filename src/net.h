@@ -274,6 +274,43 @@ void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx);
  * records, so the move has to be witnessed rather than asserted. */
 void net_get_parse_ring_stats(uint32_t* cpl0, uint32_t* cpl3);
 
+/*
+ * Per-protocol ring accounting (doc/NETDAEMON_DESIGN.md, prerequisite for D1).
+ *
+ * The global pair above is a whole-frame witness, and after D1 it stops being a
+ * sufficient assertion: TCP deliberately keeps parsing at CPL 0 while ICMP/UDP
+ * move to CPL 3, so `cpl0 == 0` — the current post-move assertion — would fail
+ * against a CORRECT build. The counters are therefore split by L4 protocol, and
+ * the post-move assertion becomes two one-sided claims that cannot both hold in
+ * a partial move: no ICMP/UDP frame parsed at CPL 0, and no TCP frame parsed at
+ * CPL 3.
+ *
+ * DNS and DHCP are not separable here and deliberately so: both ride UDP, and
+ * this counter sits at the L4 dispatch switch, which is the seam the move
+ * actually falls on. Counting them individually would mean instrumenting the
+ * port demux inside handle_udp() — a different, later seam that would report a
+ * frame as "moved" based on its destination port rather than on which ring
+ * executed the switch. The switch is where the boundary is, so the switch is
+ * where the witness reads %cs.
+ *
+ * These SUPPLEMENT the global pair rather than replacing it, so the PR #74
+ * baseline stays comparable across the move.
+ *
+ * Landed BEFORE the move it grades, for the same reason the global witness was:
+ * an assertion rewritten in the same commit as the code it grades is not an
+ * independent check.
+ */
+typedef struct {
+    uint32_t icmp_cpl0;
+    uint32_t icmp_cpl3;
+    uint32_t udp_cpl0;
+    uint32_t udp_cpl3;
+    uint32_t tcp_cpl0;
+    uint32_t tcp_cpl3;
+} net_parse_proto_cpl_stats_t;
+
+void net_get_parse_proto_cpl_stats(net_parse_proto_cpl_stats_t* out);
+
 /* DMA region layout (doc/NETWORK_ISOLATION.md item 3). The guard addresses are
  * reported so `netdma` and verify-dma-guard.sh can assert they are genuinely
  * not present, rather than trusting that the unmap was called. */

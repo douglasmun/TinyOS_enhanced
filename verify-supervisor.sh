@@ -86,23 +86,36 @@
 #          count. It passes, because the pre-kill injection already made the
 #          counter nonzero. That is why step 3 asserts a RISE and not a value.
 #
-# KNOWN GAP: THE GIVE-UP BRANCH IS NOT EXERCISED
+# CLOSED GAP: THE GIVE-UP BRANCH (step 5, added as a D1 prerequisite)
 #
-# This harness only ever asserts gave-up == 0, which proves the rate limiter does
-# not fire SPURIOUSLY -- never that it fires when it should. The give-up branch
-# is the one that matters most after PR D1: a remote host that can crash the
-# ring-3 parser on demand drives an unbounded restart loop, and the limiter is
-# the only thing that stops it. Asserting it stays zero is close to the weakest
-# possible statement about it.
+# Through PR D2 this harness only ever asserted gave-up == 0, which proves the
+# rate limiter does not fire SPURIOUSLY and says nothing about whether it fires
+# when it should. That branch is the one that matters most after D1: a remote
+# host that can crash the ring-3 parser on demand drives an unbounded restart
+# loop, and the limiter is the only thing that stops it.
 #
-# It is left untested here deliberately rather than by oversight: killing the
-# daemon SUPERVISOR_MAX_RESTARTS times inside SUPERVISOR_WINDOW_MS needs a
-# repeat-kill hook this harness does not have, and the branch it guards has no
-# consequence until something can actually crash the parser. PR D1 must not land
-# without a control that drives knetd past the budget and asserts (a) gave-up
-# becomes 1, (b) the "GIVING UP" line reaches the console, and (c) the daemon
-# stays dead afterwards -- (c) being the real claim, since a give-up that still
-# restarts is worse than no limiter at all.
+# Step 5 now drives knetd past the budget and asserts three things:
+#   (a) gave-up becomes 1
+#   (b) the "GIVING UP" line reaches the console
+#   (c) the daemon STAYS DEAD -- a further injection parses ZERO frames
+#
+# (c) is the real claim. (a) and (b) are both the supervisor's opinion of
+# itself; a give-up that sets the flag, prints the line, and restarts anyway
+# passes both and is WORSE than no limiter, because the operator now believes
+# the loop has stopped. Only the pinned RX counter is independent evidence.
+#
+# Note (c) asserts the RX counter does NOT move while step 3 asserts it DOES.
+# Same counter, opposite directions, deliberately. Do not reconcile them.
+#
+# WHY THE DEATHS ARE DRIVEN FROM INSIDE THE GUEST
+#
+# `killknetd 8` sets a countdown that each restarted knetd decrements before
+# dying again, rather than the harness typing the command eight times. The
+# budget is 5 deaths within 10 seconds; typing eight commands with echo
+# verification under TCG does not reliably fit in that window, and missing it
+# fails SILENTLY -- the supervisor restarts each time, the window rolls forward,
+# gave-up stays 0, and the run reports exactly what a BROKEN limiter reports.
+# 8 > 5 so the burst clears the budget with margin.
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
 # Logs: supervisor.log (serial), supervisor-trace.log.
@@ -166,6 +179,16 @@ grep -q "TINYOS_FAULT_INJECT" src/test_tasks.c \
     || guard_fail "src/test_tasks.c has no TINYOS_FAULT_INJECT hook; knetd cannot
   be made to die, so the restart path cannot be exercised at all"
 
+# Step 5's repeat-death budget. Guarded separately from the flag above because a
+# tree with only the single-death hook runs steps 1-3 perfectly and then reports
+# gave-up == 0 at step 5a -- which is indistinguishable from a broken limiter.
+grep -q "knetd_die_repeat" src/test_tasks.c \
+    || guard_fail "src/test_tasks.c has no knetd_die_repeat countdown; the give-up
+  branch cannot be driven and step 5 would report a limiter failure that is
+  really a missing hook"
+grep -q "knetd_die_repeat" src/shell.c \
+    || guard_fail "the kernel shell's killknetd takes no repeat count"
+
 command -v python3 >/dev/null 2>&1 || guard_fail "python3 not found"
 [ -f tools/inject_frames.py ] || guard_fail "tools/inject_frames.py is missing"
 
@@ -224,6 +247,18 @@ INJECT_CMD="python3 tools/inject_frames.py --mcast '$QEMU_MCAST' \
 export TINYOS_HOOK_INJECT1="sleep 2; $INJECT_CMD >/dev/null 2>&1; sleep 5; true"
 export TINYOS_HOOK_INJECT2="sleep 3; $INJECT_CMD >/dev/null 2>&1; sleep 6; true"
 
+# Give-up control (step 5). No frames -- just time for the 8 requested deaths to
+# play out. They land at scheduler speed, so this is generous, but the give-up
+# print and the final ifconfig must not race the last restart attempt.
+export TINYOS_HOOK_SETTLE="sleep 8; true"
+
+# After the give-up, inject again. This is the load-bearing half of step 5: the
+# claim is not "gave-up became 1" but "the daemon STAYS dead", and the only way
+# to witness that is to send frames and prove they are NOT parsed. A give-up
+# that still restarts is worse than no limiter at all, and the counter alone
+# cannot distinguish the two.
+export TINYOS_HOOK_INJECT3="sleep 3; $INJECT_CMD >/dev/null 2>&1; sleep 6; true"
+
 # Sequence (in the KERNEL shell -- `killknetd` is a kshell builtin, and the
 # default login shell is ring 3, which does not have it):
 #   kshell                hand over from the ring-3 shell
@@ -255,7 +290,13 @@ killknetd=>knetd death requested;\
 ifconfig=>Supervisor;\
 >INJECT2;\
 ifconfig=>RX ring;\
-ps -l=>knetd" \
+ps -l=>knetd;\
+killknetd 8=>knetd death requested x8;\
+>SETTLE;\
+ifconfig=>Supervisor;\
+>INJECT3;\
+ifconfig=>RX ring;\
+ps -l=>PID" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
@@ -298,13 +339,37 @@ if [ "${#SUP_SAMPLES[@]}" -lt 2 ]; then
         "assertion never got a chance to be tested."
 fi
 
+# ifconfig prints the 'Supervisor:' line on EVERY invocation, so there is one
+# sample per ifconfig and the indices line up exactly with RX_SAMPLES below:
+#   [0] baseline, before any injection          -> step 0's subject
+#   [1] after INJECT1, before the kill
+#   [2] after the single kill and its restart   -> step 2's subject
+#   [3] after INJECT2, post-restart
+#   [4] after the give-up burst + SETTLE        -> step 5's subject
+#   [5] after INJECT3, post-give-up
+#
+# Indexed by position rather than "last", because the give-up burst deliberately
+# drives gave-up to 1: reading step 2's "gave-up must be 0" off the LAST sample
+# would make steps 2 and 5 assert opposite things about the same number, and
+# whichever ran second would win. Step 2's claim is about the state after ONE
+# death; step 5's is about the state after the burst.
+if [ "${#SUP_SAMPLES[@]}" -ne 6 ]; then
+    fail_with "expected exactly 6 'Supervisor:' samples, got ${#SUP_SAMPLES[@]}" \
+        "The command sequence did not complete, so the per-step samples cannot" \
+        "be identified by position."
+fi
+
 BASE_WATCHED=$(echo "${SUP_SAMPLES[0]}" | awk '{print $1}')
 BASE_RESTARTS=$(echo "${SUP_SAMPLES[0]}" | awk '{print $2}')
-FINAL_RESTARTS=$(echo "${SUP_SAMPLES[${#SUP_SAMPLES[@]}-1]}" | awk '{print $2}')
-FINAL_GAVEUP=$(echo "${SUP_SAMPLES[${#SUP_SAMPLES[@]}-1]}" | awk '{print $3}')
+FINAL_RESTARTS=$(echo "${SUP_SAMPLES[2]}" | awk '{print $2}')
+FINAL_GAVEUP=$(echo "${SUP_SAMPLES[2]}" | awk '{print $3}')
+GU_WATCHED=$(echo "${SUP_SAMPLES[4]}" | awk '{print $1}')
+GU_RESTARTS=$(echo "${SUP_SAMPLES[4]}" | awk '{print $2}')
+GU_GAVEUP=$(echo "${SUP_SAMPLES[4]}" | awk '{print $3}')
 
-echo "  baseline: watched=$BASE_WATCHED restarts=$BASE_RESTARTS"
-echo "  final:    restarts=$FINAL_RESTARTS gave-up=$FINAL_GAVEUP"
+echo "  baseline:    watched=$BASE_WATCHED restarts=$BASE_RESTARTS"
+echo "  post-kill:   restarts=$FINAL_RESTARTS gave-up=$FINAL_GAVEUP"
+echo "  post-burst:  watched=$GU_WATCHED restarts=$GU_RESTARTS gave-up=$GU_GAVEUP"
 
 # --- Step 0: baseline ------------------------------------------------------
 [ "$BASE_WATCHED" -ge 1 ] \
@@ -326,7 +391,13 @@ if ! grep -qa "\[SUPERVISOR\] 'knetd' (PID .*) has died" "$SERIAL"; then
         "and that 'kill' reported success), or supervisor_run_once() is not" \
         "detecting death. Steps 2 and 3 are meaningless without this."
 fi
-DIED_PID=$(grep -a "\[SUPERVISOR\] 'knetd' (PID" "$SERIAL" | tail -1 | sed -n 's/.*PID \([0-9]*\).*/\1/p')
+# head -1, NOT tail -1: after step 5's burst the log holds nine death lines and
+# eight restart lines. Step 2's claim is about the FIRST death and the FIRST
+# restart -- the deliberate single kill. Taking the last of each would pair a
+# burst death with a burst restart, or worse, pair the final death (which was
+# NOT restarted, because the supervisor gave up) against a restart line from
+# several deaths earlier, and then compare two unrelated PIDs.
+DIED_PID=$(grep -a "\[SUPERVISOR\] 'knetd' (PID" "$SERIAL" | head -1 | sed -n 's/.*PID \([0-9]*\).*/\1/p')
 echo "  [step 1] supervisor observed knetd (PID $DIED_PID) die: OK"
 
 # --- Step 2: it was restarted, as a DIFFERENT task -------------------------
@@ -345,7 +416,7 @@ grep -qa "\[SUPERVISOR\] restarted 'knetd' as PID" "$SERIAL" \
         "The counter rose but the restart was never announced, so the two" \
         "sources of truth disagree."
 
-NEW_PID=$(grep -a "\[SUPERVISOR\] restarted 'knetd' as PID" "$SERIAL" | tail -1 | sed -n 's/.*as PID \([0-9]*\).*/\1/p')
+NEW_PID=$(grep -a "\[SUPERVISOR\] restarted 'knetd' as PID" "$SERIAL" | head -1 | sed -n 's/.*as PID \([0-9]*\).*/\1/p')
 if [ -n "$DIED_PID" ] && [ "$NEW_PID" = "$DIED_PID" ]; then
     fail_with "the 'restarted' knetd has the SAME pid ($NEW_PID) as the dead one" \
         "That is a recycled-slot alias, not a restart -- the exact failure" \
@@ -362,21 +433,23 @@ RX_SAMPLES=()
 while IFS= read -r line; do RX_SAMPLES+=("$line"); done < <(grep -a "RX ring:" "$SERIAL" \
     | sed -n 's/.*RX ring: *\([0-9][0-9]*\) cpl0, *\([0-9][0-9]*\) cpl3.*/\1 \2/p')
 
-# The command sequence runs ifconfig FOUR times, in this fixed order:
+# The command sequence runs ifconfig SIX times, in this fixed order:
 #   [0] baseline, before any injection      -> expected 0
 #   [1] after INJECT1, before the kill      -> the PRE value (must be > 0)
 #   [2] after the kill                      -> not used for the delta
 #   [3] after INJECT2, post-restart         -> the POST value
+#   [4] after the give-up burst + SETTLE    -> step 5's pre-value
+#   [5] after INJECT3, post-give-up         -> step 5's post-value (must NOT rise)
 #
 # Indexed explicitly rather than by "first and last", because RX_SAMPLES[0] is a
 # pre-injection zero: comparing against it would let step 3 pass on any nonzero
 # final count and would stop proving that the RX path recovered. If the sequence
 # above ever changes, this count assertion fails loudly instead of silently
 # grading the wrong pair.
-if [ "${#RX_SAMPLES[@]}" -ne 4 ]; then
-    fail_with "expected exactly 4 'RX ring:' samples, got ${#RX_SAMPLES[@]}" \
-        "The command sequence did not complete, so the pre/post pair cannot be" \
-        "identified by position and recovery is unproven."
+if [ "${#RX_SAMPLES[@]}" -ne 6 ]; then
+    fail_with "expected exactly 6 'RX ring:' samples, got ${#RX_SAMPLES[@]}" \
+        "The command sequence did not complete, so the pre/post pairs cannot be" \
+        "identified by position and neither recovery nor give-up is proven."
 fi
 
 RX_PRE=$(echo "${RX_SAMPLES[1]}" | awk '{print $1}')
@@ -397,8 +470,89 @@ if [ "$RX_POST" -le "$RX_PRE" ]; then
 fi
 echo "  [step 3] RX parsing recovered after the restart: OK"
 
+# ===========================================================================
+# STEP 5 — THE GIVE-UP BRANCH ACTUALLY FIRES, AND IS TERMINAL
+#
+# This is the control doc/NETDAEMON_DESIGN.md required before D1 lands. Until
+# now this harness only ever asserted gave-up == 0, which proves the limiter
+# does not fire SPURIOUSLY and says nothing about whether it fires when it
+# should. That is the weakest possible statement about the one branch standing
+# between an attacker-chosen frame and an unbounded restart loop.
+#
+# THREE PARTS, AND THE THIRD IS THE REAL CLAIM:
+#
+#   (a) gave-up becomes 1
+#   (b) the "GIVING UP" line reaches the console
+#   (c) the daemon STAYS DEAD -- frames injected afterwards are NOT parsed
+#
+# (a) and (b) are both readings of the supervisor's own opinion of itself. Only
+# (c) is independent: a give-up that sets the flag, prints the line, and then
+# restarts anyway would pass (a) and (b) and is WORSE than no limiter at all,
+# because the operator now believes the loop has stopped. Hence the third
+# injection and the assertion that the RX counter does NOT move.
+#
+# Note (c) is the inverse of step 3, which asserts the counter DOES rise. Two
+# assertions on the same counter pointing in opposite directions, deliberately.
+# ===========================================================================
+
+# (a) the counter
+if [ "$GU_GAVEUP" -lt 1 ]; then
+    fail_with "the supervisor did NOT give up after 8 back-to-back deaths (gave-up=$GU_GAVEUP)" \
+        "SUPERVISOR_MAX_RESTARTS is 5 within SUPERVISOR_WINDOW_MS (10000 ms) and" \
+        "the deaths land at scheduler speed, so the budget must have been" \
+        "exhausted. Either the rate limiter is not being consulted, or the" \
+        "window is rolling forward between deaths and resetting the count --" \
+        "in which case a remote host that can crash the parser has an unbounded" \
+        "restart loop and the limiter is decorative." \
+        "restarts at this point: $GU_RESTARTS"
+fi
+echo "  [step 5a] supervisor gave up on $GU_GAVEUP task(s): OK"
+
+# (b) the console line. Separate from (a) on purpose: a silently dead network
+# daemon is the exact failure NETWORK_ISOLATION.md item 1's "did it run" flag was
+# reverted for masking, so the give-up MUST be visible and not merely counted.
+grep -qa "\[SUPERVISOR\] GIVING UP on 'knetd'" "$SERIAL" \
+    || fail_with "gave-up is $GU_GAVEUP but no 'GIVING UP' line reached the console" \
+        "The state changed and the operator was never told. A silently dead" \
+        "network daemon is unreportable and undiagnosable -- the counter is" \
+        "only visible to someone who already suspected the problem and ran" \
+        "ifconfig."
+echo "  [step 5b] 'GIVING UP' announced on the console: OK"
+
+# (c) THE REAL CLAIM: it stays dead.
+RX_GU_PRE=$(echo "${RX_SAMPLES[4]}" | awk '{print $1}')
+RX_GU_POST=$(echo "${RX_SAMPLES[5]}" | awk '{print $1}')
+echo "  RX cpl0: post-give-up pre=$RX_GU_PRE post-inject=$RX_GU_POST"
+
+if [ "$RX_GU_POST" -ne "$RX_GU_PRE" ]; then
+    fail_with "RX parse count ROSE after the give-up ($RX_GU_PRE -> $RX_GU_POST)" \
+        "The supervisor reported that it stopped restarting knetd, and frames" \
+        "are still being parsed. Something is still draining the softirq ring:" \
+        "either a restart path that bypasses supervisor_restart()'s rate limit" \
+        "(the reason that check lives INSIDE the restart function), or the" \
+        "give-up state is not actually terminal." \
+        "" \
+        "This is worse than having no limiter: the operator is told the restart" \
+        "loop has stopped while it continues."
+fi
+echo "  [step 5c] daemon stayed dead; no frames parsed after the give-up: OK"
+
+# Positive control for (c). Without this, 5c passes on a run where the third
+# injection never reached the guest at all -- "no frames parsed" and "no frames
+# sent" are the same reading, which is the failure mode recorded in memory
+# ownership-harness-needs-foreign-object. Step 3 already proved this same
+# injector delivers frames to this same guest a few seconds earlier, and that is
+# what makes the zero here meaningful rather than vacuous.
+if [ "$RX_POST" -le "$RX_PRE" ]; then
+    fail_with "internal: step 3 should have caught this already" \
+        "The injector is not proven to work, so step 5c's zero is vacuous."
+fi
+
 echo ""
-echo "RESULT: PASS — knetd was killed, observed dead, restarted, and networking recovered"
-echo "  baseline restarts 0 -> final $FINAL_RESTARTS; PID $DIED_PID -> $NEW_PID;"
-echo "  RX cpl0 $RX_PRE -> $RX_POST across the kill; gave-up 0."
+echo "RESULT: PASS — restart AND give-up both proven"
+echo "  [1-3] knetd killed, observed dead, restarted as PID $NEW_PID (was $DIED_PID),"
+echo "        RX cpl0 $RX_PRE -> $RX_POST across the kill; gave-up 0 at that point."
+echo "  [5]   8 back-to-back deaths exhausted the budget: gave-up $GU_GAVEUP, announced"
+echo "        on the console, and RX stayed pinned at $RX_GU_PRE across a further"
+echo "        injection -- the daemon stayed dead."
 exit 0

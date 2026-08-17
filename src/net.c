@@ -1298,6 +1298,40 @@ static void handle_tcp(ip_header_t* ip_hdr, uint16_t ip_len) {
                      (uint8_t*)tcp_hdr, tcp_len);
 }
 
+/*
+ * Read the current privilege level out of %cs. The low two bits of the segment
+ * selector are the CPL -- this is the same idiom kernel.c:273 uses to report the
+ * boot code segment. It is deliberately NOT derived from a software flag: a flag
+ * records what the code believes about itself, and the entire purpose of this
+ * counter is to catch a build whose belief is wrong.
+ *
+ * Defined here rather than beside the global cpl0/cpl3 pair further down because
+ * the per-protocol witness in handle_ip()'s dispatch switch is the first user in
+ * file order; handle_packet() below is the second.
+ */
+static inline uint32_t net_current_cpl(void) {
+    /* %cs is a 16-bit selector, so the destination must be 16-bit too. Written
+     * as uint32_t it builds but warns under -Wasm-operand-widths (operand size
+     * does not match the constraint), and this tree is -Werror. */
+    uint16_t cs_val;
+    __asm__ volatile("mov %%cs, %0" : "=r"(cs_val));
+    return (uint32_t)(cs_val & 3u);
+}
+
+/*
+ * Per-protocol ring witness — see net.h for why the global cpl0/cpl3 pair is not
+ * a sufficient assertion once D1 lands (TCP legitimately stays at CPL 0, so the
+ * current `cpl0 == 0` post-move assertion would fail against a correct build).
+ *
+ * Counted at the L4 dispatch switch in handle_ip(), which is the exact seam the
+ * move falls on: everything above it (L2/L3 validation, firewall, IDS) stays in
+ * ring 0 by decision, and the switch plus the parsers below it are what changes
+ * trust domain. Reading %cs at the switch therefore answers "which ring executed
+ * the code that is supposed to have moved", which is the question. Reading it
+ * anywhere higher answers a question about code that was never going to move.
+ */
+static net_parse_proto_cpl_stats_t net_parse_proto_cpl = {0, 0, 0, 0, 0, 0};
+
 /**
  * @brief Handles an incoming IPv4 packet.
  * @param eth_frame Pointer to the full Ethernet frame (for ICMP reply context).
@@ -1585,6 +1619,13 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
     // 3. Dispatch to L4 handler (use validated total_len and ip_hdr_len_bytes)
     switch (ip_hdr->protocol) {
         case IPPROTO_ICMP: {
+            /* Per-protocol ring witness. Same rule as the global pair in
+             * handle_packet(): counted BEFORE any early return, because a frame
+             * that was dispatched to this arm reached the code whose ring is
+             * being asserted, whether or not it survived the length check. */
+            if (net_current_cpl() == 3) net_parse_proto_cpl.icmp_cpl3++;
+            else                        net_parse_proto_cpl.icmp_cpl0++;
+
             /*
              * ICMP requires at least 8 bytes: type(1) + code(1) + checksum(2) + rest(4)
              * Shorter packets are invalid ICMP packets → DROP
@@ -1612,6 +1653,11 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
             break;
         }
         case IPPROTO_UDP:
+            /* Ring witness for the UDP arm, which carries both DNS and DHCP.
+             * See net.h: they are not counted separately on purpose. */
+            if (net_current_cpl() == 3) net_parse_proto_cpl.udp_cpl3++;
+            else                        net_parse_proto_cpl.udp_cpl0++;
+
             /*
              * UDP requires at least 8 bytes: src_port(2) + dst_port(2) + len(2) + checksum(2)
              * Shorter packets are invalid UDP packets → DROP
@@ -1624,6 +1670,14 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
             handle_udp(ip_hdr, total_len);
             break;
         case IPPROTO_TCP:
+            /* Ring witness for the TCP arm. This is the counter whose polarity
+             * is OPPOSITE to the other two after D1: tcp_cpl3 must stay 0,
+             * because tcp_connections[] has a ring-0 timer mutator (tcp_tick)
+             * that would be free to close a record out from under a ring-3
+             * parser. A nonzero tcp_cpl3 means TCP moved when it must not have. */
+            if (net_current_cpl() == 3) net_parse_proto_cpl.tcp_cpl3++;
+            else                        net_parse_proto_cpl.tcp_cpl0++;
+
             /*
              * TCP requires at least 20 bytes for minimal header
              * Shorter packets are invalid TCP packets → DROP
@@ -1707,21 +1761,10 @@ static uint32_t net_parse_irq = 0;     /* frames parsed in an ISR (== 0) */
 static uint32_t net_parse_cpl0 = 0;    /* frames parsed in ring 0 */
 static uint32_t net_parse_cpl3 = 0;    /* frames parsed in ring 3 (0 until PR D lands) */
 
-/*
- * Read the current privilege level out of %cs. The low two bits of the segment
- * selector are the CPL -- this is the same idiom kernel.c:273 uses to report the
- * boot code segment. It is deliberately NOT derived from a software flag: a flag
- * records what the code believes about itself, and the entire purpose of this
- * counter is to catch a build whose belief is wrong.
- */
-static inline uint32_t net_current_cpl(void) {
-    /* %cs is a 16-bit selector, so the destination must be 16-bit too. Written
-     * as uint32_t it builds but warns under -Wasm-operand-widths (operand size
-     * does not match the constraint), and this tree is -Werror. */
-    uint16_t cs_val;
-    __asm__ volatile("mov %%cs, %0" : "=r"(cs_val));
-    return (uint32_t)(cs_val & 3u);
-}
+/* net_current_cpl() is defined above handle_ip(), because the per-protocol ring
+ * witness at the L4 dispatch switch needs it and that switch comes first in this
+ * file. It reads %cs directly and never a software flag — see the comment at the
+ * definition for why that distinction is the whole point of the counter. */
 
 void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx) {
     if (thread_ctx) *thread_ctx = net_parse_thread;
@@ -1731,6 +1774,11 @@ void net_get_parse_stats(uint32_t* thread_ctx, uint32_t* irq_ctx) {
 void net_get_parse_ring_stats(uint32_t* cpl0, uint32_t* cpl3) {
     if (cpl0) *cpl0 = net_parse_cpl0;
     if (cpl3) *cpl3 = net_parse_cpl3;
+}
+
+void net_get_parse_proto_cpl_stats(net_parse_proto_cpl_stats_t* out) {
+    if (!out) return;
+    *out = net_parse_proto_cpl;
 }
 
 /*=============================================================================

@@ -34,4 +34,11 @@ void task_knetd(void);    /* RX bottom-half task (doc/NETWORK_ISOLATION.md) */
 /* Set to 1 to make knetd exit at its next loop iteration; see test_tasks.c for
  * why the restart path cannot be tested without it. verify-supervisor.sh only. */
 extern volatile int knetd_die_now;
+
+/* Death budget for the give-up control: each restarted knetd decrements this and
+ * dies again, so N deaths land back-to-back at scheduler speed rather than at
+ * typing speed. Driving the same sequence from the console would race
+ * SUPERVISOR_WINDOW_MS under TCG and fail SILENTLY (gave-up stays 0, which is
+ * also what a broken limiter reports). See test_tasks.c. */
+extern volatile int knetd_die_repeat;
 #endif

@@ -34,21 +34,35 @@
 # reference to a record that a ring-0 timer can free is not fixable with a wider
 # lock -- TCP_LOCK() is a kernel critical section and ring 3 cannot take it.
 #
-# So after D1, TCP frames legitimately keep parsing at CPL 0, and the post-move
-# branch below -- which fails when cpl0 is nonzero, on the grounds that a parser
-# in both rings is a partial move -- becomes WRONG. It must be replaced by
-# PER-PROTOCOL counters asserting "no ICMP/DNS/DHCP frame at CPL 0" and "no TCP
-# frame at CPL 3".
+# So after D1, TCP frames legitimately keep parsing at CPL 0, and a post-move
+# branch that fails whenever cpl0 is nonzero would be WRONG.
 #
-# That replacement belongs in the PR BEFORE the move, not the PR that does it:
-# an assertion rewritten in the same commit as the code it grades is not an
-# independent check. The global pair stays as a total; the per-protocol counters
-# supplement it, so the PR #74 baseline remains comparable.
+# THAT REPLACEMENT HAS LANDED (this PR, before the move). The post-move branch
+# now reads PER-PROTOCOL counters and asserts three things, two of which point in
+# OPPOSITE directions:
 #
-# Do NOT simply set EXPECT_CPL3=1 after D1 and call it green. The post-move
-# branch as written today only describes a move that carried EVERYTHING, which
-# is not the move that was decided on. See doc/NETDAEMON_DESIGN.md, "Settled:
-# what moves first".
+#     icmp_cpl0 == 0  and  udp_cpl0 == 0     the moved set really moved
+#     tcp_cpl3  == 0                          TCP really did NOT move
+#     icmp_cpl3 + udp_cpl3 > 0                the zeros above are not vacuous
+#
+# The opposite polarity is deliberate and is the thing most likely to be
+# "cleaned up" by someone making the three checks look consistent. TCP appearing
+# at CPL 3 is not extra progress; it is a use-after-free hazard, because
+# tcp_tick() can free a connection record in ring 0 while a ring-3 parser holds a
+# reference to it. verify-netd-boundary.sh records that copying an assertion
+# between two opposite-polarity halves has nearly inverted it three times.
+#
+# The global cpl0/cpl3 pair stays as a running total, so the PR #74 baseline
+# remains comparable; the per-protocol counters supplement it rather than
+# replacing it.
+#
+# DNS and DHCP are NOT counted separately, on purpose: both ride UDP, and the
+# witness sits at the L4 dispatch switch, which is the seam the move actually
+# falls on. Counting them apart would mean instrumenting the port demux inside
+# handle_udp() -- a later, different seam that would classify a frame by its
+# destination port rather than by which ring executed the switch.
+#
+# See doc/NETDAEMON_DESIGN.md, "Settled: what moves first".
 #
 # WHY A SEPARATE COUNTER FROM irq-ctx AT ALL
 #
@@ -194,6 +208,29 @@ fi
 printf '%s\n' "$HP_BODY" | grep -q "net_parse_cpl3++" \
     || guard_fail "handle_packet() does not bump the ring counters; the witness is
   not on the path that parses frames"
+
+# Per-protocol witness (this PR). Guarded the same way and for the same reason:
+# a stale tree should fail with a reason rather than silently skip the half of
+# the assertion that only the per-protocol counters can express.
+grep -q "net_parse_proto_cpl" src/net.c \
+    || guard_fail "src/net.c has no per-protocol ring counters (net_parse_proto_cpl*);
+  the D1-shaped post-move assertion cannot be expressed without them"
+grep -q "net_get_parse_proto_cpl_stats" src/shell_network.c \
+    || guard_fail "ifconfig does not report the per-protocol ring counters"
+
+# The per-protocol increments must sit in the L4 dispatch switch in handle_ip(),
+# which is the seam the move falls on. Comments stripped first, same rule as the
+# handle_packet() guard below.
+HI_BODY=$(awk '/^static void handle_ip\(/,/^}/' src/net.c \
+          | grep -v '^\s*\*' | grep -v '^\s*/\*' | grep -v '^\s*//')
+if [ -z "$HI_BODY" ]; then
+    guard_fail "could not locate handle_ip() in src/net.c; this guard has gone stale"
+fi
+for f in icmp_cpl3 udp_cpl3 tcp_cpl3; do
+    printf '%s\n' "$HI_BODY" | grep -q "$f" \
+        || guard_fail "handle_ip()'s dispatch switch does not bump $f; the
+  per-protocol witness is not on the path it claims to measure"
+done
 
 command -v python3 >/dev/null 2>&1 || guard_fail "python3 not found"
 [ -f tools/inject_frames.py ] || guard_fail "tools/inject_frames.py is missing"
@@ -350,6 +387,37 @@ if [ "$EXPECT_CPL3" -eq 0 ]; then
         echo "        frame survived the wire."
     fi
 
+    # PER-PROTOCOL BASELINE (this PR). Pre-move, every protocol's cpl3 field
+    # must be 0 across every reading -- the same claim as the global cpl3 zero
+    # above, but expressed per-protocol so that D1 has to invert THESE numbers
+    # specifically. Asserting only the global pair here would leave the
+    # per-protocol counters completely ungraded until the move, which is the
+    # failure this whole "instrument before the move" ordering exists to avoid:
+    # a counter first exercised by the PR it is meant to grade is not evidence.
+    if grep -qa "RX proto-ring:" "$SERIAL"; then
+        PIDX=0
+        while IFS= read -r line; do
+            PIDX=$((PIDX + 1))
+            for proto in icmp udp tcp; do
+                V=$(printf '%s\n' "$line" \
+                    | sed -n "s/.*$proto [0-9][0-9]*\/\([0-9][0-9]*\).*/\1/p")
+                [ -n "$V" ] || continue
+                if [ "$V" -ne 0 ]; then
+                    fail_with "reading #$PIDX shows $V $proto frame(s) at CPL 3" \
+                        "The parser has not moved in this tree, so a nonzero" \
+                        "per-protocol cpl3 means the WITNESS is wrong -- most" \
+                        "likely the cpl0/cpl3 fields were transposed at the" \
+                        "increment site in handle_ip()'s dispatch switch."
+                fi
+            done
+        done <<< "$(grep -a 'RX proto-ring:' "$SERIAL")"
+        echo "  per-protocol cpl3 = 0 across $PIDX reading(s)"
+    else
+        fail_with "ifconfig printed no 'RX proto-ring:' line" \
+            "The per-protocol counters passed the source guard but produced no" \
+            "output, so the ISO is stale relative to the source tree."
+    fi
+
     echo "RESULT: PASS — pre-move baseline recorded"
     echo "  Parser runs at CPL 0 ($DELTA0 frames), never at CPL 3 across $READINGS readings."
     echo "  This is the baseline PR D's parser move must invert. Run NC1 (hollow"
@@ -360,40 +428,105 @@ else
     # ---------------- POST-MOVE (after PR D's parser move) ----------------
     #
     # Refuse to grade a D1-shaped move with a whole-parser-shaped assertion.
-    # D1 leaves TCP in ring 0 on purpose, so "cpl0 must be 0" below would fail a
-    # correct build -- and worse, someone would then "fix" it by deleting the
-    # assertion, leaving nothing. If the per-protocol counters are absent, this
-    # branch has gone stale relative to the decided design. See the header.
+    # D1 leaves TCP in ring 0 on purpose, so a global "cpl0 must be 0" would fail
+    # a correct build -- and worse, someone would then "fix" it by deleting the
+    # assertion, leaving nothing. The per-protocol counters are what make the
+    # post-move claim expressible; without them this branch has gone stale
+    # relative to the decided design. See the header.
     if ! grep -q "net_parse_proto_cpl" src/net.c 2>/dev/null; then
         echo "RESULT: INCONCLUSIVE — EXPECT_CPL3=1 but src/net.c has no"
         echo "  per-protocol ring counters (net_parse_proto_cpl*)."
         echo ""
-        echo "  The post-move branch below asserts cpl0 == 0, which describes a move"
-        echo "  that carried the WHOLE parser. The decided first move (D1) carries"
-        echo "  ICMP/DNS/DHCP and deliberately leaves TCP in ring 0, so TCP frames"
-        echo "  legitimately keep parsing at CPL 0 and that assertion would fail a"
-        echo "  correct build."
+        echo "  A global cpl0 == 0 describes a move that carried the WHOLE parser."
+        echo "  The decided first move (D1) carries ICMP/DNS/DHCP and deliberately"
+        echo "  leaves TCP in ring 0, so TCP frames legitimately keep parsing at"
+        echo "  CPL 0 and that assertion would fail a correct build."
         echo ""
-        echo "  Land the per-protocol counters BEFORE the move, then rewrite this"
-        echo "  branch to assert: no ICMP/DNS/DHCP frame at CPL 0, no TCP frame at"
-        echo "  CPL 3. See doc/NETDAEMON_DESIGN.md, 'Settled: what moves first'."
+        echo "  Land the per-protocol counters BEFORE the move. See"
+        echo "  doc/NETDAEMON_DESIGN.md, 'Settled: what moves first'."
         exit 3
     fi
 
-    # Same two halves, read the other way round.
-    if [ "$DELTA3" -eq 0 ]; then
-        fail_with "cpl3 did not rise; the parser is NOT executing in ring 3" \
-            "EXPECT_CPL3=1 asserts the parser moved, but every frame in this run" \
-            "was parsed at CPL 0. Either the move did not land, or the ring-3" \
-            "path is not on the frame path and a ring-0 fallback is serving it."
+    # -----------------------------------------------------------------------
+    # POST-MOVE ASSERTION, D1 SHAPE
+    #
+    # The claim is NOT "the parser is in ring 3". It is two one-sided claims in
+    # OPPOSITE directions, which together cannot be satisfied by a partial move:
+    #
+    #   MOVED     icmp_cpl0 == 0 and udp_cpl0 == 0
+    #             -- no frame of a protocol that was supposed to move was parsed
+    #             in ring 0. A ring-0 fallback serving some ICMP frames shows up
+    #             here and nowhere else.
+    #   NOT MOVED tcp_cpl3 == 0
+    #             -- TCP must NOT have moved. tcp_connections[] has a ring-0
+    #             timer mutator (tcp_tick) that can free a record out from under
+    #             a ring-3 parser, so a nonzero tcp_cpl3 is a use-after-free
+    #             hazard, not an over-achievement.
+    #
+    # Plus the positive half, unchanged in spirit from the pre-move branch: the
+    # moved protocols must actually have been parsed SOMEWHERE, or every zero
+    # above is vacuous.
+    #
+    # Note the polarity trap this mirrors: verify-netd-boundary.sh records that
+    # copying an assertion between two halves with opposite polarity has nearly
+    # inverted it three times. The tcp_cpl3 check is the opposite polarity to
+    # the two above it. Do not "make them consistent".
+    # -----------------------------------------------------------------------
+    read_proto() {
+        # $1 = protocol name, $2 = reading index (1 = before, 2 = after)
+        # Line: "RX proto-ring: icmp 3/0, udp 12/0, tcp 0/0 (cpl0/cpl3)"
+        # $3 = 1 for the cpl0 field, 2 for the cpl3 field.
+        grep -a "RX proto-ring:" "$SERIAL" \
+            | sed -n "${2}p" \
+            | sed -n "s/.*$1 \([0-9][0-9]*\)\/\([0-9][0-9]*\).*/\\$3/p"
+    }
+
+    PROTO_READINGS=$(grep -ac "RX proto-ring:" "$SERIAL")
+    if [ "$PROTO_READINGS" -lt 2 ]; then
+        fail_with "expected 2 per-protocol readings, got $PROTO_READINGS" \
+            "ifconfig is not reporting the per-protocol ring counters, so the" \
+            "D1-shaped assertion has nothing to read."
     fi
-    if [ "$DELTA0" -ne 0 ]; then
-        fail_with "cpl0 rose by $DELTA0 after the move; the parser runs in BOTH rings" \
-            "This is what a PARTIAL move looks like -- some protocols crossed the" \
-            "boundary and others still parse in ring 0. The ring-0 remnant is" \
-            "still the full-privilege attack surface PR D exists to remove, so" \
-            "this is a failure even though networking works."
+
+    for proto in icmp udp; do
+        B=$(read_proto "$proto" 1 1); A=$(read_proto "$proto" 2 1)
+        D=$((A - B))
+        echo "  ${proto}_cpl0: before=$B after=$A delta=$D  (must be 0)"
+        if [ "$D" -ne 0 ]; then
+            fail_with "$D $proto frame(s) parsed at CPL 0 after the move" \
+                "$proto is in the moving set, so every one of its frames must be" \
+                "parsed in ring 3. A nonzero count here is a ring-0 fallback" \
+                "still serving part of the traffic -- the full-privilege attack" \
+                "surface D1 exists to remove, still present and still reachable."
+        fi
+    done
+
+    TCP3B=$(read_proto tcp 1 2); TCP3A=$(read_proto tcp 2 2)
+    TCP3D=$((TCP3A - TCP3B))
+    echo "  tcp_cpl3:  before=$TCP3B after=$TCP3A delta=$TCP3D  (must be 0 -- OPPOSITE polarity)"
+    if [ "$TCP3D" -ne 0 ]; then
+        fail_with "$TCP3D TCP frame(s) parsed at CPL 3; TCP moved and must not have" \
+            "tcp_connections[] is mutated by tcp_tick() in ring 0, which forcibly" \
+            "closes connections on the SYN_SENT/SYN_RECEIVED timeout. A ring-3" \
+            "parser holding a reference to a record a ring-0 timer can free is a" \
+            "use-after-free, and it is NOT fixable with a wider lock: TCP_LOCK()" \
+            "is a kernel critical section that ring 3 cannot take." \
+            "This is a failure even though it looks like more progress."
     fi
-    echo "RESULT: PASS — parser executing at CPL 3 ($DELTA3 frames), zero at CPL 0"
+
+    # POSITIVE half: the moved protocols were actually exercised. Without this,
+    # all three zeros above pass on a build where no ICMP or UDP frame arrived.
+    ICMP3=$(( $(read_proto icmp 2 2) - $(read_proto icmp 1 2) ))
+    UDP3=$(( $(read_proto udp 2 2) - $(read_proto udp 1 2) ))
+    if [ $((ICMP3 + UDP3)) -eq 0 ]; then
+        fail_with "no ICMP or UDP frame was parsed at CPL 3 in this run" \
+            "The three zero-assertions above are therefore vacuous -- zero of" \
+            "nothing is zero. Drive real ICMP/UDP traffic (the injected frames" \
+            "use an unhandled EtherType and never reach the L4 switch, so this" \
+            "branch needs a netdev that carries a DHCP lease and a ping)."
+    fi
+
+    echo "RESULT: PASS — D1-shaped move witnessed"
+    echo "  ICMP/UDP parsed at CPL 3 only ($ICMP3 icmp, $UDP3 udp); TCP never at CPL 3."
     exit 0
 fi

@@ -176,6 +176,18 @@ void cmd_ifconfig(void) {
     net_get_parse_ring_stats(&parse_cpl0, &parse_cpl3);
     kprintf("  RX ring:      %u cpl0, %u cpl3\n", parse_cpl0, parse_cpl3);
 
+    /* Per-protocol ring witness (doc/NETDAEMON_DESIGN.md, D1 prerequisite).
+     * The global pair above stops being a sufficient assertion after D1: TCP
+     * deliberately keeps parsing at CPL 0 while ICMP/UDP move, so a correct
+     * post-move build has BOTH counters nonzero. These split it so the harness
+     * can assert the two halves separately and in opposite directions.
+     * DNS and DHCP both ride UDP and are not separable at this seam by design. */
+    net_parse_proto_cpl_stats_t pr;
+    net_get_parse_proto_cpl_stats(&pr);
+    kprintf("  RX proto-ring: icmp %u/%u, udp %u/%u, tcp %u/%u (cpl0/cpl3)\n",
+            pr.icmp_cpl0, pr.icmp_cpl3, pr.udp_cpl0, pr.udp_cpl3,
+            pr.tcp_cpl0, pr.tcp_cpl3);
+
     /* ICMP RX counters. Same reasoning as the drop counters above: these
      * replaced per-packet prints a remote host drove. The echo-reply count in
      * particular was NOT rate limited before — see doc/NETDAEMON_DESIGN.md

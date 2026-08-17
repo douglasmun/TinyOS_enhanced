@@ -259,6 +259,33 @@ void task_ktimerd(void) {
  * production path learns how to bypass it.
  */
 volatile int knetd_die_now = 0;
+
+/*
+ * Repeat-death budget, for the give-up control (verify-supervisor.sh step 5).
+ *
+ * WHY THIS IS A COUNTER AND NOT SIX TYPED COMMANDS
+ *
+ * The give-up branch fires only when SUPERVISOR_MAX_RESTARTS deaths land inside
+ * SUPERVISOR_WINDOW_MS (5 within 10s). Driving that from the console means the
+ * whole sequence -- type, echo-verify, restart, type again -- must complete
+ * inside ten seconds under TCG, and CLAUDE.md already records that scripted
+ * keystrokes drop under TCG load. A harness that misses the window does not fail
+ * loudly: the supervisor happily restarts each time, the window rolls forward,
+ * gave-up stays 0, and the run reports exactly what a build with a BROKEN
+ * limiter reports. That is the worst possible failure mode for a control whose
+ * entire job is to prove the limiter fires.
+ *
+ * So the repetition lives inside the guest, where it is not racing the typist:
+ * each restarted knetd sees a nonzero budget, decrements it, and dies again
+ * immediately. The deaths land back-to-back at scheduler speed, well inside the
+ * window, and the console sequence is one command.
+ *
+ * Note this deliberately does NOT reset itself the way knetd_die_now does. It
+ * counts DOWN across restarts -- that is the whole point -- and reaching zero is
+ * what lets the daemon finally stay alive if the limiter did not fire, which is
+ * the negative outcome the harness must be able to distinguish.
+ */
+volatile int knetd_die_repeat = 0;
 #endif
 
 void task_knetd(void) {
@@ -266,9 +293,15 @@ void task_knetd(void) {
     while (1) {
         e1000_rx_softirq_run();
 #ifdef TINYOS_FAULT_INJECT
-        if (knetd_die_now) {
+        if (knetd_die_now || knetd_die_repeat > 0) {
             task_t* self = scheduler_get_current_task();
             knetd_die_now = 0;
+            /* Decrement BEFORE dying: this task will not run again, so a
+             * decrement placed after task_terminate() would never execute and
+             * every restarted instance would read the same value forever. */
+            if (knetd_die_repeat > 0) {
+                knetd_die_repeat--;
+            }
             if (self) {
                 kprintf("[KNETD] fault injection: exiting on request\n");
                 self->capabilities &= ~CAP_UNKILLABLE;

@@ -88,9 +88,18 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   itself, and the point of the counter is to catch a build whose belief is wrong.
   `cpl3` must read **0** until the PR D parser move lands; that pinned zero is the
   pre-move baseline the move has to invert, which is why the witness was built before
-  the move rather than after. Harness: `verify-netd-ring3.sh` (flip with
+  the move rather than after. The global pair stops being sufficient at D1, because TCP
+  stays ring 0 while ICMP/DNS/DHCP move — a mixed `cpl0`/`cpl3` reading is then correct
+  and says nothing about *which* protocol went where. So `handle_ip()`'s L4 switch also
+  witnesses per protocol (`RX proto-ring: icmp c/c, udp c/c, tcp c/c`), counted **before**
+  any early return. **TCP's polarity is the opposite of the other two**: after D1
+  `tcp_cpl3` must stay **0** while `icmp_cpl3`/`udp_cpl3` must be nonzero — copying an
+  assertion across arms inverts it. DNS and DHCP are not separable here: both ride UDP,
+  and the witness sits at the dispatch switch, so splitting them means instrumenting the
+  port demux in `handle_udp()` — a different seam, classifying by destination port rather
+  than by which ring executed the switch. Harness: `verify-netd-ring3.sh` (flip with
   `TINYOS_EXPECT_CPL3=1`); rationale in `doc/NETDAEMON_DESIGN.md`.
-- **Three traps around kernel task lifetime**, each of which reads as healthy when
+- **Four traps around kernel task lifetime**, each of which reads as healthy when
   wrong. `task_create_kernel()` allocates but does **not** enqueue — every caller needs
   `scheduler_add_task()`, or the task is created, listed by `ps`, counted by every
   status surface, and never runs one instruction. It grants `CAP_ALL` (`0xFFFFFFFF`),
@@ -98,7 +107,15 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   `|= CAP_UNKILLABLE` grants in `kernel.c` are no-ops, and a test that plans to `kill`
   one is grading a daemon that never died. And `task_exit()` is **inert** for
   scheduler-run tasks (it reads `process.c`'s `current_task`, set only by
-  `task_switch_to`) — use `task_terminate(pid)`, capturing the pid first.
+  `task_switch_to`) — use `task_terminate(pid)`, capturing the pid first. Fourth: the
+  post-context-switch reaper must `scheduler_remove_task_locked()` **before**
+  `task_free_resources()`. A task that terminates *itself* defers the free to the reaper
+  and is still linked in the ready queue; freeing the slot left a self-linked corpse
+  there, and `scheduler_get_next_task()`'s later reject-and-remove hit the
+  `task->next == task` case, which nulled head **and** tail and discarded every live
+  task — panic "All tasks terminated" with five tasks alive. Invariant: *a freed slot is
+  never in the ready queue*. Found by the supervisor give-up control, not by anything
+  that existed before it.
 - **Freeing a guard page requires restoring its mapping first.** They are
   identity-mapped **not present** in the kernel identity map every address space shares,
   so `pmm_free` without re-mapping poisons that frame permanently and the #PF lands on
@@ -108,9 +125,15 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   `supervisor_run_once()` must use `task_get_validated(pid, generation)` — slots are
   recycled, so a bare `task_get()` can match a *different* task in the same slot and
   make a dead daemon look alive. The rate limit lives **inside** `supervisor_restart()`
-  so no second restart path skips it. Its give-up branch is **not exercised by any
-  harness** (only asserted `== 0`); PR D1 must not land without one that drives past the
-  budget and proves the daemon stays dead. Harness: `verify-supervisor.sh` (needs
+  so no second restart path skips it. Its give-up branch **is** now exercised
+  (`verify-supervisor.sh` step 5): `gave-up` rises, the line prints, and — the only
+  independent part — a further injection parses **zero** frames, so the daemon provably
+  stays dead. Step 5c asserts the RX counter is **pinned** while step 3 asserts it
+  **rises**: same counter, opposite directions, don't reconcile them. The deaths come
+  from `killknetd 8`, a countdown each restarted `knetd` decrements, because typing 8
+  commands under TCG misses the 10 s window and missing it fails **silently** — a
+  rolled-forward window reports `gave-up 0`, which is what a *broken* limiter reports
+  too. Harness: `verify-supervisor.sh` (needs
   `-DTINYOS_FAULT_INJECT`, and `make clean`s on exit — that flag is not in the
   dependency graph, so its objects break the *other* harnesses at link time).
   Rationale in `doc/NETDAEMON_DESIGN.md`.
