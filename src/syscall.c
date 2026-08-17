@@ -34,6 +34,7 @@
 #include "dhcp.h"      // SYS_NETSTAT: dhcp lease state
 #include "paging.h"    // SYS_PIPE: map those frames before touching them
 #include "shell_user.h" // SYS_CRED: the passwd/useradd/userdel implementations
+#include "time.h"      // SYS_TIME: time_get_datetime, time_get_uptime_seconds
 
 /*-----------------------------------------------------------------------------
  * Maximum single-syscall transfer size.
@@ -1297,6 +1298,56 @@ int sys_psinfo(void* user_buf, uint32_t size) {
  * process the caller can legitimately see, while task_terminate's is the
  * backstop that holds no matter which path reaches it.
  *===========================================================================*/
+/*=============================================================================
+ * FUNCTION: sys_time
+ *
+ * Wall clock + uptime, read-only and unprivileged. No visibility filter and no
+ * ownership check: unlike SYS_PSINFO there is nothing here belonging to another
+ * user, and unlike SYS_NETRX nothing that reveals other hosts' traffic.
+ *
+ * Two things worth not undoing:
+ *
+ *   - The record is built FIELD BY FIELD from datetime_t, never memcpy'd from
+ *     it. datetime_t is 9 bytes of mixed uint16/uint8 and its tail padding is
+ *     whatever the compiler chose; copying it wholesale would leak those bytes
+ *     to ring 3. `out` is zeroed first so the explicit struct's own padding is
+ *     defined too -- the padding-leak class from doc/KERNEL_BUGS.md.
+ *
+ *   - time_get_datetime() takes its own critical section and returns into a
+ *     caller buffer, so it is called with interrupts ENABLED and the result is
+ *     copied out afterwards. copy_to_user touches a ring-3 page and can fault,
+ *     which must not happen with interrupts masked -- the same constraint that
+ *     shapes the sys_psinfo loop below.
+ *===========================================================================*/
+int sys_time(void* user_buf, uint32_t size) {
+    if (!user_buf || size < sizeof(systime_t)) {
+        return -EINVAL;
+    }
+
+    datetime_t dt;
+    if (!time_get_datetime(&dt)) {
+        /* Clock not initialised. Report it rather than shipping a zeroed
+         * struct that userspace would print as a real timestamp. */
+        return -EIO;
+    }
+
+    systime_t out;
+    memset(&out, 0, sizeof(out));
+    out.uptime_seconds = time_get_uptime_seconds();
+    out.year    = dt.year;
+    out.month   = dt.month;
+    out.day     = dt.day;
+    out.hour    = dt.hour;
+    out.minute  = dt.minute;
+    out.second  = dt.second;
+    out.weekday = dt.weekday;
+
+    if (copy_to_user(user_buf, &out, sizeof(out)) < 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 int sys_kill(int pid) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -3180,6 +3231,11 @@ static void syscall_dispatch(struct cpu_state* state) {
         case SYS_KILL:
             /* arg1 = target pid */
             ret = sys_kill((int)arg1);
+            break;
+
+        case SYS_TIME:
+            /* arg1 = user buffer of systime_t, arg2 = its size in bytes */
+            ret = sys_time((void*)arg1, arg2);
             break;
 
         case SYS_NETRX:

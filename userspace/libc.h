@@ -38,6 +38,7 @@
 #define SYS_CRED     32
 #define SYS_PSINFO   33
 #define SYS_KILL     34
+#define SYS_TIME     39
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -102,6 +103,22 @@ _Static_assert(sizeof(psinfo_t) == 64, "psinfo_t layout changed: update src/sysc
 _Static_assert(offsetof(psinfo_t, uid) == 24, "psinfo_t.uid moved: update src/syscall.h to match");
 _Static_assert(offsetof(psinfo_t, name) == 32, "psinfo_t.name moved: update src/syscall.h to match");
 
+/* SYS_TIME record. Must stay identical to systime_t in src/syscall.h; the
+ * kernel builds it field by field and copies it straight into this buffer. */
+typedef struct {
+    uint32_t uptime_seconds;
+    uint16_t year;
+    uint8_t  month;          /* 1-12 */
+    uint8_t  day;            /* 1-31 */
+    uint8_t  hour;           /* 0-23 */
+    uint8_t  minute;         /* 0-59 */
+    uint8_t  second;         /* 0-59 */
+    uint8_t  weekday;        /* 0 = Sunday */
+} systime_t;
+
+_Static_assert(sizeof(systime_t) == 12, "systime_t layout changed: update src/syscall.h to match");
+_Static_assert(offsetof(systime_t, year) == 4, "systime_t.year moved: update src/syscall.h to match");
+
 /* Raw syscall wrappers */
 int syscall0(int num);
 int syscall1(int num, uint32_t arg1);
@@ -147,6 +164,12 @@ int  stat(const char* path, void* buf, size_t size);
  * negative errno. A buffer too small for every visible process truncates
  * rather than failing, so size it at 32 records to get the whole table. */
 int  psinfo(void* buf, size_t size);
+
+/* Fill `buf` with a systime_t: wall clock plus uptime. Unprivileged -- every
+ * user may read the clock. Returns 0, or a negative errno (-EIO if the kernel
+ * clock is not initialised, in which case `buf` is untouched: do NOT print it,
+ * the zeroed struct would render as a plausible timestamp). */
+int  systime(void* buf, size_t size);
 
 /* The two errno values callers actually branch on, named rather than spelled as
  * bare -1/-3 at the use site. Same numbers as src/errno.h; userspace has no

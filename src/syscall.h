@@ -299,6 +299,21 @@
  * a caller asking for more is refused, not silently truncated. */
 #define TCPSOCK_MAX_IO     1024
 
+/*-----------------------------------------------------------------------------
+ * SYS_TIME — read the wall clock and the uptime counter.
+ *
+ * Read-only on purpose. time_set_datetime() exists and is deliberately NOT
+ * reachable from here: the RTC is global machine state, so a setter needs a
+ * privilege check, and `date` has never had a set path to justify one. Adding
+ * the write direction is a separate decision with its own audit -- don't fold
+ * it in because the underlying function happens to be available.
+ *
+ * arg1 = user buffer receiving a systime_t, arg2 = sizeof that buffer.
+ * Ungated: the clock is not a secret, and every user can already observe time
+ * passing. Returns 0, or -EFAULT / -EINVAL.
+ *---------------------------------------------------------------------------*/
+#define SYS_TIME       39   // Wall clock + uptime; read-only, unprivileged
+
 typedef struct {
     uint8_t  remote_ip[4];
     uint16_t remote_port;
@@ -464,7 +479,7 @@ typedef struct {
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  38  // Highest valid syscall number (SYS_TCPSOCK)
+#define MAX_SYSCALL_NUM  39  // Highest valid syscall number (SYS_TIME)
 
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
@@ -501,6 +516,34 @@ typedef struct {
 _Static_assert(sizeof(psinfo_t) == 64, "psinfo_t layout changed: update userspace/libc.h to match");
 _Static_assert(offsetof(psinfo_t, uid) == 24, "psinfo_t.uid moved: update userspace/libc.h to match");
 _Static_assert(offsetof(psinfo_t, name) == 32, "psinfo_t.name moved: update userspace/libc.h to match");
+
+/*-----------------------------------------------------------------------------
+ * SYS_TIME record.
+ *
+ * NOT datetime_t. That struct is 9 bytes of mixed uint16/uint8 whose tail
+ * padding the compiler is free to choose, and copying it straight out would
+ * hand ring 3 those uninitialised bytes. This is a widened, explicitly padded
+ * copy built field by field, on the same "allow-list, not a redacted kernel
+ * struct" principle as psinfo_t above.
+ *
+ * uptime_seconds rides along because `date` prints it and a second syscall to
+ * fetch one uint32 would be gratuitous.
+ *---------------------------------------------------------------------------*/
+typedef struct {
+    uint32_t uptime_seconds;
+    uint16_t year;
+    uint8_t  month;          /* 1-12 */
+    uint8_t  day;            /* 1-31 */
+    uint8_t  hour;           /* 0-23 */
+    uint8_t  minute;         /* 0-59 */
+    uint8_t  second;         /* 0-59 */
+    uint8_t  weekday;        /* 0 = Sunday */
+} systime_t;
+
+/* Same ABI contract as psinfo_t: userspace/libc.h carries a byte-identical
+ * copy and nothing at runtime checks they agree. */
+_Static_assert(sizeof(systime_t) == 12, "systime_t layout changed: update userspace/libc.h to match");
+_Static_assert(offsetof(systime_t, year) == 4, "systime_t.year moved: update userspace/libc.h to match");
 
 /*=============================================================================
  * PHASE 11: NO chroot() Syscall (Security-by-Omission)
@@ -684,6 +727,7 @@ int sys_psinfo(void* user_buf, uint32_t size);
  *         holds CAP_UNKILLABLE, -EINVAL for a non-positive pid
  */
 int sys_kill(int pid);
+int sys_time(void* user_buf, uint32_t size);
 
 /**
  * SYS_NETRX / SYS_NETTX — raw Ethernet frames across the ring boundary.
