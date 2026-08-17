@@ -9,6 +9,7 @@
 #include "env.h"
 #include "test_tasks.h"   /* knetd_die_now, under TINYOS_FAULT_INJECT */
 #include "net.h"          /* net_netd_set_claimed, under TINYOS_FAULT_INJECT */
+#include "dns.h"          /* dns_forge_response, under TINYOS_FAULT_INJECT */
 #include "shell_fileops.h"
 #include "shell_search.h"
 #include "shell_monitor.h"
@@ -920,6 +921,12 @@ static void parse_and_execute(char* cmd_line) {
             net_netd_set_claimed(true);
             kprintf("[FAULT] netd claim taken\n");
         }
+    }
+    /* verify-dns-rx-counters.sh only. Drives handle_dns_response()'s drop
+     * branches, which a passing `dig` never reaches -- the counters they feed
+     * exist precisely for traffic a friendly network does not produce. */
+    else if (strcmp(argv[0], "dnsforge") == 0) {
+        dns_forge_response(argc > 1 ? argv[1] : "help");
     }
 #endif
     else if (strcmp(argv[0], "ping") == 0) {

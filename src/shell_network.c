@@ -197,6 +197,19 @@ void cmd_ifconfig(void) {
     kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited\n",
             icmp_replies, icmp_requests, icmp_limited);
 
+    /* DNS RX counters. Same reasoning as the ICMP block above, at larger scale:
+     * handle_dns_response() had 20 prints, and the spoof/TID/question ones are
+     * reached precisely by an attacker spraying forged responses. The three
+     * attack signatures stay separate — a lone "dropped" total hides which of
+     * them is happening. See doc/NETDAEMON_DESIGN.md. */
+    uint32_t dns_ok = 0, dns_spoof = 0, dns_tid = 0;
+    uint32_t dns_question = 0, dns_malformed = 0, dns_noanswer = 0;
+    dns_get_rx_stats(&dns_ok, &dns_spoof, &dns_tid,
+                     &dns_question, &dns_malformed, &dns_noanswer);
+    kprintf("  DNS rx:       %u resolved, %u no-answer\n", dns_ok, dns_noanswer);
+    kprintf("  DNS drops:    %u src-ip, %u tid, %u question, %u malformed\n",
+            dns_spoof, dns_tid, dns_question, dns_malformed);
+
     /* SYS_NETRX/SYS_NETTX traffic (doc/NETDAEMON_DESIGN.md PR B). These read 0
      * on a stock boot: the boundary exists, but the parser has not moved to
      * ring 3 yet, so nothing calls it. That zero is the baseline

@@ -480,6 +480,83 @@ audit does not change it — but it is on the code path that PR D moves to ring 
 where the stack is a different size and the budget is not the one reasoned about
 here. Flagged for PR D, not fixed now.
 
+### Finding A4 — `handle_dns_response()` had twenty of them, and one leaked attacker bytes
+
+Found while scoping D1b. The `icmp.c` sweep (A1–A3) fixed the file it was looking
+at; `dns.c` was never swept, and `handle_dns_response()` carried **20** `kprintf`
+sites — four times A1's count, on the same remotely-driven RX path.
+
+Severity above A1 on two counts. First, **the drop branches are the ones an
+attacker reaches**: source-IP mismatch, transaction-ID mismatch, and question-name
+mismatch are precisely what a spraying off-path attacker trips, so a forged
+response bought several console lines each while a *legitimate* response bought
+few. The print density was inverted with respect to who was driving it. Second,
+the question-mismatch branch printed **`question_domain`** — bytes copied out of
+the attacker's own packet — onto the kernel console, which a ring-3 shell shares
+with the user's own output. That is attacker-chosen content on the operator's
+terminal, not merely attacker-driven volume.
+
+Neither the TID nor the source-IP check bounds this: both branches *are* the
+print sites, so tripping the defence is what produces the output. Unlike A2 there
+is no rate limiter anywhere on the path, incidental or otherwise.
+
+**Fix — landed.** Six counters through `dns_get_rx_stats()`, on the
+`net_drop_runt`/`icmp_get_rx_stats` pattern, surfaced by `ifconfig` as two lines.
+The three *attack* signatures are kept apart deliberately: one combined "dropped"
+total would tell an operator that something is being rejected while hiding which
+attack is underway, and those three imply different attacker positions. Malformed
+and truncated share one counter — same signal, no such distinction.
+
+**This one is proven end-to-end, unlike A1.** A1 could only be guard-proven because
+acceptance needed a CSPRNG `ping_identifier` that is never printed. DNS has the
+same shape — matching TID and question name are required — but the values are
+*ours*, recorded in file statics from our own outbound query. So
+`dns_forge_response()` (`TINYOS_FAULT_INJECT`, driven by `dnsforge`) lives in
+`dns.c` where it can read them, and builds one synthetic response per signature.
+
+Three things about that forger not to undo. It lives in `dns.c` **because**
+`last_dns_tid` and `dns_server_get` must stay file-static: exposing a TID getter to
+build a test elsewhere would hand every caller the one value the anti-poisoning
+check depends on staying private. Each variant differs from a valid response in
+**exactly one** respect, or a rise in one counter would not identify which branch
+ran. And the `question` case is a genuine name **mismatch**, not `qdcount=0` —
+both land on `dns_drop_question`, so either makes the leg pass, but only the
+mismatch runs the `strcasecmp` branch that used to print the attacker's bytes;
+`qdcount=0` exits at the separate "require a question section" guard and would
+leave the interesting site untested while the harness reported OK. The first
+version of the forger had exactly that bug.
+
+`dnsforge valid` is the **positive control** and is load-bearing: without it every
+drop leg also passes against a forger emitting malformed garbage — the packets
+would be rejected for a reason other than the one named, while the counters moved
+exactly as expected. Proving the forger can produce an *accepted* packet is what
+makes the rejections attributable.
+
+The counter legs pair with a leg asserting `resolved` is **pinned** across the
+drop-only window: all six counters could rise while the resolver *also* accepted
+the forged answers, which is the spoofing defence failing while wearing the
+metrics of a fix. Same counter as the positive control, opposite direction — do
+not reconcile them.
+
+The remaining 23 `kprintf` in `dns.c` stay. They are in `send_dns_query` and
+`domain_to_dns_label`, driven by a local user typing `dig`/`curl` and therefore
+bounded by local action; the rule is about paths a *remote* host drives. The
+harness's print assertion is scoped to `handle_dns_response`'s body for this
+reason — a file-wide grep fails on correct code and pushes the next person into
+"fixing" the outbound path.
+
+Harness: `verify-dns-rx-counters.sh`. Negative control run, not assumed: restoring
+one print inside `handle_dns_response` fails the print leg **alone** while all
+seven counter legs still pass — counters correct, print still there, which is the
+bug exactly.
+
+**Trap worth recording.** The harness read three `ifconfig` outputs but the typist
+produces **four** — `TINYOS_EXEC_CMD` fires its own reading before the followup
+list runs. Off by one, it compared the pre-`dig` baseline against the post-`valid`
+reading, and reported *every* drop leg as "did not move" against a kernel whose
+counters were all correct. The failure mode of an index error here is a false
+FAIL, which is the safe direction, but it cost a full boot cycle to attribute.
+
 ## Harness design — before the code
 
 Per instruction, and per `harness-design-principles`: test the boundary the fix
