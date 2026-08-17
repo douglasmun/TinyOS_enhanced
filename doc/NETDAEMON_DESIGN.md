@@ -1375,16 +1375,51 @@ move withdrawn, any nonzero `cpl3` on any protocol is now a bug report rather
 than progress. `verify-netd-ring3.sh` keeps its assertion and loses its flip;
 `TINYOS_EXPECT_CPL3` should be removed rather than left as a switch nothing sets.
 
-**Keep — ICMP, as the one honest candidate.** Its inbound half writes only
-statistics. A ring-3 ICMP responder is a real privilege reduction: a compromised
-one can forge echo replies, which an on-path attacker can already do, and can
-corrupt a ping counter. It is bounded in a way DNS is not.
+**ICMP — examined separately, and also declined.** Its inbound half passes the
+result criterion cleanly: `handle_icmp_with_context` writes `pings_received` and
+three counters, and nothing in the kernel acts on any of them. On that test alone
+ICMP is the one protocol that could move.
 
-It is still not free. It needs a raw-frame TX syscall (which is `SYS_NETTX`,
-already shipped and root-gated), a timer read, and the 1514-byte stack local of
-finding A3 resolved. The two `cli` reaches (`icmp.c:241`, `icmp.c:334`) are both
-on the reply path and both would move to the kernel side of the TX syscall.
-Whether that is worth building is a separate decision and is **not** taken here.
+It fails on a **second** test the DNS scoping never had to reach, because DNS's
+response path has no TX half at all: *what capability does the moved component
+need in order to do its job?*
+
+An ICMP responder must reply, so it needs `SYS_NETTX`. And `e1000_send()`
+performs **no source validation** — it bounds the length and writes the frame.
+Raw TX is therefore unrestricted frame forgery: any source MAC, any source IP.
+A compromised ring-3 responder holding that syscall can poison the ARP cache,
+spoof DHCP, and inject TCP segments against the connections that deliberately
+stayed in ring 0.
+
+Set against what the move removes:
+
+| | Ring 0 today | Ring-3 responder |
+|---|---|---|
+| Surface removed | — | ICMP echo parse, ~60 lines, audited clean (`icmp.c:241-315`, finding A3) |
+| Capability granted | — | **unrestricted raw TX** |
+
+Trading a general forgery primitive for a small audited parser is a worse deal
+than the DNS one, not a better one. The reassuring version of this — "a
+compromised responder can only forge echo replies, which an on-path attacker can
+already do" — is false: it can forge *anything*, including traffic that an
+on-path attacker on a switched segment cannot inject.
+
+Two further costs, for the record. Finding A3's 1514-byte stack local would have
+to be resolved against a ring-3 stack budget. And `get_timer_ticks()`
+(`icmp.c:241`) gates the **rate limiter**: a responder reading a timer it does
+not control needs that limiter to stay kernel-side, or the DoS protection
+migrates into the untrusted component along with the parser.
+
+**What would change the answer:** a *validating* TX syscall that pins the source
+MAC and IP and restricts the caller to ICMP echo replies. That is buildable, and
+it is a security design problem of the same class as DHCP's validating ifconfig
+syscall — most of the total work, in service of protecting 60 audited lines. The
+ratio is what decides it, and the ratio is bad.
+
+**Decision: not built.** Recorded here so it is not restarted from momentum. The
+general form of the second test is worth carrying forward: *a component that must
+ACT, not merely observe, needs an actuator — and the actuator is usually worth
+more to an attacker than the parser is.*
 
 ### The general lesson
 
