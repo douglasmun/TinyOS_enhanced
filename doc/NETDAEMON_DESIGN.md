@@ -548,11 +548,13 @@ writes the code without saying so.
    that cannot exit. So this is new subsystem work — a supervisor that can observe
    a task's death and re-create it — rather than a policy flag on an existing
    mechanism.
-2. **Shared buffer ownership.** Item 1 established that a deferred parser **must
-   copy** the frame before RDT advances, because the NIC refills the descriptor
-   and a retained pointer is an attacker-timed UAF. A ring-3 shared buffer has the
-   same hazard with a second reader. Copy-in remains the default; zero-copy needs
-   a real argument.
+2. ~~**Shared buffer ownership.**~~ **RESOLVED 2026-08-17 — copy-in.** Item 1
+   established that a deferred parser **must copy** the frame before RDT advances,
+   because the NIC refills the descriptor and a retained pointer is an
+   attacker-timed UAF. A ring-3 shared buffer has the same hazard with a second
+   reader. No argument for zero-copy was ever produced, and the copy is forced by
+   hardware rather than chosen. See "Open question 2, resolved" at the end of this
+   document.
 3. **Does DHCP move?** It writes the config globals at boot, before a ring-3
    daemon plausibly exists. Item 1 already hit this: `kernel.c`'s boot DHCP loop
    needs its explicit `e1000_rx_softirq_run()` drain because `knetd` does not
@@ -727,17 +729,18 @@ Three of the five questions above are answered:
   RX counter *rises* across the kill. "Networking still works" was rejected
   exactly as this document warned: it passes when the kill silently failed.
 
-Two are **not** answered, and both are D1 prerequisites rather than D2 omissions:
+Two were **not** answered at D2 time. Both have since been resolved by reading
+the code — neither needed new machinery:
 
-- **What happens to in-flight state** — untouched, because it cannot be settled
-  before open question 2 (copy-in vs shared buffer). The softirq ring is
-  kernel-owned and survives a `knetd` restart today, which is itself an argument
-  for copy-in.
-- **Does the killing frame get dropped** — no consumed-but-not-completed
-  bookkeeping exists. It has no consequence yet: nothing can currently crash the
-  parser, so no frame has ever killed the daemon. It acquires teeth the moment
-  D1 lands, and without it the rate limiter is the *only* thing standing between
-  an attacker-chosen frame and an unbounded restart loop.
+- **What happens to in-flight state** — settled with open question 2: copy-in.
+  The softirq ring is kernel-owned and survives a `knetd` restart today, which
+  was always the argument for it.
+- **Does the killing frame get dropped** — **yes, already.** Both ring consumers
+  advance `rx_softirq_tail` *before* using the frame, so a restarted daemon
+  resumes at the next frame and cannot re-read the one that killed it. The claim
+  previously made here — that the rate limiter was the only thing between an
+  attacker-chosen frame and an unbounded restart loop — was **backwards**; the
+  ordering is fail-safe. Corrected in full at the end of this document.
 
 Corresponding harness gap: `verify-supervisor.sh` only ever asserts `gave-up == 0`,
 proving the limiter does not fire spuriously and nothing more. **D1 must not land
@@ -816,11 +819,11 @@ other reader of the list. The special case additionally now requires
 crashes repeatedly is exactly the trigger, and after D1 a remote host chooses when
 it fires.
 
-Still open, and still D1's to answer: **what happens to in-flight state**
-(open question 2, copy-in vs shared buffer) and **does the killing frame get
-dropped** — the consumed-but-not-completed ring bookkeeping. Without the latter
-the rate limiter is the only thing between an attacker-chosen frame and an
-unbounded restart loop; it now at least demonstrably works.
+Both of the items this section previously left open have since been resolved by
+reading the code rather than the prose — see "Open question 2, resolved" below.
+Copy-in is forced, not chosen; and the killing frame is *already* dropped, which
+inverts what this document used to claim about the restart loop. What remains
+open for D1 is `tcp_connections[]`, the hard half named in constraint 1.
 
 Two pre-existing kernel bugs surfaced while building this; both are fixed here and
 neither is specific to supervision. `task_free_resources()` returned the task's
@@ -830,3 +833,89 @@ not just kernel tasks, and invisible because the panic lands on an unrelated lat
 allocation. And `task_create_kernel()` does not enqueue, so both the restart path
 and the supervisor's own creation needed an explicit `scheduler_add_task()`;
 without it a task is created, listed by `ps`, counted healthy, and never run.
+
+## Open question 2, resolved — and a claim this document had backwards
+
+Settled 2026-08-17 by reading `e1000.c` against the prose above. Both items the
+D2 section left "open for D1" turn out not to be design forks at all. Recording
+the reasoning, because in both cases the document's own framing was the thing
+that made them look open.
+
+### Copy-in: forced, not chosen
+
+Open question 2 was framed as "copy-in vs shared buffer". It is not a choice.
+Item 1 already established that a deferred parser **must** copy the frame before
+RDT advances, because the NIC refills the descriptor and a retained pointer is an
+attacker-timed UAF. A ring-3 shared buffer has that same hazard with a second
+reader, and adds a worse one: the buffer would be writable by the parser whose
+compromise is the entire threat model for moving it out of ring 0.
+
+The document already said "copy-in remains the default; zero-copy needs a real
+argument." No such argument has been produced, and the cost copy-in was suspected
+of — a per-frame `memcpy` — is one the RX path already pays twice (ISR into
+`rx_softirq_ring`, then ring into the parser's frame buffer). Zero-copy would
+have to eliminate a copy that a hardware constraint requires.
+
+**Decided: copy-in.** Reopen only with a measurement showing the copy is a real
+cost, and a scheme where a ring-3 writer cannot reach a buffer the kernel still
+trusts.
+
+### The killing frame is already dropped — the inverted claim
+
+This document stated that no consumed-but-not-completed bookkeeping exists, and
+that without it "the rate limiter is the only thing standing between an
+attacker-chosen frame and an unbounded restart loop." The first half is true.
+The consequence is backwards.
+
+Both ring consumers advance the tail **before** the frame is used, under
+`E1000_LOCK()`:
+
+- `e1000_rx_softirq_run()` (`e1000.c:385`) advances `rx_softirq_tail`, unlocks,
+  and only then calls `handle_packet()` at line 388.
+- `e1000_rx_dequeue()` (`e1000.c:436`) does the same, and its oversize branch at
+  line 431 advances the tail with an explicit "Consume it anyway" comment.
+
+So a frame that kills the parser has already been consumed. A restarted daemon
+resumes at the *next* frame and cannot re-read the one that killed it. The
+current ordering is **fail-safe (drop-on-dequeue)**, not fail-open, and the
+restart loop this document feared is not reachable by replaying one frame — an
+attacker must resend it, which is a different and much weaker primitive that the
+rate limiter already bounds.
+
+The real bookkeeping question at D1 is the *reverse* one, and it is a
+reliability concern rather than a security one: drop-on-dequeue means a parser
+that dies mid-frame loses that frame silently. For a malicious frame that is
+exactly right. For a legitimate frame during an unrelated crash it is a silent
+drop — acceptable for a datagram protocol (ICMP/DNS/DHCP all tolerate loss and
+retry), which is precisely the moving set. **No new bookkeeping is required for
+D1.** It would only be required if a lossless protocol moved, and TCP is staying
+in ring 0.
+
+### What is actually still open: `tcp_connections[]`
+
+Constraint 1 named this "the hard half" and it is the one that survives. TCP
+stays in ring 0 at D1, so the table is not crossing the boundary — but it
+already has three writers, and D1 changes who can be running concurrently with
+them:
+
+| Writer | Context | Since |
+|---|---|---|
+| RX parser (`tcp_handle_packet`) | task, `knetd` | item 1 |
+| `SYS_TCPSOCK` kernel calls | task, syscall from ring 3 | PR C2 |
+| `tcp_tick()` | task, `ktimerd` | pre-existing |
+
+One correction worth recording, because it was briefly believed otherwise while
+writing this: **`tcp_tick()` does not run in the ISR.** `interrupts.c:111` sits
+inside `timer_softirq_run()`, which the timer ISR only flags; `task_ktimerd()`
+drains it in task context, the same top/bottom-half split as `knetd`. All three
+writers are therefore task-context and serialized by `TCP_LOCK()`, which is why
+the table is safe *today*.
+
+What D1 changes is that `knetd` becomes killable and restartable. The question
+to answer before the move is not locking but **interruption**: whether a parser
+that dies between two `TCP_LOCK()` sections can leave `tcp_connections[]`
+structurally valid but semantically half-updated (a connection advanced to a
+state whose follow-up write never happened). The lock guarantees no torn read;
+it guarantees nothing about a multi-step update abandoned midway. That is the
+open D1 item, and it is answerable by auditing `tcp_handle_packet`'s multi-step
+state transitions for a safe abort point — not by a new mechanism.
