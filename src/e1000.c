@@ -279,6 +279,7 @@ static volatile uint32_t rx_softirq_tail = 0;  /* consumer: knetd     */
 static uint32_t rx_drop_backlog = 0;
 
 
+
 // Packet dump control (set to 1 to enable, 0 to disable)
 static int enable_packet_dump = 0;  // Disabled to reduce verbosity
 
@@ -309,6 +310,126 @@ static bool link_status_stable = true;  // Link considered stable
  *=============================================================================*/
 #define E1000_LOCK()   CRITICAL_SECTION_ENTER()
 #define E1000_UNLOCK() CRITICAL_SECTION_EXIT()
+
+/*=============================================================================
+ * THE netd RING  (doc/NETDAEMON_DESIGN.md item 4, PR D1a)
+ *
+ * WHY A SECOND RING EXISTS AT ALL
+ *
+ * rx_softirq_ring is single-consumer. Before D1a it had exactly one consumer in
+ * practice: e1000_rx_softirq_run() on knetd. e1000_rx_dequeue() (the SYS_NETRX
+ * half) pops the SAME tail, and PR B got away with that only because netprobe
+ * runs on demand and knetd is never draining at the same moment.
+ *
+ * D1 breaks that. A ring-3 netd polling SYS_NETRX while knetd still drains means
+ * each frame goes to whichever consumer reaches the tail first -- so a TCP
+ * segment can be swallowed by the daemon that does not parse TCP, and an ICMP
+ * echo can be parsed in ring 0 after the move was supposed to have happened.
+ * Both failures are intermittent and load-dependent, which is the worst shape a
+ * networking bug can have.
+ *
+ * THE FIX IS TO KEEP ONE CONSUMER, NOT TO LOCK HARDER
+ *
+ * knetd remains the sole consumer of rx_softirq_ring. It classifies each frame
+ * and either parses it itself (TCP, ARP, everything not moving) or forwards it
+ * here, to a queue that only SYS_NETRX pops. Two rings, one producer and one
+ * consumer each, and the handoff is a copy under the same lock that already
+ * protects the first ring.
+ *
+ * WHY CLASSIFY IN RING 0 RATHER THAN LET netd FILTER
+ *
+ * The kernel must parse Ethernet and IP headers regardless -- TCP stays in ring
+ * 0, so those layers cannot move. Given that, classifying costs nothing new in
+ * surface: it reads the same two headers the kernel already reads. The
+ * alternative (netd receives everything and hands TCP back) makes TCP depend on
+ * a killable ring-3 task, so every supervisor restart window becomes a TCP
+ * outage. See the D1a section of the design doc.
+ *
+ * SIZING: deliberately smaller than rx_softirq_ring. This queue backs up when
+ * netd is slow or dead, and a dead netd must not consume 128 KB of .bss holding
+ * frames nobody will ever read. Overflow is drop-newest and counted, the same
+ * discipline and for the same reason as the ring above.
+ *===========================================================================*/
+#define NETD_RING_SLOTS 32
+
+struct netd_ring_slot {
+    uint16_t length;
+    uint8_t  data[RX_BUF_SIZE];
+};
+
+static struct netd_ring_slot netd_ring[NETD_RING_SLOTS];
+static volatile uint32_t netd_ring_head = 0;  /* producer: knetd, task ctx */
+static volatile uint32_t netd_ring_tail = 0;  /* consumer: SYS_NETRX       */
+
+/* Frames routed to netd, and frames dropped because netd was not draining.
+ * The drop counter is the one that matters operationally: a nonzero value with
+ * a live netd means the daemon is too slow, and with a dead netd it is the
+ * expected reading rather than a fault. */
+static uint32_t netd_routed = 0;
+static uint32_t netd_drop_backlog = 0;
+
+/*
+ * Is a ring-3 netd claiming the moving protocols?
+ *
+ * NOT a "netd is alive" flag -- it is a routing switch, set by registration and
+ * cleared on deregistration or death. While false, knetd parses everything
+ * exactly as it did before D1a, so a kernel with no netd behaves identically to
+ * the pre-D1a kernel. That is what makes this PR safe to land before any parser
+ * has actually moved: the new path is inert until something opts in.
+ */
+static volatile bool netd_claimed = false;
+
+void net_netd_set_claimed(bool claimed) {
+    E1000_LOCK();
+    netd_claimed = claimed;
+    if (!claimed) {
+        /* Drop anything queued for a daemon that is no longer there. Leaving
+         * frames behind would hand stale traffic to the NEXT netd -- after a
+         * supervisor restart, that is frames from before the crash, which is
+         * both a correctness problem and a small information leak across the
+         * restart boundary. */
+        netd_ring_tail = netd_ring_head;
+    }
+    E1000_UNLOCK();
+}
+
+bool net_netd_is_claimed(void) {
+    return netd_claimed;
+}
+
+void net_get_netd_stats(uint32_t* routed, uint32_t* dropped, bool* claimed) {
+    E1000_LOCK();
+    if (routed)  *routed  = netd_routed;
+    if (dropped) *dropped = netd_drop_backlog;
+    if (claimed) *claimed = netd_claimed;
+    E1000_UNLOCK();
+}
+
+/*
+ * Hand one frame to the netd queue. Caller must NOT hold E1000_LOCK().
+ * Drop-newest on overflow, counted, never printed -- this is a path a remote
+ * flood drives directly (CLAUDE.md: count, don't print).
+ */
+static void netd_ring_enqueue(const uint8_t* data, uint16_t length) {
+    if (length > RX_BUF_SIZE) {
+        netd_drop_backlog++;
+        return;
+    }
+
+    E1000_LOCK();
+    uint32_t next = (netd_ring_head + 1) % NETD_RING_SLOTS;
+    if (next == netd_ring_tail) {
+        netd_drop_backlog++;
+        E1000_UNLOCK();
+        return;
+    }
+    memcpy(netd_ring[netd_ring_head].data, data, length);
+    netd_ring[netd_ring_head].length = length;
+    __asm__ volatile("" ::: "memory");
+    netd_ring_head = next;
+    netd_routed++;
+    E1000_UNLOCK();
+}
 
 /*=============================================================================
  * FUNCTION: rx_softirq_enqueue  (TOP HALF — runs in the ISR)
@@ -365,6 +486,43 @@ static void rx_softirq_enqueue(const uint8_t* data, uint16_t length) {
  * Anything still queued is picked up on the next pass — the task loop yields
  * and comes straight back.
  *===========================================================================*/
+/*
+ * Does this frame belong to the ring-3 netd?
+ *
+ * Reads only the Ethernet ethertype and the IP protocol byte, both of which the
+ * kernel must read anyway to dispatch TCP. Every bounds check here is
+ * deliberately independent of handle_ip()'s: this runs BEFORE that function and
+ * must not assume any of its validation has happened. A frame too short to
+ * classify is not routed -- it falls through to handle_packet(), which is the
+ * code that already knows how to reject it, and which counts the drop.
+ *
+ * Only the protocols D1 actually moves are claimed. Everything else -- TCP,
+ * ARP, non-IPv4, malformed -- stays in ring 0, so an unrecognised frame is
+ * never silently diverted away from the parser that handles it today.
+ */
+static bool netd_claims_frame(const uint8_t* data, uint16_t length) {
+    if (length < sizeof(eth_header_t) + sizeof(ip_header_t)) {
+        return false;
+    }
+
+    const eth_header_t* eth = (const eth_header_t*)data;
+    if (ntohs(eth->ethertype) != ETH_TYPE_IPV4) {
+        return false;
+    }
+
+    const ip_header_t* ip = (const ip_header_t*)(data + sizeof(eth_header_t));
+    switch (ip->protocol) {
+        case IPPROTO_ICMP:
+        case IPPROTO_UDP:
+            return true;
+        default:
+            /* TCP included: it stays in ring 0 permanently, because TCP_LOCK is
+             * `cli` and ring 3 runs with IOPL=0. See doc/NETDAEMON_DESIGN.md
+             * finding 2. */
+            return false;
+    }
+}
+
 void e1000_rx_softirq_run(void) {
     uint32_t drained = 0;
 
@@ -385,7 +543,14 @@ void e1000_rx_softirq_run(void) {
         rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
         E1000_UNLOCK();
 
-        handle_packet(frame, length);
+        /* Route or parse -- never both, and never neither. knetd stays the sole
+         * consumer of rx_softirq_ring; this is the fork in the road, and it is
+         * an if/else precisely so that no frame can be delivered twice. */
+        if (netd_claimed && netd_claims_frame(frame, length)) {
+            netd_ring_enqueue(frame, length);
+        } else {
+            handle_packet(frame, length);
+        }
         drained++;
     }
 }
@@ -393,10 +558,17 @@ void e1000_rx_softirq_run(void) {
 /*=============================================================================
  * FUNCTION: e1000_rx_dequeue  (the SYS_NETRX half of the ring-3 boundary)
  *
- * Copies one frame out of the software ring into a KERNEL buffer and advances
- * the tail. Same producer/consumer discipline as e1000_rx_softirq_run() above;
- * this is that function's body with handle_packet() replaced by "give it to the
- * caller". See doc/NETDAEMON_DESIGN.md (item 4, PR B).
+ * Copies one frame out of the NETD ring into a KERNEL buffer and advances that
+ * ring's tail. See doc/NETDAEMON_DESIGN.md (item 4, PR B for the boundary
+ * itself, PR D1a for which ring it reads).
+ *
+ * CHANGED IN D1a, AND THE CHANGE IS THE WHOLE POINT. This used to pop
+ * rx_softirq_ring -- the same ring knetd drains. Two consumers on a
+ * single-consumer ring meant each frame went to whichever got there first, so a
+ * live netd would have stolen TCP segments from the kernel parser at random.
+ * It now pops netd_ring, which knetd fills by classification and nothing else
+ * consumes. If you are tempted to point this back at rx_softirq_ring, read the
+ * netd-ring comment block above first.
  *
  * Returns bytes copied, 0 if the ring is empty, or -1 if the frame does not fit
  * in out_len. In the -1 case the frame IS consumed: a frame too large for the
@@ -418,22 +590,22 @@ int e1000_rx_dequeue(uint8_t* out, uint16_t out_len) {
     }
 
     E1000_LOCK();
-    if (rx_softirq_tail == rx_softirq_head) {
+    if (netd_ring_tail == netd_ring_head) {
         E1000_UNLOCK();
         return 0;
     }
-    length = rx_softirq_ring[rx_softirq_tail].length;
+    length = netd_ring[netd_ring_tail].length;
     if (length > RX_BUF_SIZE) {
         length = RX_BUF_SIZE;
     }
     if (length > out_len) {
         /* Consume it anyway — see the head comment. */
-        rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+        netd_ring_tail = (netd_ring_tail + 1) % NETD_RING_SLOTS;
         E1000_UNLOCK();
         return -1;
     }
-    memcpy(out, rx_softirq_ring[rx_softirq_tail].data, length);
-    rx_softirq_tail = (rx_softirq_tail + 1) % RX_SOFTIRQ_SLOTS;
+    memcpy(out, netd_ring[netd_ring_tail].data, length);
+    netd_ring_tail = (netd_ring_tail + 1) % NETD_RING_SLOTS;
     E1000_UNLOCK();
 
     return (int)length;
