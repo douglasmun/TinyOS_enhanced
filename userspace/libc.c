@@ -106,6 +106,10 @@ int chdir(const char* path) {
     return syscall1(SYS_CHDIR, (uint32_t)(uintptr_t)path);
 }
 
+int systime(void* buf, size_t size) {
+    return syscall3(SYS_TIME, (uint32_t)(uintptr_t)buf, (uint32_t)size, 0);
+}
+
 int psinfo(void* buf, size_t size) {
     return syscall3(SYS_PSINFO, (uint32_t)(uintptr_t)buf, (uint32_t)size, 0);
 }
@@ -229,6 +233,14 @@ int vprintf(const char* fmt, va_list ap) {
         int left = 0;
         while (*fmt == '-') { left = 1; fmt++; }
 
+        /* '0' flag. Must be consumed BEFORE the width digits below, or the
+         * leading zero of "%02d" is read as part of the width and the flag
+         * silently disappears -- which is what made `date` print "7:30: 3"
+         * where it meant "07:30:03". Ignored when left-justifying, as in C:
+         * "%-05d" pads on the right, where zeros would change the value. */
+        int zero = 0;
+        while (*fmt == '0') { zero = 1; fmt++; }
+
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') {
             width = width * 10 + (*fmt - '0');
@@ -286,9 +298,21 @@ int vprintf(const char* fmt, va_list ap) {
         while (body[len]) len++;
         int pad = (width > len) ? width - len : 0;
 
-        if (!left) { while (pad-- > 0) out_ch(&o, ' '); }
-        out_str(&o, body);
-        if (left)  { while (pad-- > 0) out_ch(&o, ' '); }
+        if (left) {
+            out_str(&o, body);
+            while (pad-- > 0) out_ch(&o, ' ');
+        } else if (zero) {
+            /* Zeros go AFTER any sign, not before it: "%05d" of -42 is
+             * "-0042", never "00-42". Emit the '-' first, then the zeros,
+             * then the digits. */
+            int off = 0;
+            if (body[0] == '-') { out_ch(&o, '-'); off = 1; }
+            while (pad-- > 0) out_ch(&o, '0');
+            out_str(&o, body + off);
+        } else {
+            while (pad-- > 0) out_ch(&o, ' ');
+            out_str(&o, body);
+        }
     }
 
     out_flush(&o);

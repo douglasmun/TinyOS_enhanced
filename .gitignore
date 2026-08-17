@@ -152,6 +152,8 @@ ring3-redirect.log
 ring3-redirect-trace.log
 ring3-pipes.log
 ring3-pipes-trace.log
+ring3date.log
+ring3date-trace.log
 scratchpad/
 argv.log
 argv-trace.log

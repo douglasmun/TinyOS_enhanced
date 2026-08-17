@@ -77,6 +77,7 @@ static void cmd_help(void) {
           "  touch <file>...   create a file if it does not exist\n"
           "  getpid            print this shell's pid\n"
           "  id                print uid and gid\n"
+          "  date              print the date, time and uptime\n"
           "  ps [-l]           list your processes (root: all)\n"
           "  kill <pid>        terminate a process\n"
           "  top               one-shot snapshot of CPU use\n"
@@ -132,6 +133,41 @@ static void cmd_pwd(void) {
         return;
     }
     printf("%s\n", buf);
+}
+
+/* Output format deliberately matches the kernel shell's cmd_date
+ * (shell_system.c): two shells printing the same clock in two formats is a
+ * gratuitous difference for anyone comparing them side by side. */
+static void cmd_date(void) {
+    static const char* const day_names[] = {"Sun", "Mon", "Tue", "Wed",
+                                            "Thu", "Fri", "Sat"};
+    static const char* const month_names[] = {"", "Jan", "Feb", "Mar", "Apr",
+                                              "May", "Jun", "Jul", "Aug",
+                                              "Sep", "Oct", "Nov", "Dec"};
+    systime_t t;
+    int err = systime(&t, sizeof(t));
+    if (err < 0) {
+        fail("date", 0, err);
+        return;
+    }
+
+    /* Bound both indices before use. The kernel builds this record from RTC
+     * hardware, so a wedged clock reporting month 0xFF would otherwise read
+     * off the end of month_names -- cheap to check, and the alternative is a
+     * ring-3 crash on a bad battery. */
+    const char* dow = (t.weekday < 7) ? day_names[t.weekday] : "???";
+    const char* mon = (t.month >= 1 && t.month <= 12) ? month_names[t.month] : "???";
+
+    printf("%s %s %2d %02d:%02d:%02d %04d\n",
+           dow, mon, t.day, t.hour, t.minute, t.second, t.year);
+
+    uint32_t up = t.uptime_seconds;
+    uint32_t days = up / 86400;
+    printf("Uptime: ");
+    if (days > 0) {
+        printf("%d day%s, ", days, days == 1 ? "" : "s");
+    }
+    printf("%02d:%02d:%02d\n", (up % 86400) / 3600, (up % 3600) / 60, up % 60);
 }
 
 static void cmd_cd(int argc, char** argv) {
@@ -1120,6 +1156,7 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "mv") == 0)     { cmd_mv(argc, argv);       return 0; }
     if (strcmp(cmd, "touch") == 0)  { cmd_touch(argc, argv);    return 0; }
     if (strcmp(cmd, "id") == 0)     { cmd_id();                 return 0; }
+    if (strcmp(cmd, "date") == 0)   { cmd_date();               return 0; }
     if (strcmp(cmd, "ps") == 0)     { cmd_ps(argc, argv);       return 0; }
     if (strcmp(cmd, "kill") == 0)   { cmd_kill(argc, argv);     return 0; }
     if (strcmp(cmd, "top") == 0)    { cmd_top(argc, argv);      return 0; }
