@@ -28,33 +28,17 @@ static bool is_public_key_zero(const uint8_t* key) {
     return true;
 }
 
-void secure_boot_init(const uint8_t* public_key, uint32_t min_version, uint32_t flags) {
+void secure_boot_init(const uint8_t* public_key) {
     /*=========================================================================
-     * SECURITY FIX: Fail-Closed on Missing Public Key
+     * Fail closed on a missing or all-zero key.
      *
-     * VULNERABILITY: Accepts NULL or zero public key and continues
-     *
-     * OLD CODE (VULNERABLE):
-     * if (public_key) { copy key } else { memset to zeros }
-     * → System boots with no public key, signature checks meaningless
-     *
-     * NEW CODE (SECURE):
-     * - Reject NULL public key as FATAL error
-     * - Reject all-zeros public key as configuration error
-     * - Force enforcement ON by default (fail-closed)
-     * - Only allow disabling enforcement if explicitly requested AND key valid
-     *
-     * ATTACK SCENARIO PREVENTED:
-     * 1. Attacker clears public key in boot config
-     * 2. System initializes with zero key
-     * 3. Signature verification always fails (no valid key to check against)
-     * 4. BUT: Code falls back to unenforced mode
-     * 5. Attacker executes unsigned code
-     *
-     * FIX: Require valid public key, default to enforcement ON
+     * This is load-bearing, not defensive boilerplate: elf.c refuses every
+     * signature when initialized is false, so leaving it false is the safe
+     * state. The original code took the opposite path -- memset the key to
+     * zeros and continue -- which booted a system where no signature could
+     * ever match and the caller was free to treat that as "unenforced".
      *=======================================================================*/
 
-    /* Copy public key */
     if (!public_key) {
         kprintf("[SECURE_BOOT] FATAL: No public key provided\n");
         kprintf("[SECURE_BOOT] Secure boot cannot initialize without a valid public key\n");
@@ -75,15 +59,12 @@ void secure_boot_init(const uint8_t* public_key, uint32_t min_version, uint32_t 
         return;
     }
 
-    boot_config.min_version = min_version;
-
-    boot_config.flags = flags;
     boot_config.initialized = true;
 
     /* Report what this subsystem actually establishes: a pinned key. Do NOT
      * reintroduce an "Enforcement:" line here -- whether unsigned binaries are
      * rejected is decided by elf.c's build-mode gate, and a line printed from
-     * boot_config.flags reported ENFORCED even in a permissive build. */
+     * a policy flag reported ENFORCED even in a permissive build. */
     kprintf("[SECURE_BOOT] Signing key pinned (ECDSA P-256)\n");
 }
 

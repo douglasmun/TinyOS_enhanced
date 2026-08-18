@@ -22,8 +22,8 @@
  *
  * This exists because `secstatus` used to source its "ELF signatures" line
  * from secure_boot_is_enforced(), which was hardwired true: secure_boot_init()
- * ORed SECURE_BOOT_FLAG_ENFORCE in whenever the caller omitted it, and kernel.c
- * omits it. So a -DELF_PERMISSIVE_SIGNATURES build -- one that warns and loads
+ * ORed an ENFORCE flag in whenever the caller omitted it, and kernel.c omitted
+ * it. So a -DELF_PERMISSIVE_SIGNATURES build -- one that warns and loads
  * unsigned binaries -- still reported "ENFORCED (fail-closed)". The status
  * surface could not report the state it named. That accessor has since been
  * deleted outright, so this is now the only way to ask the question.

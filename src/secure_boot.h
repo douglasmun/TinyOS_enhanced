@@ -30,12 +30,6 @@
 /* Pinned key size (ECDSA P-256: x || y) */
 #define SECURE_BOOT_PUBKEY_SIZE         64      /* x + y coordinates */
 
-/* Boot policy flags */
-#define SECURE_BOOT_FLAG_ENFORCE        0x0001  /* Enforce signature checking */
-#define SECURE_BOOT_FLAG_MEASURED       0x0002  /* Enable measured boot */
-#define SECURE_BOOT_FLAG_ROLLBACK_CHECK 0x0004  /* Check version for rollback */
-#define SECURE_BOOT_FLAG_AUDIT_LOG      0x0008  /* Log all verification events */
-
 /*=============================================================================
  * Data Structures
  *=============================================================================*/
@@ -45,9 +39,7 @@
  */
 typedef struct {
     uint8_t  public_key[SECURE_BOOT_PUBKEY_SIZE];   /* Trusted public key (x || y) */
-    uint32_t min_version;                           /* Minimum acceptable version */
-    uint32_t flags;                                 /* Global boot policy flags */
-    bool     initialized;                           /* Is secure boot initialized? */
+    bool     initialized;                           /* Is a valid key pinned? */
 } secure_boot_config_t;
 
 /*=============================================================================
@@ -55,13 +47,20 @@ typedef struct {
  *=============================================================================*/
 
 /**
- * @brief Initialize secure boot subsystem
+ * @brief Pin the trusted code-signing key
+ *
+ * Takes no policy arguments, deliberately. It used to accept min_version and
+ * a flags word, and after the dead verifier was removed nothing read either:
+ * they were stored, copied out by get_config, and consulted by nobody, while
+ * kernel.c went on passing SECURE_BOOT_FLAG_MEASURED for a measured boot that
+ * has no implementation. Accepting policy you cannot enforce is how the
+ * "Measured boot: ENABLED" line got written in the first place. If rollback
+ * protection is ever wanted, build it where the signature format lives
+ * (elf.c) and give it a version field something actually checks.
  *
  * @param public_key Trusted ECDSA P-256 public key (64 bytes: x || y)
- * @param min_version Minimum acceptable binary version
- * @param flags Boot policy flags
  */
-void secure_boot_init(const uint8_t* public_key, uint32_t min_version, uint32_t flags);
+void secure_boot_init(const uint8_t* public_key);
 
 /**
  * @brief Get current secure boot configuration

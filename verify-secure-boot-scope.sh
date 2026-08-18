@@ -52,6 +52,27 @@ else
     grep -nE "^(void|int|bool) +secure_boot_[a-z_]+ *\(" src/secure_boot.h | sed 's/^/       /'
 fi
 
+echo "== leg 3b: no write-only policy state =="
+# Found auditing this change's own first draft: after the dead verifier went,
+# boot_config.flags and .min_version were stored by init, copied out by
+# get_config, and read by NOBODY -- while kernel.c went on passing
+# SECURE_BOOT_FLAG_MEASURED for a measured boot with no implementation. That is
+# the same defect in miniature: accepting policy you cannot enforce. Leg 3
+# counts functions and cannot see it, so assert the struct's shape directly.
+# Match DECLARATIONS only -- the prose above secure_boot_init() explains why
+# these fields are gone and must not itself trip the assertion.
+if grep -qE '^ *uint32_t +(min_version|flags) *;' src/secure_boot.h; then
+    bad "secure_boot.h carries policy state again (min_version/flags) -- is it READ anywhere?"
+    grep -nE '^ *uint32_t +(min_version|flags) *;' src/secure_boot.h | sed 's/^/       /'
+else
+    ok "no unread policy fields; the pinned key and initialized flag are all that is stored"
+fi
+if grep -qE 'secure_boot_init\([^)]*,' src/secure_boot.h; then
+    bad "secure_boot_init() takes policy arguments again"
+else
+    ok "secure_boot_init() takes only the key"
+fi
+
 echo "== leg 4: the boot log claims only what is true =="
 LOG=$(mktemp /tmp/sbscope.XXXXXX.log)
 trap 'rm -f "$LOG"' EXIT
