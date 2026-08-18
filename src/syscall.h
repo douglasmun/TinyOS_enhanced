@@ -378,6 +378,7 @@
 #define ENV_OP_ALIAS_GET  5  // name -> value (the alias command)
 #define ENV_OP_ALIAS_SET  6  // name + value
 #define ENV_OP_ALIAS_LIST 7  // index -> name + value
+#define ENV_OP_ALIAS_UNSET 8 // name; deletes one alias
 
 /*-----------------------------------------------------------------------------
  * SYS_ENV record. ONE struct for every subcommand, fixed layout.

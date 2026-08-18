@@ -186,12 +186,13 @@ trap cleanup EXIT
 # reassembles the remaining argv, but this harness deliberately uses a
 # single-word value so the leg tests SUBSTITUTION, not quote handling.
 #
-# The alias target is `id`, NOT `whoami`: whoami is a KERNEL-shell builtin and
-# does not exist in ring 3, so aliasing to it makes the leg fail with "not
-# found" even when substitution worked perfectly -- the alias fired, and the
-# harness would still have blamed the alias. Pick a target the ring-3 shell
-# actually has. `id` prints "uid=<n> gid=<n>", and the uid is a string the
-# `alias` listing line cannot contain, so the leg stays self-checking.
+# The alias target is `id`. When this leg was written the reason was that
+# `whoami` did not exist in ring 3 and aliasing to it would fail with "not
+# found" even though substitution had worked -- blaming the alias for a missing
+# target. whoami HAS existed in ring 3 since PR #95, so that specific hazard is
+# gone, but `id` stays: it prints "uid=<n> gid=<n>", and that uid= string cannot
+# appear in the `alias` listing line, which is what keeps the leg self-checking.
+# whoami's output is a bare username that DOES appear elsewhere in the log.
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_PASSWORD="$PASSWORD" \
@@ -214,6 +215,10 @@ exec /shell.elf=>TinyOS shell (ring 3);\
 !alias envll=id;\
 !alias=>envll;\
 !envll=>uid=;\
+!unalias envll;\
+!alias=>(no aliases);\
+!envll=>not found;\
+!unalias envll=>not found;\
 !export PATH;\
 !/hello.elf=>Hello from ELF" \
 python3 tools/qemu_typist.py
@@ -420,6 +425,89 @@ fi
 note_pass "alias substituted client-side and ran (envll -> id)"
 
 # ---------------------------------------------------------------------------
+# Leg 7b: unalias DELETED it -- witnessed by the alias no longer FIRING.
+#
+# ENV_OP_ALIAS_UNSET (8) is the ninth SYS_ENV subcommand and the only piece of
+# new kernel surface in this group; the other eight could not express deletion.
+#
+# The witness is deliberately NOT "the name vanished from `alias`". A deletion
+# that cleared the listing while leaving the entry live, and a LISTING bug that
+# hid a still-present alias, produce the identical empty listing -- so that
+# assertion cannot tell a working unalias from a broken alias_list. Typing the
+# name again can: if the entry is really gone the shell finds no substitution
+# and reports "not found", and if it is still there the alias fires and `id`
+# prints "uid=" one more time.
+#
+# So this leg counts "uid=" occurrences AFTER the unalias and requires zero.
+# Leg 7 above already proved the alias fired BEFORE it, which is what makes the
+# count meaningful -- a zero here with no prior positive would also be produced
+# by an alias that never worked at all.
+UNALIAS_REGION=$(printf '%s\n' "$USER_REGION" | sed -n '/\$ unalias envll/,$p')
+
+if [ -z "$UNALIAS_REGION" ]; then
+    fail_with "the unalias command never appeared in the log" \
+        "The typist did not reach it; this is a harness/timing failure," \
+        "not a kernel result. Re-run before investigating."
+fi
+
+# The region must actually CONTAIN the post-unalias `envll` attempt before a
+# zero count means anything. Without this the leg passes vacuously on a
+# truncated log: if the typist stalls at the `alias` step -- which is exactly
+# what a BROKEN unalias causes, since `alias` then prints the surviving entry
+# instead of the expected "(no aliases)" and the typist waits for a string that
+# never arrives -- the region holds no `envll` invocation at all and "zero
+# uid=" is trivially true. The first negative control of this leg passed for
+# precisely that reason. Assert the command was reached, THEN assert it did
+# not fire.
+if ! printf '%s\n' "$UNALIAS_REGION" | grep -q '\$ envll'; then
+    fail_with "the post-unalias \`envll\` was never typed" \
+        "The log stops before it, so 'the alias did not fire' cannot be" \
+        "concluded -- nothing was asked of it. A stall at the preceding" \
+        "\`alias\` step is itself a symptom: a surviving alias makes that" \
+        "listing non-empty and the typist waits for '(no aliases)' forever."
+fi
+
+# Drop the shell's own echo lines and history's numbered listing before
+# counting -- both replay the command text, and `$ envll` contains the alias
+# name by construction. Same trap documented in verify-ring3-builtins.sh leg 5.
+FIRED=$(printf '%s\n' "$UNALIAS_REGION" \
+    | grep -v '\$ ' \
+    | grep -vE '^ *[0-9]+  ' \
+    | grep -c "uid=")
+if [ "$FIRED" -ne 0 ]; then
+    fail_with "the alias still FIRED after unalias ($FIRED run(s) of \`id\`)" \
+        "ENV_OP_ALIAS_UNSET returned success but alias_unset() did not clear" \
+        "the slot, or cmd_unalias called the wrong op. Note the listing may" \
+        "look empty while this is broken -- that is why this leg tests" \
+        "firing rather than listing."
+fi
+note_pass "unalias deleted the alias -- it no longer fires (paired with leg 7)"
+
+# ---------------------------------------------------------------------------
+# Leg 7c: deleting an ABSENT alias is reported, not silently accepted.
+#
+# The second `unalias envll` runs when the alias is already gone, so
+# alias_unset() returns -1, sys_env maps it to -ENOENT, and cmd_unalias prints
+# "unalias: envll: not found". A kernel that returned 0 unconditionally would
+# pass leg 7b -- nothing fires either way -- so this is the leg that separates
+# "deleted it" from "reported success without looking".
+#
+# Two "not found" lines are expected in this region: one from typing the dead
+# alias (leg 7b) and one from this second unalias. Requiring BOTH is what pins
+# the errno path; requiring only one would pass on either alone.
+NOTFOUND=$(printf '%s\n' "$UNALIAS_REGION" \
+    | grep -v '\$ ' \
+    | grep -vE '^ *[0-9]+  ' \
+    | grep -c "not found")
+if [ "$NOTFOUND" -lt 2 ]; then
+    fail_with "deleting an absent alias was not reported ($NOTFOUND/2 lines)" \
+        "Expected a 'not found' from invoking the dead alias AND one from" \
+        "the second unalias. If only one is present, sys_env probably" \
+        "returned 0 for a missing name instead of -ENOENT."
+fi
+note_pass "unalias on an absent alias reports -ENOENT (not silent success)"
+
+# ---------------------------------------------------------------------------
 # Leg 8: $USER reflects the CURRENT identity, not the one env_init() seeded.
 #
 # env_init() seeds USER="root" because it runs before anyone has logged in, and
@@ -476,10 +564,10 @@ fi
 note_pass "export + spawn works (smoke test; inheritance proof is sectest 10)"
 
 echo ""
-if [ "$PASSES" -eq 9 ]; then
-    echo "RESULT: PASS — the env group works from ring 3 via SYS_ENV ($PASSES/9)"
+if [ "$PASSES" -eq 11 ]; then
+    echo "RESULT: PASS — the env group works from ring 3 via SYS_ENV ($PASSES/11)"
     exit 0
 fi
 
-echo "RESULT: FAIL — only $PASSES/9 legs passed"
+echo "RESULT: FAIL — only $PASSES/11 legs passed"
 exit 1

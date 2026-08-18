@@ -213,7 +213,7 @@ corrupted the signature hash until `exec_buffer` and `elf_load_process`'s
 ## Current state
 
 The **ring-3 shell is the default login shell** (PR #51); the kernel shell is the
-fallback (`kshell` hands over, `exit` logs out). ~33 builtins against the kernel shell's
+fallback (`kshell` hands over, `exit` logs out). ~35 builtins against the kernel shell's
 ~70 — redirection, pipelines, credentials, `ps`/`kill`/`top`, `cp`/`mv`/`touch`,
 `date`/`chmod`, the env/alias group, and
 `clear`/`history`/`jobs`/`grep`/`find`/`man`/`whoami` have landed. Those last seven
@@ -221,8 +221,9 @@ needed **no new syscall**. `whoami` is the one to remember: it was deferred as n
 uid→username path across the boundary, and that was wrong — `env_refresh_identity()`
 already resolves the name kernel-side and exports it as `$USER`, so ring 3 reads its own
 identity through `SYS_ENV` and there is no account-enumeration primitive to weigh (the
-kernel resolves `self->uid` and nothing else). `unalias` genuinely does need surface —
-`SYS_ENV` has no alias-delete subcommand — so it stays deferred. `history`/`jobs` are
+kernel resolves `self->uid` and nothing else). `unalias` genuinely did need surface —
+`SYS_ENV` had no alias-delete subcommand — so it took a ninth
+(`ENV_OP_ALIAS_UNSET`, 8) and shipped separately with an audit of `alias_unset`. `history`/`jobs` are
 ring-3-local by design, not migrations: sharing the kernel shell's buffers would leak one
 session's command lines to another user. The machine-state commands (`pae`,
 `mem`, `wxaudit`, `auditlog`, networking and security tooling) stay kernel-shell only,
@@ -273,7 +274,7 @@ reports a **match count** beside the signature count (a loaded count alone let t
 read as protection). The login-spray detector counts **distinct usernames** per window,
 alerts and never denies. Rationale in `doc/FIREWALL_AND_IDS_CONFIG.md`.
 
-**`SYS_ENV` (41) carries the env/alias group to ring 3** — one syscall, eight
+**`SYS_ENV` (41) carries the env/alias group to ring 3** — one syscall, nine
 subcommands, a fixed-width `env_record_t` mirrored in `userspace/libc.h` with
 `_Static_assert`s on both copies. **Ungated**, the opposite polarity to `SYS_CHMOD`
 directly above it: storage is per-task, so a caller can only address its own table and an

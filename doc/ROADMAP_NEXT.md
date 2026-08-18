@@ -119,11 +119,13 @@ also the more correct answer — a shared history buffer would leak one session'
 command lines, arguments included, into another user's listing. Harness:
 `verify-ring3-builtins.sh`.
 
-**One looks like it belongs in that group and does not:**
-
-- `unalias` — `SYS_ENV`'s eight subcommands include no alias-delete.
-  `alias_unset()` exists in `src/env.c:1015` but is unreachable from ring 3.
-  Needs a ninth (`ENV_OP_ALIAS_UNSET`), so it takes its own PR and audit.
+**One looked like it belonged in that group and did not** — `unalias`.
+`SYS_ENV`'s eight subcommands included no alias-delete, and `alias_unset()`
+existed in `src/env.c:1015` but was unreachable from ring 3. It shipped in its
+own PR with a ninth subcommand (`ENV_OP_ALIAS_UNSET`, 8) and an audit of the
+newly-exposed `alias_unset()` — which came back clean: locked, bounds-checked,
+and NULL-safe because `alias_find()` rejects a NULL state and returns -1 before
+any dereference.
 
 `whoami` was listed alongside it and that was wrong, twice over. The claim was
 "there is no uid → username path across the boundary at all"; the per-struct
@@ -246,8 +248,8 @@ protocol means the witness is broken or something moved that must not have.
 1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
 dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
 new-syscall group it once blocked on. The seven no-new-syscall builtins are
-done; the next concrete step is `unalias`, which does need a ninth `SYS_ENV`
-subcommand and so takes an audit, followed by the `su`/`fatls`/`edit` design
-calls. AUDIT-8E is
+done, and `unalias` has since landed with the ninth `SYS_ENV` subcommand it
+needed. What remains of item 4 is the `su`/`fatls`/`edit` group, which needs
+design calls rather than typing. AUDIT-8E is
 closed on both halves and was independent of that work. Networking is closed too
 (see above), and likewise never gated item 4.

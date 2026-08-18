@@ -862,16 +862,36 @@ PR A woke the subsystem and made its storage per-task, but left it **kernel-only
 the ring-3 shell had no `env`, no `set`, no `$VAR`, no aliases. PR B carries it
 across the boundary.
 
-### `SYS_ENV` (41) — one syscall, eight subcommands
+### `SYS_ENV` (41) — one syscall, nine subcommands
 
 Same shape as `SYS_NETSTAT`/`SYS_TCPSOCK`: a single entry point with an `op`
-selector rather than eight syscall numbers, because the eight operations share one
+selector rather than nine syscall numbers, because the nine operations share one
 fixed-width wire record and differ only in which fields they read.
 
 ```c
 ENV_OP_GET / SET / UNSET / EXPORT / LIST
-ENV_OP_ALIAS_GET / ALIAS_SET / ALIAS_LIST
+ENV_OP_ALIAS_GET / ALIAS_SET / ALIAS_LIST / ALIAS_UNSET
 ```
+
+`ALIAS_UNSET` (8) arrived a PR later than the other eight and is the reason the
+multiplexed shape earns its keep: adding deletion cost one `case`, not a tenth
+syscall number and another `MAX_SYSCALL_NUM` bump. It is symmetric with
+`ENV_OP_UNSET` including its errno — `alias_unset()` returns -1 both for an
+absent name and in its defensive bounds branch, and both mean "no such alias" to
+the caller, so `-ENOENT` covers each. That is checked, not assumed: `-ENOENT` is
+-2 and nothing else in `sys_env` returns it, so there is no repeat of the
+`ramfs_chmod` collision where `-EPERM` (-1) silently aliased "not found".
+
+Exposing it meant auditing `alias_unset()` in the same PR, per the rule that
+making a path ring-3-reachable turns latent bugs into corruption primitives. It
+came back clean: the whole body is inside `CRITICAL_SECTION_ENTER/EXIT`, the
+index is bounds-checked against `ALIAS_MAX_COUNT` before the array write, and
+all three fields (`in_use`, `name`, `command`) are cleared rather than just the
+flag. The NULL case is safe by delegation rather than by a local check —
+`env_state()` returns NULL when the task has no env page yet (it is lazily
+allocated), but `alias_find()` rejects a NULL state and returns -1, so the
+`idx < 0` path returns before any dereference. Worth knowing, because a grep for
+`!s` in the function finds nothing and reads like a missing check.
 
 The record is built field by field into an explicit `env_record_t` (32-byte name,
 64-byte value, `index`, `exported`), never `memcpy`'d out of a kernel struct, and

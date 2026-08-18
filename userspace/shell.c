@@ -594,6 +594,7 @@ static const man_entry_t man_pages[] = {
     { "kill",    "kill <pid> -- terminate a process you own" },
     { "ls",      "ls [dir] -- list directory contents" },
     { "man",     "man [command] -- describe a command" },
+    { "unalias", "unalias NAME... -- remove one or more aliases" },
     { "whoami",  "whoami -- print the current user name" },
     { "mkdir",   "mkdir <dir> -- create a directory" },
     { "ps",      "ps -- list processes visible to you" },
@@ -1670,6 +1671,31 @@ static void cmd_export(int argc, char** argv) {
     }
 }
 
+/* unalias -- delete one or more aliases.
+ *
+ * The one builtin in this group that needed new kernel surface:
+ * ENV_OP_ALIAS_UNSET, a ninth SYS_ENV subcommand. The other eight could not
+ * express deletion, so alias_unset() sat in src/env.c reachable only from the
+ * kernel shell.
+ *
+ * Takes several names and reports each miss separately, matching the kernel
+ * shell's cmd_unalias: a loop that stopped at the first failure would leave
+ * later names silently undeleted. -ENOENT is a report, not a fatal error, so
+ * the loop continues -- `unalias a b` must delete b even when a was absent. */
+static void cmd_unalias(int argc, char** argv) {
+    if (argc < 2) {
+        print("unalias: missing alias name\n");
+        print("Usage: unalias NAME...\n");
+        return;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (alias_unset_cmd(argv[i]) != 0) {
+            printf("unalias: %s: not found\n", argv[i]);
+        }
+    }
+}
+
 static void cmd_alias(int argc, char** argv) {
     if (argc < 2) {
         env_record_t rec;
@@ -1872,16 +1898,21 @@ static void expand_vars(char* line, size_t size) {
  *
  * Returns 0 to keep looping, or 1 to exit the shell (with *status set).
  *---------------------------------------------------------------------------*/
-/* Two commands that belong with the group above are NOT here, because neither
- * is actually free:
+/* Two commands were once deferred from the group above as "not free". Both are
+ * now here, and they resolved in OPPOSITE ways -- worth keeping, because the
+ * question that separates them is the one to ask of the next candidate:
  *
- *   unalias -- SYS_ENV has eight subcommands and none of them deletes an
- *              alias. alias_unset() exists in src/env.c but is unreachable
- *              from ring 3, so this needs a ninth (ENV_OP_ALIAS_UNSET), and
- *              therefore its own PR with its own audit.
+ *   whoami  -- was never expensive. The deferral checked psinfo_t and SYS_CRED,
+ *              found no uid -> username field in either, and concluded no path
+ *              existed. It did: env_refresh_identity() resolves the name
+ *              kernel-side and exports it as $USER, so ring 3 already had it.
+ *              Checking the structures one at a time answered "does THIS carry
+ *              it", never "is it reachable at all".
  *
- * whoami was listed here too and that was wrong: $USER already holds it,
- * resolved kernel-side by env_refresh_identity(). See cmd_whoami above. */
+ *   unalias -- genuinely was expensive, and stayed deferred through that PR.
+ *              SYS_ENV's eight subcommands could not express deletion, so it
+ *              took a ninth (ENV_OP_ALIAS_UNSET) and an audit of alias_unset()
+ *              before ring 3 could reach it. */
 static int dispatch(int argc, char** argv, int background, int* status) {
     const char* cmd = argv[0];
 
@@ -1944,6 +1975,7 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "grep") == 0)    { cmd_grep(argc, argv);    return 0; }
     if (strcmp(cmd, "find") == 0)    { cmd_find(argc, argv);    return 0; }
     if (strcmp(cmd, "man") == 0)     { cmd_man(argc, argv);     return 0; }
+    if (strcmp(cmd, "unalias") == 0) { cmd_unalias(argc, argv); return 0; }
     if (strcmp(cmd, "whoami") == 0)  { cmd_whoami();           return 0; }
 
     if (looks_like_program(cmd)) {
