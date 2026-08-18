@@ -73,6 +73,10 @@ src/ssh_clean.txt
 .playwright-mcp/
 
 # --- Historical / superseded docs cut from the public set (kept on disk, not published) ---
+# Two former members of this set are now TRACKED and public:
+# doc/SECURITY_ROADMAP_2025.md and doc/CRYPTO_PHASE1_COMPLETE.md. Both carry
+# SUPERSEDED markers pointing at what actually shipped, so they are published
+# deliberately -- do not re-add them here.
 # The public repo ships a curated 13-doc set; everything below is retained locally
 # only. publish.sh exports `git archive HEAD` (tracked files only), so these never
 # reach GitHub regardless — these patterns just keep them out of the index too.
@@ -84,7 +88,6 @@ doc/CHANGELOG_PASSWORD_FIX.md
 doc/CLAUDE.md
 doc/CROSS_DRIVE_ACCESS_ANALYSIS.md
 doc/CRYPTO_DEBUGGING_STATUS.md
-doc/CRYPTO_PHASE1_COMPLETE.md
 doc/DEEP_DIVE_ISSUES.md
 doc/DEEP_DIVE_SUMMARY.md
 doc/DEEP_SECURITY_AUDIT_FIXES.md
@@ -120,7 +123,6 @@ doc/SECURITY_AUDIT_RESPONSE.md
 doc/SECURITY_FIXES_COMPLETED.md
 doc/SECURITY_FIXES_PROGRESS.md
 doc/SECURITY_FIXES_STATUS.md
-doc/SECURITY_ROADMAP_2025.md
 doc/SESSION_SUMMARY_2025-01-17.md
 doc/SHELL_COMMANDS_AUDIT.md
 doc/SSHD_USERSPACE_ANALYSIS.md
