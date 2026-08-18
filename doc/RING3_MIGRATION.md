@@ -909,6 +909,30 @@ pin the *layout*, the one in `env.h` pins the *agreement*.
 filled slot returns 1, a hole returns 0, so the client skips holes rather than
 stopping at the first one.
 
+### `su` is NOT migrating — decided 2026-08-18
+
+Recorded here because this file is where a future reader looks for "which
+syscall carries X to ring 3", and for `su` the answer is **none, deliberately**.
+
+`SYS_SWITCH_USER` (15) already has a ring-3 dispatch case and it is refused with
+`-ENOSYS` by default (PR #55). The reason is structural: the call takes a
+plaintext password through an argument register, so a ring-3 caller must hold
+the secret to make it — the exact exposure `SYS_CRED` (32) was built to remove
+by having the kernel prompt and read the keystrokes itself.
+
+The obvious repair — a `CRED_OP_SU` on `SYS_CRED`, kernel-prompted, no plaintext
+crossing — was considered and rejected on a different ground. It would give ring
+3 a syscall that changes the **calling task's own uid in place**, and the uid is
+what every ownership gate in the tree is written against: `SYS_CHMOD`,
+`SYS_TCPSOCK`, `task_visible_to_current()`, the per-uid task cap. Making that
+field mutable from the untrusted side to gain one convenience builtin is a bad
+trade, and it is the same "what does moving it buy vs. what capability does it
+need" test that withdrew the ring-3 parser move (D1).
+
+The kernel shell's `su` calls `sys_switch_user()` directly rather than through
+`int 0x80`, so it is unaffected and stays fully supported. `kshell` is one
+command away from the ring-3 shell.
+
 ### Gating: UNGATED, and that is not the polarity of its neighbour
 
 `SYS_CHMOD` sits directly above it in the header and is **ownership-gated**.

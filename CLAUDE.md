@@ -229,8 +229,19 @@ session's command lines to another user. The machine-state commands (`pae`,
 `mem`, `wxaudit`, `auditlog`, networking and security tooling) stay kernel-shell only,
 ~20 of them by design — together they are an ASLR defeat (PR #58).
 
+**`su` stays kernel-shell only — decided, not deferred.** PR #55 already refused
+`SYS_SWITCH_USER` (15) from ring 3 with `-ENOSYS`, because a ring-3 caller must hold the
+**plaintext password** to make the call — the exposure `SYS_CRED` (32) exists to remove,
+since there the kernel prompts and reads the keystrokes itself. The alternative that
+avoids the plaintext (a `CRED_OP_SU` where the kernel prompts) is worse: it hands ring 3
+a way to **mutate its own uid in place**, and every ownership gate in the tree
+(`SYS_CHMOD`, `SYS_TCPSOCK`, `task_visible_to_current()`, the per-uid task cap) is
+written against that uid. Don't reopen this by "just adding a subcommand"; reasoning in
+`doc/ROADMAP_NEXT.md`.
+
 Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**; item 4
-(userspace shell) is in progress. `fork()` was skipped deliberately (PAE, no COW pages).
+(userspace shell) has all its **implementation** done — what remains is `fatls` and
+`edit`, which are design calls, not typing (`su` is settled, above). `fork()` was skipped deliberately (PAE, no COW pages).
 Task-slot exhaustion is closed (per-uid cap + root reserve, both returning `-EAGAIN`, so
 only the printed message identifies which refused). `kprintf`→`stream_printf` conversion
 is **finished** — no console-only blocks remain.
