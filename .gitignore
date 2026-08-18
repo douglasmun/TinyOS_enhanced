@@ -160,6 +160,8 @@ ring3chmod.log
 ring3chmod-trace.log
 ring3env.log
 ring3env-trace.log
+ring3builtins.log
+ring3builtins-trace.log
 envpertask.log
 envpertask-trace.log
 scratchpad/

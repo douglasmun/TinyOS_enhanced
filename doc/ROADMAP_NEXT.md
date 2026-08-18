@@ -143,10 +143,58 @@ at another account, and the one string returned is the caller's own identity —
 which they already have. `whoami` therefore shipped as a pure-userspace builtin
 with the six above, reading `$USER` via `env_get_var()`.
 
-Three need a decision rather than typing: `su` (changes credentials on the
-*same* task, so it must call `env_refresh_identity()` on **both** branches —
-the root fast path and the password-authenticating one; fixing only the branch
-a harness drives leaves the other lying), `fatls`, and `edit`.
+### Item 4: the `su`/`fatls`/`edit` group
+
+All implementation work on item 4 is finished. These three are what is left,
+and they are **decisions, not typing**.
+
+**`su` — DECIDED 2026-08-18: stays kernel-shell only. Not a deferral.**
+
+This is not a new call so much as a confirmation of one already made in PR #55,
+which is why it needs no further design work. `SYS_SWITCH_USER` (15) exists and
+its ring-3 dispatch case is **refused with `-ENOSYS` by default**, deliberately.
+The reason is structural and cannot be fixed by hardening the implementation: a
+ring-3 caller must hold the **plaintext password** to make the call, so the
+secret passes through a user address space and a syscall argument register.
+That is precisely the exposure `SYS_CRED` (32) was built to remove — there the
+kernel prompts and reads the keystrokes itself, so the plaintext never enters
+ring 3 at all.
+
+A ring-3 `su` would therefore have to be one of:
+
+1. `SYS_SWITCH_USER` re-enabled from ring 3 — reintroduces the plaintext-in-
+   register exposure PR #55 closed. Rejected.
+2. A new `CRED_OP_SU` on `SYS_CRED`, with the kernel prompting for the password
+   itself. This avoids the plaintext exposure, but hands ring 3 a syscall that
+   **changes the calling task's credentials in place**. Every `task->uid` check
+   in the kernel — the ownership gates on `SYS_CHMOD` and `SYS_TCPSOCK`, the
+   `task_visible_to_current()` predicate, the per-uid task cap — is written
+   against a uid that a compromised ring-3 shell could then move. Rejected: the
+   value is one convenience builtin; the cost is making a central invariant
+   mutable from the untrusted side.
+3. Leave it in the kernel shell. **Chosen.** `kshell` is one command away, the
+   kernel shell's `su` calls `sys_switch_user()` directly rather than through
+   `int 0x80`, and nothing about it is broken.
+
+Note this is the same criterion that killed the ring-3 parser move (D1) and
+that mis-deferred `whoami`: *what does moving it buy, and what capability does
+the moved component need?* Here it buys one builtin and needs the ability to
+mutate the identity every other gate is written against.
+
+**`fatls` and `edit` — still open.** Neither has been designed. `fatls` is the
+smaller question (it is a listing command, so the gating polarity and the
+cross-drive behaviour in `doc/CROSS_DRIVE_ACCESS_ANALYSIS.md` are the things to
+settle); `edit` is the larger one, since a ring-3 editor needs a way to write
+back that does not simply re-expose the FAT32 write path.
+
+Two need a decision rather than typing — `fatls` and `edit`; `su` is settled
+above. One fact about the kernel shell's `su` outlives that decision and is
+worth keeping here, because it stays true of the implementation that remains:
+it changes credentials on the **same** task, so it must call
+`env_refresh_identity()` on **both** branches — the root fast path and the
+password-authenticating one. Fixing only the branch a harness drives leaves the
+other lying, which is exactly the bug PR B found (`$USER` still reading `root`
+after an `su`).
 
 Any future item that *does* add ring-3-reachable kernel surface belongs in its
 own PR with its own audit — see the recurring lesson in CLAUDE.md that exposing
@@ -249,7 +297,8 @@ protocol means the witness is broken or something moved that must not have.
 dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
 new-syscall group it once blocked on. The seven no-new-syscall builtins are
 done, and `unalias` has since landed with the ninth `SYS_ENV` subcommand it
-needed. What remains of item 4 is the `su`/`fatls`/`edit` group, which needs
-design calls rather than typing. AUDIT-8E is
+needed. What remains of item 4 is the `fatls`/`edit` pair, which needs design
+calls rather than typing; `su` is decided and stays kernel-shell only (see
+"Item 4: the su/fatls/edit group" above). AUDIT-8E is
 closed on both halves and was independent of that work. Networking is closed too
 (see above), and likewise never gated item 4.
