@@ -88,27 +88,54 @@ item; do last.
 
 **Landed so far:** the ring-3 shell is the default login shell (PR #51), with
 redirection, pipelines, the credential commands, `ps`/`kill`/`top`, and
-`cp`/`mv`/`touch` — ~25 builtins against the kernel shell's ~70.
+`cp`/`mv`/`touch`.
 
-**The remaining gap is smaller than the raw count suggests.** Of the ~36
-commands the ring-3 shell lacks, roughly 20 are machine-state and security
-tooling (`pae`, `mem`, `aslr`, `wxaudit`, `auditlog`, the networking stack)
-that **should stay kernel-only**: PR #58 gated them behind `require_root`
-precisely because `pae`+`mem`+`aslr`+`wxaudit` together are an ASLR defeat
-readable by any user. Exposing them to ring 3 would re-open that. `exec` is
-not a gap either — the ring-3 shell already spawns `.elf` files directly.
+**The new-syscall group named below as "what is genuinely left" is now DONE**
+(updated 2026-08-18). All three landed: `SYS_TIME` (39, `date`), `SYS_CHMOD`
+(40) and `SYS_ENV` (41, the whole `env`/`export`/`set`/`unset`/`alias` group).
+Each is wired dispatcher → libc → builtin and carries its own harness
+(`verify-ring3-chmod.sh`, `verify-ring3-env.sh`). `MAX_SYSCALL_NUM` is 41.
+**Nothing outstanding in item 4 requires a new syscall.**
 
-What is genuinely left is one coherent group needing **new syscalls**:
-`env`/`export`/`set`/`unset`/`alias` (needs an environment the kernel can
-hand across the ring boundary), `chmod`, and `date`. Each adds ring-3-reachable
-kernel surface, so it belongs in its own PR with its own audit — see the
-recurring lesson in CLAUDE.md that exposing a path to ring 3 turns latent bugs
-into corruption primitives (PRs #45, #47, #54, #55).
+**The remaining gap is smaller than the raw count suggests**, and splits three
+ways. Roughly ten commands are machine-state and security tooling (`pae`,
+`mem`, `aslr`, `wxaudit`, `auditlog`, `secstatus`, `sectest`, the networking
+stack, `reboot`/`shutdown`/`mount`) that **should stay kernel-only**: PR #58
+gated the first four behind `require_root` precisely because
+`pae`+`mem`+`aslr`+`wxaudit` together are an ASLR defeat readable by any user.
+Exposing them to ring 3 would re-open that. `exec` is not a gap either — the
+ring-3 shell dispatches any word ending `.elf` straight through `spawn()`, so
+there is no verb to migrate.
+
+What is genuinely left is **~8 commands needing no new kernel surface at all**:
+`whoami`, `clear`, `unalias`, `jobs`, `history`, `grep`, `find`, `man`. Each is
+pure userspace over syscalls that already exist — `whoami` reads what
+`SYS_PSINFO` already exposes, `unalias` is a subcommand `SYS_ENV` already
+carries, `grep`/`find` are file I/O. This is the cheapest block left and the
+one where the recurring hazard below does **not** apply, since it adds no
+ring-3-reachable path to audit.
+
+Three need a decision rather than typing: `su` (changes credentials on the
+*same* task, so it must call `env_refresh_identity()` on **both** branches —
+the root fast path and the password-authenticating one; fixing only the branch
+a harness drives leaves the other lying), `fatls`, and `edit`.
+
+Any future item that *does* add ring-3-reachable kernel surface belongs in its
+own PR with its own audit — see the recurring lesson in CLAUDE.md that exposing
+a path to ring 3 turns latent bugs into corruption primitives (PRs #45, #47,
+#54, #55).
 
 Doing `cp`/`mv`/`touch` also surfaced a live kernel bug in a shipping builtin:
 `open(O_TRUNC)` was a no-op on the RAM disk. See `doc/KERNEL_BUGS.md`.
 
 ### The env group is split in two, and the first half is not a migration
+
+> **BOTH HALVES SHIPPED** (updated 2026-08-18). PR A woke the subsystem in the
+> kernel shell; PR B added `SYS_ENV` (41), libc and the ring-3 builtins. Kept
+> because the reasoning still explains why the split was necessary and why the
+> isolation check lives where it does — read the two PR labels below as history,
+> not as planned work.
+
 
 `chmod` and `date` were each one PR: the kernel behaviour already existed and
 only had to cross the ring boundary. **`env` is not like that** — the subsystem
@@ -135,8 +162,10 @@ identically under global, per-uid and per-task storage. The check therefore
 lives in the kernel — `env_pertask_self_test()`, `sectest`'s TEST 10 — and its
 verdict is three-way, because a child whose page allocation *failed* also sees
 none of its parent's variables and would pass a two-way check for the wrong
-reason. Once `SYS_ENV` lands, PR B can assert this from ring 3 and the self-test
-becomes the redundant-but-cheap half.
+reason. `SYS_ENV` has since landed, and `verify-ring3-env.sh` asserts the group
+from ring 3 (9/9); the kernel self-test is now the redundant-but-cheap half.
+Note it still does **not** witness per-task isolation — `su` shares the task, so
+that check remains `sectest` TEST 10's job.
 
 ## Hygiene (fold into whichever PR comes first)
 Known, low-severity, from the PR #1 audit (see memory `exec-failure-path-leaks`):
@@ -189,6 +218,8 @@ protocol means the witness is broken or something moved that must not have.
 
 ## Recommendation
 1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
-dependencies (spawn, waitpid, file syscalls) are now all in place. AUDIT-8E is
+dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
+new-syscall group it once blocked on. The next concrete step is the ~8
+no-new-syscall builtins listed under item 4. AUDIT-8E is
 closed on both halves and was independent of that work. Networking is closed too
 (see above), and likewise never gated item 4.
