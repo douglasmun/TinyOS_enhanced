@@ -48,97 +48,65 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   by default and **must stay that way** (`readline()` costs one syscall per keystroke).
   Same for routine FS errors: a failed `rmdir` is a userspace error the caller already
   reports on its own stream.
-- **The RX path is stricter still: no per-packet `kprintf` at all.** Those sites need no
-  local account — any host on the segment drives them, from the ISR, before the firewall.
-  Five such prints were replaced by counters surfaced in `ifconfig` (PR: `net_drop_runt`,
-  `net_drop_ethertype`, `rx_drop_errors`, `rx_drop_badlen`). Count, don't print, and don't
-  reach for `stream_printf` here either: interrupt context has no current user stream.
-  Harness: `verify-rxdrop-counters.sh`; rationale in `doc/NETWORK_ISOLATION.md`.
-  **That sweep covered the RX loops and so missed `icmp.c`**, which had three more
-  (`icmp_echo_replies_rx`, `icmp_echo_requests_rx`, `icmp_replies_dropped` now).
-  The echo-*reply* one was unbounded — its branch returns before the rate limiter,
-  and the identifier it gates on is cleartext in every outbound ping, so an on-path
-  attacker drove one line per packet. When looking for this class of bug, sweep the
-  protocol files too, not just the loops. Harness: `verify-icmp-counters.sh`.
-  **And that sweep in turn only fixed the file it was looking at** —
-  `handle_dns_response()` had **20** more, now six counters via `dns_get_rx_stats()`.
-  Worse than the ICMP case: the sites are the *drop* branches (source-IP, TID,
-  question-name), so a spraying attacker bought more console lines than a legitimate
-  response did, and the question branch printed `question_domain` — the attacker's
-  own bytes — onto a console the ring-3 shell shares with the user. The three attack
-  signatures stay **separate** counters; one "dropped" total hides which attack is
-  underway. `dns.c`'s other 23 prints stay: they are on `send_dns_query` /
-  `domain_to_dns_label`, driven by a local `dig`/`curl` and so bounded by local
-  action — the rule is about what a *remote* host drives, and a file-wide grep here
-  fails on correct code. Harness: `verify-dns-rx-counters.sh` (needs
-  `-DTINYOS_FAULT_INJECT` for `dnsforge`), whose `valid` leg is the positive control
-  — without it every drop leg passes against a forger emitting garbage.
+- **The RX path is stricter still: no per-packet `kprintf` at all.** Any host on the
+  segment drives those sites, from the ISR, before the firewall. Count, don't print —
+  counters surface in `ifconfig`; `stream_printf` is wrong here too (interrupt context
+  has no current user stream). Three sweeps were needed (the RX loops, then `icmp.c`,
+  then `handle_dns_response`'s 20 sites), so **sweep the protocol files, not just the
+  loops** — and keep distinct attack signatures as **separate** counters, since one
+  "dropped" total hides which attack is underway. A file-wide grep fails on correct
+  code: the rule is about what a *remote* host drives, so `dns.c`'s local-`dig`-driven
+  prints stay. Harnesses: `verify-rxdrop-counters.sh`, `verify-icmp-counters.sh`,
+  `verify-dns-rx-counters.sh` (needs `-DTINYOS_FAULT_INJECT`; its `valid` leg is the
+  positive control). Rationale: `doc/NETWORK_ISOLATION.md`.
 - **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
-  `critical_section_exit()` only touches `IF` when `__interrupt_context_depth == 0`, and
-  that clause is deliberate (a `popfl` mid-ISR would corrupt the preempted thread's
-  flags). So `e1000_poll_rx`'s mid-loop unlocks and its post-budget "process with
-  interrupts RE-ENABLED" block are depth decrements only, and `E1000_RX_PACKET_BUDGET`
-  does not bound interrupt-off time the way its comments claim. Don't trust those
-  comments; see `doc/NETWORK_ISOLATION.md`.
+  `critical_section_exit()` only touches `IF` at depth 0, and that clause is deliberate
+  (a `popfl` mid-ISR would corrupt the preempted thread's flags). So `e1000_poll_rx`'s
+  mid-loop unlocks are depth decrements only, and `E1000_RX_PACKET_BUDGET` does **not**
+  bound interrupt-off time the way its comments claim. Don't trust those comments; see
+  `doc/NETWORK_ISOLATION.md`.
 - **The RX path parses in *task* context, on `knetd` — keep it that way.** The ISR only
-  copies each frame into `rx_softirq_ring` and returns; `e1000_rx_softirq_run()` drains
-  it and calls `handle_packet()` with `IF=1`. Never call `handle_packet()` (or anything
-  that reaches the parser) from an ISR — that is the ~8,350-line surface running with
-  interrupts disabled at a remote host's chosen rate. Three things easy to undo: the
-  frame **must be copied** before RDT is advanced (the NIC refills that descriptor, so a
-  retained `rx_bufs[]` pointer is an attacker-timed UAF); the boot DHCP loop in
-  `kernel.c` **must keep its explicit `e1000_rx_softirq_run()` call**, because `knetd`
-  does not exist yet there (a "did it run" flag was tried and reverted — it masks a
+  copies each frame into `rx_softirq_ring`; `e1000_rx_softirq_run()` drains it and calls
+  `handle_packet()` with `IF=1`. Never reach the parser from an ISR — that is ~8,350
+  lines running interrupts-disabled at a remote host's chosen rate. Three things easy to
+  undo: the frame **must be copied** before RDT advances (the NIC refills that
+  descriptor, so a retained `rx_bufs[]` pointer is an attacker-timed UAF); the boot DHCP
+  loop in `kernel.c` **must keep its explicit `e1000_rx_softirq_run()` call** (`knetd`
+  does not exist yet there, and a "did it run" flag was tried and reverted — it masks a
   stalled `knetd`); and ring overflow is **drop-newest**, counted, because drop-oldest
-  lets a fast sender evict frames already accepted. `ifconfig`'s `irq-ctx` count must
-  read **0**. Harness: `verify-rx-thread-context.sh`.
+  lets a fast sender evict accepted frames. `ifconfig`'s `irq-ctx` must read **0**.
+  Harness: `verify-rx-thread-context.sh`.
 - **`rx_softirq_ring` is single-consumer, and `knetd` is that consumer.** `SYS_NETRX`
   (`e1000_rx_dequeue`) must pop **`netd_ring`**, never `rx_softirq_ring` — pointing it
-  back at the latter restores a race where each frame goes to whichever consumer reaches
-  the tail first, so a live ring-3 netd steals TCP segments from the kernel parser at
-  random (intermittent, load-dependent, presents as "networking is flaky"). PR B was safe
-  only because `netprobe` runs on demand and never overlaps `knetd`. `knetd` now
-  classifies: ICMP/UDP to `netd_ring`, everything else parsed in place — one `if`/`else`,
-  so no frame is delivered twice or dropped between paths. TCP is **never** routed
-  (`TCP_LOCK` is `cli`; ring 3 has IOPL=0). Routing is gated on `netd_claimed`, inert
-  until claimed and reversible on release — the supervisor needs the release, or a dead
-  netd takes ICMP/UDP down permanently. **The `e1000_rx_dequeue` guard in the harness is
-  load-bearing: no leg drives the syscall side, so nothing else catches that edit.**
-  Harness: `verify-netd-arbitration.sh` (needs `-DTINYOS_FAULT_INJECT` for `netdclaim`).
+  back restores a race where a live ring-3 netd steals TCP segments from the kernel
+  parser at random (intermittent, load-dependent, presents as "networking is flaky").
+  `knetd` classifies: ICMP/UDP to `netd_ring`, everything else parsed in place — one
+  `if`/`else`, so no frame is delivered twice or dropped between paths. TCP is **never**
+  routed (`TCP_LOCK` is `cli`; ring 3 has IOPL=0). Routing is gated on `netd_claimed`,
+  inert until claimed and reversible on release — the supervisor needs the release, or a
+  dead netd takes ICMP/UDP down permanently. **The `e1000_rx_dequeue` guard in the
+  harness is load-bearing: no leg drives the syscall side, so nothing else catches that
+  edit.** Harness: `verify-netd-arbitration.sh` (needs `-DTINYOS_FAULT_INJECT`).
 - **`irq-ctx` and `cpl3` are different questions — don't let one stand in for the
-  other.** `knetd` runs with `IF=1` *and* at CPL 0, so a kernel where nothing has moved
-  to ring 3 still reports a perfectly healthy `RX parsed: N thread-ctx, 0 irq-ctx`.
-  Interrupt state and privilege level are independent axes. `handle_packet()` therefore
-  also witnesses the ring from `%cs` (`RX ring: N cpl0, M cpl3`), read from the hardware
-  and **never from a software flag** — a flag records what the code believes about
-  itself, and the point of the counter is to catch a build whose belief is wrong.
-  `cpl3` must read **0** — and that is now a **standing invariant, not a baseline
-  awaiting inversion**. The parser move was withdrawn 2026-08-17 (see below), so there
-  is no flag to flip: nonzero `cpl3` on any protocol means the witness is broken or
-  something moved that must not have. `handle_ip()`'s L4 switch also witnesses per
-  protocol (`RX proto-ring: icmp c/c, udp c/c, tcp c/c`), counted **before** any early
-  return, which stays useful for exactly that reason. DNS and DHCP are not separable
-  here: both ride UDP, and the witness sits at the dispatch switch, so splitting them
-  means instrumenting the port demux in `handle_udp()` — a different seam. Harness:
-  `verify-netd-ring3.sh`; rationale in `doc/NETDAEMON_DESIGN.md`.
+  other.** `knetd` runs with `IF=1` *and* at CPL 0, so a kernel where nothing moved to
+  ring 3 still reports a healthy `N thread-ctx, 0 irq-ctx`. `handle_packet()` witnesses
+  the ring from `%cs`, read from the hardware and **never from a software flag** — a flag
+  records what the code believes about itself. `cpl3` must read **0**, and that is a
+  **standing invariant, not a baseline awaiting inversion**: the parser move was
+  withdrawn, so nonzero `cpl3` means the witness is broken or something moved that must
+  not have. `handle_ip()` also witnesses per protocol, counted **before** any early
+  return. Harness: `verify-netd-ring3.sh`; rationale in `doc/NETDAEMON_DESIGN.md`.
 - **The ring-3 parser move (D1) is WITHDRAWN — don't restart it without reading
-  "D1 re-scoped" in `doc/NETDAEMON_DESIGN.md`.** The plan asked "can this protocol
-  move?" (privileged instructions, TX path, stack budget) and never asked **"what does
-  moving buy?"** The criterion that decides it: *does ring 0 consume a result this
-  parser produces, and act on it?* DNS (`last_resolved_ip` → `curl`/`dig`), DHCP (all
-  four interface globals → routing, ARP, **TCP ISN generation**) and ARP (`arp_cache` →
-  every TX's destination MAC) all do, so moving them relocates the parse and hands the
-  trust straight back through a syscall a compromised daemon can call at will. Kernel
-  re-validation doesn't rescue DNS: question-name validation walks **compressed labels**
-  and the A-record search walks the answer RRs, so validating honestly means ring 0
-  re-executes essentially the whole parser — ring 3 would do a `memcpy`. **ICMP passes
-  the result test and still fails**, on a second one DNS never reached: *what capability
-  does the moved component need to do its job?* A responder must reply, so it needs
-  `SYS_NETTX` — and `e1000_send()` does **no source validation**, so that is unrestricted
-  frame forgery (ARP poisoning, DHCP spoofing, TCP injection against the connections
-  that stayed in ring 0). Trading a general actuator for ~60 audited lines of echo parse
-  is a worse deal than DNS, not a better one. Nothing is being moved to ring 3; four PRs
-  of prerequisites (#76–#80) stay correct because none depended on the answer.
+  "D1 re-scoped" in `doc/NETDAEMON_DESIGN.md`.** The plan asked "can this protocol move?"
+  (privileged instructions, TX path, stack budget) and never asked **"what does moving
+  buy?"** The criterion that decides it: *does ring 0 consume a result this parser
+  produces, and act on it?* DNS, DHCP and ARP all do, so moving them relocates the parse
+  and hands the trust straight back through a syscall a compromised daemon can call at
+  will. **ICMP passes that test and still fails** a second one: *what capability does the
+  moved component need?* A responder must reply, so it needs `SYS_NETTX` — and
+  `e1000_send()` does **no source validation**, so that is unrestricted frame forgery
+  (ARP poisoning, DHCP spoofing, TCP injection). Nothing is being moved to ring 3; the
+  four PRs of prerequisites stay correct because none depended on the answer.
 - **Four traps around kernel task lifetime**, each of which reads as healthy when
   wrong. `task_create_kernel()` allocates but does **not** enqueue — every caller needs
   `scheduler_add_task()`, or the task is created, listed by `ps`, counted by every
@@ -244,150 +212,69 @@ corrupted the signature hash until `exec_buffer` and `elf_load_process`'s
 
 ## Current state
 
-The **ring-3 shell is the default login shell** (PR #51), with the kernel shell as a
-fallback (`kshell` hands over; `exit` logs out). It has ~27 builtins against the kernel
-shell's ~70 — redirection, pipelines, the credential commands, `ps`/`kill`/`top`,
-`cp`/`mv`/`touch` and now `date`/`chmod` have landed; the machine-state commands (`pae`, `mem`, `wxaudit`,
-`auditlog`, the networking and security tooling) are still kernel-shell only, and ~20 of
-those stay that way by design (PR #58 gated them: together they are an ASLR defeat).
+The **ring-3 shell is the default login shell** (PR #51); the kernel shell is the
+fallback (`kshell` hands over, `exit` logs out). ~27 builtins against the kernel shell's
+~70 — redirection, pipelines, credentials, `ps`/`kill`/`top`, `cp`/`mv`/`touch`,
+`date`/`chmod`, and the env/alias group have landed. The machine-state commands (`pae`,
+`mem`, `wxaudit`, `auditlog`, networking and security tooling) stay kernel-shell only,
+~20 of them by design — together they are an ASLR defeat (PR #58).
 
-**`open(O_TRUNC)` did nothing on the RAM disk** until `ramfs_vfs_open` was wired to
-`ramfs_truncate` — `ramfs_open` takes a `uint8_t` of `RAMFS_FLAG_*` and cannot represent
-`VFS_O_TRUNC` (0x0200), so the flag was validated by `sys_open`, passed down, and then
-dropped. Since `ramfs_write` only ever **grows** `node->size`, every short rewrite left
-the old tail live inside the file — silent corruption in the shipping `write` builtin,
-not a missing feature. The trap for anyone testing this: **`cat` cannot see it** (it
-prints `BBB` either way); only `stat` can, because the symptom is the size (31 vs 4).
-A `cat`-based harness passed against a build with the fix removed. Harness:
-`verify-ring3-fileops.sh`, which asserts on `stat`.
-
-Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**. Item 4
+Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**; item 4
 (userspace shell) is in progress. `fork()` was skipped deliberately (PAE, no COW pages).
+Task-slot exhaustion is closed (per-uid cap + root reserve, both returning `-EAGAIN`, so
+only the printed message identifies which refused). `kprintf`→`stream_printf` conversion
+is **finished** — no console-only blocks remain.
 
-**Task-slot exhaustion is closed**: a per-uid live-task cap (`USER_MAX_CONCURRENT_TASKS`)
-plus a root slot reserve (`TASK_ROOT_RESERVED_SLOTS`) in `task_create_user_argv`, checked
-**before** the rate limiter and charged to the **creator's** uid (the child's is not set
-until the caller overwrites it after the call). Both limiters return `-EAGAIN`, so only
-the printed message identifies which one refused — see `doc/RING3_MIGRATION.md` and
-`verify-slotcap.sh`. Fixing this also uncovered a pre-existing refill bug in the rate
-limiter itself (`doc/KERNEL_BUGS.md`).
+Invariants worth keeping in mind before touching these areas — each is the residue of a
+real bug, and `doc/RING3_MIGRATION.md` has the reasoning and the harness traps:
 
-**`ps`/`kill`/`top` now work from ring 3** via `SYS_PSINFO` (33) / `SYS_KILL` (34), which
-carry the listing across the ring boundary with `task_visible_to_current()` applied
-kernel-side. Two invariants that are easy to undo: `sys_psinfo` walks **raw task slots**
-(`task_get_slot`), not `task_get_all`'s compacted output, because it drops the lock
-between records and a compacted index skips a task when an earlier one exits; and the
-visibility check must read the fields in the **same** critical section that passed it,
-or a reused slot copies another user's name out. Harness: `verify-ring3-ps.sh`.
+- **Syscall gating polarity is a deliberate per-syscall decision, and the harness
+  assertion inverts with it.** Ungated (`SYS_ENV`, `SYS_TIME`) — storage is per-task, so
+  there is no foreign object and an unprivileged `-EPERM` is *the bug*. Ownership-gated
+  (`SYS_TCPSOCK`, `SYS_CHMOD`) — an unprivileged caller *must* succeed on its own object.
+  euid-gated (`SYS_NETRX`/`SYS_NETTX`) — raw frames are the whole segment's traffic.
+  Copying an assertion between two of these inverts it; that has nearly happened
+  repeatedly, so measure new legs as a **non-root** user.
+- **An ownership harness needs a live *foreign* object.** "I can see my own socket"
+  passes against a completely inert filter. `verify-netd-boundary.sh`'s root pass leaks a
+  socket on purpose so exclusion is falsifiable — don't "clean up" that leak.
+- **A socket/PID the caller cannot see is `-EBADF`/nonexistent, never `-EPERM`** — the
+  errno must not enumerate the table. Same rule in `cmd_kill` and `sys_waitpid`.
+- **`sys_psinfo` walks raw task slots** (`task_get_slot`), not `task_get_all`'s compacted
+  output: it drops the lock between records, and a compacted index skips a task when an
+  earlier one exits. The visibility check must read the fields in the **same** critical
+  section that passed it, or a reused slot copies another user's name out.
+- **`tcp_socket()` stamps `owner_uid` on *both* allocation paths** (fast scan and
+  TIME_WAIT eviction retry) — `memset` zeroes it, and uid 0 is root. `tcp_recv()` takes
+  `TCP_LOCK` **before** reading `in_use`/`state`/`rx_head`/`rx_tail`, since the IRQ path
+  mutates the head/tail pair a torn read would drive the copy loop with.
+- **Per-task env storage:** `pmm_alloc()` **does not zero**; `env_get`/`alias_get` copy
+  out **under the lock** (a borrowed pointer is a use-after-unlock once the page is freed
+  at task exit); `env_inherit_exported()` allocates the child's page directly, since
+  `env_state_alloc()` resolves the *parent* and would copy the page onto itself; and
+  `env_refresh_identity()` must be called from **both** `su` branches. Neither isolation
+  nor inheritance is observable from the shell (`su` shares the task) — both are asserted
+  in `sectest` TEST 10.
+- **`open(O_TRUNC)` is witnessed by `stat`, not `cat`.** `cat` prints the same bytes
+  either way; the symptom is the *size*. A `cat`-based harness passed against a build
+  with the fix removed.
 
-**The socket API crosses the boundary as two syscalls with subcommands**, not
-twenty-three entry points: `SYS_NETSTAT` (37, read-only queries) and `SYS_TCPSOCK`
-(38, the data path — socket/connect/send/recv/close). Both are **ownership-gated,
-the opposite polarity to `SYS_NETRX`/`SYS_NETTX`**, which are euid-gated because raw
-frames are the whole segment's traffic. An unprivileged caller *must* succeed here;
-a `-EPERM` is the bug. Copying an assertion between the two halves inverts it — that
-has nearly happened three times, so the shared harness header says so explicitly.
-Four things not to undo: the ownership check lives at the **syscall boundary**, not
-in the TCP primitives (the one place the `ramfs_chmod` "enforce in the primitive"
-rule inverts — `curl`/`tcp_tick`/the IRQ receiver have no current task to check);
-`tcp_socket()` stamps `owner_uid` on **both** allocation paths, the fast scan and the
-TIME_WAIT eviction retry, since `memset` zeroes it and uid 0 is root; `tcp_recv()`
-takes `TCP_LOCK` **before** reading `in_use`/`state`/`rx_head`/`rx_tail`, because
-`tcp_rx_available()` subtracts a head/tail pair the IRQ path mutates and a torn read
-drives the copy loop; and a socket the caller cannot see is **`-EBADF`, never
-`-EPERM`**, or the errno enumerates the table. Harness: `verify-netd-boundary.sh`.
-**Its ownership assertion only works because the root pass leaks a socket** — a probe
-that merely checks "I can see my own socket" passes against a completely inert
-filter, since the caller's is the only socket in the table at that moment. Exclusion
-needs a live *foreign* socket to not see. Don't "clean up" that leak.
+Security posture: `ids_inspect_payload()` scans every inbound IP payload and `secstatus`
+reports a **match count** beside the signature count (a loaded count alone let the gap
+read as protection). The login-spray detector counts **distinct usernames** per window,
+alerts and never denies. Rationale in `doc/FIREWALL_AND_IDS_CONFIG.md`.
 
-**AUDIT-8E is closed for the network half.** `ids_inspect_payload()` (`ids.c`, called at
-the end of `ids_analyze_packet`) scans every inbound IP payload against the signature
-table, and `secstatus` reports a **match count** beside the signature count — a loaded
-count alone is what let the gap read as protection. Two things not to undo: the bounds
-check rejects `pattern_len > len` **before** the `len - pattern_len` subtraction (both
-`size_t`; the wrap is a remote OOB read), and the inner loop **breaks on first match**
-so one NOP sled cannot flood the alert ring. Harness: `verify-ids-signature.sh`.
-**The host-based stubs are resolved** — one implemented, two deleted.
-`ids_register_login_failure()` counts **distinct usernames** per window (a horizontal
-spray; `user.c`'s per-account lockout structurally cannot see it) and is called from
-**both** failure branches of `user_authenticate_for`, including user-not-found. Four
-things not to undo: the threshold is `IDS_SPRAY_THRESHOLD` (3), **not** the
-network-side `IDS_BRUTEFORCE_THRESHOLD` (5) — `shell_login_prompt()` halts after
-`max_attempts = 3`, so 5 is unreachable from the only path that calls it; it alerts
-and never denies (denying on username diversity is a self-inflicted console DoS); it
-prints via `kprintf` because its own `AUDIT_WARN` never reaches serial; and
-`ids_analyze_syscall`/`ids_check_fork_bomb` were **removed, not implemented** —
-`edr_behavioral_check()` and the per-uid task cap already enforce those. Harness:
-`verify-ids-spray.sh`; rationale in `doc/FIREWALL_AND_IDS_CONFIG.md`.
+**`SYS_ENV` (41) carries the env/alias group to ring 3** — one syscall, eight
+subcommands, a fixed-width `env_record_t` mirrored in `userspace/libc.h` with
+`_Static_assert`s on both copies. **Ungated**, the opposite polarity to `SYS_CHMOD`
+directly above it: storage is per-task, so a caller can only address its own table and an
+unprivileged `-EPERM` is *the bug* — measure its harness as a non-root user. There is
+deliberately **no subcommand taking a pid**. Two traps: `LIST` enumerates **by index**
+(filled slot 1, hole 0) because `env_list()` prints through `stream_printf` and cannot
+cross; and the syscall **alone ships a dead feature**, since `$VAR`/alias expansion lived
+only in the kernel shell — `expand_aliases`/`expand_vars` in `userspace/shell.c` are part
+of the same change. Harness: `verify-ring3-env.sh`.
 
-`shell_system.c` is **converted** (~220 sites → `stream_printf`), so `mem > f` now
-writes the report to `f` instead of printing it to the console and leaving `f` empty.
-`cmd_shutdown`/`cmd_reboot`'s banners deliberately stay on `kprintf` — each is
-commented in place; don't "finish the job" on them. `env_list`/`alias_list`
-moved too, and their locking became per-slot because `stream_printf` can reach
-`ramfs_write`, which must not run with interrupts masked. Harness:
-`verify-sysredirect.sh`; rationale in `doc/RING3_MIGRATION.md`.
-
-`security_tests.c` is **converted** (161 sites) — the last console-only block, so
-`cmd_sectest`'s banner now follows its output and **no console-only blocks remain**.
-Two things easy to undo: the suite's report comes from **three** files, since
-`scheduler_stats()` (scheduler.c) and `arp_security_self_test()` (net.c) have this
-suite as their only caller — leaving either on `kprintf` drops 17 lines of results on
-the console while the report still looks complete; and `scheduler_stats()` printed
-**inside** its critical section, so it now snapshots under the lock and prints after
-(the `env.c` pattern), a redirected stream reaching `ramfs_write`. Harness:
-`verify-sectest-redirect.sh`.
-
-**The env/alias subsystem was dead, and its storage is now per-task.** `env_init()`
-sat commented out in `kernel.c` since the initial public release while every
-consumer stayed wired — alias substitution, `$VAR` expansion, all six builtins —
-so the commands ran and printed `(no variables)` forever without erroring. It is
-now called per **shell session** from `shell_task()` after login (no boot-time
-call: storage is per-task, so at boot there is no task to populate). `task_t`
-holds a **pointer** to a lazily `pmm_alloc()`'d page — the `edr_advanced` pattern;
-embedding it would add ~102 KB of `.bss` at `MAX_TASKS 32`. Four things not to
-undo: `pmm_alloc()` **does not zero** (a recycled frame is a table of garbage
-variables); `env_state_alloc()` runs **outside** the critical section;
-`env_get`/`alias_get` **copy out under the lock** (the old borrowed-pointer
-versions are a use-after-unlock once the page is freed at task exit); and
-`env_inherit_exported()` allocates the child's page **directly**, not via
-`env_state_alloc()`, which resolves the *parent* at spawn time and would copy the
-parent's page onto itself. Value limits dropped 256→64 so both tables fit one
-page (`_Static_assert`), and default aliases 16→**12** of 16 slots, because the
-old list filled the table to capacity and made every user `alias` fail.
-And the trap: **neither per-task isolation nor inheritance is observable from the
-shell** — `su` changes credentials on the *same* task, so both users share one env
-page, and "set FOO, read FOO" passes identically under global, per-uid and
-per-task storage. Both are asserted in the kernel instead, by
-`env_pertask_self_test()` (`sectest` TEST 10), whose two verdict lines are
-deliberately multi-clause and mask each other's failures. Full rationale, the
-negative controls, and three harness traps (typist keymap, `cmd_alias` argv[1],
-CRLF anchors) are in `doc/RING3_MIGRATION.md`. Harness:
-`verify-env-pertask.sh`.
-
-**The group now crosses to ring 3 via `SYS_ENV` (41)** — one syscall, eight
-subcommands (`GET`/`SET`/`UNSET`/`EXPORT`/`LIST` + three alias ops), a fixed-width
-`env_record_t` mirrored in `userspace/libc.h` with `_Static_assert`s on both
-copies. It is **ungated**, the opposite polarity to `SYS_CHMOD` directly above it:
-storage is per-task, so a caller can only address its own table — there is no
-foreign object, and an unprivileged `-EPERM` here is *the bug*. Measure the harness
-as a non-root user; copying the chmod harness's refusal leg inverts it. There is
-deliberately **no subcommand taking a pid** — that would hand back exactly the
-isolation PR A established, so `sectest` TEST 10 stays the only witness for it.
-Four things not to undo: `LIST` enumerates **by index** (filled slot 1, hole 0)
-because `env_list()` prints through `stream_printf` and cannot cross; `syscall.h`
-must *not* include `env.h`, so the 32/64 field-width tie-back assert lives in
-`env.h` and the layout asserts in `syscall.h` — both halves are load-bearing; the
-syscall **alone ships a dead feature**, since alias substitution and `$VAR`
-expansion live only in the kernel shell (`src/shell.c:542`, `:565`), so
-`expand_aliases`/`expand_vars` in `userspace/shell.c` are part of the same PR —
-without them `env` lists perfectly and `echo $HOME` prints a literal `$HOME`; and
-`env_refresh_identity()` must be called from **both** `su` branches. That last was
-a live bug this PR exposed — `env_init()` seeds `USER="root"`, login corrected it
-and `su` never did (same task, so the env page survives), so every post-`su` shell
-reported `USER=root`. Harness: `verify-ring3-env.sh`; traps and rationale in
-`doc/RING3_MIGRATION.md`.
 
 ## Not compiled (don't audit/fix)
 

@@ -158,6 +158,14 @@ bool elf_validate(const void* elf_data);
  */
 bool elf_verify_signature(const void* elf_data, size_t elf_size);
 
+/*-----------------------------------------------------------------------------
+ * Report whether unsigned binaries are actually rejected. This is the real
+ * gate (-DELF_PERMISSIVE_SIGNATURES), NOT secure_boot_is_enforced(), which is
+ * hardwired true -- see the definition in elf.c before using either one in a
+ * status surface.
+ *---------------------------------------------------------------------------*/
+bool elf_signatures_enforced(void);
+
 /**
  * @brief Load ELF executable and create a process
  * @param elf_data Pointer to ELF file data in memory

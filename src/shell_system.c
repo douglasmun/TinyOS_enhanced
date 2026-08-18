@@ -23,7 +23,8 @@
 #include "firewall.h"  /* secstatus: firewall stats */
 #include "ids.h"  /* secstatus: IDS stats */
 #include "edr_ml.h"  /* secstatus: EDR daemon stats */
-#include "secure_boot.h"  /* secstatus: ELF enforcement state */
+#include "secure_boot.h"  /* secstatus: secure-boot key pinning state */
+#include "elf.h"          /* elf_signatures_enforced: the real ELF gate */
 #include "stdio.h"  /* stream_printf / get_current_streams */
 #include <stdint.h>
 #include <limits.h>
@@ -1263,7 +1264,9 @@ void cmd_secstatus(int argc, char* argv[]) {
     edr_daemon_get_stats(&edr_scans, &edr_threats, &edr_procs, &edr_responses);
 
     uint32_t wx_violations = pae_wx_audit();
-    bool elf_enforced = secure_boot_is_enforced();
+    /* The ACTUAL gate, from elf.c. NOT secure_boot_is_enforced(), which is
+     * hardwired true and so reported "ENFORCED" even in a permissive build. */
+    bool elf_enforced = elf_signatures_enforced();
 
     stream_printf(ctx, "\n");
     stream_printf(ctx, "=== TinyOS Security Status ===\n");
