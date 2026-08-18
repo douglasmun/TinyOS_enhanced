@@ -333,7 +333,21 @@ int stdin_read(stream_context_t* ctx, char* buffer, size_t size) {
                     break;          /* deliver the line, newline included */
                 } else if (c == '\b') {
                     if (i > 0) {
-                        i--;        /* echo is handled in the keyboard IRQ */
+                        /* Drop the character from the line buffer. NOTHING is
+                         * echoed here, and the keyboard IRQ does not echo
+                         * either -- keyboard_irq_handler() only calls
+                         * buffer_put(), deliberately, so an application can
+                         * choose asterisks for a password (see the ARCHITECTURE
+                         * note in keyboard.c). This comment used to claim the
+                         * IRQ echoed; it never did.
+                         *
+                         * Consequence: on the ring-3 path the user sees no
+                         * per-keystroke feedback. userspace/shell.c echoes the
+                         * whole ACCEPTED line after readline() returns, so a
+                         * backspace is invisible until then. Fixing that means
+                         * a real TTY discipline, not a printf here -- this
+                         * function has no stream to write to. */
+                        i--;
                     }
                 } else {
                     buffer[i++] = c;

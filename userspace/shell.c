@@ -1290,10 +1290,20 @@ int main(int argc, char** argv) {
             break;
         }
 
-        /* Echo the accepted line. The kernel echoes keystrokes in the keyboard
-         * IRQ, which reaches the VGA console but NOT the serial log, so
-         * without this a serial transcript shows output with no commands.
-         * readline() has already stripped the newline. */
+        /* Echo the accepted line. This is the ONLY echo on the ring-3 path:
+         * the keyboard IRQ deliberately does not echo (keyboard.c buffers
+         * only, so a password prompt can print asterisks instead), sys_read /
+         * stdin_read do not echo, and readline() is a bare read(). An earlier
+         * version of this comment blamed the IRQ; that was wrong, and the same
+         * wrong claim sat in stdio.c.
+         *
+         * Because the echo happens per LINE rather than per keystroke, typed
+         * characters are invisible until Enter, and a serial transcript shows
+         * the command exactly once, here. Harnesses grepping that transcript
+         * therefore see BOTH this echoed line and the command's own output --
+         * filter prompt lines before asserting (verify-ring3-env.sh documents
+         * the false pass this caused). readline() already stripped the
+         * newline. */
         printf("%s\n", line);
 
         if (n == 0) continue;
