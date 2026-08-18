@@ -245,9 +245,12 @@ static void edr_daemon_main(void) {
     task_t* self = task_current();
     kprintf("[EDR DAEMON] Starting EDR background daemon (PID %d)\n", self->pid);
 
-    /* SECURITY: Mark daemon as unkillable */
+    /* Redundant today and kept for intent: task_create_kernel() already grants
+     * CAP_ALL (0xFFFFFFFF), which includes CAP_UNKILLABLE, so this OR changes
+     * nothing. Deliberately NOT announced -- a log line saying protection was
+     * "enabled" here would credit this statement for a property the task
+     * already had, which is how a no-op reads as a security step. */
     self->capabilities |= CAP_UNKILLABLE;
-    kprintf("[EDR DAEMON] Process protection enabled (CAP_UNKILLABLE)\n");
 
     /* Initialize daemon state */
     g_edr_daemon_state.scans_performed = 0;
@@ -287,8 +290,13 @@ static void edr_daemon_main(void) {
 
 /**
  * @brief Start the EDR daemon process
+ *
+ * Returns the daemon's pid, or -1 on failure. It MUST return it: PIDs are
+ * crypto-random in the range 100-65535 (process.c), so a caller cannot derive
+ * this from creation order. kernel.c used to guess `pid_edr = 3` and its
+ * task_get(3) therefore returned NULL on every boot that has ever run.
  */
-void edr_daemon_start(void) {
+int edr_daemon_start(void) {
     kprintf("[EDR DAEMON] Initializing EDR daemon...\n");
 
     /* Create EDR daemon as high-priority kernel task */
@@ -296,7 +304,7 @@ void edr_daemon_start(void) {
 
     if (daemon_pid < 0) {
         kprintf("[EDR DAEMON] ERROR: Failed to create daemon process\n");
-        return;
+        return -1;
     }
 
     /* Get daemon task and set high priority */
@@ -307,6 +315,7 @@ void edr_daemon_start(void) {
     }
 
     kprintf("[EDR DAEMON] EDR daemon started successfully\n");
+    return daemon_pid;
 }
 
 /**

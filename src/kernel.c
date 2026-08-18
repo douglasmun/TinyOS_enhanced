@@ -1039,28 +1039,44 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         for(;;) __asm__ volatile("hlt");
     }
 
-    /* Start EDR daemon - PID 3 (Phase 4a MVP) - Protected background monitoring */
-    int pid_edr = -1;
-    edr_daemon_start();
-    /* edr_daemon_start() creates the task internally, so we need to find it */
-    pid_edr = 3;  /* EDR daemon will be PID 3 since it's created third */
+    /* Start EDR daemon (Phase 4a MVP) - protected background monitoring.
+     * Take the pid it returns. This used to be hardcoded `pid_edr = 3` with the
+     * comment "created third" -- but PIDs are crypto-random in 100..65535
+     * (process.c), so 3 can never be allocated: task_get(3) returned NULL on
+     * every boot and the EDR grant below never executed once. The missing
+     * "[KERNEL] EDR daemon protected" line was the only evidence, and it reads
+     * as a line that simply is not there rather than as a failure. */
+    int pid_edr = edr_daemon_start();
 
-    /* Protect critical system processes with CAP_UNKILLABLE */
+    /* Protect critical system processes with CAP_UNKILLABLE.
+     *
+     * These ORs are REDUNDANT today: task_create_kernel() grants CAP_ALL
+     * (0xFFFFFFFF), which already includes CAP_UNKILLABLE. They are kept
+     * because they document which tasks would still need it if that default
+     * ever narrowed -- but the log lines below deliberately say "already
+     * protected" rather than "protected", because announcing a no-op as a
+     * security step is how the EDR bug stayed invisible: the operation the
+     * line described was not the reason the task was safe. */
     task_t* shell_task_ptr = task_get((uint32_t)pid_shell_kernel);
     task_t* idle_task_ptr = task_get((uint32_t)pid_idle);
     task_t* edr_task_ptr = task_get((uint32_t)pid_edr);
 
     if (shell_task_ptr) {
         shell_task_ptr->capabilities |= CAP_UNKILLABLE;
-        kprintf("[KERNEL] Shell process protected (CAP_UNKILLABLE)\n");
+        kprintf("[KERNEL] Shell already protected (CAP_UNKILLABLE via CAP_ALL)\n");
     }
     if (idle_task_ptr) {
         idle_task_ptr->capabilities |= CAP_UNKILLABLE;
-        kprintf("[KERNEL] Idle process protected (CAP_UNKILLABLE)\n");
+        kprintf("[KERNEL] Idle already protected (CAP_UNKILLABLE via CAP_ALL)\n");
     }
     if (edr_task_ptr) {
         edr_task_ptr->capabilities |= CAP_UNKILLABLE;
-        kprintf("[KERNEL] EDR daemon protected (CAP_UNKILLABLE)\n");
+        kprintf("[KERNEL] EDR daemon already protected (CAP_UNKILLABLE via CAP_ALL)\n");
+    } else {
+        /* Loud, because the silent version of this hid a dead grant for the
+         * lifetime of the feature. */
+        kprintf("[KERNEL] WARNING: EDR daemon task not found (pid %d) - not protected\n",
+                pid_edr);
     }
 
     /*
@@ -1074,7 +1090,7 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     task_t* supervisor_task_ptr = task_get((uint32_t)pid_supervisor);
     if (supervisor_task_ptr) {
         supervisor_task_ptr->capabilities |= CAP_UNKILLABLE;
-        kprintf("[KERNEL] Supervisor protected (CAP_UNKILLABLE)\n");
+        kprintf("[KERNEL] Supervisor already protected (CAP_UNKILLABLE via CAP_ALL)\n");
     }
 
     // Set task priorities

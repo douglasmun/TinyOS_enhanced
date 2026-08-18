@@ -730,9 +730,15 @@ void edr_response_get_stats(uint32_t* total_responses, uint8_t* log_count);
  * - Automated threat response coordination
  * - System health status reporting (every 60 seconds)
  *
- * @note The daemon is automatically protected with CAP_UNKILLABLE
+ * @return the daemon's pid, or -1 on failure. Callers MUST use it: PIDs are
+ *         crypto-random in 100..65535, so the pid cannot be inferred from
+ *         creation order (kernel.c used to guess 3 and always got NULL back
+ *         from task_get()).
+ *
+ * @note Unkillable via task_create_kernel()'s CAP_ALL grant, which includes
+ *       CAP_UNKILLABLE -- not via any step this function performs.
  */
-void edr_daemon_start(void);
+int edr_daemon_start(void);
 
 /**
  * @brief Stop the EDR daemon process
