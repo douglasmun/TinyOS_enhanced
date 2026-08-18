@@ -107,13 +107,28 @@ Exposing them to ring 3 would re-open that. `exec` is not a gap either — the
 ring-3 shell dispatches any word ending `.elf` straight through `spawn()`, so
 there is no verb to migrate.
 
-What is genuinely left is **~8 commands needing no new kernel surface at all**:
-`whoami`, `clear`, `unalias`, `jobs`, `history`, `grep`, `find`, `man`. Each is
-pure userspace over syscalls that already exist — `whoami` reads what
-`SYS_PSINFO` already exposes, `unalias` is a subcommand `SYS_ENV` already
-carries, `grep`/`find` are file I/O. This is the cheapest block left and the
-one where the recurring hazard below does **not** apply, since it adds no
-ring-3-reachable path to audit.
+What is genuinely left splits by whether it needs kernel surface, and that
+line falls in a different place than a first pass suggests.
+
+**Six need none, and are DONE** (2026-08-18): `clear`, `history`, `jobs`,
+`grep`, `find`, `man` — all pure userspace over syscalls that already exist.
+Note that `history` and `jobs` are **not migrations**: the kernel shell's
+history buffer (`src/shell_history.c`) and `cmd_jobs` (which walks the kernel
+task table) are kernel-shell state. The ring-3 shell keeps its own, which is
+also the more correct answer — a shared history buffer would leak one session's
+command lines, arguments included, into another user's listing. Harness:
+`verify-ring3-builtins.sh`.
+
+**Two look like they belong in that group and do not.** Both were originally
+listed here as needing no new surface; checking the source rather than assuming
+showed otherwise, and they are deferred to their own PR with its own audit:
+
+- `unalias` — `SYS_ENV`'s eight subcommands include no alias-delete.
+  `alias_unset()` exists in `src/env.c:1015` but is unreachable from ring 3.
+  Needs a ninth (`ENV_OP_ALIAS_UNSET`).
+- `whoami` — there is no uid → username path across the boundary at all.
+  `psinfo_t` carries a numeric `uid` and a *process* name, not a user name, and
+  `SYS_CRED` does only passwd/useradd/userdel.
 
 Three need a decision rather than typing: `su` (changes credentials on the
 *same* task, so it must call `env_refresh_identity()` on **both** branches —
@@ -219,7 +234,8 @@ protocol means the witness is broken or something moved that must not have.
 ## Recommendation
 1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
 dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
-new-syscall group it once blocked on. The next concrete step is the ~8
-no-new-syscall builtins listed under item 4. AUDIT-8E is
+new-syscall group it once blocked on. The six no-new-syscall builtins are done;
+the next concrete step is `unalias` + `whoami`, which do need a syscall each and
+so take an audit, followed by the `su`/`fatls`/`edit` design calls. AUDIT-8E is
 closed on both halves and was independent of that work. Networking is closed too
 (see above), and likewise never gated item 4.
