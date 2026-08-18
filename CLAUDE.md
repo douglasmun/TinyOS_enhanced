@@ -264,6 +264,18 @@ reports a **match count** beside the signature count (a loaded count alone let t
 read as protection). The login-spray detector counts **distinct usernames** per window,
 alerts and never denies. Rationale in `doc/FIREWALL_AND_IDS_CONFIG.md`.
 
+**`SYS_ENV` (41) carries the env/alias group to ring 3** — one syscall, eight
+subcommands, a fixed-width `env_record_t` mirrored in `userspace/libc.h` with
+`_Static_assert`s on both copies. **Ungated**, the opposite polarity to `SYS_CHMOD`
+directly above it: storage is per-task, so a caller can only address its own table and an
+unprivileged `-EPERM` is *the bug* — measure its harness as a non-root user. There is
+deliberately **no subcommand taking a pid**. Two traps: `LIST` enumerates **by index**
+(filled slot 1, hole 0) because `env_list()` prints through `stream_printf` and cannot
+cross; and the syscall **alone ships a dead feature**, since `$VAR`/alias expansion lived
+only in the kernel shell — `expand_aliases`/`expand_vars` in `userspace/shell.c` are part
+of the same change. Harness: `verify-ring3-env.sh`.
+
+
 ## Not compiled (don't audit/fix)
 
 `kernel_old.c`, `keyboard_old.c`, `tls13_demo.c`, `secure_delete.c` are not in the

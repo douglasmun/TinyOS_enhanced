@@ -80,6 +80,11 @@ static void cmd_help(void) {
           "  getpid            print this shell's pid\n"
           "  id                print uid and gid\n"
           "  date              print the date, time and uptime\n"
+          "  env               list environment variables\n"
+          "  set [NAME=VALUE]  set a variable (no arg: list)\n"
+          "  unset <NAME>      remove a variable\n"
+          "  export <NAME>     mark a variable for inheritance by children\n"
+          "  alias [n='cmd']   define or list aliases\n"
           "  ps [-l]           list your processes (root: all)\n"
           "  kill <pid>        terminate a process\n"
           "  top               one-shot snapshot of CPU use\n"
@@ -1196,6 +1201,309 @@ static void run_pipeline(int largc, char** largv, const redir_t* lredir,
 }
 
 /*-----------------------------------------------------------------------------
+ * Alias substitution and $VAR expansion
+ *
+ * The ring-3 counterpart of src/shell.c:542 and :565. Both rewrite `line` in
+ * place and are BEST EFFORT: if the result would not fit, the line is left
+ * exactly as the user typed it. Half-substituting is the one outcome to avoid
+ * -- a command truncated mid-argument can mean something entirely different
+ * from what was typed, whereas an unexpanded one merely fails to do what was
+ * meant, visibly.
+ *---------------------------------------------------------------------------*/
+/*-----------------------------------------------------------------------------
+ * env / set / export / unset / alias
+ *
+ * All UNGATED: the table is this task's own, so every one of these must work
+ * for an unprivileged user. A -ELIBC_EPERM from any of them is a kernel bug,
+ * not something to report as a permission problem.
+ *
+ * The list walks skip empty slots rather than stopping at the first one --
+ * env_list() returns 0 for a hole, and the table genuinely has holes once
+ * anything has been unset.
+ *---------------------------------------------------------------------------*/
+static void cmd_env(void) {
+    env_record_t rec;
+    int shown = 0;
+
+    for (unsigned int i = 0; i < ENV_LIST_MAX_SLOTS; i++) {
+        int rc = env_list(i, &rec);
+        if (rc < 0) {
+            printf("env: %d\n", rc);
+            return;
+        }
+        if (rc == 0) continue;          /* empty slot, not end of table */
+        printf("%s=%s\n", rec.name, rec.value);
+        shown++;
+    }
+
+    if (shown == 0) {
+        print("(no variables)\n");
+    }
+}
+
+static void cmd_set(int argc, char** argv) {
+    /* Bare `set` lists, like the kernel shell's. */
+    if (argc < 2) {
+        cmd_env();
+        return;
+    }
+
+    /* set NAME=VALUE, or set NAME VALUE. */
+    char* eq = strchr(argv[1], '=');
+    const char* name;
+    const char* value;
+
+    if (eq) {
+        *eq = '\0';
+        name = argv[1];
+        value = eq + 1;
+    } else if (argc >= 3) {
+        name = argv[1];
+        value = argv[2];
+    } else {
+        print("usage: set NAME=VALUE\n");
+        return;
+    }
+
+    int rc = env_set_var(name, value);
+    if (rc == -ELIBC_EINVAL) {
+        printf("set: %s: invalid name (letters, digits, _; not leading digit)\n",
+               name);
+    } else if (rc < 0) {
+        printf("set: %s: no room (table full)\n", name);
+    }
+}
+
+static void cmd_unset(int argc, char** argv) {
+    if (argc < 2) {
+        print("usage: unset NAME\n");
+        return;
+    }
+    if (env_unset_var(argv[1]) < 0) {
+        printf("unset: %s: not set\n", argv[1]);
+    }
+}
+
+static void cmd_export(int argc, char** argv) {
+    if (argc < 2) {
+        print("usage: export NAME  (or export NAME=VALUE)\n");
+        return;
+    }
+
+    /* export NAME=VALUE sets and exports in one step, as bash does. */
+    char* eq = strchr(argv[1], '=');
+    if (eq) {
+        *eq = '\0';
+        int rc = env_set_var(argv[1], eq + 1);
+        if (rc < 0) {
+            printf("export: %s: could not set\n", argv[1]);
+            return;
+        }
+    }
+
+    if (env_export_var(argv[1]) < 0) {
+        printf("export: %s: not set\n", argv[1]);
+    }
+}
+
+static void cmd_alias(int argc, char** argv) {
+    if (argc < 2) {
+        env_record_t rec;
+        int shown = 0;
+
+        for (unsigned int i = 0; i < ALIAS_LIST_MAX_SLOTS; i++) {
+            int rc = alias_list_get(i, &rec);
+            if (rc < 0) {
+                printf("alias: %d\n", rc);
+                return;
+            }
+            if (rc == 0) continue;
+            printf("alias %s='%s'\n", rec.name, rec.value);
+            shown++;
+        }
+
+        if (shown == 0) {
+            print("(no aliases)\n");
+        }
+        return;
+    }
+
+    char* eq = strchr(argv[1], '=');
+    if (!eq) {
+        /* Show one alias. */
+        char cmd[ENV_REC_VALUE_LEN];
+        if (alias_get_cmd(argv[1], cmd, sizeof(cmd)) == 0) {
+            printf("alias %s='%s'\n", argv[1], cmd);
+        } else {
+            printf("alias: %s: not found\n", argv[1]);
+        }
+        return;
+    }
+
+    *eq = '\0';
+    const char* name = argv[1];
+    const char* value = eq + 1;
+
+    /* Strip one layer of surrounding quotes, so `alias ll='ls -l'` stores
+     * `ls -l` rather than `'ls`. This is where the KERNEL shell's cmd_alias
+     * falls down: it reads argv[1] only, so the tokeniser has already split
+     * the value at the first space and the rest is lost silently. Reassembling
+     * from the remaining argv here is what makes a multi-word alias usable
+     * from ring 3 at all. */
+    char joined[ENV_REC_VALUE_LEN];
+    size_t jl = 0;
+    int quoted = (value[0] == '\'' || value[0] == '"');
+    char qc = value[0];
+
+    if (quoted) value++;
+
+    for (size_t k = 0; value[k] && jl < sizeof(joined) - 1; k++) {
+        joined[jl++] = value[k];
+    }
+
+    /* Append the remaining argv words, which the tokeniser split apart. */
+    for (int a = 2; a < argc && jl < sizeof(joined) - 1; a++) {
+        joined[jl++] = ' ';
+        for (size_t k = 0; argv[a][k] && jl < sizeof(joined) - 1; k++) {
+            joined[jl++] = argv[a][k];
+        }
+    }
+    joined[jl] = '\0';
+
+    /* Drop the closing quote if there was an opening one. */
+    if (quoted && jl > 0 && joined[jl - 1] == qc) {
+        joined[jl - 1] = '\0';
+    }
+
+    if (alias_set_cmd(name, joined) < 0) {
+        printf("alias: %s: no room (table full)\n", name);
+    }
+}
+
+/* Local, because userspace has no ctype.h. Matches env_is_valid_name()'s idea
+ * of a name character in src/env.c -- a mismatch would have this shell parse a
+ * name the kernel then rejects. */
+static int isalnum_c(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9');
+}
+
+static void expand_aliases(char* line, size_t size) {
+    /* First word only, like the kernel shell: an alias names a command, and
+     * substituting anywhere else would rewrite arguments that merely happen to
+     * match an alias name. */
+    size_t wlen = 0;
+    while (line[wlen] && line[wlen] != ' ' && wlen < ENV_REC_NAME_LEN - 1) {
+        wlen++;
+    }
+    if (wlen == 0 || (line[wlen] && line[wlen] != ' ')) {
+        return;  /* empty, or a first word too long to be an alias name */
+    }
+
+    char name[ENV_REC_NAME_LEN];
+    memcpy(name, line, wlen);
+    name[wlen] = '\0';
+
+    char cmd[ENV_REC_VALUE_LEN];
+    if (alias_get_cmd(name, cmd, sizeof(cmd)) != 0) {
+        return;  /* not an alias; leave the line alone */
+    }
+
+    /* NO RECURSION. One pass only, so `alias ls='ls -l'` cannot loop forever.
+     * The kernel shell has the same single-pass rule. */
+    size_t clen = strlen(cmd);
+    size_t rest = strlen(line + wlen);
+    if (clen + rest + 1 > size) {
+        return;
+    }
+
+    char out[MAX_LINE];
+    if (clen + rest + 1 > sizeof(out)) {
+        return;
+    }
+    memcpy(out, cmd, clen);
+    memcpy(out + clen, line + wlen, rest);
+    out[clen + rest] = '\0';
+
+    memcpy(line, out, clen + rest + 1);
+}
+
+static void expand_vars(char* line, size_t size) {
+    /* Nothing to do is the common case; skip the copy entirely. */
+    int has_dollar = 0;
+    for (size_t i = 0; line[i]; i++) {
+        if (line[i] == '$') { has_dollar = 1; break; }
+    }
+    if (!has_dollar) {
+        return;
+    }
+
+    char out[MAX_LINE];
+    size_t o = 0;
+    size_t i = 0;
+
+    while (line[i]) {
+        if (line[i] != '$') {
+            if (o + 1 >= sizeof(out)) return;
+            out[o++] = line[i++];
+            continue;
+        }
+
+        /* ${VAR} and $VAR both, as the kernel shell accepts both. */
+        i++;
+        int braced = (line[i] == '{');
+        if (braced) i++;
+
+        char name[ENV_REC_NAME_LEN];
+        size_t nlen = 0;
+        while (line[i] && nlen < sizeof(name) - 1 &&
+               (isalnum_c(line[i]) || line[i] == '_')) {
+            name[nlen++] = line[i++];
+        }
+        name[nlen] = '\0';
+
+        if (braced) {
+            if (line[i] != '}') {
+                /* Unclosed brace: emit what was consumed literally rather than
+                 * guessing where the name ended. */
+                if (o + nlen + 2 >= sizeof(out)) return;
+                out[o++] = '$';
+                out[o++] = '{';
+                memcpy(out + o, name, nlen);
+                o += nlen;
+                continue;
+            }
+            i++;  /* consume '}' */
+        }
+
+        if (nlen == 0) {
+            /* A bare '$' is itself, not the start of a name. */
+            if (o + 1 >= sizeof(out)) return;
+            out[o++] = '$';
+            continue;
+        }
+
+        /* An UNSET variable expands to nothing, as in every POSIX shell --
+         * NOT to its own name. Printing "$FOO" back would make a typo look
+         * like a literal, and a script testing for emptiness would see a
+         * non-empty string. */
+        char value[ENV_REC_VALUE_LEN];
+        if (env_get_var(name, value, sizeof(value)) == 0) {
+            size_t vlen = strlen(value);
+            if (o + vlen >= sizeof(out)) return;
+            memcpy(out + o, value, vlen);
+            o += vlen;
+        }
+    }
+
+    if (o + 1 > size) {
+        return;
+    }
+    out[o] = '\0';
+    memcpy(line, out, o + 1);
+}
+
+/*-----------------------------------------------------------------------------
  * Dispatch
  *
  * Returns 0 to keep looping, or 1 to exit the shell (with *status set).
@@ -1234,6 +1542,11 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "touch") == 0)  { cmd_touch(argc, argv);    return 0; }
     if (strcmp(cmd, "id") == 0)     { cmd_id();                 return 0; }
     if (strcmp(cmd, "date") == 0)   { cmd_date();               return 0; }
+    if (strcmp(cmd, "env") == 0)    { cmd_env();                return 0; }
+    if (strcmp(cmd, "set") == 0)    { cmd_set(argc, argv);      return 0; }
+    if (strcmp(cmd, "unset") == 0)  { cmd_unset(argc, argv);    return 0; }
+    if (strcmp(cmd, "export") == 0) { cmd_export(argc, argv);   return 0; }
+    if (strcmp(cmd, "alias") == 0)  { cmd_alias(argc, argv);    return 0; }
     if (strcmp(cmd, "ps") == 0)     { cmd_ps(argc, argv);       return 0; }
     if (strcmp(cmd, "kill") == 0)   { cmd_kill(argc, argv);     return 0; }
     if (strcmp(cmd, "top") == 0)    { cmd_top(argc, argv);      return 0; }
@@ -1307,6 +1620,23 @@ int main(int argc, char** argv) {
         printf("%s\n", line);
 
         if (n == 0) continue;
+
+        /* Alias substitution and $VAR expansion, in that order -- an alias may
+         * itself contain a variable, and bash expands after substituting.
+         *
+         * These run HERE, in the shell, rather than in the kernel. The kernel
+         * shell does its own at src/shell.c:542 and :565, but that code is
+         * reached only by kernel-shell input: a ring-3 shell that merely gained
+         * the env BUILTINS would still print a literal "$HOME" for `echo $HOME`,
+         * because nothing on this path had ever looked at a '$'. Shipping
+         * SYS_ENV without this would have been PR A's failure mode again -- a
+         * subsystem that appears wired and observably does nothing.
+         *
+         * Both are best-effort: on overflow the line is left exactly as typed
+         * rather than half-substituted, since a truncated command is more
+         * dangerous than an unexpanded one. */
+        expand_aliases(line, sizeof(line));
+        expand_vars(line, sizeof(line));
 
         /* A pipeline is handled entirely here rather than through dispatch():
          * it is two commands, and dispatch runs exactly one. Split before

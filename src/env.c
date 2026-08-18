@@ -9,6 +9,7 @@
 #include "process.h"
 #include "pmm.h"
 #include "scheduler.h"
+#include "user.h"   /* user_find_by_uid, for env_refresh_identity */
 #include <stddef.h>
 
 /*=============================================================================
@@ -453,6 +454,25 @@ void env_init(void) {
     alias_set("h", "history");
 }
 
+void env_refresh_identity(void) {
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        return;
+    }
+
+    user_account_t* acct = user_find_by_uid(self->uid);
+    if (!acct) {
+        return;
+    }
+
+    /* Real uid, not euid: $USER is who you ARE, not what you are momentarily
+     * authorized as. self->uid is what su commits via sys_setuid. */
+    env_set("USER", acct->username);
+    env_export("USER");
+    env_set("HOME", acct->uid == 0 ? "/" : "/home");
+    env_export("HOME");
+}
+
 /*=============================================================================
  * Variable Management
  *=============================================================================*/
@@ -652,6 +672,54 @@ void env_list(bool exported_only) {
     if (count == 0) {
         stream_printf(ctx, "(no variables)\n");
     }
+}
+
+bool env_get_by_index(size_t index, char* name_out, size_t name_size,
+                      char* value_out, size_t value_size, bool* exported_out) {
+    if (!name_out || !value_out || !exported_out || index >= ENV_MAX_VARS) {
+        return false;
+    }
+
+    env_state_t* s = env_state();
+    if (!s) {
+        return false;
+    }
+
+    CRITICAL_SECTION_ENTER();
+
+    bool found = s->vars[index].in_use;
+    if (found) {
+        /* Copied inside the lock, like env_get(), and for the same reason. */
+        SAFE_STRNCPY(name_out, s->vars[index].name, name_size);
+        SAFE_STRNCPY(value_out, s->vars[index].value, value_size);
+        *exported_out = s->vars[index].exported;
+    }
+
+    CRITICAL_SECTION_EXIT();
+    return found;
+}
+
+bool alias_get_by_index(size_t index, char* name_out, size_t name_size,
+                        char* cmd_out, size_t cmd_size) {
+    if (!name_out || !cmd_out || index >= ALIAS_MAX_COUNT) {
+        return false;
+    }
+
+    env_state_t* s = env_state();
+    if (!s) {
+        return false;
+    }
+
+    CRITICAL_SECTION_ENTER();
+
+    bool found = s->aliases[index].in_use;
+    if (found) {
+        SAFE_STRNCPY(name_out, s->aliases[index].name, name_size);
+        SAFE_STRNCPY(cmd_out, s->aliases[index].command, cmd_size);
+    }
+
+    CRITICAL_SECTION_EXIT();
+    return found;
 }
 
 /*=============================================================================

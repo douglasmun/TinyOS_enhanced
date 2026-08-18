@@ -122,6 +122,131 @@ int chmod(const char* path, unsigned int mode) {
     return syscall3(SYS_CHMOD, (uint32_t)(uintptr_t)path, (uint32_t)mode, 0);
 }
 
+/*=============================================================================
+ * SYS_ENV wrappers
+ *
+ * Every op shares one env_record_t. Each wrapper zeroes it before filling the
+ * fields that op reads -- the kernel forces NUL termination on the way in, but
+ * a record left partly uninitialised here would send this process's own stack
+ * bytes across as a variable name.
+ *===========================================================================*/
+static int env_call(unsigned int op, env_record_t* rec) {
+    return syscall3(SYS_ENV, (uint32_t)op, (uint32_t)(uintptr_t)rec,
+                    (uint32_t)sizeof(env_record_t));
+}
+
+int env_get_var(const char* name, char* value_out, size_t value_size) {
+    if (!name || !value_out || value_size == 0) {
+        return -ELIBC_EINVAL;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.name, name, sizeof(rec.name) - 1);
+
+    int rc = env_call(ENV_OP_GET, &rec);
+    if (rc < 0) {
+        return rc;
+    }
+
+    /* rec.value is NUL-terminated by the kernel, but terminate again after the
+     * copy: value_size may be shorter than the field. */
+    strncpy(value_out, rec.value, value_size - 1);
+    value_out[value_size - 1] = '\0';
+    return 0;
+}
+
+int env_set_var(const char* name, const char* value) {
+    if (!name || !value) {
+        return -ELIBC_EINVAL;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.name, name, sizeof(rec.name) - 1);
+    strncpy(rec.value, value, sizeof(rec.value) - 1);
+
+    return env_call(ENV_OP_SET, &rec);
+}
+
+int env_unset_var(const char* name) {
+    if (!name) {
+        return -ELIBC_EINVAL;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.name, name, sizeof(rec.name) - 1);
+
+    return env_call(ENV_OP_UNSET, &rec);
+}
+
+int env_export_var(const char* name) {
+    if (!name) {
+        return -ELIBC_EINVAL;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.name, name, sizeof(rec.name) - 1);
+
+    return env_call(ENV_OP_EXPORT, &rec);
+}
+
+int env_list(unsigned int index, env_record_t* rec_out) {
+    if (!rec_out) {
+        return -ELIBC_EINVAL;
+    }
+
+    memset(rec_out, 0, sizeof(*rec_out));
+    rec_out->index = index;
+
+    return env_call(ENV_OP_LIST, rec_out);
+}
+
+int alias_get_cmd(const char* name, char* cmd_out, size_t cmd_size) {
+    if (!name || !cmd_out || cmd_size == 0) {
+        return -ELIBC_EINVAL;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.name, name, sizeof(rec.name) - 1);
+
+    int rc = env_call(ENV_OP_ALIAS_GET, &rec);
+    if (rc < 0) {
+        return rc;
+    }
+
+    strncpy(cmd_out, rec.value, cmd_size - 1);
+    cmd_out[cmd_size - 1] = '\0';
+    return 0;
+}
+
+int alias_set_cmd(const char* name, const char* cmd) {
+    if (!name || !cmd) {
+        return -ELIBC_EINVAL;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.name, name, sizeof(rec.name) - 1);
+    strncpy(rec.value, cmd, sizeof(rec.value) - 1);
+
+    return env_call(ENV_OP_ALIAS_SET, &rec);
+}
+
+int alias_list_get(unsigned int index, env_record_t* rec_out) {
+    if (!rec_out) {
+        return -ELIBC_EINVAL;
+    }
+
+    memset(rec_out, 0, sizeof(*rec_out));
+    rec_out->index = index;
+
+    return env_call(ENV_OP_ALIAS_LIST, rec_out);
+}
+
 int redirect(int fd, const char* path, int mode) {
     return syscall3(SYS_REDIRECT, (uint32_t)fd, (uint32_t)(uintptr_t)path,
                     (uint32_t)mode);

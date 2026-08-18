@@ -339,6 +339,77 @@
  *---------------------------------------------------------------------------*/
 #define SYS_CHMOD      40   // Change permission bits; authorization in ramfs
 
+/*-----------------------------------------------------------------------------
+ * SYS_ENV — the calling task's environment variables and aliases.
+ *
+ * UNGATED, and that is the opposite polarity to SYS_CHMOD directly above.
+ * Storage is PER-TASK (task->env, a lazily allocated page), so a caller can
+ * only ever address its own table -- there is no foreign object to reach and
+ * therefore nothing to authorize. An unprivileged -EPERM here is THE BUG, so
+ * the harness must measure as a non-root user. Same shape as SYS_TIME.
+ *
+ * There is deliberately no "read another task's environment" subcommand. It
+ * would be the only way for one task to observe another's page, which is
+ * precisely the isolation PR A was built to establish; a getter taking a pid
+ * would hand it straight back. Env is not shared state and this syscall does
+ * not make it any.
+ *
+ * LIST enumerates BY INDEX rather than returning the whole table, because
+ * env_list()/alias_list() print through stream_printf and cannot cross the
+ * boundary at all. The index walks raw slots (0..ENV_MAX_VARS-1), so a caller
+ * sees holes and must skip !in_use records -- the SYS_PSINFO convention, and
+ * for the same reason: compacting would renumber the remaining entries when a
+ * slot is freed between two calls.
+ *
+ * arg1 = subcommand, arg2 = user pointer to an env_record_t (in and/or out),
+ * arg3 = sizeof that record. Returns 0, or -EFAULT / -EINVAL / -ENOENT /
+ * -ENOSPC. LIST returns 1 for "record filled", 0 for "empty slot".
+ *---------------------------------------------------------------------------*/
+#define SYS_ENV        41   // Per-task env vars + aliases; ungated, own-table-only
+
+/* SYS_ENV subcommands. Aliases share the syscall because they share the page
+ * and the same per-task lifetime; splitting them would be two numbers for one
+ * storage model. */
+#define ENV_OP_GET       0   // name -> value
+#define ENV_OP_SET       1   // name + value
+#define ENV_OP_UNSET     2   // name
+#define ENV_OP_EXPORT    3   // name; marks exported so spawn inherits it
+#define ENV_OP_LIST      4   // index -> name + value + exported
+#define ENV_OP_ALIAS_GET  5  // name -> value (the alias command)
+#define ENV_OP_ALIAS_SET  6  // name + value
+#define ENV_OP_ALIAS_LIST 7  // index -> name + value
+
+/*-----------------------------------------------------------------------------
+ * SYS_ENV record. ONE struct for every subcommand, fixed layout.
+ *
+ * Sized to the kernel's own limits: a value field shorter than
+ * ENV_MAX_VALUE_LEN would silently truncate on the way out, which is the
+ * failure mode that is hardest to see from a shell. `index` is only read by
+ * the LIST ops and `exported` only written by them.
+ *
+ * Not an env_var_t. That struct carries an `in_use` bool the caller has no
+ * business seeing (LIST's return value already says whether the slot was
+ * live) and its layout is the kernel's to change freely.
+ *---------------------------------------------------------------------------*/
+#define ENV_REC_NAME_LEN   32
+#define ENV_REC_VALUE_LEN  64
+
+typedef struct {
+    char     name[ENV_REC_NAME_LEN];
+    char     value[ENV_REC_VALUE_LEN];
+    uint32_t index;        // in: slot to read (LIST ops only)
+    uint32_t exported;     // out: bool widened, for a stable layout
+} env_record_t;
+
+/* Mirrored in userspace/libc.h -- nothing at runtime checks the two agree, so
+ * both copies carry these. The tie back to ENV_MAX_NAME_LEN/ENV_MAX_VALUE_LEN
+ * is asserted in env.h, which owns those limits; syscall.h deliberately does
+ * not include env.h, as that would pull env into every syscall.h consumer. */
+_Static_assert(sizeof(env_record_t) == 104, "env_record_t layout changed: update userspace/libc.h to match");
+_Static_assert(offsetof(env_record_t, value) == 32, "env_record_t.value moved: update userspace/libc.h to match");
+_Static_assert(offsetof(env_record_t, index) == 96, "env_record_t.index moved: update userspace/libc.h to match");
+_Static_assert(offsetof(env_record_t, exported) == 100, "env_record_t.exported moved: update userspace/libc.h to match");
+
 typedef struct {
     uint8_t  remote_ip[4];
     uint16_t remote_port;
@@ -504,7 +575,7 @@ typedef struct {
  * SYS_SLEEP (17) and SYS_WAITPID (18) are declared further up and have working
  * dispatcher cases, but this bound stayed at 16 when they were added, so the
  * range check rejected both before dispatch and userspace could never block. */
-#define MAX_SYSCALL_NUM  40  // Highest valid syscall number (SYS_CHMOD)
+#define MAX_SYSCALL_NUM  41  // Highest valid syscall number (SYS_ENV)
 
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
@@ -754,6 +825,7 @@ int sys_psinfo(void* user_buf, uint32_t size);
 int sys_kill(int pid);
 int sys_time(void* user_buf, uint32_t size);
 int sys_chmod(const char* user_path, uint32_t mode);
+int sys_env(uint32_t op, void* user_rec, uint32_t size);
 
 /**
  * SYS_NETRX / SYS_NETTX — raw Ethernet frames across the ring boundary.

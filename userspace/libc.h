@@ -40,6 +40,7 @@
 #define SYS_KILL     34
 #define SYS_TIME     39
 #define SYS_CHMOD    40
+#define SYS_ENV      41
 
 /* Open flags (must match VFS_O_* in src/vfs.h) */
 #define O_RDONLY    0x0000
@@ -120,6 +121,34 @@ typedef struct {
 _Static_assert(sizeof(systime_t) == 12, "systime_t layout changed: update src/syscall.h to match");
 _Static_assert(offsetof(systime_t, year) == 4, "systime_t.year moved: update src/syscall.h to match");
 
+/* SYS_ENV subcommands. Must stay identical to the block in src/syscall.h. */
+#define ENV_OP_GET        0
+#define ENV_OP_SET        1
+#define ENV_OP_UNSET      2
+#define ENV_OP_EXPORT     3
+#define ENV_OP_LIST       4
+#define ENV_OP_ALIAS_GET  5
+#define ENV_OP_ALIAS_SET  6
+#define ENV_OP_ALIAS_LIST 7
+
+#define ENV_REC_NAME_LEN   32
+#define ENV_REC_VALUE_LEN  64
+
+/* SYS_ENV record. Must stay identical to env_record_t in src/syscall.h.
+ * The kernel memsets it and fills it field by field; a mismatch here shifts
+ * every field after the changed one and nothing at runtime would notice. */
+typedef struct {
+    char     name[ENV_REC_NAME_LEN];
+    char     value[ENV_REC_VALUE_LEN];
+    uint32_t index;          /* in: slot to read (LIST ops only) */
+    uint32_t exported;       /* out: bool widened */
+} env_record_t;
+
+_Static_assert(sizeof(env_record_t) == 104, "env_record_t layout changed: update src/syscall.h to match");
+_Static_assert(offsetof(env_record_t, value) == 32, "env_record_t.value moved: update src/syscall.h to match");
+_Static_assert(offsetof(env_record_t, index) == 96, "env_record_t.index moved: update src/syscall.h to match");
+_Static_assert(offsetof(env_record_t, exported) == 100, "env_record_t.exported moved: update src/syscall.h to match");
+
 /* Raw syscall wrappers */
 int syscall0(int num);
 int syscall1(int num, uint32_t arg1);
@@ -171,6 +200,33 @@ int  psinfo(void* buf, size_t size);
  * clock is not initialised, in which case `buf` is untouched: do NOT print it,
  * the zeroed struct would render as a plausible timestamp). */
 int  systime(void* buf, size_t size);
+
+/* Per-task environment variables and aliases (SYS_ENV).
+ *
+ * UNGATED: the table belongs to the calling task and no op can name another
+ * task's, so an unprivileged caller MUST succeed. A -ELIBC_EPERM from any of
+ * these is a kernel bug, not a permission to report -- the opposite polarity
+ * to chmod() above.
+ *
+ * env_list()/alias_list_get() walk RAW SLOTS: they return 1 when the slot held
+ * an entry, 0 when it was empty, and negative on error. A caller iterates
+ * 0..ENV_MAX-1 and SKIPS the zeros rather than stopping at the first one --
+ * the table has holes and stopping early would hide every later variable. */
+int  env_get_var(const char* name, char* value_out, size_t value_size);
+int  env_set_var(const char* name, const char* value);
+int  env_unset_var(const char* name);
+int  env_export_var(const char* name);
+int  env_list(unsigned int index, env_record_t* rec_out);
+int  alias_get_cmd(const char* name, char* cmd_out, size_t cmd_size);
+int  alias_set_cmd(const char* name, const char* cmd);
+int  alias_list_get(unsigned int index, env_record_t* rec_out);
+
+/* Slot counts for the list walks above. Mirror ENV_MAX_VARS / ALIAS_MAX_COUNT
+ * in src/env.h; the kernel rejects an index past its own bound with -EINVAL,
+ * so these being too LARGE is merely noisy, but too small silently hides the
+ * tail of the table. */
+#define ENV_LIST_MAX_SLOTS    16
+#define ALIAS_LIST_MAX_SLOTS  16
 
 /* The errno values callers actually branch on, named rather than spelled as
  * bare -1/-3 at the use site. Same numbers as src/errno.h; userspace has no
