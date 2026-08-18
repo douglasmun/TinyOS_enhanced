@@ -261,6 +261,343 @@ static void cmd_cat(int argc, char** argv) {
     }
 }
 
+/*-----------------------------------------------------------------------------
+ * Builtins that need no kernel help
+ *
+ * Everything below is implemented entirely over syscalls that already exist.
+ * That is the reason this group was separable from the rest of the ring-3
+ * migration: adding a builtin here creates no new ring-3-reachable kernel
+ * path, so it cannot turn a latent kernel bug into a corruption primitive the
+ * way PRs #45/#47/#54/#55 did. Two commands that LOOK like they belong here
+ * do not, and were deliberately left out -- see the note above dispatch().
+ *---------------------------------------------------------------------------*/
+
+/* Clear the screen. The console understands the usual two-part sequence:
+ * erase-display then home-cursor. Erasing alone leaves the cursor wherever it
+ * was, so the next prompt prints into the middle of a blank screen. */
+static void cmd_clear(void) {
+    print("\033[2J\033[H");
+}
+
+/* history
+ *
+ * This is NOT a migration of the kernel shell's history. That buffer lives in
+ * src/shell_history.c and records what was typed at the KERNEL prompt; this
+ * shell has its own input loop and never touches it. Recording our own lines
+ * locally is both simpler and more correct -- a shared buffer would leak one
+ * session's command lines into another's listing, and those lines routinely
+ * contain arguments the other user should not see.
+ *
+ * Fixed ring, oldest dropped. Numbering counts every line ever entered rather
+ * than the slot index, so entries keep the number they were shown with after
+ * the ring wraps. */
+#define HISTORY_MAX   32
+#define HISTORY_LINE  128
+
+static char history_ring[HISTORY_MAX][HISTORY_LINE];
+static unsigned history_total = 0;   /* lines ever entered, not slots used */
+
+static void history_add(const char* line) {
+    /* Skip blank lines: they are not commands and would push real entries out
+     * of a small ring. */
+    const char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return;
+
+    char* slot = history_ring[history_total % HISTORY_MAX];
+    size_t n = strlen(line);
+    if (n >= HISTORY_LINE) n = HISTORY_LINE - 1;
+    memcpy(slot, line, n);
+    slot[n] = '\0';
+    history_total++;
+}
+
+static void cmd_history(int argc, char** argv) {
+    unsigned have = (history_total < HISTORY_MAX) ? history_total : HISTORY_MAX;
+    unsigned want = have;
+
+    if (argc > 1) {
+        int n = atoi(argv[1]);
+        if (n <= 0) {
+            printf("history: %s: expected a positive count\n", argv[1]);
+            return;
+        }
+        if ((unsigned)n < want) want = (unsigned)n;
+    }
+
+    /* Print the oldest of the requested tail first. history_total - want is
+     * the absolute number of the first line to show. */
+    for (unsigned i = history_total - want; i < history_total; i++) {
+        printf("%5u  %s\n", i + 1, history_ring[i % HISTORY_MAX]);
+    }
+}
+
+/* jobs
+ *
+ * Also not a migration. cmd_jobs in src/shell_monitor.c walks the kernel task
+ * table; this shell already knows which children it spawned, and asking the
+ * kernel would list tasks this shell never started. We track our own and then
+ * ask psinfo() whether each is still alive, so a finished job disappears.
+ *
+ * psinfo()'s filtering is the kernel's, not ours: an unprivileged shell sees
+ * only its own tasks anyway. We must NOT report a pid we cannot find as an
+ * error -- that is the same "a pid you cannot see is nonexistent, never
+ * permission denied" rule cmd_kill and sys_waitpid follow. Here it is simply
+ * treated as finished. */
+#define JOBS_MAX 16
+
+typedef struct {
+    int  pid;
+    char cmd[48];
+} job_t;
+
+static job_t jobs_list[JOBS_MAX];
+static int   jobs_count = 0;
+
+static void jobs_record(int pid, const char* cmd) {
+    if (jobs_count >= JOBS_MAX) {
+        /* Full: drop the oldest rather than refusing to track the new one, so
+         * a long-lived shell keeps reporting recent jobs. */
+        for (int i = 1; i < JOBS_MAX; i++) jobs_list[i - 1] = jobs_list[i];
+        jobs_count = JOBS_MAX - 1;
+    }
+    jobs_list[jobs_count].pid = pid;
+    size_t n = strlen(cmd);
+    if (n >= sizeof(jobs_list[0].cmd)) n = sizeof(jobs_list[0].cmd) - 1;
+    memcpy(jobs_list[jobs_count].cmd, cmd, n);
+    jobs_list[jobs_count].cmd[n] = '\0';
+    jobs_count++;
+}
+
+static int job_is_live(int pid) {
+    psinfo_t ps[16];
+    int n = psinfo(ps, sizeof(ps));
+    if (n <= 0) return 0;
+
+    int have = n / (int)sizeof(psinfo_t);
+    for (int i = 0; i < have; i++) {
+        if ((int)ps[i].pid == pid && ps[i].state != PS_TERMINATED) return 1;
+    }
+    return 0;
+}
+
+static void cmd_jobs(void) {
+    int live = 0;
+
+    /* Compact in place: a job that has exited is forgotten, so `jobs` run
+     * twice does not keep listing a corpse. */
+    for (int i = 0; i < jobs_count; i++) {
+        if (!job_is_live(jobs_list[i].pid)) continue;
+        jobs_list[live] = jobs_list[i];
+        printf("[%d]  %d  %s\n", live + 1, jobs_list[live].pid,
+               jobs_list[live].cmd);
+        live++;
+    }
+    jobs_count = live;
+
+    if (live == 0) print("no background jobs\n");
+}
+
+/* grep -- fixed-string match, no regular expressions.
+ *
+ * Deliberately literal: a regex engine here would be a parser running on
+ * attacker-influenced file contents, which is a much larger thing to audit
+ * than this command is worth. Lines longer than the buffer are split rather
+ * than truncated, so a match late in a very long line is still found. */
+static int grep_line_has(const char* line, const char* needle) {
+    if (*needle == '\0') return 1;
+    for (const char* s = line; *s; s++) {
+        const char* a = s;
+        const char* b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*b == '\0') return 1;
+    }
+    return 0;
+}
+
+static int grep_fd(int fd, const char* needle, const char* label, int show_name) {
+    char buf[512];
+    char line[256];
+    size_t len = 0;
+    int matches = 0;
+
+    for (;;) {
+        int n = read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+
+        for (int i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\n' || len == sizeof(line) - 1) {
+                line[len] = '\0';
+                if (grep_line_has(line, needle)) {
+                    if (show_name) printf("%s:%s\n", label, line);
+                    else           printf("%s\n", line);
+                    matches++;
+                }
+                len = 0;
+                if (c != '\n') line[len++] = c;
+            } else {
+                line[len++] = c;
+            }
+        }
+    }
+
+    /* A final line with no trailing newline still counts. */
+    if (len > 0) {
+        line[len] = '\0';
+        if (grep_line_has(line, needle)) {
+            if (show_name) printf("%s:%s\n", label, line);
+            else           printf("%s\n", line);
+            matches++;
+        }
+    }
+    return matches;
+}
+
+static void cmd_grep(int argc, char** argv) {
+    if (argc < 2) {
+        print("usage: grep <text> [file...]\n");
+        return;
+    }
+
+    if (argc == 2) {
+        grep_fd(0, argv[1], "(stdin)", 0);
+        return;
+    }
+
+    /* Prefix with the filename only when more than one file was named -- with
+     * a single file the prefix is noise, and it also keeps `grep x f | ...`
+     * feeding the pipe the line itself. */
+    int show_name = (argc > 3);
+    for (int i = 2; i < argc; i++) {
+        int fd = open(argv[i], O_RDONLY);
+        if (fd < 0) {
+            fail("grep", argv[i], fd);
+            continue;
+        }
+        grep_fd(fd, argv[1], argv[i], show_name);
+        close(fd);
+    }
+}
+
+/* find -- walk a directory tree, optionally filtering by name substring.
+ *
+ * Depth is bounded explicitly. Recursion here is driven by directory
+ * structure, which on a writable filesystem is attacker-controlled, so an
+ * unbounded walk is a stack overflow looking for a deep tree. Each level holds
+ * ~840 bytes (a 256-byte path plus the 576-byte readdir batch), so 8 levels is
+ * ~6.7 KB against this shell's USER_STACK_NORMAL of 128 KB -- the limit exists
+ * to bound the recursion at all, not because 8 is near the edge. The limit is
+ * reported rather than silently applied, so a truncated listing is never
+ * mistaken for a complete one. */
+#define FIND_MAX_DEPTH 8
+
+static void find_walk(const char* path, const char* needle, int depth) {
+    if (depth > FIND_MAX_DEPTH) {
+        printf("find: %s: not descending past depth %d\n", path, FIND_MAX_DEPTH);
+        return;
+    }
+
+    int fd = open(path, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        fail("find", path, fd);
+        return;
+    }
+
+    dirent_t ents[8];
+    for (;;) {
+        int n = readdir(fd, ents, sizeof(ents));
+        if (n <= 0) break;
+
+        int have = n / (int)sizeof(dirent_t);
+        for (int i = 0; i < have; i++) {
+            const char* nm = ents[i].name;
+            if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
+
+            char child[256];
+            size_t plen = strlen(path);
+            size_t nlen = strlen(nm);
+            /* Skip anything that would not fit rather than building a
+             * truncated path -- a truncated path names a DIFFERENT file, and
+             * printing it would be a false report about which file exists. */
+            int need_slash = (plen > 0 && path[plen - 1] != '/');
+            if (plen + (size_t)need_slash + nlen + 1 > sizeof(child)) {
+                printf("find: %s: path too long, skipped\n", nm);
+                continue;
+            }
+            memcpy(child, path, plen);
+            if (need_slash) child[plen++] = '/';
+            memcpy(child + plen, nm, nlen);
+            child[plen + nlen] = '\0';
+
+            if (!needle || grep_line_has(nm, needle)) puts(child);
+
+            if (ents[i].type == DT_DIR) find_walk(child, needle, depth + 1);
+        }
+    }
+    close(fd);
+}
+
+static void cmd_find(int argc, char** argv) {
+    const char* path   = (argc > 1) ? argv[1] : ".";
+    const char* needle = (argc > 2) ? argv[2] : (const char*)0;
+    find_walk(path, needle, 0);
+}
+
+/* man -- one-line synopses, shown for a named command or all of them.
+ *
+ * Kept separate from `help`: help lists what this shell can run, man explains
+ * what a command does. Entries exist only for builtins this shell actually
+ * has, so it cannot advertise a kernel-shell command that would fail here. */
+typedef struct {
+    const char* name;
+    const char* summary;
+} man_entry_t;
+
+static const man_entry_t man_pages[] = {
+    { "cat",     "cat [file...] -- print files, or stdin when given none" },
+    { "cd",      "cd [dir] -- change the working directory" },
+    { "chmod",   "chmod <mode> <file> -- set permission bits (octal)" },
+    { "clear",   "clear -- erase the screen and home the cursor" },
+    { "cp",      "cp <src> <dst> -- copy a file" },
+    { "date",    "date -- print the current time and uptime" },
+    { "echo",    "echo [text...] -- print arguments" },
+    { "env",     "env -- list environment variables" },
+    { "export",  "export <name> -- mark a variable for inheritance by children" },
+    { "find",    "find [dir] [text] -- walk a tree, optionally matching names" },
+    { "grep",    "grep <text> [file...] -- print lines containing text" },
+    { "help",    "help -- list available commands" },
+    { "history", "history [n] -- show recent command lines" },
+    { "jobs",    "jobs -- list this shell's running background jobs" },
+    { "kill",    "kill <pid> -- terminate a process you own" },
+    { "ls",      "ls [dir] -- list directory contents" },
+    { "man",     "man [command] -- describe a command" },
+    { "mkdir",   "mkdir <dir> -- create a directory" },
+    { "ps",      "ps -- list processes visible to you" },
+    { "pwd",     "pwd -- print the working directory" },
+    { "rm",      "rm <file> -- remove a file" },
+    { "set",     "set <name> <value> -- set an environment variable" },
+    { "stat",    "stat <path> -- show size, mode and type" },
+    { "unset",   "unset <name> -- remove an environment variable" },
+};
+
+static void cmd_man(int argc, char** argv) {
+    unsigned count = sizeof(man_pages) / sizeof(man_pages[0]);
+
+    if (argc < 2) {
+        for (unsigned i = 0; i < count; i++) puts(man_pages[i].summary);
+        return;
+    }
+
+    for (unsigned i = 0; i < count; i++) {
+        if (strcmp(argv[1], man_pages[i].name) == 0) {
+            puts(man_pages[i].summary);
+            return;
+        }
+    }
+    printf("man: no entry for %s\n", argv[1]);
+}
+
 static void cmd_stat(int argc, char** argv) {
     if (argc < 2) {
         print("usage: stat <path>...\n");
@@ -837,6 +1174,10 @@ static void run_program(int argc, char** argv, int background) {
     }
 
     if (background) {
+        /* Remember it so `jobs` can report it. Only background children are
+         * tracked: a foreground child is waited for on the next line and is
+         * never a "job" anyone could ask about. */
+        jobs_record(pid, argv[0]);
         printf("[%d] %s\n", pid, argv[0]);
         return;
     }
@@ -1508,6 +1849,18 @@ static void expand_vars(char* line, size_t size) {
  *
  * Returns 0 to keep looping, or 1 to exit the shell (with *status set).
  *---------------------------------------------------------------------------*/
+/* Two commands that belong with the group above are NOT here, because neither
+ * is actually free:
+ *
+ *   unalias -- SYS_ENV has eight subcommands and none of them deletes an
+ *              alias. alias_unset() exists in src/env.c but is unreachable
+ *              from ring 3, so this needs a ninth (ENV_OP_ALIAS_UNSET).
+ *   whoami  -- there is no uid -> username path across the boundary. psinfo_t
+ *              carries a numeric uid and a PROCESS name, not a user name, and
+ *              SYS_CRED only does passwd/useradd/userdel.
+ *
+ * Both therefore add ring-3-reachable kernel surface and belong in their own
+ * PR with its own audit, not in this one. */
 static int dispatch(int argc, char** argv, int background, int* status) {
     const char* cmd = argv[0];
 
@@ -1563,6 +1916,13 @@ static int dispatch(int argc, char** argv, int background, int* status) {
         printf("%d\n", getpid());
         return 0;
     }
+
+    if (strcmp(cmd, "clear") == 0)   { cmd_clear();            return 0; }
+    if (strcmp(cmd, "history") == 0) { cmd_history(argc, argv); return 0; }
+    if (strcmp(cmd, "jobs") == 0)    { cmd_jobs();              return 0; }
+    if (strcmp(cmd, "grep") == 0)    { cmd_grep(argc, argv);    return 0; }
+    if (strcmp(cmd, "find") == 0)    { cmd_find(argc, argv);    return 0; }
+    if (strcmp(cmd, "man") == 0)     { cmd_man(argc, argv);     return 0; }
 
     if (looks_like_program(cmd)) {
         run_program(argc, argv, background);
@@ -1620,6 +1980,12 @@ int main(int argc, char** argv) {
         printf("%s\n", line);
 
         if (n == 0) continue;
+
+        /* Record BEFORE expansion, so history shows what was typed rather than
+         * what it turned into. Showing the expanded form would make `history`
+         * useless for the thing it is mainly used for -- seeing the command
+         * again in order to retype it. */
+        history_add(line);
 
         /* Alias substitution and $VAR expansion, in that order -- an alias may
          * itself contain a variable, and bash expands after substituting.
