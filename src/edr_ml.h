@@ -732,7 +732,7 @@ void edr_response_get_stats(uint32_t* total_responses, uint8_t* log_count);
  *
  * @note The daemon is automatically protected with CAP_UNKILLABLE
  */
-void edr_daemon_start(void);
+int edr_daemon_start(void);
 
 /**
  * @brief Stop the EDR daemon process
