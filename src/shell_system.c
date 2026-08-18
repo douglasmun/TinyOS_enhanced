@@ -1264,8 +1264,9 @@ void cmd_secstatus(int argc, char* argv[]) {
     edr_daemon_get_stats(&edr_scans, &edr_threats, &edr_procs, &edr_responses);
 
     uint32_t wx_violations = pae_wx_audit();
-    /* The ACTUAL gate, from elf.c. NOT secure_boot_is_enforced(), which is
-     * hardwired true and so reported "ENFORCED" even in a permissive build. */
+    /* The ACTUAL gate, from elf.c -- a build-mode question, not a policy flag.
+     * This line used to come from secure_boot_is_enforced(), which was hardwired
+     * true and so reported "ENFORCED" even in a permissive build. */
     bool elf_enforced = elf_signatures_enforced();
 
     stream_printf(ctx, "\n");

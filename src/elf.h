@@ -160,9 +160,10 @@ bool elf_verify_signature(const void* elf_data, size_t elf_size);
 
 /*-----------------------------------------------------------------------------
  * Report whether unsigned binaries are actually rejected. This is the real
- * gate (-DELF_PERMISSIVE_SIGNATURES), NOT secure_boot_is_enforced(), which is
- * hardwired true -- see the definition in elf.c before using either one in a
- * status surface.
+ * gate (-DELF_PERMISSIVE_SIGNATURES), and it is the ONLY one: secure_boot.c
+ * used to export a rival secure_boot_is_enforced() that was hardwired true,
+ * and it was deleted rather than left as a trap. Never answer "are signatures
+ * enforced?" from a policy flag -- see the definition in elf.c.
  *---------------------------------------------------------------------------*/
 bool elf_signatures_enforced(void);
 

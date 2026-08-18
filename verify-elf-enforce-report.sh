@@ -5,8 +5,8 @@
 # THE BUG THIS LOCKS DOWN
 #
 # `secstatus` printed "ELF signatures ...... ENFORCED (fail-closed)" from
-# secure_boot_is_enforced(). That function cannot return false: secure_boot_init()
-# ORs SECURE_BOOT_FLAG_ENFORCE in whenever the caller omits it (secure_boot.c),
+# secure_boot_is_enforced(). That function could not return false: secure_boot_init()
+# ORed an ENFORCE flag in whenever the caller omitted it (secure_boot.c),
 # and kernel.c omits it. Meanwhile the ACTUAL gate is elf_require_signatures in
 # elf_load_process(), set by #ifdef ELF_PERMISSIVE_SIGNATURES in elf.c.
 #
@@ -27,7 +27,7 @@
 # THE ASSERTION: default build -> accessor returns 1
 #                permissive   -> accessor returns 0
 #                and secstatus sources its line from THAT accessor, not from
-#                secure_boot_is_enforced().
+#                secure_boot_is_enforced(), since deleted outright.
 #
 # The third leg is the load-bearing one: legs 1-2 alone pass against a kernel
 # where the accessor is perfect but secstatus still calls the wrong function.
@@ -50,13 +50,14 @@ command -v "$OBJDUMP" >/dev/null 2>&1 || {
 
 # --- Leg 3 first: it is pure source inspection and needs no build -----------
 # secstatus must read the elf.c accessor. If it still calls
-# secure_boot_is_enforced(), legs 1-2 can both pass while the display lies.
+# secure_boot_is_enforced() (now deleted), legs 1-2 can both pass while the
+# display lies.
 if grep -q 'elf_enforced = elf_signatures_enforced()' src/shell_system.c; then
     pass "secstatus sources its ELF line from elf_signatures_enforced()"
 else
     fail "secstatus does NOT call elf_signatures_enforced()" \
          "Expected 'elf_enforced = elf_signatures_enforced();' in shell_system.c." \
-         "If it reads secure_boot_is_enforced() again, the line is hardwired" \
+         "If it reads a policy flag again, the line is hardwired" \
          "to ENFORCED and this whole fix has been reverted."
 fi
 

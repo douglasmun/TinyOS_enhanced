@@ -712,10 +712,10 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     /* kprintf("[SECURE_DELETE] Initializing............ [OK]\n"); */
     /* secure_delete_init(); */
 
-    /* Initialize secure boot with the pinned ELF signing key; ELF loading
-     * runs in enforce mode and rejects binaries not signed with this key */
-    secure_boot_init(tinyos_trusted_signing_key, 0,
-                     SECURE_BOOT_FLAG_MEASURED | SECURE_BOOT_FLAG_AUDIT_LOG);
+    /* Pin the ELF signing key. Whether unsigned binaries are rejected is a
+     * separate question, decided at build time in elf.c -- see
+     * elf_signatures_enforced(). */
+    secure_boot_init(tinyos_trusted_signing_key);
 
     /* Initialize EDR Advanced Detection (Phase 3) */
     edr_advanced_init();

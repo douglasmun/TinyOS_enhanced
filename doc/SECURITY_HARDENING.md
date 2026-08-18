@@ -1356,21 +1356,28 @@ Every binary launched via `exec` is cryptographically verified before it runs.
 
 ---
 
-## Secure Boot Chain — measured boot, anti-rollback, fail-closed
+## Pinned code-signing key — fail-closed
 
-A boot-integrity layer underpinning the ELF-signing key.
+Not a secure boot chain. This holds the one ECDSA P-256 public key that every
+signed ELF is checked against, and nothing else.
 
-- **Least-trust verify ordering:** `secure_boot_verify` validates in
-  size → magic → hash → ECDSA order, so cheap/safe checks gate the expensive ones
-  and a malformed image can't reach the crypto (BootHole/AVB-style hardening).
-  (`src/secure_boot.c:157`.)
-- **Anti-rollback:** images carry a version; a version below the stored
-  `min_version` is rejected, preventing downgrade to a known-vulnerable build.
-- **Measured boot (PCRs):** eight SHA-256 "platform configuration registers"
-  support `PCR[n] = SHA256(PCR[n] || value)` extension for attestation-style
-  measurement (`secure_boot_extend_pcr`, `src/secure_boot.h`).
-- **Fail-closed by default:** `secure_boot_init` forces ENFORCE on, so the secure
-  path is the default, not an opt-in (`src/secure_boot.c`).
+- **Fail-closed on a bad key:** `secure_boot_init` refuses a NULL or all-zero
+  key and leaves `initialized` false; `elf.c` then rejects every signature. The
+  safe state is the default, not an opt-in (`src/secure_boot.c`).
+- **Key pinning:** the signature trailer carries the signer's public key, but an
+  attacker controls the trailer, so `elf.c` compares all 64 bytes against the
+  pinned key before importing it (`src/elf.c`).
+- **Enforcement is a separate question**, answered by `elf_signatures_enforced()`
+  in `src/elf.c` — a build-mode gate (`-DELF_PERMISSIVE_SIGNATURES`), not a
+  runtime policy flag.
+
+**Not implemented, deliberately:** measured boot / PCRs, anti-rollback, and a
+second `secure_boot_verify` were all declared here and never called — the PCR
+array stayed zero for the machine's lifetime while the boot log printed
+"Measured boot: ENABLED". They were deleted rather than wired up; the verifier
+used an incompatible prepended-header format, and with no TPM, PCRs computed by
+the kernel being measured attest to nothing an attacker in that kernel cannot
+forge. See `verify-secure-boot-scope.sh`.
 
 **Implementation:** `src/secure_boot.c`, `src/secure_boot.h`.
 
