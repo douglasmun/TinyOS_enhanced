@@ -279,6 +279,28 @@ static void cmd_clear(void) {
     print("\033[2J\033[H");
 }
 
+/* whoami -- the caller's own username.
+ *
+ * No syscall of its own, and no uid -> username lookup crossing the boundary.
+ * env_refresh_identity() (src/env.c) resolves user_find_by_uid(self->uid)
+ * kernel-side on login and on both su branches, and exports the result as
+ * $USER; this only reads that back. The distinction matters: the kernel
+ * resolves self->uid and nothing else, so there is no argument here that could
+ * name a different account and no way to walk the user table through it.
+ *
+ * Falls back to the numeric uid rather than printing nothing, so a shell
+ * started before any identity was established still answers truthfully. */
+static void cmd_whoami(void) {
+    char name[ENV_REC_VALUE_LEN];
+
+    if (env_get_var("USER", name, sizeof(name)) == 0 && name[0] != '\0') {
+        printf("%s\n", name);
+        return;
+    }
+
+    printf("uid %d\n", getuid());
+}
+
 /* history
  *
  * This is NOT a migration of the kernel shell's history. That buffer lives in
@@ -572,6 +594,7 @@ static const man_entry_t man_pages[] = {
     { "kill",    "kill <pid> -- terminate a process you own" },
     { "ls",      "ls [dir] -- list directory contents" },
     { "man",     "man [command] -- describe a command" },
+    { "whoami",  "whoami -- print the current user name" },
     { "mkdir",   "mkdir <dir> -- create a directory" },
     { "ps",      "ps -- list processes visible to you" },
     { "pwd",     "pwd -- print the working directory" },
@@ -1854,13 +1877,11 @@ static void expand_vars(char* line, size_t size) {
  *
  *   unalias -- SYS_ENV has eight subcommands and none of them deletes an
  *              alias. alias_unset() exists in src/env.c but is unreachable
- *              from ring 3, so this needs a ninth (ENV_OP_ALIAS_UNSET).
- *   whoami  -- there is no uid -> username path across the boundary. psinfo_t
- *              carries a numeric uid and a PROCESS name, not a user name, and
- *              SYS_CRED only does passwd/useradd/userdel.
+ *              from ring 3, so this needs a ninth (ENV_OP_ALIAS_UNSET), and
+ *              therefore its own PR with its own audit.
  *
- * Both therefore add ring-3-reachable kernel surface and belong in their own
- * PR with its own audit, not in this one. */
+ * whoami was listed here too and that was wrong: $USER already holds it,
+ * resolved kernel-side by env_refresh_identity(). See cmd_whoami above. */
 static int dispatch(int argc, char** argv, int background, int* status) {
     const char* cmd = argv[0];
 
@@ -1923,6 +1944,7 @@ static int dispatch(int argc, char** argv, int background, int* status) {
     if (strcmp(cmd, "grep") == 0)    { cmd_grep(argc, argv);    return 0; }
     if (strcmp(cmd, "find") == 0)    { cmd_find(argc, argv);    return 0; }
     if (strcmp(cmd, "man") == 0)     { cmd_man(argc, argv);     return 0; }
+    if (strcmp(cmd, "whoami") == 0)  { cmd_whoami();           return 0; }
 
     if (looks_like_program(cmd)) {
         run_program(argc, argv, background);

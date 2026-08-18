@@ -119,16 +119,27 @@ also the more correct answer — a shared history buffer would leak one session'
 command lines, arguments included, into another user's listing. Harness:
 `verify-ring3-builtins.sh`.
 
-**Two look like they belong in that group and do not.** Both were originally
-listed here as needing no new surface; checking the source rather than assuming
-showed otherwise, and they are deferred to their own PR with its own audit:
+**One looks like it belongs in that group and does not:**
 
 - `unalias` — `SYS_ENV`'s eight subcommands include no alias-delete.
   `alias_unset()` exists in `src/env.c:1015` but is unreachable from ring 3.
-  Needs a ninth (`ENV_OP_ALIAS_UNSET`).
-- `whoami` — there is no uid → username path across the boundary at all.
-  `psinfo_t` carries a numeric `uid` and a *process* name, not a user name, and
-  `SYS_CRED` does only passwd/useradd/userdel.
+  Needs a ninth (`ENV_OP_ALIAS_UNSET`), so it takes its own PR and audit.
+
+`whoami` was listed alongside it and that was wrong, twice over. The claim was
+"there is no uid → username path across the boundary at all"; the per-struct
+facts behind it hold (`psinfo_t` does carry a numeric uid and a *process* name,
+and `SYS_CRED` does only passwd/useradd/userdel) but the conclusion does not,
+because none of those is the path. `env_refresh_identity()` (`src/env.c:457`)
+already resolves `user_find_by_uid(self->uid)` **kernel-side** and stores the
+result in `$USER`, exported — so ring 3 reads its own username through
+`SYS_ENV`/`ENV_OP_GET` with no new surface at all.
+
+The second error was the security concern raised with it: that exposing
+uid → username would let a user enumerate the account table. It cannot. The
+kernel resolves `self->uid` and nothing else, so there is no argument to point
+at another account, and the one string returned is the caller's own identity —
+which they already have. `whoami` therefore shipped as a pure-userspace builtin
+with the six above, reading `$USER` via `env_get_var()`.
 
 Three need a decision rather than typing: `su` (changes credentials on the
 *same* task, so it must call `env_refresh_identity()` on **both** branches —
@@ -234,8 +245,9 @@ protocol means the witness is broken or something moved that must not have.
 ## Recommendation
 1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
 dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
-new-syscall group it once blocked on. The six no-new-syscall builtins are done;
-the next concrete step is `unalias` + `whoami`, which do need a syscall each and
-so take an audit, followed by the `su`/`fatls`/`edit` design calls. AUDIT-8E is
+new-syscall group it once blocked on. The seven no-new-syscall builtins are
+done; the next concrete step is `unalias`, which does need a ninth `SYS_ENV`
+subcommand and so takes an audit, followed by the `su`/`fatls`/`edit` design
+calls. AUDIT-8E is
 closed on both halves and was independent of that work. Networking is closed too
 (see above), and likewise never gated item 4.

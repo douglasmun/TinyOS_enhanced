@@ -215,12 +215,16 @@ corrupted the signature hash until `exec_buffer` and `elf_load_process`'s
 The **ring-3 shell is the default login shell** (PR #51); the kernel shell is the
 fallback (`kshell` hands over, `exit` logs out). ~33 builtins against the kernel shell's
 ~70 — redirection, pipelines, credentials, `ps`/`kill`/`top`, `cp`/`mv`/`touch`,
-`date`/`chmod`, the env/alias group, and `clear`/`history`/`jobs`/`grep`/`find`/`man`
-have landed. Those last six needed **no new syscall**, and two commands that look like
-they belong with them do not: `unalias` (SYS_ENV has no alias-delete subcommand) and
-`whoami` (no uid→username path exists across the boundary — `psinfo_t` carries a uid and
-a *process* name). `history`/`jobs` are ring-3-local by design, not migrations: sharing
-the kernel shell's buffers would leak one session's command lines to another user. The machine-state commands (`pae`,
+`date`/`chmod`, the env/alias group, and
+`clear`/`history`/`jobs`/`grep`/`find`/`man`/`whoami` have landed. Those last seven
+needed **no new syscall**. `whoami` is the one to remember: it was deferred as needing a
+uid→username path across the boundary, and that was wrong — `env_refresh_identity()`
+already resolves the name kernel-side and exports it as `$USER`, so ring 3 reads its own
+identity through `SYS_ENV` and there is no account-enumeration primitive to weigh (the
+kernel resolves `self->uid` and nothing else). `unalias` genuinely does need surface —
+`SYS_ENV` has no alias-delete subcommand — so it stays deferred. `history`/`jobs` are
+ring-3-local by design, not migrations: sharing the kernel shell's buffers would leak one
+session's command lines to another user. The machine-state commands (`pae`,
 `mem`, `wxaudit`, `auditlog`, networking and security tooling) stay kernel-shell only,
 ~20 of them by design — together they are an ASLR defeat (PR #58).
 
