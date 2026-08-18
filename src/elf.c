@@ -21,11 +21,12 @@
  * elf_signatures_enforced -- report the ACTUAL signature gate.
  *
  * This exists because `secstatus` used to source its "ELF signatures" line
- * from secure_boot_is_enforced(), which is hardwired true: secure_boot_init()
- * ORs SECURE_BOOT_FLAG_ENFORCE in whenever the caller omits it, and kernel.c
+ * from secure_boot_is_enforced(), which was hardwired true: secure_boot_init()
+ * ORed SECURE_BOOT_FLAG_ENFORCE in whenever the caller omitted it, and kernel.c
  * omits it. So a -DELF_PERMISSIVE_SIGNATURES build -- one that warns and loads
  * unsigned binaries -- still reported "ENFORCED (fail-closed)". The status
- * surface could not report the state it named.
+ * surface could not report the state it named. That accessor has since been
+ * deleted outright, so this is now the only way to ask the question.
  *
  * The real gate is elf_require_signatures in elf_load_process(), a
  * function-local static nothing outside could read. Keep the #ifdef in THIS
