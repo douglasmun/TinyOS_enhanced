@@ -130,6 +130,12 @@ trap cleanup EXIT
 # `sleeper.elf&` backgrounds a child so `jobs` has something live to report;
 # it is the same binary verify-ring3-ps.sh uses for this purpose.
 #
+# The whoami leg asserts $TESTUSER, deliberately NOT root: the shell is running
+# as the unprivileged user by then, so a whoami that reported the identity the
+# fixture was staged under -- or one that read a stale $USER seeded by env_init
+# before login -- would print "root" and fail here. That is the same bug class
+# su had before env_refresh_identity() existed.
+#
 # Ordering note: history legs run LAST so there are several earlier commands
 # for them to list; a history leg run early would assert against an almost
 # empty ring and could pass on a single default entry.
@@ -156,6 +162,7 @@ exec /shell.elf=>TinyOS shell (ring 3);\
 !find /BLTFIND=>F.TXT;\
 !sleeper.elf&=>[;\
 !jobs=>sleeper.elf;\
+!whoami=>$TESTUSER;\
 !history=>man clear;\
 !history 2=>;\
 " \
@@ -247,7 +254,45 @@ else
     bad "jobs did not list the backgrounded sleeper.elf"
 fi
 
-# Leg 8 — history listed an EARLIER command from this session, numbered. The
+# Leg 8 — whoami printed the UNPRIVILEGED user's name on a line of its own.
+#
+# The bare username is all over a passing log for reasons that have nothing to
+# do with whoami: the `useradd bltuser` and `su bltuser` command echoes, the
+# "Now running as bltuser" confirmation, history listing those back, and the
+# prompt itself. A substring match on "$TESTUSER" would pass with cmd_whoami
+# deleted -- the same defect leg 5 was fixed for, and the reason that leg's
+# comment is worth reading before adding any leg here.
+#
+# So this anchors on the WHOLE line: whoami prints the name and nothing else,
+# so a line that is exactly the username, after prompt and history lines are
+# dropped, could only have come from whoami. It also pins the VALUE to the
+# unprivileged user rather than merely "some name", which is what catches a
+# stale $USER still reading "root" from env_init's pre-login seed.
+WHO=$(printf '%s' "$LOG" \
+    | grep -v '\$ ' \
+    | grep -vE '^ *[0-9]+  ' \
+    | grep -cE "^${TESTUSER}\$")
+if [ "$WHO" -ge 1 ]; then
+    ok "whoami printed the unprivileged user's own name"
+else
+    bad "whoami did not print '$TESTUSER' on a line of its own (stale \$USER, or not dispatched)"
+fi
+
+# Leg 9 — negative pin for leg 8: whoami must NOT report root. The shell is
+# running as $TESTUSER, so a bare "root" line means $USER was never refreshed
+# across the su -- which is precisely the bug env_refresh_identity() exists to
+# prevent, and it would otherwise pass leg 8's sibling formulations.
+ROOTLINE=$(printf '%s' "$LOG" \
+    | grep -v '\$ ' \
+    | grep -vE '^ *[0-9]+  ' \
+    | grep -cE '^root$')
+if [ "$ROOTLINE" -eq 0 ]; then
+    ok "whoami did not report root (paired with leg 8)"
+else
+    bad "whoami reported root while running as $TESTUSER — \$USER not refreshed across su"
+fi
+
+# Leg 10 — history listed an EARLIER command from this session, numbered. The
 # numbering is asserted because it is produced only by the ring buffer's own
 # counter; the command text alone appears in the echo.
 if printf '%s' "$LOG" | grep -E "^ *[0-9]+ +man clear" >/dev/null; then
@@ -257,8 +302,8 @@ else
 fi
 
 echo
-if [ "$fail" -eq 0 ] && [ "$pass" -ge 8 ]; then
-    echo "RESULT: PASS — the six no-new-syscall builtins work from ring 3 ($pass/$pass)"
+if [ "$fail" -eq 0 ] && [ "$pass" -ge 10 ]; then
+    echo "RESULT: PASS — the seven no-new-syscall builtins work from ring 3 ($pass/$pass)"
     rc=0
 else
     echo "RESULT: FAIL — $fail leg(s) red, $pass green"
