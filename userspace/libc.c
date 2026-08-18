@@ -236,6 +236,18 @@ int alias_set_cmd(const char* name, const char* cmd) {
     return env_call(ENV_OP_ALIAS_SET, &rec);
 }
 
+int alias_unset_cmd(const char* name) {
+    if (!name) {
+        return -ELIBC_EINVAL;
+    }
+
+    env_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.name, name, sizeof(rec.name) - 1);
+
+    return env_call(ENV_OP_ALIAS_UNSET, &rec);
+}
+
 int alias_list_get(unsigned int index, env_record_t* rec_out) {
     if (!rec_out) {
         return -ELIBC_EINVAL;

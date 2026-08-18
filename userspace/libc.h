@@ -130,6 +130,7 @@ _Static_assert(offsetof(systime_t, year) == 4, "systime_t.year moved: update src
 #define ENV_OP_ALIAS_GET  5
 #define ENV_OP_ALIAS_SET  6
 #define ENV_OP_ALIAS_LIST 7
+#define ENV_OP_ALIAS_UNSET 8
 
 #define ENV_REC_NAME_LEN   32
 #define ENV_REC_VALUE_LEN  64
@@ -219,6 +220,7 @@ int  env_export_var(const char* name);
 int  env_list(unsigned int index, env_record_t* rec_out);
 int  alias_get_cmd(const char* name, char* cmd_out, size_t cmd_size);
 int  alias_set_cmd(const char* name, const char* cmd);
+int  alias_unset_cmd(const char* name);
 int  alias_list_get(unsigned int index, env_record_t* rec_out);
 
 /* Slot counts for the list walks above. Mirror ENV_MAX_VARS / ALIAS_MAX_COUNT

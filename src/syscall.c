@@ -1544,6 +1544,24 @@ int sys_env(uint32_t op, void* user_rec, uint32_t size) {
         }
         return 0;
 
+    /* Deletion, the ninth subcommand. Symmetric with ENV_OP_UNSET directly
+     * above, including its errno: alias_unset() returns -1 both when the name
+     * is absent and in its defensive bounds branch, and from the caller's side
+     * both mean "there is no such alias", so -ENOENT covers each without the
+     * sentinel collision that bit ramfs_chmod (-ENOENT is -2 and no other
+     * return here uses it).
+     *
+     * No ownership check, matching every other op on this syscall: the alias
+     * table is the CALLER'S OWN per-task page, reached through
+     * scheduler_get_current_task(), so there is no foreign object to authorize
+     * against and no argument that could name another task's table. An
+     * unprivileged -EPERM here would be the bug. */
+    case ENV_OP_ALIAS_UNSET:
+        if (rec.name[0] == '\0') {
+            return -EINVAL;
+        }
+        return (alias_unset(rec.name) == 0) ? 0 : -ENOENT;
+
     case ENV_OP_ALIAS_LIST: {
         char name[ALIAS_MAX_NAME_LEN];
         char cmd[ALIAS_MAX_CMD_LEN];
