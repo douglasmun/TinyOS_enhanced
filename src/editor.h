@@ -47,3 +47,19 @@ void editor_open(const char *filename);
 int editor_save(void);
 void editor_run(void);
 void editor_cleanup(void);
+
+#ifdef TINYOS_FAULT_INJECT
+/* verify-editor-rowfail.sh only.
+ *
+ * Drives editor_insert_row()'s allocation-failure path, which is otherwise
+ * only reachable under genuine PMM exhaustion -- impractical to produce under
+ * QEMU without disturbing everything else being measured. The failure path is
+ * exactly where the double free lived, so a harness that cannot reach it is
+ * grading the success path and proving nothing.
+ *
+ * editor_fail_next_alloc(n): fail the n-th pmm_alloc() inside
+ * editor_insert_row (1 = the `chars` alloc, 2 = the `render` alloc), once.
+ * Both are tested: they were separate bugs with separate consequences. */
+void editor_fail_next_alloc(int which);
+void editor_rowtest(void);
+#endif
