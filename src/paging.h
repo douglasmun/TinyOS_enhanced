@@ -415,6 +415,7 @@ bool pae_verify_kernel_layout(void);
  * @return 0 on success, -1 on error (invalid address, unmapped page, or non-user page)
  */
 int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size);
+void pae_get_mseal_stats(uint32_t* args, uint32_t* unmapped, uint32_t* pages);
 
 /**
  * @brief Seal a memory region in the current CR3

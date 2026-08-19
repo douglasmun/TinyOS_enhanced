@@ -3026,12 +3026,50 @@ int sys_switch_user(const char* username, const char* password) {
  *
  * SECURITY: Once sealed, even root cannot unseal pages until process exits
  *===========================================================================*/
+/*=============================================================================
+ * SYS_MSEAL REJECTION COUNTERS
+ *
+ * Every kprintf that used to live in this path was driven by a ring-3
+ * caller's own argument, on a console the ring-3 shell shares -- the class
+ * closed for the RX path in PR #101, reached here through a syscall instead
+ * of a frame. The cheapest one needs no memory and no privilege at all: pass
+ * size 0, get rejected at the validation above any page walk, and print a
+ * line. Repeat at syscall rate.
+ *
+ * Count, don't print. Grouped by CALLER INTENT rather than by source line,
+ * for the same reason the TCP counters are grouped by attacker position: a
+ * single "rejected" total would hide which mistake -- or which probe -- is
+ * being made. The four kernel-boundary rejections (kernel address, range
+ * crossing into kernel space, wrap-around) are one signature: someone
+ * testing where the boundary is. A bad size is a different signature, and
+ * is the one an unprivileged flood would use.
+ *
+ * `sealed` counts SUCCESSES, and is deliberately not a rejection counter:
+ * without it the surface reports only failures, and a mechanism that is
+ * never successfully used looks identical to one that is working fine.
+ *===========================================================================*/
+static uint32_t mseal_reject_bounds = 0;   /* kernel addr / crosses / wraps  */
+static uint32_t mseal_reject_size = 0;     /* size 0 or > MAX_SEAL_SIZE      */
+static uint32_t mseal_reject_nospace = 0;  /* no address space to seal in    */
+static uint32_t mseal_reject_failed = 0;   /* pae_seal_memory_in() refused   */
+static uint32_t mseal_sealed = 0;          /* regions sealed successfully    */
+
+void syscall_get_mseal_stats(uint32_t* bounds, uint32_t* size,
+                             uint32_t* nospace, uint32_t* failed,
+                             uint32_t* sealed) {
+    if (bounds)  *bounds  = mseal_reject_bounds;
+    if (size)    *size    = mseal_reject_size;
+    if (nospace) *nospace = mseal_reject_nospace;
+    if (failed)  *failed  = mseal_reject_failed;
+    if (sealed)  *sealed  = mseal_sealed;
+}
+
 int sys_mseal(uint32_t addr, uint32_t size) {
     /*=========================================================================
      * SECURITY: Validate address is in user space
      *=======================================================================*/
     if (addr >= KERNEL_BASE) {
-        kprintf("[SYSCALL] sys_mseal: Cannot seal kernel memory (0x%08x)\n", addr);
+        mseal_reject_bounds++;
         RETURN_ERROR(EINVAL);
     }
 
@@ -3040,7 +3078,7 @@ int sys_mseal(uint32_t addr, uint32_t size) {
      *=======================================================================*/
     #define MAX_SEAL_SIZE (64 * 1024 * 1024)  /* 64 MB max */
     if (size == 0 || size > MAX_SEAL_SIZE) {
-        kprintf("[SYSCALL] sys_mseal: Invalid size %u (max %u)\n", size, MAX_SEAL_SIZE);
+        mseal_reject_size++;
         RETURN_ERROR(EINVAL);
     }
 
@@ -3049,37 +3087,35 @@ int sys_mseal(uint32_t addr, uint32_t size) {
      *=======================================================================*/
     uint32_t end = addr + size;
     if (end < addr) {
-        kprintf("[SYSCALL] sys_mseal: Address range wraps around\n");
+        mseal_reject_bounds++;
         RETURN_ERROR(EINVAL);
     }
 
     if (end > KERNEL_BASE) {
-        kprintf("[SYSCALL] sys_mseal: Range crosses into kernel memory (0x%08x - 0x%08x)\n",
-                addr, end);
+        mseal_reject_bounds++;
         RETURN_ERROR(EINVAL);
     }
 
     task_t* cur = scheduler_get_current_task();
     if (!cur || cur->page_directory == 0) {
-        kprintf("[SYSCALL] sys_mseal: No target address space\n");
+        mseal_reject_nospace++;
         RETURN_ERROR(EPERM);
     }
 
     /*=========================================================================
      * Call PAE sealing function against the calling task's address space
      *=======================================================================*/
-    kprintf("[SYSCALL] sys_mseal: Sealing 0x%08x - 0x%08x (%u bytes)\n",
-            addr, end, size);
-
     int ret = pae_seal_memory_in(cur->page_directory, addr, size);
     if (ret < 0) {
-        kprintf("[SYSCALL] sys_mseal: Failed to seal memory\n");
+        mseal_reject_failed++;
         RETURN_ERROR(EPERM);
     }
 
     /* Null-check current task before dereferencing ->uid, matching the other
      * syscall handlers. Reachable only via int 0x80 from a running task today,
      * so cur is non-NULL in practice — defensive consistency / hardening. */
+    mseal_sealed++;
+
     uint16_t cur_uid = cur ? cur->uid : 0;
     audit_log(AUDIT_MEMORY_SEAL, AUDIT_INFO, cur_uid,
               "Sealed memory region 0x%08x - 0x%08x",

@@ -16,7 +16,7 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 # User programs to build
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
-            netprobe.elf
+            netprobe.elf msealprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -118,6 +118,15 @@ slothold.elf: slothold.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c slothold.c -o slothold.o
 	$(LD) $(LDFLAGS) -o slothold.elf crt0.o slothold.o libc.o -lgcc
 	@echo "Built slothold.elf"
+
+# msealprobe.elf drives SYS_MSEAL (16) straight through int 0x80. That syscall
+# has NO libc wrapper and NO shell builtin, so no other program in the tree can
+# reach it -- which is exactly how sixteen ring-3-driven kprintf sites sat on
+# that path unnoticed. See verify-mseal-counters.sh.
+msealprobe.elf: msealprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c msealprobe.c -o msealprobe.o
+	$(LD) $(LDFLAGS) -o msealprobe.elf crt0.o msealprobe.o libc.o -lgcc
+	@echo "Built msealprobe.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld

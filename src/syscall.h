@@ -1021,6 +1021,9 @@ int sys_switch_user_preauth(const char* username);
 
 /* Memory Sealing Syscall (Phase 14) */
 int sys_mseal(uint32_t addr, uint32_t size);
+void syscall_get_mseal_stats(uint32_t* bounds, uint32_t* size,
+                             uint32_t* nospace, uint32_t* failed,
+                             uint32_t* sealed);
 
 /*-----------------------------------------------------------------------------
  * User-space System Call Wrappers (inline for user programs)
