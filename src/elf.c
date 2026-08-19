@@ -924,6 +924,20 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
      * (16MB worth), which matches our ELF_MAX_PROCESS_MEMORY limit.
      *=========================================================================*/
     #define MAX_TRACKED_PAGES 4096
+    /* Must equal the dimension of task_t::image_pages_phys[]: that array is
+     * what frees these frames on exit, so anything this loader accepts must
+     * fit in it. The _Static_assert below pins the two together -- if someone
+     * resizes the field, the build breaks here rather than silently
+     * reintroducing an untracked (leaked) tail. */
+    #define ELF_MAX_IMAGE_PAGES 256
+    _Static_assert(ELF_MAX_IMAGE_PAGES ==
+                   sizeof(((task_t*)0)->image_pages_phys) /
+                   sizeof(((task_t*)0)->image_pages_phys[0]),
+                   "ELF_MAX_IMAGE_PAGES must match task_t::image_pages_phys[]");
+    /* image_pages is uint16_t; the cap must fit it, or the count truncates and
+     * task_free_resources() frees a prefix while the rest leaks silently. */
+    _Static_assert(ELF_MAX_IMAGE_PAGES <= 65535,
+                   "ELF_MAX_IMAGE_PAGES must fit task_t::image_pages (uint16_t)");
     /* Static, not stack: a 16KB array would overflow the caller's kernel-task
      * stack (cmd_exec -> elf_load_process -> ECDSA verify is a deep chain).
      * elf_load_process is only invoked from the single-threaded shell. */
@@ -1137,6 +1151,33 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
             /*=================================================================
              * Track allocated frame for cleanup on failure
              *===============================================================*/
+            /* Two limits, deliberately distinct. MAX_TRACKED_PAGES bounds this
+             * function's own rollback array; ELF_MAX_IMAGE_PAGES bounds what
+             * task_t can record for teardown. Exceeding EITHER must refuse the
+             * load: an image the task cannot track is one whose frames nothing
+             * frees on exit, which is precisely the leak image_pages_phys[]
+             * exists to close. Refusing loudly beats loading silently
+             * untracked. The messages are distinct so the log says which limit
+             * was hit -- they have very different fixes. */
+            if (num_allocated >= ELF_MAX_IMAGE_PAGES) {
+                kprintf("[ELF] ERROR: Image exceeds trackable frames (%d pages, %d KB); "
+                        "raise image_pages_phys[] in process.h to load it\n",
+                        ELF_MAX_IMAGE_PAGES, ELF_MAX_IMAGE_PAGES * 4);
+
+                for (uint32_t j = 0; j < num_allocated; j++) {
+                    pmm_free(allocated_frames[j]);
+                }
+                pmm_free(phys_frame);
+                elf_abort_load(pid, kernel_cr3);
+                return -1;
+            }
+
+            /* Dominated by the ELF_MAX_IMAGE_PAGES check above while that cap
+             * is the smaller of the two (256 vs 4096), so this branch is
+             * currently unreachable. Kept, not deleted: it bounds
+             * allocated_frames[] itself, which is a different array with a
+             * different owner, and raising the image cap to 4096 would make it
+             * load-bearing again with no other edit. */
             if (num_allocated >= MAX_TRACKED_PAGES) {
                 kprintf("[ELF] ERROR: Exceeded maximum trackable pages (%d)\n",
                         MAX_TRACKED_PAGES);
@@ -1257,7 +1298,39 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
      * This ensures the new program begins with a clean FD table (except for
      * explicitly inherited FDs like stdin/stdout/stderr).
      *=======================================================================*/
+    if (num_allocated > ELF_MAX_IMAGE_PAGES) {
+        /* Unreachable: the loop refuses before exceeding the cap. If it ever
+         * fires, tracking a truncated list would be worse than not loading --
+         * the untracked tail leaks exactly as before. */
+        kprintf("[ELF] ERROR: internal: %u frames exceeds image cap %d\n",
+                num_allocated, ELF_MAX_IMAGE_PAGES);
+        for (uint32_t j = 0; j < num_allocated; j++) {
+            pmm_free(allocated_frames[j]);
+        }
+        elf_abort_load(pid, kernel_cr3);
+        return -1;
+    }
+
     ramfs_close_on_exec();
+
+    /* Hand the image frames to the task so task_free_resources() can free them
+     * on exit. Before this, nothing did: the teardown frees page TABLES but
+     * never their targets, leaking the whole image every exec (8 frames per
+     * /hello.elf, measured -- verify-exec-frame-leak.sh).
+     *
+     * ONLY ON SUCCESS, AND ONLY HERE. Every failure path above pmm_free()s
+     * these frames itself and then calls elf_abort_load() -> task_terminate()
+     * -> task_free_resources(); registering earlier would make that second
+     * pass a double-free. This point is after the last failure return, so a
+     * registered frame is always one no failure path has touched.
+     *
+     * num_allocated <= ELF_MAX_IMAGE_PAGES is guaranteed by the refusal in the
+     * allocation loop, so this cannot overrun; the assert states that rather
+     * than trusting it silently. */
+    for (uint32_t j = 0; j < num_allocated; j++) {
+        task->image_pages_phys[j] = allocated_frames[j];
+    }
+    task->image_pages = (uint16_t)num_allocated;
 
     kprintf("[ELF] Process created successfully: PID=%d\n", pid);
     return pid;
