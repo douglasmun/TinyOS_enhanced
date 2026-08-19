@@ -124,6 +124,23 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   task — panic "All tasks terminated" with five tasks alive. Invariant: *a freed slot is
   never in the ready queue*. Found by the supervisor give-up control, not by anything
   that existed before it.
+- **Teardown frees only what a `task_t` field names — including the ELF image.**
+  `task_free_resources()` walks `task->*_phys[]` arrays and `pae_free_user_pdpt()`
+  frees the PDs/PDPT/page tables; **nothing walks the PTEs to free what they point
+  at**. That leaked the whole image on every exit — measured at exactly 8 frames
+  per `exec /hello.elf`, its exact page count — and since `SYS_SPAWN` is ungated
+  and the frames leak on *exit*, a spawn-and-wait loop drained memory while never
+  holding two tasks at once, so the per-uid cap (which bounds *concurrent* tasks)
+  never fired. Now tracked in `task_t::image_pages_phys[256]`. **The ordering is
+  the invariant:** registration happens only on the success path, *after the last
+  failure return* (in `elf.c`, registration sits below every `return -1`), because every failure path already
+  `pmm_free`s these frames and *then* calls `elf_abort_load()` → `task_terminate()`
+  → `task_free_resources()` — registering earlier makes that a double-free. Image
+  frames are private `pmm_alloc()`s, so the COW kernel-shared-PT concern does
+  **not** apply to them (that is about page *tables*); an oversize image is
+  **refused**, never loaded untracked. Harness: `verify-exec-frame-leak.sh`,
+  whose assertion is **exact equality** of free frames, not a smaller delta — a
+  double-free shows as free frames *rising*.
 - **Freeing a guard page requires restoring its mapping first.** They are
   identity-mapped **not present** in the kernel identity map every address space shares,
   so `pmm_free` without re-mapping poisons that frame permanently and the #PF lands on
