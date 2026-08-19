@@ -124,6 +124,19 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   task — panic "All tasks terminated" with five tasks alive. Invariant: *a freed slot is
   never in the ready queue*. Found by the supervisor give-up control, not by anything
   that existed before it.
+- **Allocate before you disturb the array — `editor_insert_row`'s ordering is
+  load-bearing.** It used to shift rows down *then* `pmm_alloc()`, so a failed
+  allocation returned with `E.rows[at]` a bitwise copy of `E.rows[at+1]` — same
+  `chars`, same `render`, both below `E.numrows`, both freed by
+  `editor_cleanup()`. `pmm_free`'s double-free guard (`pmm.c:963`) refuses the
+  second free, so the counter **falls** (2 frames lost per failed insert) rather
+  than rising, and a surviving row reads back `NULL` — one OOM hiccup silently
+  eats a line of the user's file. Three of the four callers append at
+  `E.numrows`, where the shift loop is empty and no alias exists, which is
+  exactly why this survived. Harness: `verify-editor-rowfail.sh` (needs
+  `-DTINYOS_FAULT_INJECT`), whose arms all insert **mid-file** for that reason,
+  and whose arm 1 is a positive control because "balanced frames" is otherwise
+  satisfied by an editor that allocated nothing.
 - **Teardown frees only what a `task_t` field names — including the ELF image.**
   `task_free_resources()` walks `task->*_phys[]` arrays and `pae_free_user_pdpt()`
   frees the PDs/PDPT/page tables; **nothing walks the PTEs to free what they point
