@@ -426,3 +426,82 @@ Generalises, and complements the `O_TRUNC` lesson above: a negative control
 proves the harness can fail; a **positive control** proves it is testing the
 thing it names. A denial is only evidence when you have shown the resource was
 there to deny.
+
+## FIXED: `editor_insert_row` destroyed a line of text (and leaked) on OOM
+
+`editor_insert_row()` shifted the row array down **before** allocating:
+
+```c
+for (int i = E.numrows; i > at; i--) E.rows[i] = E.rows[i - 1];
+E.rows[at].size  = len;
+E.rows[at].chars = pmm_alloc();
+if (!E.rows[at].chars) { editor_set_status_message("Out of memory"); return; }
+```
+
+The shift makes `E.rows[at]` a bitwise copy of `E.rows[at + 1]` — same `chars`,
+same `render`. The failure return leaves that aliasing in place, and both slots
+sit below `E.numrows`, so `editor_cleanup()`'s per-row `editor_free_row()` hands
+the same frames to `pmm_free()` twice.
+
+**What it actually cost — measured, and not what I first predicted.** I claimed
+this degraded into frame aliasing (one frame served to two unrelated callers).
+It does not: `pmm_free()` has a double-free guard (`pmm.c:963`) that detects the
+second free and returns without freeing. The negative control produced:
+
+```
+[PMM] CRITICAL: Double-free detected at physical address 0x004a9000 (frame 1193)
+[ROWTEST] arm2 FAIL: chars-alloc failure 64300 -> 64298 (leak)
+[ROWTEST] arm4 FAIL: rows disturbed by failed insert (numrows=3 row1=(null))
+```
+
+So the real harm is (a) **2 frames permanently lost** per failed insert, since
+the refused frees never return them, and (b) **a surviving row destroyed** —
+the row previously at `at` reads back `NULL`, because the failed slot's pointers
+were written over it. User-visible: a single OOM hiccup while editing silently
+eats a line of the file. Note the frame counter goes **down**, not up; the guard
+is why. A rewrite that removes that guard restores the aliasing.
+
+**Why it hid.** `editor_insert_row` has four callers. Three append at
+`E.numrows`, where the shift loop body never runs and no alias is created. Only
+the mid-file insert (Enter pressed inside the file, `at = E.cy + E.rowoff + 1`)
+actually shifts. Any test built from the common path passes against the bug.
+
+**The fix is an ordering invariant, not a repair.** Allocate both frames first;
+only touch `E.rows` once nothing can fail. A failure then returns with the array
+completely untouched — no shift to unwind, no partial row, nothing for cleanup
+to see. Do not "tidy" this back into shift-then-allocate.
+
+Three adjacent defects fixed in the same pass, all the same shape (a pointer
+outliving the frame it names):
+
+- `editor_del_row` left a stale duplicate of the last row at `E.rows[E.numrows]`
+  after shifting up. Out of range today, so nothing double-freed it — but that
+  safety rested entirely on every future loop bound staying strictly below
+  `numrows`. Now zeroed.
+- `editor_init`'s allocation-failure path `return`ed **before** `E.filename = NULL`,
+  so a failed init left the previous session's pointer live for the next
+  `editor_open()` to overwrite. Now cleared on both exits.
+- `editor_open` clamped the copy loop at 4095 but wrote the terminator at the
+  **unclamped** `E.filename[len]`. Not reachable (`cmd_edit` is the only caller
+  and `resolve_path` bounds it by `MAX_PATH == 256`) — fixed precisely because
+  the next caller would make it reachable.
+
+Reachability: `edit` is kernel-shell only (no `SYS_` case), but `kshell` is
+ungated by design, so the actor is any logged-in user — only the trigger (OOM)
+is hard.
+
+Harness: `verify-editor-rowfail.sh` (needs `-DTINYOS_FAULT_INJECT`;
+`make clean`s on exit). Four arms, all inserting at index 1 of a 3-row buffer
+because the append shape would pass against the bug. Arm 1 is the positive
+control (asserts the rows actually consume frames — without it every "balanced"
+result is vacuous); arms 2 and 3 drive the `chars` and `render` failures
+separately, since those were distinct defects; arm 4 asserts the surviving rows
+are intact, because balanced frame accounting alone is also satisfied by a
+failure path that mangles rows.
+
+**Lesson worth keeping: run the negative control before believing the impact
+statement, not just the fix.** The guard at `pmm.c:963` was invisible from
+`editor.c`, and the harness's verdict branch was written to match a signature
+("free frames rise") that the guard makes impossible — it would have printed a
+generic FAIL and hidden its own best evidence. The measurement corrected the
+severity claim in both directions.
