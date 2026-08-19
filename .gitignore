@@ -218,6 +218,8 @@ sectest-redirect-trace.log
 ring3-fileops.log
 ring3-fileops-trace.log
 chmod-owner.log
+ring3fatls.log
+ring3fatls-trace.log
 rowfail.log
 rowfail-trace.log
 framelk.log

@@ -270,8 +270,13 @@ written against that uid. Don't reopen this by "just adding a subcommand"; reaso
 `doc/ROADMAP_NEXT.md`.
 
 Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**; item 4
-(userspace shell) has all its **implementation** done — what remains is `fatls` and
-`edit`, which are design calls, not typing (`su` is settled, above). `fork()` was skipped deliberately (PAE, no COW pages).
+(userspace shell) has all its **implementation** done — what remains is `edit`, a design
+call, not typing (`su` is settled above; **`fatls` needed no migration** — ring 3 already
+lists FAT32 through the generic `ls`, since `SYS_OPEN`/`SYS_READDIR` dispatch on the
+drive letter into FAT32's full `file_operations_t`. `ls C:/` *is* `fatls`; harness
+`verify-ring3-fatls.sh`. Third instance of asking "does THIS component carry it?"
+instead of "is it reachable at all?" — after `whoami` and D1; trace the path before
+designing the migration). `fork()` was skipped deliberately (PAE, no COW pages).
 Task-slot exhaustion is closed (per-uid cap + root reserve, both returning `-EAGAIN`, so
 only the printed message identifies which refused). `kprintf`→`stream_printf` conversion
 is **finished** — no console-only blocks remain.
