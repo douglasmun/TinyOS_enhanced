@@ -1821,6 +1821,68 @@ void net_count_tcp_no_connection(void) { tcp_no_connection++; }
 
 uint32_t net_get_tcp_no_connection(void) { return tcp_no_connection; }
 
+/*=============================================================================
+ * TCP RX-PATH COUNTERS (replacing per-packet kprintf)
+ *=============================================================================
+ * tcp.c was never swept the way icmp.c and dns.c were. The passive-open branch
+ * removed above took one site with it and cited the rule while doing so, but
+ * nine remote-driven kprintf sites were left in tcp_process_segment() and
+ * tcp_handle_packet(). Each is chosen by a remote host, from the RX path,
+ * before any local user is involved.
+ *
+ * Two of them are the worst class in the tree: the malformed-header checks in
+ * tcp_handle_packet() fire BEFORE tcp_find_connection(), so they need no
+ * connection, no matching port and no state. One 54-byte frame with
+ * data_offset=0 produced one console line, from any host on the segment, with
+ * no local account -- an unauthenticated remote console flood.
+ *
+ * Three of them were self-defeating: "RST flood detected" and "FIN flood
+ * detected" printed once per flooding packet, so the branch that exists to
+ * absorb a flood amplified it into the console instead. The invalid-sequence
+ * site additionally printed seq/rcv_nxt/rcv_wnd -- our receive-window state --
+ * onto a console the ring-3 shell shares with the user's own output.
+ *
+ * GROUPING, deliberate (same reasoning as the dns.c block above). Distinct
+ * counters for distinct attacker positions, because one "dropped" total tells
+ * an operator that something is being rejected while hiding which attack is
+ * underway:
+ *   - malformed:  off-path, needs nothing; any host on the segment
+ *   - rst/fin flood: on-path or 4-tuple guesser, targeting an open connection
+ *   - out-of-window RST + bad sequence: blind injection against a live
+ *     connection -- the RFC 5961 signature
+ * Merged where the signal is genuinely the same: rx_full is one counter
+ * (buffer pressure, not an attack signature), and reset/zero-window are
+ * ordinary peer behaviour counted for visibility rather than alarm.
+ *
+ * Counters, not prints, and not stream_printf: this path runs on knetd in
+ * interrupt-adjacent task context with no current user stream.
+ * Surfaced by ifconfig. See doc/NETWORK_ISOLATION.md.
+ *===========================================================================*/
+static uint32_t tcp_drop_malformed = 0;   /* bad data_offset; pre-connection  */
+static uint32_t tcp_drop_flood = 0;       /* RST/FIN rate limiter fired       */
+static uint32_t tcp_drop_sequence = 0;    /* out-of-window RST or bad seq     */
+static uint32_t tcp_rx_full = 0;          /* RX buffer full; data not ACKed   */
+static uint32_t tcp_peer_reset = 0;       /* accepted RST; connection closed  */
+static uint32_t tcp_zero_window = 0;      /* peer advertised a closed window  */
+
+void net_count_tcp_malformed(void)    { tcp_drop_malformed++; }
+void net_count_tcp_flood(void)        { tcp_drop_flood++; }
+void net_count_tcp_sequence(void)     { tcp_drop_sequence++; }
+void net_count_tcp_rx_full(void)      { tcp_rx_full++; }
+void net_count_tcp_peer_reset(void)   { tcp_peer_reset++; }
+void net_count_tcp_zero_window(void)  { tcp_zero_window++; }
+
+void net_get_tcp_rx_stats(uint32_t* malformed, uint32_t* flood,
+                          uint32_t* sequence, uint32_t* rx_full,
+                          uint32_t* peer_reset, uint32_t* zero_window) {
+    if (malformed)   *malformed   = tcp_drop_malformed;
+    if (flood)       *flood       = tcp_drop_flood;
+    if (sequence)    *sequence    = tcp_drop_sequence;
+    if (rx_full)     *rx_full     = tcp_rx_full;
+    if (peer_reset)  *peer_reset  = tcp_peer_reset;
+    if (zero_window) *zero_window = tcp_zero_window;
+}
+
 /**
  * @brief Main packet reception handler.
  * @param data Pointer to received Ethernet frame.

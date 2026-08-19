@@ -91,15 +91,76 @@ def build_icmp_frame(dst_mac, src_mac, src_ip, dst_ip, icmp_type,
     return frame
 
 
+def build_tcp_frame(dst_mac, src_mac, src_ip, dst_ip, src_port, dst_port,
+                    data_offset_words, payload_len):
+    """A frame whose IP layer is valid but whose TCP data_offset is chosen.
+
+    The point of this mode is tcp_handle_packet()'s header-length validation,
+    which runs BEFORE tcp_find_connection(). That ordering is what makes the
+    site interesting: the guest needs no matching connection, no listening
+    port and no local account for a remote host to reach it. So the IP layer
+    must be genuinely well-formed (otherwise handle_ip drops the frame earlier
+    and the test measures nothing), while the TCP header is deliberately not.
+
+    data_offset_words is written into the high nibble of the offset/reserved
+    byte, unshifted by the guest's own arithmetic:
+      0        -> below the legal minimum of 5   (drives validation 1)
+      15       -> legal by word count, but 60 bytes of header, which exceeds a
+                  20-byte segment -> drives validation 2
+      5        -> legal; used as the NEGATIVE CONTROL, since a frame that is
+                  well-formed but matches no connection must land on the
+                  no-conn counter instead, proving the malformed counter is
+                  selective rather than counting everything that arrives.
+    """
+    payload = bytes((i % 251) for i in range(payload_len)) if payload_len else b""
+
+    tcp = struct.pack("!HHIIBBHHH",
+                      src_port, dst_port,
+                      0x11223344,                 # seq
+                      0x00000000,                 # ack
+                      (data_offset_words & 0x0F) << 4,
+                      0x02,                       # SYN
+                      8192, 0, 0) + payload
+
+    total_len = 20 + len(tcp)
+    ip = struct.pack("!BBHHHBBH4s4s",
+                     0x45, 0x00, total_len,
+                     0x4321, 0x0000,
+                     64, 6, 0,                    # protocol 6 = TCP
+                     socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    ip = ip[:10] + struct.pack("!H", checksum16(ip)) + ip[12:]
+
+    # TCP checksum over the pseudo-header. TinyOS does not verify it today,
+    # but computing it for real keeps this frame valid if that check is ever
+    # added -- otherwise this harness would start silently measuring nothing.
+    pseudo = (socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
+              + struct.pack("!BBH", 0, 6, len(tcp)))
+    csum = checksum16(pseudo + tcp)
+    tcp = tcp[:16] + struct.pack("!H", csum) + tcp[18:]
+
+    frame = dst_mac + src_mac + struct.pack("!H", 0x0800) + ip + tcp
+    if len(frame) < 60:
+        frame += bytes(60 - len(frame))
+    return frame
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--mcast", required=True, help="group:port, e.g. 230.0.0.1:1234")
     ap.add_argument("--count", type=int, default=20)
     ap.add_argument("--ethertype", default="0x88b5",
                     help="EtherType, e.g. 0x88b5 (ignored in --mode icmp)")
-    ap.add_argument("--mode", choices=("ethertype", "icmp"), default="ethertype",
+    ap.add_argument("--mode", choices=("ethertype", "icmp", "tcp"), default="ethertype",
                     help="ethertype: raw frame with an unhandled EtherType. "
-                         "icmp: well-formed IPv4/ICMP echo request or reply.")
+                         "icmp: well-formed IPv4/ICMP echo request or reply. "
+                         "tcp: valid IPv4 carrying a TCP header whose "
+                         "data_offset is chosen by --tcp-data-offset.")
+    ap.add_argument("--tcp-data-offset", type=int, default=0,
+                    help="TCP data offset in 32-bit words. 0 or >15 is "
+                         "malformed (below the 5-word minimum); 5 is legal "
+                         "and used as the negative control.")
+    ap.add_argument("--tcp-src-port", type=int, default=40000)
+    ap.add_argument("--tcp-dst-port", type=int, default=80)
     ap.add_argument("--icmp-type", type=int, default=8,
                     help="8 = Echo Request, 0 = Echo Reply")
     ap.add_argument("--icmp-id", type=lambda s: int(s, 0), default=0,
@@ -124,7 +185,12 @@ def main():
     if not 0 <= ethertype <= 0xFFFF:
         sys.exit("--ethertype out of range")
 
-    if args.mode == "icmp":
+    if args.mode == "tcp":
+        frame = build_tcp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
+                                args.tcp_src_port, args.tcp_dst_port,
+                                args.tcp_data_offset, 0)
+        desc = f"tcp data_offset {args.tcp_data_offset} words"
+    elif args.mode == "icmp":
         frame = build_icmp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
                                  args.icmp_type, args.icmp_id, 1,
                                  args.payload_len)
