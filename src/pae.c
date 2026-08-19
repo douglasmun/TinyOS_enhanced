@@ -1458,40 +1458,60 @@ bool pae_verify_kernel_layout(void) {
 /**
  * @brief Seal a memory region in a target PDPT, making it permanently immutable
  */
+/*=============================================================================
+ * MSEAL REJECTION COUNTERS (see the matching block in syscall.c)
+ *
+ * These sites are reached with a ring-3 caller's own address and size, so
+ * they print at whatever rate that caller chooses -- and two of them
+ * (not-mapped, not-user-accessible) sit INSIDE the page loop, so one call
+ * over a large unmapped region printed from within the walk itself.
+ *
+ * Grouped by what the caller got wrong, not by source line: `unmapped`
+ * covers both per-page rejections, since a caller passing a region that is
+ * not entirely its own mapped user memory made one mistake, not two.
+ *===========================================================================*/
+static uint32_t mseal_pae_reject_args = 0;     /* alignment, size, wrap, PAE */
+static uint32_t mseal_pae_reject_unmapped = 0; /* page absent or not user    */
+static uint32_t mseal_pae_pages_sealed = 0;    /* cumulative pages sealed    */
+
+void pae_get_mseal_stats(uint32_t* args, uint32_t* unmapped, uint32_t* pages) {
+    if (args)     *args     = mseal_pae_reject_args;
+    if (unmapped) *unmapped = mseal_pae_reject_unmapped;
+    if (pages)    *pages    = mseal_pae_pages_sealed;
+}
+
 int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size) {
     if (!pae_active) {
-        kprintf("[MSEAL] ERROR: PAE not active\n");
+        mseal_pae_reject_args++;
         return -1;
     }
 
     if ((vaddr_start & (PAGE_SIZE - 1)) != 0) {
-        kprintf("[MSEAL] ERROR: Address 0x%08x not page-aligned\n", vaddr_start);
+        mseal_pae_reject_args++;
         return -1;
     }
 
     if (size == 0) {
-        kprintf("[MSEAL] ERROR: Size must be non-zero\n");
+        mseal_pae_reject_args++;
         return -1;
     }
 
     uint32_t end = vaddr_start + size;
     if (end < vaddr_start) {
-        kprintf("[MSEAL] ERROR: Address range wraps around\n");
+        mseal_pae_reject_args++;
         return -1;
     }
 
     uint32_t end_rounded = end;
     if ((end_rounded & (PAGE_SIZE - 1)) != 0) {
         if (end_rounded > 0xFFFFFFFFu - (PAGE_SIZE - 1)) {
-            kprintf("[MSEAL] ERROR: Rounded address range wraps around\n");
+            mseal_pae_reject_args++;
             return -1;
         }
         end_rounded = (end_rounded + PAGE_SIZE - 1) & PAGE_FRAME_MASK;
     }
 
     uint32_t num_pages = (end_rounded - vaddr_start) / PAGE_SIZE;
-    kprintf("[MSEAL] Sealing %u pages starting at 0x%08x (size: %u bytes)\n",
-            num_pages, vaddr_start, size);
 
     CRITICAL_SECTION_ENTER();
 
@@ -1501,13 +1521,13 @@ int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size) 
         if (!pde || !(*pde & PAE_PRESENT) ||
             !pte || !(*pte & PAE_PRESENT)) {
             CRITICAL_SECTION_EXIT();
-            kprintf("[MSEAL] ERROR: Page 0x%08x not mapped\n", vaddr);
+            mseal_pae_reject_unmapped++;
             return -1;
         }
 
         if (!(*pde & PAE_USER) || !(*pte & PAE_USER)) {
             CRITICAL_SECTION_EXIT();
-            kprintf("[MSEAL] ERROR: Page 0x%08x is not user-accessible\n", vaddr);
+            mseal_pae_reject_unmapped++;
             return -1;
         }
     }
@@ -1526,7 +1546,8 @@ int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size) 
 
     CRITICAL_SECTION_EXIT();
 
-    kprintf("[MSEAL] Successfully sealed %u pages\n", num_pages);
+    mseal_pae_pages_sealed += num_pages;
+
     return 0;
 }
 

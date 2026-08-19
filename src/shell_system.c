@@ -1264,6 +1264,15 @@ void cmd_secstatus(int argc, char* argv[]) {
     edr_daemon_get_stats(&edr_scans, &edr_threats, &edr_procs, &edr_responses);
 
     uint32_t wx_violations = pae_wx_audit();
+
+    /* SYS_MSEAL (16) is ungated, so its rejection sites are driven by a ring-3
+     * caller's own arguments -- they count instead of printing (PR: mseal
+     * kprintf sweep). Successes are reported alongside, because a mechanism
+     * nobody ever uses successfully looks identical to one that works. */
+    uint32_t ms_bounds = 0, ms_size = 0, ms_nospace = 0, ms_failed = 0, ms_sealed = 0;
+    syscall_get_mseal_stats(&ms_bounds, &ms_size, &ms_nospace, &ms_failed, &ms_sealed);
+    uint32_t ms_pae_args = 0, ms_pae_unmapped = 0, ms_pae_pages = 0;
+    pae_get_mseal_stats(&ms_pae_args, &ms_pae_unmapped, &ms_pae_pages);
     /* The ACTUAL gate, from elf.c -- a build-mode question, not a policy flag.
      * This line used to come from secure_boot_is_enforced(), which was hardwired
      * true and so reported "ENFORCED" even in a permissive build. */
@@ -1280,6 +1289,12 @@ void cmd_secstatus(int argc, char* argv[]) {
     stream_printf(ctx, "    W^X enforcement ..... %s (%u current violations)\n",
                   wx_violations == 0 ? "CLEAN" : "VIOLATIONS",
                   wx_violations);
+
+    stream_printf(ctx, "    Memory sealing ...... %u regions / %u pages sealed, %u rejected (%u bounds, %u size, %u nospace, %u failed)\n",
+                  ms_sealed, ms_pae_pages, ms_bounds + ms_size + ms_nospace + ms_failed,
+                  ms_bounds, ms_size, ms_nospace, ms_failed);
+    stream_printf(ctx, "    Seal arg rejects .... %u bad-args, %u unmapped-page\n",
+                  ms_pae_args, ms_pae_unmapped);
 
     stream_printf(ctx, "\n  Boot integrity\n");
     stream_printf(ctx, "    ELF signatures ...... %s\n",

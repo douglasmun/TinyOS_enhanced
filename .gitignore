@@ -228,3 +228,5 @@ rowfail.log
 rowfail-trace.log
 framelk.log
 framelk-trace.log
+mseal.log
+mseal-trace.log

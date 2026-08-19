@@ -36,6 +36,7 @@
 #include "counter_elf_data.h"
 #include "credprobe_elf_data.h"
 #include "netprobe_elf_data.h"
+#include "msealprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -884,6 +885,22 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(netprobe_fd, netprobe_elf_data, netprobe_elf_data_len);
             ramfs_close(netprobe_fd);
             ramfs_chmod("/netprobe.elf", 0755);
+        }
+    }
+
+    /* msealprobe.elf drives SYS_MSEAL (16) straight through int 0x80. That
+     * syscall has no libc wrapper and no shell builtin, so no other program in
+     * the tree reaches it -- which is how sixteen ring-3-driven kprintf sites
+     * sat on that path unnoticed until the mseal audit. Every rejection it
+     * provokes uses its OWN arguments and needs no privilege, so 0755 is
+     * correct and deliberate: the point is that an unprivileged caller drives
+     * these counters. See verify-mseal-counters.sh. */
+    {
+        int msealprobe_fd = ramfs_open("/msealprobe.elf", RAMFS_FLAG_WRITE);
+        if (msealprobe_fd >= 0) {
+            ramfs_write(msealprobe_fd, msealprobe_elf_data, msealprobe_elf_data_len);
+            ramfs_close(msealprobe_fd);
+            ramfs_chmod("/msealprobe.elf", 0755);
         }
     }
 

@@ -16,6 +16,7 @@ look arbitrary until you know which failure produced them.
 | Ring-3 migration: every syscall's design rationale, PRs #43–#58, harness traps | `doc/RING3_MIGRATION.md` |
 | Fixed kernel bugs worth remembering (ISR EAX clobber, exec triple-fault, sha256/PMM/COW faults) | `doc/KERNEL_BUGS.md` |
 | Crypto invariants, ELF signing, what a harness must prove | `doc/CRYPTO_INVARIANTS.md` |
+| `SYS_MSEAL` audit: the disproved latency hypothesis, the 16 kprintf sites | `doc/MSEAL_AUDIT.md` |
 | Post-v2.2 roadmap with rationale | `doc/ROADMAP_NEXT.md` |
 | Security mechanism reference (17 mechanisms) | `doc/SECURITY_HARDENING.md` |
 | Security history index / latest audit | `doc/SECURITY_STATUS_COMPLETE.md`, `doc/MULTI_AGENT_SECURITY_AUDIT_2026.md` |
@@ -48,6 +49,20 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   by default and **must stay that way** (`readline()` costs one syscall per keystroke).
   Same for routine FS errors: a failed `rmdir` is a userspace error the caller already
   reports on its own stream.
+  **A syscall with no libc wrapper and no builtin is where this rule rots**, because
+  nothing in the tree drives it and no harness ever sees the sites: `SYS_MSEAL` (16)
+  carried **sixteen** of them (7 in `sys_mseal`, 9 in `pae_seal_memory_in`), all driven
+  by the caller's own argument, two from *inside* the page-walk loop, and the cheapest
+  (`size == 0`) rejected above any walk — no memory, no privilege, repeatable at syscall
+  rate. Group by **caller intent** and count successes too (`sealed`/`pages`), or the
+  surface reports only failures and an unused mechanism reads as a working one. The
+  harness needs its own ring-3 driver (`/msealprobe.elf`) and a **positive control**: the
+  rejection deltas are all satisfied perfectly by a `sys_mseal` that refuses everything.
+  Its two-pass walk inside one `CRITICAL_SECTION` **looks** like an unprivileged
+  interrupt-stall primitive and is not — measured against `get_timer_ticks()`, the tick
+  delta *falls* as the region grows (worst case ~10 ms under TCG); the two passes are
+  load-bearing for atomicity, so don't collapse them. Harness:
+  `verify-mseal-counters.sh`; rationale: `doc/MSEAL_AUDIT.md`.
 - **The RX path is stricter still: no per-packet `kprintf` at all.** Any host on the
   segment drives those sites, from the ISR, before the firewall. Count, don't print —
   counters surface in `ifconfig`; `stream_printf` is wrong here too (interrupt context
