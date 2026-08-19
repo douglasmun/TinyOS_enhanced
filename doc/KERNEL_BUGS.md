@@ -426,3 +426,85 @@ Generalises, and complements the `O_TRUNC` lesson above: a negative control
 proves the harness can fail; a **positive control** proves it is testing the
 thing it names. A denial is only evidence when you have shown the resource was
 there to deny.
+
+## FIXED: every process exit leaked its whole ELF image
+
+Measured, not inferred. Five `exec /hello.elf` cycles in the kernel shell, with
+`mem` read before and after (`verify-exec-frame-leak.sh`):
+
+```
+free frames before : 64302
+free frames after  : 64262     -> 40 frames over 5 execs = 8 per exec
+```
+
+`/hello.elf`'s LOAD segments are 1 + 1 + 6 = **exactly 8 pages**. The leak was
+the image, precisely, with nothing else mixed in — the loader's own log shows
+the PDPT/PDs/PTs being recycled to the *same physical addresses* every round,
+which is why the number came out clean rather than noisy.
+
+**Root cause: teardown frees only what a bookkeeping field names.**
+`task_free_resources()` frees the kernel stack, the user stack, both guard
+pages, the EDR page and the env page — each from a `task->*_phys[]` array.
+`pae_free_user_pdpt()` frees the four PDs and the PDPT, and `pae_free_user_pt()`
+frees each page table (or returns it to the static pool). Nothing anywhere
+walked the PTEs to free what they point **at**. `grep image_pages src/process.h`
+found no field, because there was none.
+
+The frames were not untracked during the load: `elf_load_process_argv()` records
+every one in `static uint32_t allocated_frames[MAX_TRACKED_PAGES]`. But all five
+`pmm_free` loops over that array are **failure-path rollback**. On success the
+array was simply left to be overwritten by the next exec, and the frames it
+named became unreachable.
+
+**Why this was a security bug and not untidiness.** `SYS_SPAWN` dispatches
+ungated (`syscall.c`, `case SYS_SPAWN`) into the same loader. Because the frames
+leak on **exit**, a spawn-and-wait loop never holds two tasks at once, so it
+never approaches the per-uid task cap — that cap bounds *concurrent* tasks, not
+the spawn/exit *rate*. Any unprivileged ring-3 process could therefore drain
+physical memory permanently, 32 KB per iteration, while staying inside every
+existing limit.
+
+**The fix** is `task_t::image_pages_phys[256]` + `image_pages`, freed in
+`task_free_resources()` next to the user-stack loop it mirrors, and populated by
+`elf_load_process_argv()` from `allocated_frames[]`.
+
+Two placement facts carry the whole correctness argument:
+
+*Registration happens only on the success path, after the last failure return.*
+Every failure path already `pmm_free`s these frames itself and **then** calls
+`elf_abort_load()` → `task_terminate()` → `task_free_resources()`. Registering
+earlier would make that second pass a double-free. The last failure return is
+the last failure return; registration follows it. That ordering is the invariant — preserve
+it if either end moves.
+
+*Every image frame is a private `pmm_alloc()`.* They are never shared and never
+kernel frames, so freeing them on exit is exactly the missing half of the
+allocation. The COW kernel-shared concern (commit `1596a04`) applies to page
+**tables**, which `pae_free_user_pdpt()` already handles by skipping entries
+still shared with the kernel; it does not apply here. This is why the
+track-a-list fix was chosen over walking the user PTEs in `pae_free_user_pdpt()`:
+a PTE walker would have to reproduce that shared-entry skip at PTE granularity,
+where a mistake corrupts the kernel instead of merely leaking.
+
+Sizing is deliberate: 256 frames = 1 MB of image, against a largest shipped
+binary (`shell.elf`) of 15 pages. `ELF_MAX_PROCESS_MEMORY` (16 MB / 4096 pages)
+bounds what a malicious ELF may *declare*, and dimensioning to that would cost
+4096 × 4 × `MAX_TASKS` = 512 KB of `.bss` — the trade `env.h` already rejected
+for per-task storage. An image above the cap is **refused with a distinct
+message**, not loaded untracked, because a silently untracked image is the
+original leak. A `_Static_assert` pins `ELF_MAX_IMAGE_PAGES` to the array
+dimension so a future resize breaks the build instead of reintroducing a leaked
+tail.
+
+After the fix the same harness reports **64308 → 64308 over 5 execs: zero
+drift**. Exact equality is the assertion worth keeping — not "a smaller delta".
+It says the freed set is precisely the allocated set: a double-free would show
+as free frames *rising*, and a partial fix as them still falling.
+
+*Harness lesson, learned the hard way in the same session:* the first run
+against the fixed kernel printed **nothing** and exited 1. `mapfile` is bash 4+,
+macOS ships bash 3.2, and under `set -u` the unset array killed the verdict
+before its first line — so a **passing kernel looked like a broken harness**.
+The raw serial log was the ground truth that caught it. Prefer a plain `while
+read` loop; and when a harness reports failure, confirm the failure is in the
+subject before believing it.

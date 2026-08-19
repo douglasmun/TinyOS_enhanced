@@ -1729,6 +1729,27 @@ void task_free_resources(task_t* task) {
             }
         }
         task->user_stack_pages = 0;
+
+        /* Free the ELF image frames (text/rodata/data+bss).
+         *
+         * These are the frames the user PTEs point AT. pae_free_user_pdpt()
+         * below frees the page tables, the PDs and the PDPT but never their
+         * targets, so without this loop every process exit leaked its whole
+         * image -- 8 frames per `exec /hello.elf`, measured. See the
+         * image_pages_phys[] comment in process.h.
+         *
+         * Zeroing each entry AND the count is what keeps this idempotent:
+         * elf_abort_load() -> task_terminate() can run against a task the
+         * scheduler cleanup queue then reaps again, and a second pass here
+         * must free nothing rather than double-free. Same reason the user
+         * stack loop above zeroes as it goes. */
+        for (int i = 0; i < task->image_pages; i++) {
+            if (task->image_pages_phys[i] != 0) {
+                pmm_free(task->image_pages_phys[i]);
+                task->image_pages_phys[i] = 0;
+            }
+        }
+        task->image_pages = 0;
     }
 
     // Free page directory if it's not the kernel page directory
