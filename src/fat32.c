@@ -813,7 +813,13 @@ int fat32_open(const char* path) {
         uint32_t parent_cluster = current_cluster;
         if (find_dir_entry(parent_cluster, components[i], &entry,
                            &dirent_cluster, &dirent_index) != 0) {
-            kprintf("[FAT32] ERROR: File not found: %s\n", components[i]);
+            /* Not an error, and deliberately silent. fat32_vfs_open() probes
+             * with fat32_open() FIRST and only then creates on VFS_O_CREAT, so
+             * this miss is the ordinary path for every file creation on C: --
+             * printing here labelled a successful `write` as an ERROR. It is
+             * also ring-3-reachable, which is the rule in CLAUDE.md: a routine
+             * FS miss is a userspace result the caller already reports on its
+             * own stream, so the kernel console must stay quiet. */
             mutex_unlock(&fat32_mutex);
             return -1;
         }
