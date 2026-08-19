@@ -265,6 +265,18 @@ void net_get_netd_stats(uint32_t* routed, uint32_t* dropped, bool* claimed);
 void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames);
 void net_count_tcp_no_connection(void);
 uint32_t net_get_tcp_no_connection(void);
+
+/* TCP RX-path drop counters. These replace nine remote-driven kprintf sites;
+ * see the block comment in net.c for why each is separate. */
+void net_count_tcp_malformed(void);
+void net_count_tcp_flood(void);
+void net_count_tcp_sequence(void);
+void net_count_tcp_rx_full(void);
+void net_count_tcp_peer_reset(void);
+void net_count_tcp_zero_window(void);
+void net_get_tcp_rx_stats(uint32_t* malformed, uint32_t* flood,
+                          uint32_t* sequence, uint32_t* rx_full,
+                          uint32_t* peer_reset, uint32_t* zero_window);
 void net_count_syscall_rx(void);
 void net_count_syscall_tx(void);
 void e1000_poll_rx(void);

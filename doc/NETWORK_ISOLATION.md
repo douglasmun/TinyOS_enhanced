@@ -237,7 +237,7 @@ arrival rate decided how much of the parser ran with `IF=0`.
 Also re-ran `verify-ids-signature.sh`, which needs a DHCP lease and inbound UDP and so
 covers the boot-drain path this harness's NAT-less netdev cannot reach. Both pass.
 
-### 2. Remove the remotely-floodable `kprintf` sites — **DONE**
+### 2. Remove the remotely-floodable `kprintf` sites — **DONE** (reopened for `tcp.c`, closed again)
 
 **Why:** nearly free, no design questions, closes a no-account-required console DoS.
 
@@ -269,6 +269,71 @@ Two things the run established that are worth keeping:
 
 `ifconfig` is where the counters surface. Note `e1000_get_stats()` had **no callers**
 before this — surfacing new counters through it alone would have left them invisible.
+
+#### Reopened, then closed again: `tcp.c` was never swept
+
+This item was marked DONE three times — the RX loops, then `icmp.c`, then
+`handle_dns_response`'s 20 sites — and each time the sweep stopped at the file it
+had come to fix. `tcp.c` was never swept at all, and it carried **nine**
+remote-driven `kprintf` sites the whole time.
+
+The file itself proves the rule was known. `tcp.c:1579` removed the passive-open
+branch partly to drop "a per-packet kprintf on the RX path", and cites CLAUDE.md
+while doing it. One branch was fixed; the sites on either side of it kept theirs.
+So the failure was not ignorance of the rule — it was applying it at the point of
+the edit rather than sweeping the file. That is the same shape as the three earlier
+rounds, which is why "sweep the protocol files, not just the loops" is now stated
+as a rule rather than a description of what was done.
+
+**Two of the nine are materially worse than the rest**, and they set the severity:
+
+    tcp_handle_packet()   "TCP: Invalid data_offset=%d words"
+    tcp_handle_packet()   "TCP: data_offset (%d bytes) exceeds segment length"
+
+Both run **before `tcp_find_connection()`**. No connection, no listening port, no
+matching 4-tuple, no local account — one malformed 60-byte frame from any host on
+the segment produced one console line, at a rate that host chose. The other seven
+need an established connection (on-path, or a 4-tuple guess), so they are attacker-
+driven but not attacker-*reachable* in the same unauthenticated way.
+
+Three of the nine were self-defeating rather than merely noisy. "RST flood
+detected" and "FIN flood detected" printed **once per flooding packet**: the branch
+whose entire purpose is to absorb a flood was amplifying it into the console
+instead. A rate limiter that logs per rejected packet has not limited anything.
+
+One leaked state: the invalid-sequence site printed `seq`, `rcv_nxt` and `rcv_wnd`
+— our receive-window position — to a console the ring-3 shell shares.
+
+**Grouping.** Six counters, not one and not nine. Distinct attack signatures stay
+separate (a single "dropped" total hides which attack is underway), but sites an
+attacker reaches from the *same position* with the *same* frame share a counter:
+both `data_offset` validations are one malformed header, and the RX-full site
+printed two lines per packet and now counts once. Grouping is by attacker position,
+not by source line.
+
+**Harness:** `verify-tcp-rx-counters.sh`. Three legs: exact delta on the malformed
+counter, a **selectivity** leg, and console silence.
+
+The selectivity leg is the one worth keeping. It sends well-formed TCP
+(`--tcp-data-offset 5`) matching no connection and asserts it lands on the existing
+**no-conn** counter and *not* on malformed. Without it, a counter that simply
+incremented on every inbound TCP segment would pass the exact-delta leg perfectly.
+The two frame counts are deliberately **different** (20 malformed, 7 control) so a
+counter catching both cannot match either expected delta by accident.
+
+The RED run was more informative than the GREEN one, and corrected the harness. With
+the two sites reverted to `kprintf`, leg 1 read `malformed +0` while leg 2 read
+`no-conn +7` — the frames plainly arrived and parsed. But leg 1's failure hint
+blamed delivery ("the frames never reached tcp_handle_packet"), which would have
+sent a future reader to debug the network setup instead of the counter. The hint now
+reads leg 2 first and distinguishes *nothing arrived* from *arrived but uncounted*.
+Leg 3 caught the defect directly and unambiguously: 20 attacker-chosen console lines
+from a host with no account.
+
+**Left in place deliberately** (`tcp.c` 800, 815, 1028): once-per-connection state
+transitions, bounded by the connection count, not by the packet rate. A file-wide
+grep would flag these; the rule is about what a *remote* host drives at a rate of
+its choosing, not about the word `kprintf`.
 
 ### 3. Constrain DMA by placement — **DONE**
 

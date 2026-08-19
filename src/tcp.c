@@ -744,7 +744,10 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
         if (conn_idx >= 0 && conn_idx < TCP_MAX_CONNECTIONS) {
             // Check if RST is coming too fast
             if (now - last_rst_time[conn_idx] < RST_FIN_MIN_INTERVAL_MS) {
-                kprintf("TCP: RST flood detected, dropping packet\n");
+                /* Printing here amplified the very flood this branch absorbs:
+                 * one console line per flooding packet, at the attacker's
+                 * chosen rate. Count it. */
+                net_count_tcp_flood();
                 return;
             }
             last_rst_time[conn_idx] = now;
@@ -755,11 +758,12 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
          * receive window yet, so the strict check is skipped there. */
         if (conn->state >= TCP_ESTABLISHED &&
             !tcp_validate_sequence(seq, conn->rcv_nxt, conn->rcv_wnd)) {
-            kprintf("TCP: out-of-window RST dropped\n");
+            /* Blind RST injection (RFC 5961). Remote-driven by definition. */
+            net_count_tcp_sequence();
             return;
         }
 
-        kprintf("TCP: Connection reset by peer\n");
+        net_count_tcp_peer_reset();
         conn->state = TCP_CLOSED;
         conn->in_use = false;
         return;
@@ -776,7 +780,7 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
      *=======================================================================*/
     // Window size of 0 is valid (flow control), but log suspicious behavior
     if (window == 0 && conn->snd_wnd > 0) {
-        kprintf("TCP: Peer window closed (zero window received)\n");
+        net_count_tcp_zero_window();
     }
     // No need to check window > 65535 since uint16_t cannot exceed this
     
@@ -828,8 +832,10 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
              * Exception: Allow exact match for retransmissions
              *===============================================================*/
             if (!tcp_validate_sequence(seq, conn->rcv_nxt, conn->rcv_wnd)) {
-                kprintf("TCP: Segment with invalid sequence %u rejected (expected %u, window %u).\n",
-                        seq, conn->rcv_nxt, conn->rcv_wnd);
+                /* Never print seq/rcv_nxt/rcv_wnd: that is our receive-window
+                 * state, echoed to a console the ring-3 shell shares with the
+                 * user's own output, at a rate the attacker picks. */
+                net_count_tcp_sequence();
                 // Send duplicate ACK per RFC 793 (but rate-limit to prevent ACK storm)
                 tcp_send_segment(conn, TCP_ACK, NULL, 0);
                 return;
@@ -893,10 +899,10 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
                          * Security: Prevents silent data corruption by
                          * refusing to overwrite unread data in RX buffer.
                          *====================================================*/
-                        kprintf("[TCP] SECURITY: RX buffer full (%u free, %zu needed). "
-                                "Dropping data without ACK.\n", free_space, data_len);
-                        kprintf("[TCP] Peer will retransmit when we advertise window > 0 "
-                                "(after application reads buffered data).\n");
+                        /* Two console lines per packet, driven by a peer that
+                         * simply keeps sending while the application is slow to
+                         * read. Counted instead; `ifconfig` shows the pressure. */
+                        net_count_tcp_rx_full();
 
                         // Update rcv_wnd to 0 to signal full buffer
                         conn->rcv_wnd = 0;
@@ -931,7 +937,8 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
                 if (conn_idx >= 0 && conn_idx < TCP_MAX_CONNECTIONS) {
                     // Rate limit FIN packets
                     if (now - last_fin_time[conn_idx] < RST_FIN_MIN_INTERVAL_MS) {
-                        kprintf("TCP: FIN flood detected, dropping packet\n");
+                        /* Same self-defeating shape as the RST limiter above. */
+                        net_count_tcp_flood();
                         return;
                     }
                     last_fin_time[conn_idx] = now;
@@ -1539,15 +1546,18 @@ void tcp_handle_packet(const uint8_t* src_ip, const uint8_t* dest_ip,
 
     // Validation 1: Check word count range (5-15)
     if (data_offset_words < 5 || data_offset_words > 15) {
-        kprintf("TCP: Invalid data_offset=%d words (must be 5-15). Dropping.\n",
-                data_offset_words);
+        /* Counted, never printed. This check runs BEFORE tcp_find_connection(),
+         * so any host on the segment reaches it with a single malformed frame
+         * -- no connection, no port match, no local account. A kprintf here is
+         * an unauthenticated remote console flood. */
+        net_count_tcp_malformed();
         return;
     }
 
     // Validation 2: Ensure data_offset doesn't exceed segment length
     if (data_offset > tcp_len) {
-        kprintf("TCP: data_offset (%d bytes) exceeds segment length (%zu bytes). Dropping.\n",
-                data_offset, tcp_len);
+        /* Same pre-connection reachability as the check above. */
+        net_count_tcp_malformed();
         return;
     }
 

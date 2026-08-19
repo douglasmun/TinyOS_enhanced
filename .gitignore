@@ -218,6 +218,10 @@ sectest-redirect-trace.log
 ring3-fileops.log
 ring3-fileops-trace.log
 chmod-owner.log
+tcprx.log
+tcprx-trace.log
+tcprx-red.log
+tcprx-red-trace.log
 ring3fatls.log
 ring3fatls-trace.log
 rowfail.log

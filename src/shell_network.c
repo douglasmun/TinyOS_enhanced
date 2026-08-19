@@ -241,6 +241,23 @@ void cmd_ifconfig(void) {
     kprintf("  TCP no-conn:  %u segments dropped (no listener; client-only stack)\n",
             net_get_tcp_no_connection());
 
+    /* TCP RX-path drops. Nine remote-driven kprintf sites became these six
+     * counters; the split is by ATTACKER POSITION, not by call site, so a
+     * single total cannot hide which attack is underway:
+     *   malformed  reaches us before any connection lookup -- any host
+     *   flood      RST/FIN rate limiter -- needs the 4-tuple
+     *   bad-seq    blind injection into a live connection (RFC 5961)
+     * rx-full/reset/zero-win are ordinary peer behaviour, shown for context so
+     * a rising `malformed` is legible against a quiet baseline. */
+    uint32_t t_malformed = 0, t_flood = 0, t_seq = 0;
+    uint32_t t_rxfull = 0, t_reset = 0, t_zwin = 0;
+    net_get_tcp_rx_stats(&t_malformed, &t_flood, &t_seq,
+                         &t_rxfull, &t_reset, &t_zwin);
+    kprintf("  TCP rx drops: %u malformed, %u flood-limited, %u bad-seq\n",
+            t_malformed, t_flood, t_seq);
+    kprintf("  TCP rx state: %u buf-full, %u peer-reset, %u zero-window\n",
+            t_rxfull, t_reset, t_zwin);
+
     /* DMA region placement (doc/NETWORK_ISOLATION.md item 3). Printed with the
      * live present/absent state of each guard rather than just the addresses:
      * the addresses only show where the guards were MEANT to go, whereas the

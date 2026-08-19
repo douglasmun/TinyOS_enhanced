@@ -51,14 +51,25 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
 - **The RX path is stricter still: no per-packet `kprintf` at all.** Any host on the
   segment drives those sites, from the ISR, before the firewall. Count, don't print —
   counters surface in `ifconfig`; `stream_printf` is wrong here too (interrupt context
-  has no current user stream). Three sweeps were needed (the RX loops, then `icmp.c`,
-  then `handle_dns_response`'s 20 sites), so **sweep the protocol files, not just the
+  has no current user stream). Four sweeps were needed (the RX loops, then `icmp.c`,
+  then `handle_dns_response`'s 20 sites, then `tcp.c`'s nine — that last one *after* the
+  item had been marked DONE three times), so **sweep the protocol files, not just the
   loops** — and keep distinct attack signatures as **separate** counters, since one
   "dropped" total hides which attack is underway. A file-wide grep fails on correct
   code: the rule is about what a *remote* host drives, so `dns.c`'s local-`dig`-driven
-  prints stay. Harnesses: `verify-rxdrop-counters.sh`, `verify-icmp-counters.sh`,
+  prints stay, as do `tcp.c` 800/815/1028 (once-per-connection transitions, bounded by
+  connection count, not packet rate). **`tcp.c`'s two `data_offset` sites were the worst
+  of the class**: they fire *before* `tcp_find_connection()`, so one malformed frame from
+  any host printed a line with no connection, port match, or local account. Two more were
+  self-defeating — the RST/FIN flood detectors printed once per flooding packet,
+  amplifying what they exist to absorb. Group counters by **attacker position**, not by
+  source line (both `data_offset` checks are one malformed header, so one counter), and
+  give a counter harness a **selectivity** leg — a well-formed frame matching no
+  connection must land on `no-conn`, not `malformed`, or a counter incrementing on
+  *every* inbound segment passes the exact-delta assertion perfectly. Harnesses:
+  `verify-rxdrop-counters.sh`, `verify-icmp-counters.sh`,
   `verify-dns-rx-counters.sh` (needs `-DTINYOS_FAULT_INJECT`; its `valid` leg is the
-  positive control). Rationale: `doc/NETWORK_ISOLATION.md`.
+  positive control), `verify-tcp-rx-counters.sh`. Rationale: `doc/NETWORK_ISOLATION.md`.
 - **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
   `critical_section_exit()` only touches `IF` at depth 0, and that clause is deliberate
   (a `popfl` mid-ISR would corrupt the preempted thread's flags). So `e1000_poll_rx`'s
