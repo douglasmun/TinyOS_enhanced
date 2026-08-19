@@ -9,6 +9,7 @@
 #include "util.h"
 #include "pit.h"
 #include "pmm.h"
+#include "stdio.h"
 #include <stddef.h>
 
 /*=============================================================================
@@ -111,17 +112,36 @@ static void editor_update_row(erow *row) {
     row->rsize = idx;
 }
 
+#ifdef TINYOS_FAULT_INJECT
+/* 0 = no injection; 1 = fail the `chars` alloc; 2 = fail the `render` alloc.
+ * Cleared by the alloc it fires on, so one arm = one failure. */
+static int editor_inject_fail = 0;
+static int editor_alloc_seq = 0;
+
+void editor_fail_next_alloc(int which) {
+    editor_inject_fail = which;
+    editor_alloc_seq = 0;
+}
+
+/* pmm_alloc() wrapper used ONLY by editor_insert_row, so injection cannot
+ * disturb E.rows/E.filename or anything outside the path under test. */
+static uint32_t editor_row_alloc(void) {
+    editor_alloc_seq++;
+    if (editor_inject_fail == editor_alloc_seq) {
+        editor_inject_fail = 0;
+        return 0;
+    }
+    return pmm_alloc();
+}
+#else
+#define editor_row_alloc() pmm_alloc()
+#endif
+
 static void editor_insert_row(int at, const char *s, size_t len) {
     if (at > E.numrows || E.numrows >= EDITOR_MAX_ROWS) return;
     /* E.rows is a single 4096-byte page; never exceed the slots it holds */
     if (E.numrows >= (int)(4096 / sizeof(erow))) return;
 
-    /* Shift rows down */
-    for (int i = E.numrows; i > at; i--) {
-        E.rows[i] = E.rows[i - 1];
-    }
-
-    /* Allocate and copy */
     /* SECURITY FIX: Prevent buffer overflow when len is at maximum
      * The pmm_alloc() returns a 4096-byte page. Writing chars[4096] when
      * len==4096 would overflow into the next page. Limit len to 4095 to
@@ -130,24 +150,58 @@ static void editor_insert_row(int at, const char *s, size_t len) {
         len = 4095;  /* Reserve one byte for null terminator */
     }
 
-    E.rows[at].size = len;
-    E.rows[at].chars = (char*)pmm_alloc();
-    if (!E.rows[at].chars) {
+    /* Allocate BEFORE shifting.
+     *
+     * This ordering is load-bearing, not style. The shift makes E.rows[at] a
+     * bitwise copy of E.rows[at + 1] -- same `chars`, same `render`. If a
+     * pmm_alloc() then fails and we return, that aliasing survives: two slots
+     * below E.numrows name the same two frames, and editor_cleanup()'s
+     * per-row editor_free_row() hands each of them to pmm_free() TWICE.
+     *
+     * pmm_free() has a double-free guard (pmm.c:963) that detects the second
+     * free and returns WITHOUT freeing, so this does not become frame
+     * aliasing -- credit where due. What it does instead, measured on the
+     * unfixed kernel: the refused frees permanently lose 2 frames per failed
+     * insert, and the surviving rows are corrupted -- the row that was at
+     * `at` reads back as NULL, because the failed slot's pointers were
+     * written over it. Editing a file after a single OOM hiccup silently
+     * destroys a line of the user's text.
+     *
+     * The failing insert is the one that matters: Enter pressed mid-file
+     * (editor_process_keypress, at = E.cy + E.rowoff + 1 < E.numrows) is the
+     * only caller with a non-empty shift loop -- the other three append at
+     * E.numrows, where the loop body never runs and no alias exists. So the
+     * append callers hid this for as long as they were the ones being tested.
+     *
+     * Allocating first means a failure returns with E.rows completely
+     * untouched: no shift to unwind, no partial row, nothing for cleanup to
+     * see. Do not "tidy" this back into shift-then-allocate. */
+    char *new_chars = (char*)editor_row_alloc();
+    if (!new_chars) {
+        editor_set_status_message("Out of memory");
+        return;
+    }
+
+    char *new_render = (char*)editor_row_alloc();
+    if (!new_render) {
+        pmm_free((uint32_t)new_chars);
         editor_set_status_message("Out of memory");
         return;
     }
 
     for (size_t i = 0; i < len; i++) {
-        E.rows[at].chars[i] = s[i];
+        new_chars[i] = s[i];
     }
-    E.rows[at].chars[len] = '\0';
+    new_chars[len] = '\0';
 
-    E.rows[at].render = (char*)pmm_alloc();
-    if (!E.rows[at].render) {
-        pmm_free((uint32_t)E.rows[at].chars);
-        editor_set_status_message("Out of memory");
-        return;
+    /* Past this point nothing can fail, so the array is safe to disturb. */
+    for (int i = E.numrows; i > at; i--) {
+        E.rows[i] = E.rows[i - 1];
     }
+
+    E.rows[at].size = len;
+    E.rows[at].chars = new_chars;
+    E.rows[at].render = new_render;
 
     editor_update_row(&E.rows[at]);
     E.numrows++;
@@ -170,6 +224,18 @@ static void editor_del_row(int at) {
     }
 
     E.numrows--;
+
+    /* Clear the vacated slot. The shift leaves E.rows[E.numrows] holding a
+     * duplicate of the row now at E.numrows - 1 -- same chars/render
+     * pointers. It is out of range today, so nothing frees it twice, but that
+     * safety rests entirely on every future loop bound staying strictly below
+     * E.numrows. Zeroing costs nothing and makes a hypothetical <= bound a
+     * no-op free instead of a double free. */
+    E.rows[E.numrows].chars = NULL;
+    E.rows[E.numrows].render = NULL;
+    E.rows[E.numrows].size = 0;
+    E.rows[E.numrows].rsize = 0;
+
     E.dirty = true;
 }
 
@@ -295,7 +361,17 @@ void editor_open(const char *filename) {
     E.filename = (char*)pmm_alloc();
     if (!E.filename) return;
 
-    for (size_t i = 0; i < len && i < 4095; i++) {
+    /* Clamp ONCE, then use the clamped length for both the copy and the
+     * terminator. Previously the loop clamped at 4095 but the terminator wrote
+     * E.filename[len] with the UNCLAMPED len -- a 5000-byte name would have
+     * written a zero 904 bytes past this page. Not reachable today (cmd_edit
+     * is the only caller and resolve_path bounds it by MAX_PATH == 256), which
+     * is precisely why it is worth fixing now rather than when a second caller
+     * makes it reachable. */
+    if (len > 4095) {
+        len = 4095;
+    }
+    for (size_t i = 0; i < len; i++) {
         E.filename[i] = filename[i];
     }
     E.filename[len] = '\0';
@@ -767,6 +843,13 @@ void editor_init(void) {
         // Set a safe state and return (editor won't function, but won't crash)
         E.rows = NULL;
         E.numrows = 0;
+        /* Clear filename HERE too. This early return skips the
+         * E.filename = NULL below, so a failed init would leave the previous
+         * session's pointer in place; the following editor_open() overwrites
+         * it with a fresh page and that frame is lost. Cheap to get right, and
+         * it keeps every exit from this function leaving E in one known
+         * state. */
+        E.filename = NULL;
         kprintf("EDITOR: CRITICAL - Failed to allocate memory for rows\n");
         return;  // Safe degradation - editor won't work, but kernel continues
     }
@@ -792,6 +875,7 @@ void editor_run(void) {
     }
 }
 
+
 void editor_cleanup(void) {
     /* Free all rows */
     for (int i = 0; i < E.numrows; i++) {
@@ -800,4 +884,157 @@ void editor_cleanup(void) {
 
     if (E.rows) pmm_free((uint32_t)E.rows);
     if (E.filename) pmm_free((uint32_t)E.filename);
+
+    /* Leave E in a state where a second cleanup is a no-op rather than a
+     * double free. cmd_edit pairs one init with one cleanup today, so this is
+     * belt-and-braces -- but every other defect fixed in this file came from a
+     * pointer outliving the frame it named. */
+    E.rows = NULL;
+    E.filename = NULL;
+    E.numrows = 0;
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/* verify-editor-rowfail.sh only.
+ *
+ * WHAT IS BEING ASSERTED, and why it is the free-frame count.
+ *
+ * The bug was: editor_insert_row() shifted E.rows[at] <- E.rows[at-1] BEFORE
+ * allocating, so a failed pmm_alloc() returned with slots `at` and `at + 1`
+ * holding identical chars/render pointers. Both sit below E.numrows, so
+ * editor_cleanup()'s per-row editor_free_row() handed the SAME frames to
+ * pmm_free() twice.
+ *
+ * pmm_free() catches that (pmm.c:963) and REFUSES the second free, so the
+ * outcome is not frame aliasing. Measured on the unfixed kernel it is: 2
+ * frames permanently lost per failed insert (the refused frees never return
+ * them), plus corruption of a surviving row. Do not expect free_frames to
+ * RISE -- the guard is why it falls instead. That prediction was wrong once
+ * already; the counter direction below is what the hardware actually did.
+ *
+ * The test brackets each arm with pmm_free_frames() and requires the count to
+ * return EXACTLY to baseline:
+ *
+ *   too LOW  after  -> frames allocated and never freed (this bug, or a leak)
+ *   too HIGH after  -> freed more often than allocated, on a kernel whose
+ *                      double-free guard was removed or bypassed
+ *   equal           -> the freed set is precisely the allocated set
+ *
+ * Exact equality BOTH ways is the point; a one-sided check passes against
+ * whichever direction it does not test.
+ *
+ * The mid-file insert is the load-bearing case. Appending at E.numrows leaves
+ * the shift loop empty, so it never aliased and would pass against the
+ * unfixed kernel -- that is precisely how this survived: the other three
+ * callers of editor_insert_row all append. Every arm below inserts at index 1
+ * of a 3-row buffer, where the shift loop actually runs. */
+void editor_rowtest(void) {
+    uint32_t base, after;
+    int failures = 0;
+
+    stream_printf(get_current_streams(), "[ROWTEST] editor_insert_row failure-path check\n");
+
+    /* --- Arm 1: POSITIVE CONTROL -------------------------------------
+     * No injection. Proves the sequence really allocates and frees -- an
+     * assertion that only ever runs against a no-op path is not evidence.
+     * If this arm does not move the counter during the run, the later arms
+     * are measuring nothing. */
+    base = pmm_free_frames();
+    editor_init();
+    editor_insert_row(0, "alpha", 5);
+    editor_insert_row(1, "beta", 4);
+    editor_insert_row(2, "gamma", 5);
+    {
+        uint32_t peak = pmm_free_frames();
+        if (peak >= base) {
+            stream_printf(get_current_streams(),
+                "[ROWTEST] arm1 CONTROL-DEAD: 3 rows allocated nothing (%u -> %u)\n",
+                base, peak);
+            failures++;
+        } else {
+            stream_printf(get_current_streams(),
+                "[ROWTEST] arm1 control: 3 rows consumed %u frames\n", base - peak);
+        }
+    }
+    editor_insert_row(1, "delta", 5);   /* mid-file insert, succeeds */
+    editor_cleanup();
+    after = pmm_free_frames();
+    if (after != base) {
+        stream_printf(get_current_streams(),
+            "[ROWTEST] arm1 FAIL: %u -> %u (%s)\n", base, after,
+            after > base ? "double free" : "leak");
+        failures++;
+    } else {
+        stream_printf(get_current_streams(), "[ROWTEST] arm1 PASS: balanced at %u\n", after);
+    }
+
+    /* --- Arm 2: `chars` alloc fails on a mid-file insert --------------
+     * Unfixed kernel: the shift has already happened, E.rows[1].render
+     * aliases E.rows[2].render, and cleanup frees that frame twice ->
+     * after > base. */
+    base = pmm_free_frames();
+    editor_init();
+    editor_insert_row(0, "alpha", 5);
+    editor_insert_row(1, "beta", 4);
+    editor_insert_row(2, "gamma", 5);
+    editor_fail_next_alloc(1);
+    editor_insert_row(1, "should-fail", 11);
+    editor_cleanup();
+    after = pmm_free_frames();
+    if (after != base) {
+        stream_printf(get_current_streams(),
+            "[ROWTEST] arm2 FAIL: chars-alloc failure %u -> %u (%s)\n", base, after,
+            after > base ? "DOUBLE FREE" : "leak");
+        failures++;
+    } else {
+        stream_printf(get_current_streams(), "[ROWTEST] arm2 PASS: balanced at %u\n", after);
+    }
+
+    /* --- Arm 3: `render` alloc fails on a mid-file insert -------------
+     * A separate bug on the unfixed kernel, not a repeat of arm 2: there the
+     * old code freed `chars` explicitly but left the stale pointer in the
+     * slot, so cleanup double-freed BOTH chars and the aliased render. */
+    base = pmm_free_frames();
+    editor_init();
+    editor_insert_row(0, "alpha", 5);
+    editor_insert_row(1, "beta", 4);
+    editor_insert_row(2, "gamma", 5);
+    editor_fail_next_alloc(2);
+    editor_insert_row(1, "should-fail", 11);
+    editor_cleanup();
+    after = pmm_free_frames();
+    if (after != base) {
+        stream_printf(get_current_streams(),
+            "[ROWTEST] arm3 FAIL: render-alloc failure %u -> %u (%s)\n", base, after,
+            after > base ? "DOUBLE FREE" : "leak");
+        failures++;
+    } else {
+        stream_printf(get_current_streams(), "[ROWTEST] arm3 PASS: balanced at %u\n", after);
+    }
+
+    /* --- Arm 4: the failed insert must not corrupt the surviving rows --
+     * Balanced frame accounting alone would also be satisfied by a failure
+     * path that dropped or mangled existing rows. Allocating before shifting
+     * means the array is untouched, so row 1 must still read "beta". */
+    editor_init();
+    editor_insert_row(0, "alpha", 5);
+    editor_insert_row(1, "beta", 4);
+    editor_insert_row(2, "gamma", 5);
+    editor_fail_next_alloc(1);
+    editor_insert_row(1, "should-fail", 11);
+    if (E.numrows != 3 ||
+        !E.rows[1].chars || strcmp(E.rows[1].chars, "beta") != 0) {
+        stream_printf(get_current_streams(),
+            "[ROWTEST] arm4 FAIL: rows disturbed by failed insert (numrows=%d row1=%s)\n",
+            E.numrows, E.rows[1].chars ? E.rows[1].chars : "(null)");
+        failures++;
+    } else {
+        stream_printf(get_current_streams(),
+            "[ROWTEST] arm4 PASS: 3 rows intact, row1 unchanged\n");
+    }
+    editor_cleanup();
+
+    stream_printf(get_current_streams(), "[ROWTEST] VERDICT: %s (%d failure(s))\n",
+                  failures == 0 ? "PASS" : "FAIL", failures);
+}
+#endif

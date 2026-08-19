@@ -203,6 +203,37 @@ typedef struct task {
     uint32_t user_guard_page_phys;   // Physical address of user stack guard page (for stack overflow detection)
     uint32_t user_guard_page_virt;   // Virtual address the guard is mapped at (CR2 compare in the #PF handler)
 
+    /* Physical frames holding the process's ELF image (text/rodata/data+bss).
+     *
+     * WHY THIS EXISTS. Teardown frees only what a bookkeeping field names:
+     * task_free_resources() frees the stacks, guard pages, EDR and env pages
+     * from the arrays above, and pae_free_user_pdpt() frees the page TABLES,
+     * the four PDs and the PDPT. Nothing walks the PTEs to free what they
+     * point AT, so before this field the image frames were leaked on EVERY
+     * process exit -- measured at exactly 8 frames per `exec /hello.elf`
+     * (verify-exec-frame-leak.sh), which is precisely its 8-page image.
+     *
+     * That made exec an unprivileged memory-exhaustion primitive rather than
+     * an untidy teardown: SYS_SPAWN is ungated, and because the frames leak on
+     * EXIT, a spawn-and-wait loop never holds two tasks at once and so never
+     * approaches the per-uid task cap, which bounds CONCURRENT tasks only.
+     *
+     * SIZED FOR REAL IMAGES, NOT THE THEORETICAL LIMIT. 256 frames = 1MB of
+     * image. The largest binary the tree ships is shell.elf at 15 pages, so
+     * this is ~17x headroom; ELF_MAX_PROCESS_MEMORY (16MB / 4096 pages) bounds
+     * what a malicious ELF may DECLARE, and dimensioning to that would cost
+     * 4096 * 4 * MAX_TASKS = 512KB of .bss -- the same trade env.h rejected
+     * for per-task storage. An image needing more than this is REFUSED by the
+     * loader with a distinct message rather than silently untracked, because a
+     * silently untracked image is exactly the leak this field removes.
+     *
+     * Populated by elf_load_process_argv() only on the SUCCESS path, after the
+     * last failure return. Every failure path already pmm_free()s these frames
+     * itself and THEN calls elf_abort_load() -> task_terminate(); registering
+     * them earlier would have task_free_resources() free them a second time. */
+    uint32_t image_pages_phys[256];
+    uint16_t image_pages;            // Frames actually recorded in image_pages_phys[]
+
     /* Parent process, recorded as a {pid, generation} VALUE PAIR rather than a
      * task_t* on purpose: a parent can exit and have its slot recycled while
      * the child is still alive, and a raw pointer would then alias an

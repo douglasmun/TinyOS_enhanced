@@ -181,13 +181,52 @@ that mis-deferred `whoami`: *what does moving it buy, and what capability does
 the moved component need?* Here it buys one builtin and needs the ability to
 mutate the identity every other gate is written against.
 
-**`fatls` and `edit` — still open.** Neither has been designed. `fatls` is the
-smaller question (it is a listing command, so the gating polarity and the
-cross-drive behaviour in `doc/CROSS_DRIVE_ACCESS_ANALYSIS.md` are the things to
-settle); `edit` is the larger one, since a ring-3 editor needs a way to write
-back that does not simply re-expose the FAT32 write path.
+**`fatls` — DECIDED 2026-08-19: nothing to migrate. Ring 3 already lists FAT32
+through the generic `ls`.**
 
-Two need a decision rather than typing — `fatls` and `edit`; `su` is settled
+The question as recorded ("gating polarity, plus the cross-drive behaviour in
+`doc/CROSS_DRIVE_ACCESS_ANALYSIS.md`") presumed the capability had to be
+carried across the boundary. It does not: the path is already complete and
+already compiled in.
+
+```
+cmd_ls -> open(path, O_RDONLY|O_DIRECTORY)      [SYS_OPEN 20]
+       -> syscall_copy_path -> task_resolve_path
+             (drive-qualified paths are returned VERBATIM — the
+              `drive_qualified` branch copies and returns before any
+              cwd prefix can be joined on)
+       -> vfs_open -> vfs_resolve_drive('C')
+       -> fat32_file_ops.readdir == fat32_vfs_readdir   [SYS_READDIR 22]
+```
+
+FAT32 registers the **full** `file_operations_t` (`src/fat32_vfs.c`), `C:` is
+mounted at boot (`kernel.c`), and the VFS dispatches on the drive letter rather
+than on a hardcoded driver. So `ls C:/` **is** `fatls`, with no new syscall and
+no new builtin. Verified end to end as an unprivileged user:
+`verify-ring3-fatls.sh`.
+
+The gating polarity question answers itself once the path is seen: FAT32 has no
+per-file uid, so there is nothing for an ownership gate to compare, and the
+listing is reachable by a non-root caller exactly as `ls D:/scratch` is. The
+kernel shell keeps its `fatls` because `ls C:` routes to `cmd_fatls` there;
+that is a kernel-shell implementation detail, not a capability ring 3 lacks.
+
+This is the **third** instance of one error shape, and the count is the reason
+it is written down rather than just fixed. `whoami` was deferred for a
+uid→username path that `env_refresh_identity()` already provided; the D1
+parser move survived four PRs of feasibility work before one grep killed it;
+`fatls` was carried as an open design call while the code to do it was already
+linked into the kernel. Each time the question asked was *"does THIS component
+carry the capability?"* — psinfo_t, then a protocol parser, then a builtin —
+when the question that decides it is *"is the capability REACHABLE AT ALL?"*
+Component-by-component review cannot answer that, because the answer lives in a
+path that runs through no single component in particular. Trace the path before
+designing the migration.
+
+**`edit` — still open.** It is the larger one, since a ring-3 editor needs a way
+to write back that does not simply re-expose the FAT32 write path.
+
+One decision rather than typing remains — `edit`; `su` and `fatls` are settled
 above. One fact about the kernel shell's `su` outlives that decision and is
 worth keeping here, because it stays true of the implementation that remains:
 it changes credentials on the **same** task, so it must call
@@ -297,8 +336,9 @@ protocol means the witness is broken or something moved that must not have.
 dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
 new-syscall group it once blocked on. The seven no-new-syscall builtins are
 done, and `unalias` has since landed with the ninth `SYS_ENV` subcommand it
-needed. What remains of item 4 is the `fatls`/`edit` pair, which needs design
-calls rather than typing; `su` is decided and stays kernel-shell only (see
-"Item 4: the su/fatls/edit group" above). AUDIT-8E is
+needed. What remains of item 4 is `edit` alone, which needs a design
+call rather than typing; `su` is decided and stays kernel-shell only, and
+`fatls` needed no migration at all — ring 3 already lists FAT32 through the
+generic `ls` (see "Item 4: the su/fatls/edit group" above). AUDIT-8E is
 closed on both halves and was independent of that work. Networking is closed too
 (see above), and likewise never gated item 4.

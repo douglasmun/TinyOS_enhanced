@@ -135,6 +135,36 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   task — panic "All tasks terminated" with five tasks alive. Invariant: *a freed slot is
   never in the ready queue*. Found by the supervisor give-up control, not by anything
   that existed before it.
+- **Allocate before you disturb the array — `editor_insert_row`'s ordering is
+  load-bearing.** It used to shift rows down *then* `pmm_alloc()`, so a failed
+  allocation returned with `E.rows[at]` a bitwise copy of `E.rows[at+1]` — same
+  `chars`, same `render`, both below `E.numrows`, both freed by
+  `editor_cleanup()`. `pmm_free`'s double-free guard (`pmm.c:963`) refuses the
+  second free, so the counter **falls** (2 frames lost per failed insert) rather
+  than rising, and a surviving row reads back `NULL` — one OOM hiccup silently
+  eats a line of the user's file. Three of the four callers append at
+  `E.numrows`, where the shift loop is empty and no alias exists, which is
+  exactly why this survived. Harness: `verify-editor-rowfail.sh` (needs
+  `-DTINYOS_FAULT_INJECT`), whose arms all insert **mid-file** for that reason,
+  and whose arm 1 is a positive control because "balanced frames" is otherwise
+  satisfied by an editor that allocated nothing.
+- **Teardown frees only what a `task_t` field names — including the ELF image.**
+  `task_free_resources()` walks `task->*_phys[]` arrays and `pae_free_user_pdpt()`
+  frees the PDs/PDPT/page tables; **nothing walks the PTEs to free what they point
+  at**. That leaked the whole image on every exit — measured at exactly 8 frames
+  per `exec /hello.elf`, its exact page count — and since `SYS_SPAWN` is ungated
+  and the frames leak on *exit*, a spawn-and-wait loop drained memory while never
+  holding two tasks at once, so the per-uid cap (which bounds *concurrent* tasks)
+  never fired. Now tracked in `task_t::image_pages_phys[256]`. **The ordering is
+  the invariant:** registration happens only on the success path, *after the last
+  failure return* (in `elf.c`, registration sits below every `return -1`), because every failure path already
+  `pmm_free`s these frames and *then* calls `elf_abort_load()` → `task_terminate()`
+  → `task_free_resources()` — registering earlier makes that a double-free. Image
+  frames are private `pmm_alloc()`s, so the COW kernel-shared-PT concern does
+  **not** apply to them (that is about page *tables*); an oversize image is
+  **refused**, never loaded untracked. Harness: `verify-exec-frame-leak.sh`,
+  whose assertion is **exact equality** of free frames, not a smaller delta — a
+  double-free shows as free frames *rising*.
 - **Freeing a guard page requires restoring its mapping first.** They are
   identity-mapped **not present** in the kernel identity map every address space shares,
   so `pmm_free` without re-mapping poisons that frame permanently and the #PF lands on
@@ -251,8 +281,13 @@ written against that uid. Don't reopen this by "just adding a subcommand"; reaso
 `doc/ROADMAP_NEXT.md`.
 
 Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**; item 4
-(userspace shell) has all its **implementation** done — what remains is `fatls` and
-`edit`, which are design calls, not typing (`su` is settled, above). `fork()` was skipped deliberately (PAE, no COW pages).
+(userspace shell) has all its **implementation** done — what remains is `edit`, a design
+call, not typing (`su` is settled above; **`fatls` needed no migration** — ring 3 already
+lists FAT32 through the generic `ls`, since `SYS_OPEN`/`SYS_READDIR` dispatch on the
+drive letter into FAT32's full `file_operations_t`. `ls C:/` *is* `fatls`; harness
+`verify-ring3-fatls.sh`. Third instance of asking "does THIS component carry it?"
+instead of "is it reachable at all?" — after `whoami` and D1; trace the path before
+designing the migration). `fork()` was skipped deliberately (PAE, no COW pages).
 Task-slot exhaustion is closed (per-uid cap + root reserve, both returning `-EAGAIN`, so
 only the printed message identifies which refused). `kprintf`→`stream_printf` conversion
 is **finished** — no console-only blocks remain.

@@ -222,3 +222,9 @@ tcprx.log
 tcprx-trace.log
 tcprx-red.log
 tcprx-red-trace.log
+ring3fatls.log
+ring3fatls-trace.log
+rowfail.log
+rowfail-trace.log
+framelk.log
+framelk-trace.log

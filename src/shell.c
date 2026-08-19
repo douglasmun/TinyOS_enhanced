@@ -8,6 +8,7 @@
 #include "util.h"
 #include "env.h"
 #include "user.h"
+#include "editor.h"     /* editor_rowtest, under TINYOS_FAULT_INJECT */
 #include "test_tasks.h"   /* knetd_die_now, under TINYOS_FAULT_INJECT */
 #include "net.h"          /* net_netd_set_claimed, under TINYOS_FAULT_INJECT */
 #include "dns.h"          /* dns_forge_response, under TINYOS_FAULT_INJECT */
@@ -884,6 +885,12 @@ static void parse_and_execute(char* cmd_line) {
         cmd_ifconfig();
     }
 #ifdef TINYOS_FAULT_INJECT
+    /* verify-editor-rowfail.sh only. Not in the command table, so it never
+     * appears in `help`. Drives editor_insert_row()'s allocation-failure path,
+     * which real OOM is the only other way to reach. */
+    else if (strcmp(argv[0], "rowtest") == 0) {
+        editor_rowtest();
+    }
     /* verify-supervisor.sh only. Not in the command table, so it never appears
      * in `help` -- see the rationale on knetd_die_now in test_tasks.c. */
     else if (strcmp(argv[0], "killknetd") == 0) {
