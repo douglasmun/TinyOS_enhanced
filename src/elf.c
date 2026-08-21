@@ -1205,6 +1205,24 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
             map_page(page_vaddr, phys_frame, page_flags | PAGE_READWRITE | PAE_NX);
         }
 
+        /* Zero the HEAD gap, for the same reason the tail is zeroed below.
+         *
+         * Pages are allocated from start_page (vaddr rounded DOWN), but the
+         * copy begins at vaddr. When p_vaddr is not page-aligned, the bytes in
+         * [start_page, vaddr) are never written -- and pmm_alloc() does not
+         * zero, so they are whatever the previous owner of that frame left
+         * there, readable by the loaded process at its own base address.
+         *
+         * The AUDIT 9F fix below closed exactly this leak at the other end of
+         * the segment and stopped there. Nothing in a typical toolchain-
+         * produced binary has an unaligned PT_LOAD, which is why this half
+         * went unnoticed -- but p_vaddr is read from the file, so alignment is
+         * the author's choice, not an invariant. */
+        uint32_t head_size = vaddr - start_page;
+        if (head_size > 0) {
+            memset((uint8_t*)start_page, 0, head_size);
+        }
+
         // Copy segment data from ELF file to memory
         const uint8_t* src = (const uint8_t*)elf_data + offset;
         uint8_t* dest = (uint8_t*)vaddr;
@@ -1269,8 +1287,8 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
             }
         }
 
-        kprintf("[ELF]   Copied %d bytes, zeroed BSS %d bytes, zeroed page tail %d bytes\n",
-                filesz, memsz - filesz, tail_size);
+        kprintf("[ELF]   Copied %d bytes, zeroed BSS %d bytes, zeroed head %d / tail %d bytes\n",
+                filesz, memsz - filesz, head_size, tail_size);
     }
 
     // Switch back to kernel page directory
