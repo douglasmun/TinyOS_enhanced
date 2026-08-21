@@ -986,6 +986,15 @@ int sys_open(const char* user_path, int flags) {
         return -EINVAL;
     }
 
+    /* Access mode 3 is not a POSIX access mode, and the whole-flags check
+     * above lets it through because both its bits are individually allowed.
+     * Neither driver handles it: ramfs_vfs_open's translation matches neither
+     * of its two tests and passes a zero flag mask down, and fat32_vfs_open
+     * has the same shape. Reject it at the boundary so no driver has to. */
+    if ((flags & 0x3) == 0x3) {
+        return -EINVAL;
+    }
+
     /* vfs_open enforces the uid/permission checks; this runs with the calling
      * task's credentials because syscalls execute on the caller's behalf. */
     int vfs_fd = vfs_open(path, flags);
@@ -3105,6 +3114,7 @@ int sys_mseal(uint32_t addr, uint32_t size) {
     /*=========================================================================
      * Call PAE sealing function against the calling task's address space
      *=======================================================================*/
+    /* Returns the number of pages whose seal bit transitioned, or < 0. */
     int ret = pae_seal_memory_in(cur->page_directory, addr, size);
     if (ret < 0) {
         mseal_reject_failed++;
@@ -3116,10 +3126,18 @@ int sys_mseal(uint32_t addr, uint32_t size) {
      * so cur is non-NULL in practice — defensive consistency / hardening. */
     mseal_sealed++;
 
-    uint16_t cur_uid = cur ? cur->uid : 0;
-    audit_log(AUDIT_MEMORY_SEAL, AUDIT_INFO, cur_uid,
-              "Sealed memory region 0x%08x - 0x%08x",
-              (unsigned int)addr, (unsigned int)end);
+    /* Audit only a seal that actually changed state. Sealing is idempotent,
+     * so an unprivileged caller could otherwise re-seal one page in a loop and
+     * push every AUDIT_CRITICAL record out of the fixed-size ring buffer --
+     * evidence destruction at syscall rate, from ring 3, needing no privilege.
+     * The mseal_sealed counter above still counts every call, so the surface
+     * does not lose the fact that the syscall is being driven. */
+    if (ret > 0) {
+        uint16_t cur_uid = cur ? cur->uid : 0;
+        audit_log(AUDIT_MEMORY_SEAL, AUDIT_INFO, cur_uid,
+                  "Sealed %d page(s): 0x%08x - 0x%08x",
+                  ret, (unsigned int)addr, (unsigned int)end);
+    }
 
     return 0;
 }
@@ -3128,6 +3146,24 @@ int sys_mseal(uint32_t addr, uint32_t size) {
  * System Call Dispatcher
  * Called from interrupt handler with register state
  *-----------------------------------------------------------------------------*/
+/* Invalid-syscall counters. These sites sat ABOVE the EDR hook, so any ring-3
+ * caller could drive the kernel console at syscall rate with a number of its
+ * own choosing -- and the number was formatted into the line, which is how a
+ * process with no privilege at all writes attacker-chosen text into the
+ * kernel log the harnesses grep. Count instead. `syscall_accepted` is the
+ * positive control: the reject counters alone read identically whether the
+ * dispatcher is working or refusing everything. */
+static uint32_t syscall_accepted = 0;
+static uint32_t syscall_reject_range = 0;   /* num > MAX_SYSCALL_NUM      */
+static uint32_t syscall_reject_unimpl = 0;  /* in range, no implementation */
+
+void syscall_get_reject_stats(uint32_t* accepted, uint32_t* reject_range,
+                              uint32_t* reject_unimpl) {
+    if (accepted)       *accepted       = syscall_accepted;
+    if (reject_range)   *reject_range   = syscall_reject_range;
+    if (reject_unimpl)  *reject_unimpl  = syscall_reject_unimpl;
+}
+
 static void syscall_dispatch(struct cpu_state* state) {
     // System call number is in EAX
     uint32_t syscall_num = state->eax;
@@ -3173,8 +3209,8 @@ static void syscall_dispatch(struct cpu_state* state) {
      * 4. Prevents potential integer overflow issues
      *=======================================================================*/
     if (syscall_num > MAX_SYSCALL_NUM) {
-        kprintf("[SYSCALL] ERROR: Invalid syscall number %d (max %d)\n",
-                syscall_num, MAX_SYSCALL_NUM);
+        /* Never format syscall_num back out -- it is the caller's own byte. */
+        syscall_reject_range++;
         state->eax = (uint32_t)(-ENOSYS);
         return;
     }
@@ -3388,7 +3424,7 @@ static void syscall_dispatch(struct cpu_state* state) {
          *===================================================================*/
         case SYS_CRYPTO:
             /* Cryptographic operations are not yet implemented */
-            kprintf("[SYSCALL] SYS_CRYPTO called but not implemented\n");
+            syscall_reject_unimpl++;
             ret = -ENOSYS;
             break;
 
@@ -3584,9 +3620,17 @@ static void syscall_dispatch(struct cpu_state* state) {
             break;
 
         default:
-            kprintf("[SYSCALL] ERROR: Unknown system call number %d\n", syscall_num);
+            /* Same signature as SYS_CRYPTO above: in range, not implemented. */
+            syscall_reject_unimpl++;
             ret = -ENOSYS;  /* Function not implemented */
             break;
+    }
+
+    /* Positive control for the reject counters above. Counts dispatches that
+     * reached a real handler -- including ones the handler itself refused,
+     * since that refusal is the handler's decision, not the dispatcher's. */
+    if (ret != -ENOSYS) {
+        syscall_accepted++;
     }
     
     /*=========================================================================

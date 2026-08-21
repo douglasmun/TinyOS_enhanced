@@ -338,8 +338,14 @@ void cmd_cd(int argc, char* argv[]) {
             new_path[i + 1] = '\0';
         } else {
             /* Append to current directory */
+            /* Reserve room for BOTH the separator and the terminator. The
+             * copy loops below stop at size-1, so a path that fills the
+             * buffer left pos == size-1; the separator then took the last
+             * byte and the terminator wrote one past the end of the stack
+             * array. resolve_path() gets this right by pre-computing the
+             * total length -- same idea, done in place here. */
             size_t pos = 0;
-            for (size_t i = 0; current_dir[i] != '\0' && pos < sizeof(new_path) - 1; i++) {
+            for (size_t i = 0; current_dir[i] != '\0' && pos < sizeof(new_path) - 2; i++) {
                 new_path[pos++] = current_dir[i];
             }
             new_path[pos++] = '/';
@@ -807,8 +813,10 @@ void cmd_cat(int argc, char* argv[]) {
         if (filename[0] != '/' && filename[0] != '\\') {
             /* Relative path - prepend current_dir */
             /* Copy current_dir after drive letter */
+            /* -2, so the separator below still has a byte and the terminator
+             * after the filename loop does not land one past the array. */
             size_t j = 0;
-            while (current_dir[j] != '\0' && offset < sizeof(full_path) - 1) {
+            while (current_dir[j] != '\0' && offset < sizeof(full_path) - 2) {
                 full_path[offset++] = current_dir[j++];
             }
             /* Add separator if current_dir doesn't end with one */
@@ -1041,9 +1049,11 @@ int canonicalize_path(const char* path, char* canonical_out, size_t size) {
     /* Convert relative path to absolute */
     if (path[0] != '/') {
         size_t pos = 0;
-        /* Copy current directory */
+        /* Copy current directory. Stops at MAX_PATH-2, not MAX_PATH-1, so the
+         * separator below and the terminator further down both still fit --
+         * at -1 a full-length cwd let the terminator write one past the end. */
         if (strcmp(current_dir, "/") != 0) {
-            for (size_t i = 0; current_dir[i] != '\0' && pos < MAX_PATH - 1; i++) {
+            for (size_t i = 0; current_dir[i] != '\0' && pos < MAX_PATH - 2; i++) {
                 working_path[pos++] = current_dir[i];
             }
         }
@@ -1300,8 +1310,11 @@ static int rm_recursive(const char* path) {
             char child_path[MAX_PATH];
             int pos = 0;
 
+            /* Bounds are expressed against sizeof(child_path), not a literal
+             * 255 that silently stops matching if MAX_PATH changes. The parent
+             * copy reserves room for the separator as well as the terminator. */
             /* Copy parent path */
-            for (const char* p = path; *p && pos < 255; p++) {
+            for (const char* p = path; *p && pos < (int)sizeof(child_path) - 2; p++) {
                 child_path[pos++] = *p;
             }
 
@@ -1311,7 +1324,7 @@ static int rm_recursive(const char* path) {
             }
 
             /* Add child name */
-            for (const char* p = child->name; *p && pos < 255; p++) {
+            for (const char* p = child->name; *p && pos < (int)sizeof(child_path) - 1; p++) {
                 child_path[pos++] = *p;
             }
             child_path[pos] = '\0';
@@ -1442,8 +1455,14 @@ void cmd_exec(int argc, char* argv[]) {
             abs_path[i + 1] = '\0';
         } else {
             /* Append to current directory */
+            /* Reserve room for BOTH the separator and the terminator. The
+             * copy loops below stop at size-1, so a path that fills the
+             * buffer left pos == size-1; the separator then took the last
+             * byte and the terminator wrote one past the end of the stack
+             * array. resolve_path() gets this right by pre-computing the
+             * total length -- same idea, done in place here. */
             size_t pos = 0;
-            for (size_t i = 0; current_dir[i] != '\0' && pos < sizeof(abs_path) - 1; i++) {
+            for (size_t i = 0; current_dir[i] != '\0' && pos < sizeof(abs_path) - 2; i++) {
                 abs_path[pos++] = current_dir[i];
             }
             abs_path[pos++] = '/';

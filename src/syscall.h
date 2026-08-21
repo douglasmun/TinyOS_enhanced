@@ -578,6 +578,21 @@ typedef struct {
  * range check rejected both before dispatch and userspace could never block. */
 #define MAX_SYSCALL_NUM  41  // Highest valid syscall number (SYS_ENV)
 
+/**
+ * @brief Dispatcher accept/reject counters that replaced the invalid-syscall
+ *        kprintf sites. Surfaced by `secstatus`.
+ *
+ * Those sites sat above the EDR hook and formatted the caller's own syscall
+ * number into the kernel log, so any ring-3 process could drive the console
+ * at syscall rate with text of its choosing.
+ *
+ * @param accepted      Dispatches that reached a real handler (positive control)
+ * @param reject_range  Rejected: number above MAX_SYSCALL_NUM
+ * @param reject_unimpl Rejected: in range but unimplemented
+ */
+void syscall_get_reject_stats(uint32_t* accepted, uint32_t* reject_range,
+                              uint32_t* reject_unimpl);
+
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
  * why this is an allow-list rather than a redacted task_t.
