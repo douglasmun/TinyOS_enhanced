@@ -139,3 +139,23 @@ const dhcp_client_t* dhcp_get_client_info(void);
  * - Lease rebinding at T2 (87.5% of lease time)
  */
 void dhcp_tick(uint32_t current_time);
+
+/**
+ * @brief DHCP RX counters that replaced handle_dhcp()'s and
+ *        dhcp_parse_options()'s per-packet kprintf sites. Surfaced by ifconfig.
+ *
+ * DHCP is firewall-exempt inbound, so every counter below is driven by any
+ * host on the segment. They are kept apart because they imply different
+ * attacks: a forged option stream is not a rogue server is not a wrap-DoS
+ * lease. A single total would hide which one is underway.
+ *
+ * @param replies      Valid BOOTREPLYs matching our XID (positive control)
+ * @param drop_short   Dropped: frame shorter than the DHCP header
+ * @param drop_cookie  Dropped: bad magic cookie
+ * @param drop_options Dropped: malformed option TLV stream
+ * @param drop_rogue   Dropped: ACK from an unexpected server, or a NAK
+ * @param clamp_lease  Lease times clamped (integer-wraparound DoS attempt)
+ */
+void dhcp_get_rx_stats(uint32_t* replies, uint32_t* drop_short,
+                       uint32_t* drop_cookie, uint32_t* drop_options,
+                       uint32_t* drop_rogue, uint32_t* clamp_lease);

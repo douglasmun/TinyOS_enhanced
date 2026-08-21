@@ -18,11 +18,20 @@ static int history_index = 0;
  * FUNCTION: history_init
  *=============================================================================*/
 void history_init(void) {
+    /* Called once per LOGIN, not once per boot: the buffer is a single
+     * global in the shell task, so without the re-run one session's command
+     * lines stayed readable via `history` to whoever logged in next.
+     *
+     * memset the whole line rather than just truncating it. Truncation hides
+     * the text from `history` but leaves the bytes in a static buffer that
+     * outlives the session -- command lines carry arguments, and the point
+     * of clearing on logout is that they stop existing, not that one
+     * particular reader stops printing them. */
+    CRITICAL_SECTION_ENTER();
     history_count = 0;
     history_index = 0;
-    for (int i = 0; i < HISTORY_SIZE; i++) {
-        history_buffer[i][0] = '\0';
-    }
+    memset(history_buffer, 0, sizeof(history_buffer));
+    CRITICAL_SECTION_EXIT();
 }
 
 /*=============================================================================

@@ -1119,9 +1119,6 @@ static int launch_login_shell(void) {
 void shell_task(void) {
     kprintf("[SHELL] Shell task started! (ESP check)\n");
 
-    /* Initialize history system */
-    history_init();
-
     /*
      * SECURITY FIX: Streams are now allocated per-process in task_create_*()
      * No need to manually initialize here - each task gets its own stream context
@@ -1174,6 +1171,14 @@ void shell_task(void) {
          * env_init() clears before setting, so the re-run on each login is
          * the reset. */
         env_init();
+
+        /* Same reasoning, and the same reason it belongs HERE rather than
+         * once at task start: the history buffer is a single global in this
+         * task, so a session that ended at logout left its command lines
+         * readable -- with `history` -- by whoever logged in next. Command
+         * lines carry arguments, and `passwd`-adjacent typos carry more than
+         * that. history_init() clears, so re-running it is the reset. */
+        history_init();
 
         /* USER defaults to "root" in env_init(); correct it to whoever actually
          * logged in. `su` is the OTHER caller of this helper -- see there. */

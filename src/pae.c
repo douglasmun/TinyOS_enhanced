@@ -1535,8 +1535,17 @@ int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size) 
     uint32_t cr0;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
 
+    /* Count pages whose seal bit actually transitioned. Sealing is idempotent,
+     * so without this a caller re-sealing the same page looks identical to one
+     * sealing fresh memory -- which is what let ring 3 drive an audit record
+     * per call and evict the AUDIT_CRITICAL ring buffer. */
+    uint32_t newly_sealed = 0;
+
     for (uint32_t vaddr = vaddr_start; vaddr < end_rounded; vaddr += PAGE_SIZE) {
         pae_pte_t* pte = pae_get_pte_in(pdpt_phys, vaddr);
+        if (!(*pte & PAE_SEALED)) {
+            newly_sealed++;
+        }
         uint64_t sealed_pte = (*pte | PAE_SEALED) & ~PAE_READWRITE;
         pae_atomic_write_pte(pte, sealed_pte);
         if (cr0 & (1 << 31)) {
@@ -1548,7 +1557,7 @@ int pae_seal_memory_in(uint32_t pdpt_phys, uint32_t vaddr_start, uint32_t size) 
 
     mseal_pae_pages_sealed += num_pages;
 
-    return 0;
+    return (int)newly_sealed;
 }
 
 /**

@@ -1104,12 +1104,30 @@ static void handle_arp(arp_header_t* arp_hdr, eth_header_t* eth_hdr) {
  * @param ip_hdr Pointer to the IP header.
  * @param ip_len Total length of the IP datagram.
  */
+/* UDP RX counters. Every site below is driven by any host on the segment,
+ * before the firewall, so these are counted and never printed
+ * (doc/NETWORK_ISOLATION.md). Grouped by attacker position, not by source
+ * line: the three length tests are one forged-length signature, so they
+ * share one counter. `udp_accepted` is the positive control -- a counter
+ * surface that only ever counts failures reads the same whether the parser
+ * is working or refusing everything. */
+static uint32_t udp_rx_accepted = 0;
+static uint32_t udp_drop_length = 0;
+static uint32_t udp_drop_checksum = 0;
+
+void udp_get_rx_stats(uint32_t* accepted, uint32_t* drop_length,
+                      uint32_t* drop_checksum) {
+    if (accepted)      *accepted      = udp_rx_accepted;
+    if (drop_length)   *drop_length   = udp_drop_length;
+    if (drop_checksum) *drop_checksum = udp_drop_checksum;
+}
+
 static void handle_udp(ip_header_t* ip_hdr, uint16_t ip_len) {
     size_t ip_hdr_len = (ip_hdr->version_ihl & 0x0F) * 4;
     
     // Check if packet length is sufficient for UDP header
     if (ip_len < ip_hdr_len + sizeof(udp_header_t)) {
-        kprintf("UDP: Error - IP payload too short for UDP header.\n");
+        udp_drop_length++;
         return;
     }
 
@@ -1147,17 +1165,14 @@ static void handle_udp(ip_header_t* ip_hdr, uint16_t ip_len) {
 
     /* VALIDATION 1: UDP length must be at least size of UDP header */
     if (len < sizeof(udp_header_t)) {
-        kprintf("UDP: SECURITY - Invalid UDP length %u (< UDP header size %zu). Dropping.\n",
-                len, sizeof(udp_header_t));
+        udp_drop_length++;
         return;
     }
 
     /* VALIDATION 2: UDP length must not exceed IP payload size */
     if (len > ip_payload_len) {
-        kprintf("UDP: SECURITY - UDP length %u exceeds IP payload %u. Dropping.\n",
-                len, ip_payload_len);
-        kprintf("UDP: Possible attack: IP claims %u bytes, UDP claims %u bytes\n",
-                ip_payload_len, len);
+        /* Same signature as the two tests above -- one forged length field. */
+        udp_drop_length++;
         return;
     }
 
@@ -1175,8 +1190,7 @@ static void handle_udp(ip_header_t* ip_hdr, uint16_t ip_len) {
             udp_hdr->checksum = saved_checksum; // Restore
             
             if (calculated_checksum != received_checksum) {
-                kprintf("UDP: Checksum failed (Calculated: 0x%x, Received: 0x%x). Dropping packet.\n", 
-                        calculated_checksum, received_checksum);
+                udp_drop_checksum++;
                 return;
             } else {
                 // kprintf("UDP: Checksum verified OK (0x%x)\n", received_checksum);
@@ -1191,6 +1205,11 @@ static void handle_udp(ip_header_t* ip_hdr, uint16_t ip_len) {
 
     // kprintf("UDP: Checking handlers... DNS_PORT=%d\n", DNS_PORT);
     
+    /* Past every validation: this datagram is well-formed and will be
+     * dispatched (or fall through to no handler). Counted here so the
+     * surface distinguishes a working parser from one refusing everything. */
+    udp_rx_accepted++;
+
     // If the packet originated from the DNS server (Source Port 53),
     // it's a DNS response.
     if (src_port == DNS_PORT) {
@@ -2008,6 +2027,13 @@ void send_udp_packet(uint8_t* dest_ip, uint8_t* dest_mac,
     
     // Final IP Checksum
     ip_hdr->checksum = htons(calculate_checksum(ip_hdr, sizeof(ip_header_t)));
+
+    /* Record the flow before it leaves, so the reply is admitted by the
+     * connection-tracking branch of firewall_check_packet() rather than by a
+     * wildcard ACCEPT rule. This is what makes DNS resolution work under the
+     * default-deny policy. */
+    firewall_track_outgoing(ntohl(*(uint32_t*)my_ip), ntohl(*(uint32_t*)dest_ip),
+                            src_port, dest_port, IPPROTO_UDP);
 
     // Removed verbose UDP send log to reduce console noise
     e1000_send(packet, packet_len);

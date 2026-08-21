@@ -37,6 +37,8 @@
 #include "credprobe_elf_data.h"
 #include "netprobe_elf_data.h"
 #include "msealprobe_elf_data.h"
+#include "callprobe_elf_data.h"
+#include "busyprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -904,6 +906,38 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         }
     }
 
+    /* callprobe.elf drives the syscall dispatcher's reject counters. An
+     * out-of-range syscall number reaches the range check with no libc
+     * wrapper, no builtin and no privilege behind it -- the number is the
+     * caller's own byte -- so nothing in the tree produced one and the three
+     * kprintf sites there went unnoticed, the same way SYS_MSEAL's sixteen
+     * did. 0755 is deliberate: the point is that an UNPRIVILEGED caller
+     * drives these counters. See verify-syscall-reject-counters.sh. */
+    {
+        int callprobe_fd = ramfs_open("/callprobe.elf", RAMFS_FLAG_WRITE);
+        if (callprobe_fd >= 0) {
+            ramfs_write(callprobe_fd, callprobe_elf_data, callprobe_elf_data_len);
+            ramfs_close(callprobe_fd);
+            ramfs_chmod("/callprobe.elf", 0755);
+        }
+    }
+
+    /* busyprobe.elf holds a descriptor open across an unlink, which no shell
+     * builtin does -- cmd_path_op opens nothing, and every builtin that opens
+     * a file closes it before returning. Without a driver the busy refusal has
+     * nothing to conflict with and a harness would pass against the unfixed
+     * kernel. 0755: an unprivileged caller must be able to drive it, since the
+     * use-after-free it prevents needed no privilege either.
+     * See verify-ramfs-unlink-busy.sh. */
+    {
+        int busyprobe_fd = ramfs_open("/busyprobe.elf", RAMFS_FLAG_WRITE);
+        if (busyprobe_fd >= 0) {
+            ramfs_write(busyprobe_fd, busyprobe_elf_data, busyprobe_elf_data_len);
+            ramfs_close(busyprobe_fd);
+            ramfs_chmod("/busyprobe.elf", 0755);
+        }
+    }
+
     /* slotbomb.elf spawns /slothold.elf in a tight loop WITHOUT reaping, to
      * prove the per-user concurrent task cap engages (see verify-slotcap.sh).
      * Like credprobe.elf it has to bypass the shell: the cap lives in
@@ -1146,6 +1180,21 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
      * `ifconfig` still reports "1 watched", so the omission reads as healthy
      * from both status surfaces while nothing is actually being supervised. */
     scheduler_add_task(task_get((uint32_t)pid_supervisor));
+
+    /* Same omission as the supervisor line above, and it hid the same way:
+     * edr_daemon_start() creates the task, sets PRIORITY_HIGH and prints
+     * "EDR daemon started successfully", so the boot log, `ps` and the
+     * CAP_UNKILLABLE grant all show a healthy daemon -- while edr_daemon_main()
+     * had never executed a single instruction. Every EDR counter therefore
+     * read 0, which is indistinguishable from "scanned everything, found
+     * nothing". The daemon whose serial spam CLAUDE.md tells us to grep away
+     * was the syscall-path hook, not this task.
+     *
+     * Guarded because edr_daemon_start() returns -1 on failure, and
+     * task_get(-1) would not find a task to enqueue. */
+    if (pid_edr >= 0) {
+        scheduler_add_task(task_get((uint32_t)pid_edr));
+    }
 
     kprintf("[SHELL] Tinyshell is ready to play!  [OK]\n");
 

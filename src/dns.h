@@ -67,10 +67,13 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
  * @param drop_question   Dropped: question name mismatched or absent (injection)
  * @param drop_malformed  Dropped: short, truncated, or non-zero RCODE
  * @param drop_no_answer  Well-formed responses carrying no A record
+ * @param drop_name_ptr   Dropped: hostile name-compression pointer
+ * @param drop_name_label Dropped: invalid label length / label count
  */
 void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
                       uint32_t* drop_tid, uint32_t* drop_question,
-                      uint32_t* drop_malformed, uint32_t* drop_no_answer);
+                      uint32_t* drop_malformed, uint32_t* drop_no_answer,
+                      uint32_t* drop_name_ptr, uint32_t* drop_name_label);
 
 #ifdef TINYOS_FAULT_INJECT
 /**

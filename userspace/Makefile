@@ -16,7 +16,8 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 # User programs to build
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
-            netprobe.elf msealprobe.elf
+            netprobe.elf msealprobe.elf callprobe.elf \
+            busyprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -127,6 +128,25 @@ msealprobe.elf: msealprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c msealprobe.c -o msealprobe.o
 	$(LD) $(LDFLAGS) -o msealprobe.elf crt0.o msealprobe.o libc.o -lgcc
 	@echo "Built msealprobe.elf"
+
+# callprobe.elf drives the syscall DISPATCHER's reject counters straight
+# through int 0x80. An out-of-range syscall number has no libc wrapper and no
+# builtin -- nothing else in the tree produces one -- which is why the three
+# kprintf sites on that path went unnoticed. The number is the caller's own
+# byte, so this needs no privilege: 0755 is deliberate.
+callprobe.elf: callprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c callprobe.c -o callprobe.o
+	$(LD) $(LDFLAGS) -o callprobe.elf crt0.o callprobe.o libc.o -lgcc
+	@echo "Built callprobe.elf"
+
+# busyprobe.elf holds a descriptor open across an unlink. Nothing else in the
+# tree does -- every builtin that opens a file closes it before returning --
+# so without this the busy refusal has no driver and a harness would grade an
+# unlink with no descriptor to conflict with.
+busyprobe.elf: busyprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c busyprobe.c -o busyprobe.o
+	$(LD) $(LDFLAGS) -o busyprobe.elf crt0.o busyprobe.o libc.o -lgcc
+	@echo "Built busyprobe.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld

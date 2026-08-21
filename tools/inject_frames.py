@@ -144,17 +144,171 @@ def build_tcp_frame(dst_mac, src_mac, src_ip, dst_ip, src_port, dst_port,
     return frame
 
 
+def build_udp_frame(dst_mac, src_mac, src_ip, dst_ip, src_port, dst_port,
+                    payload_len, udp_len_override=None, corrupt_checksum=False):
+    """A well-formed IPv4 frame carrying UDP, with the length field chosen.
+
+    handle_udp() groups its three length tests into ONE counter
+    (udp_drop_length) because they are one forged-length signature; the
+    checksum test is a separate attacker position and has its own. The modes
+    this builder needs to reach, therefore:
+
+      udp_len_override=None     -> honest length. Drives udp_rx_accepted, and
+                                   that is the POSITIVE CONTROL: a surface
+                                   that only counts failures reads identically
+                                   whether the parser works or refuses
+                                   everything.
+      udp_len_override=4        -> below the 8-byte UDP header minimum
+                                   (validation 1).
+      udp_len_override=5000     -> exceeds the IP payload (validation 2). This
+                                   is the OOB-read shape the counter exists
+                                   for; the guest must reject it on the length
+                                   test and never reach the checksum.
+      corrupt_checksum=True     -> honest length, wrong checksum. Must land on
+                                   udp_drop_checksum and NOT on the length
+                                   counter -- that separation is the whole
+                                   point of counting by attacker position.
+
+    The checksum is computed for real in the honest case. It has to be: a
+    frame that fails checksum validation would be dropped one test later than
+    intended, so an "accepted" leg built on a bogus checksum would silently
+    measure the checksum path instead.
+    """
+    payload = bytes((i % 251) for i in range(payload_len)) if payload_len else b""
+
+    real_len = 8 + len(payload)
+    wire_len = real_len if udp_len_override is None else udp_len_override
+
+    udp = struct.pack("!HHHH", src_port, dst_port, wire_len, 0) + payload
+
+    total_len = 20 + len(udp)
+    ip = struct.pack("!BBHHHBBH4s4s",
+                     0x45, 0x00, total_len,
+                     0x5678, 0x0000,
+                     64, 17, 0,                   # protocol 17 = UDP
+                     socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    ip = ip[:10] + struct.pack("!H", checksum16(ip)) + ip[12:]
+
+    # The guest checksums over `wire_len` bytes, not over what is really
+    # present -- so on an oversize override we must not try to match it. Those
+    # frames are meant to die on the length test anyway.
+    if udp_len_override is None:
+        pseudo = (socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
+                  + struct.pack("!BBH", 0, 17, real_len))
+        csum = checksum16(pseudo + udp)
+        if csum == 0:
+            csum = 0xFFFF          # RFC 768: 0 means "no checksum"
+        if corrupt_checksum:
+            csum ^= 0xFFFF
+            if csum == 0:
+                csum = 0x1234
+        udp = udp[:6] + struct.pack("!H", csum) + udp[8:]
+
+    frame = dst_mac + src_mac + struct.pack("!H", 0x0800) + ip + udp
+    if len(frame) < 60:
+        frame += bytes(60 - len(frame))
+    return frame
+
+
+DHCP_HEADER_LEN = 240          # through the magic cookie, inclusive
+
+
+def build_dhcp_frame(dst_mac, src_mac, src_ip, dst_ip, xid,
+                     truncate=False, bad_cookie=False):
+    """A UDP/67->68 frame carrying a DHCP BOOTREPLY.
+
+    Reachability is NOT uniform across handle_dhcp()'s counters, and the
+    difference is the point:
+
+      dhcp_drop_short  -- tested before anything else, so ANY host on the
+                          segment can drive it. `truncate=True` sends fewer
+                          than 240 bytes.
+      dhcp_drop_cookie -- sits BEHIND an op==BOOTREPLY test and an xid match
+                          against the guest's own in-flight transaction. An
+                          off-path injector cannot reach it without knowing
+                          that xid, which is why --dhcp-xid exists and why a
+                          harness leg for this counter must source the value
+                          from the guest rather than guess it. A wrong xid
+                          makes the frame vanish into the silent-ignore arm
+                          and the leg then measures nothing at all.
+
+    That asymmetry is a property of the guest, not a limitation here: it means
+    the cookie counter is a same-segment-race signal, while the short counter
+    is genuinely remote-driven.
+    """
+    dhcp = bytearray(DHCP_HEADER_LEN)
+    dhcp[0] = 2                                    # op = BOOTREPLY
+    dhcp[1] = 1                                    # htype = Ethernet
+    dhcp[2] = 6                                    # hlen
+    struct.pack_into("!I", dhcp, 4, xid)
+    dhcp[16:20] = socket.inet_aton("10.0.2.15")    # yiaddr
+    dhcp[28:34] = src_mac                          # chaddr
+    cookie = 0x63825363 ^ (0xFFFFFFFF if bad_cookie else 0)
+    struct.pack_into("!I", dhcp, 236, cookie)
+
+    body = bytes(dhcp) + bytes([53, 1, 5, 255])    # DHCPACK, end
+    if truncate:
+        body = body[:DHCP_HEADER_LEN - 8]
+
+    udp = struct.pack("!HHHH", 67, 68, 8 + len(body), 0) + body
+
+    total_len = 20 + len(udp)
+    ip = struct.pack("!BBHHHBBH4s4s",
+                     0x45, 0x00, total_len,
+                     0x9abc, 0x0000,
+                     64, 17, 0,
+                     socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    ip = ip[:10] + struct.pack("!H", checksum16(ip)) + ip[12:]
+
+    pseudo = (socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
+              + struct.pack("!BBH", 0, 17, len(udp)))
+    csum = checksum16(pseudo + udp) or 0xFFFF
+    udp = udp[:6] + struct.pack("!H", csum) + udp[8:]
+
+    frame = dst_mac + src_mac + struct.pack("!H", 0x0800) + ip + udp
+    if len(frame) < 60:
+        frame += bytes(60 - len(frame))
+    return frame
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--mcast", required=True, help="group:port, e.g. 230.0.0.1:1234")
     ap.add_argument("--count", type=int, default=20)
     ap.add_argument("--ethertype", default="0x88b5",
                     help="EtherType, e.g. 0x88b5 (ignored in --mode icmp)")
-    ap.add_argument("--mode", choices=("ethertype", "icmp", "tcp"), default="ethertype",
+    ap.add_argument("--mode",
+                    choices=("ethertype", "icmp", "tcp", "udp", "dhcp"),
+                    default="ethertype",
                     help="ethertype: raw frame with an unhandled EtherType. "
                          "icmp: well-formed IPv4/ICMP echo request or reply. "
                          "tcp: valid IPv4 carrying a TCP header whose "
-                         "data_offset is chosen by --tcp-data-offset.")
+                         "data_offset is chosen by --tcp-data-offset. "
+                         "udp: valid IPv4/UDP whose length field and checksum "
+                         "are chosen by --udp-length / --udp-corrupt-checksum. "
+                         "dhcp: UDP 67->68 BOOTREPLY, optionally truncated or "
+                         "with a bad magic cookie.")
+    ap.add_argument("--udp-src-port", type=int, default=40001)
+    ap.add_argument("--udp-dst-port", type=int, default=9999,
+                    help="default is a port with no handler: the accepted "
+                         "counter increments before dispatch, so this leg "
+                         "measures the parser and not a service")
+    ap.add_argument("--udp-length", type=int, default=None,
+                    help="value to write into the UDP length field. Omit for "
+                         "an honest length (the positive control). 4 is below "
+                         "the header minimum; 5000 exceeds the IP payload.")
+    ap.add_argument("--udp-corrupt-checksum", action="store_true",
+                    help="honest length, wrong checksum -- must land on the "
+                         "checksum counter and not the length counter")
+    ap.add_argument("--dhcp-xid", type=lambda s: int(s, 0), default=0,
+                    help="transaction ID. Must match the guest's in-flight "
+                         "xid or the frame is silently ignored well before "
+                         "the cookie test -- see build_dhcp_frame().")
+    ap.add_argument("--dhcp-truncate", action="store_true",
+                    help="send fewer than 240 bytes (drives dhcp_drop_short)")
+    ap.add_argument("--dhcp-bad-cookie", action="store_true",
+                    help="corrupt the magic cookie (needs a matching "
+                         "--dhcp-xid to be reachable at all)")
     ap.add_argument("--tcp-data-offset", type=int, default=0,
                     help="TCP data offset in 32-bit words. 0 or >15 is "
                          "malformed (below the 5-word minimum); 5 is legal "
@@ -185,7 +339,22 @@ def main():
     if not 0 <= ethertype <= 0xFFFF:
         sys.exit("--ethertype out of range")
 
-    if args.mode == "tcp":
+    if args.mode == "udp":
+        frame = build_udp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
+                                args.udp_src_port, args.udp_dst_port,
+                                args.payload_len, args.udp_length,
+                                args.udp_corrupt_checksum)
+        desc = ("udp length "
+                + ("honest" if args.udp_length is None else str(args.udp_length))
+                + (", corrupt checksum" if args.udp_corrupt_checksum else ""))
+    elif args.mode == "dhcp":
+        frame = build_dhcp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
+                                 args.dhcp_xid, args.dhcp_truncate,
+                                 args.dhcp_bad_cookie)
+        desc = (f"dhcp xid 0x{args.dhcp_xid:08x}"
+                + (" truncated" if args.dhcp_truncate else "")
+                + (" bad-cookie" if args.dhcp_bad_cookie else ""))
+    elif args.mode == "tcp":
         frame = build_tcp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
                                 args.tcp_src_port, args.tcp_dst_port,
                                 args.tcp_data_offset, 0)

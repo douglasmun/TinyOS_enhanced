@@ -109,6 +109,8 @@ SRC := \
   src/credprobe_elf_data.c \
   src/netprobe_elf_data.c \
   src/msealprobe_elf_data.c \
+  src/callprobe_elf_data.c \
+  src/busyprobe_elf_data.c \
   src/slotbomb_elf_data.c \
   src/slothold_elf_data.c \
   src/shell_elf_data.c \

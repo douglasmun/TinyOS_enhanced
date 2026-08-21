@@ -67,6 +67,31 @@ static volatile bool scheduler_enabled = false;
  *===========================================================================*/
 static volatile task_t* fpu_owner = NULL;  // Task that owns FPU state
 
+/**
+ * @brief Drop `task` as the lazy-FPU owner, if it currently is.
+ *
+ * fpu_owner is a raw task_t* that outlives nothing: the next lazy FPU switch
+ * does `fxsave` straight into fpu_owner->context.fpu_state. If the owning task
+ * is freed without clearing this, that write lands in a recycled -- or
+ * reallocated -- task slot, corrupting whatever now lives there.
+ *
+ * The post-context-switch reaper always cleared it, which is why this was
+ * latent: that path covers a task that exits on its own. A task killed from
+ * outside is freed via task_free_resources() without passing through the
+ * reaper, so it needs the same clear -- hence this is exported rather than
+ * open-coded, so a third teardown path cannot forget it.
+ */
+void scheduler_fpu_release(task_t* task) {
+    if (!task) {
+        return;
+    }
+    CRITICAL_SECTION_ENTER();
+    if (fpu_owner == task) {
+        fpu_owner = NULL;
+    }
+    CRITICAL_SECTION_EXIT();
+}
+
 /*=============================================================================
  * SECURITY FIX (v2.0): Cleanup Queue for Rapid Task Terminations
  *
@@ -1089,9 +1114,7 @@ void scheduler_schedule_from_interrupt(interrupt_regs_t* regs) {
         /*=====================================================================
          * SECURITY FIX (Issue 5.3): Clear FPU owner if terminated task owns it
          *===================================================================*/
-        if (fpu_owner == task_to_cleanup) {
-            fpu_owner = NULL;
-        }
+        scheduler_fpu_release((task_t*)task_to_cleanup);
 
         if (switched_to_kernel_pd) {
             __asm__ volatile("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");

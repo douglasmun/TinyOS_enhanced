@@ -1296,6 +1296,16 @@ void cmd_secstatus(int argc, char* argv[]) {
     stream_printf(ctx, "    Seal arg rejects .... %u bad-args, %u unmapped-page\n",
                   ms_pae_args, ms_pae_unmapped);
 
+    /* Dispatcher accept/reject. These replaced kprintf sites that sat ABOVE
+     * the EDR hook and echoed the caller's own syscall number, so any ring-3
+     * process could write chosen text into the kernel log at syscall rate.
+     * `accepted` is the positive control -- the reject counts alone read the
+     * same whether the dispatcher works or refuses everything. */
+    uint32_t sc_ok = 0, sc_range = 0, sc_unimpl = 0;
+    syscall_get_reject_stats(&sc_ok, &sc_range, &sc_unimpl);
+    stream_printf(ctx, "    Syscall dispatch .... %u accepted, %u out-of-range, %u unimplemented\n",
+                  sc_ok, sc_range, sc_unimpl);
+
     stream_printf(ctx, "\n  Boot integrity\n");
     stream_printf(ctx, "    ELF signatures ...... %s\n",
                   elf_enforced ? "ENFORCED (fail-closed)" : "PERMISSIVE (warn-and-load)");
