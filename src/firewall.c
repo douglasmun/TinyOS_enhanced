@@ -240,6 +240,43 @@ static connection_entry_t* create_connection(uint32_t src_ip, uint32_t dst_ip,
 }
 
 /*=============================================================================
+ * FUNCTION: firewall_track_outgoing
+ * PURPOSE: Record a flow WE initiated so its reply is recognised inbound.
+ *
+ * firewall_check_packet() runs on ingress only, so before this existed the
+ * connection table could only ever be populated by an inbound packet that had
+ * already been accepted by a rule. That made the stateful branch useless for
+ * its actual purpose -- letting replies to our own queries back in -- and the
+ * gap was being covered by two all-wildcard ACCEPT rules that matched every
+ * inbound packet on the segment instead.
+ *
+ * Called from the egress helpers in net.c. Ports are in host order, matching
+ * find_connection()'s convention. The entry is created ESTABLISHED because we
+ * sent it: there is no handshake to wait for on our side.
+ *===========================================================================*/
+void firewall_track_outgoing(uint32_t src_ip, uint32_t dst_ip,
+                             uint16_t src_port, uint16_t dst_port,
+                             uint8_t protocol) {
+    if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) {
+        return;  /* ICMP has no ports; it has its own rule. */
+    }
+
+    CRITICAL_SECTION_ENTER();
+
+    connection_entry_t* conn =
+        find_connection(src_ip, dst_ip, src_port, dst_port, protocol);
+    if (!conn) {
+        conn = create_connection(src_ip, dst_ip, src_port, dst_port, protocol);
+    }
+    if (conn) {
+        conn->state = CONN_STATE_ESTABLISHED;
+        conn->last_seen = pit_get_ticks();
+    }
+
+    CRITICAL_SECTION_EXIT();
+}
+
+/*=============================================================================
  * Rate Limiting
  *===========================================================================
  * SECURITY FIX: Fail-closed rate limiting with LRU eviction
@@ -469,11 +506,22 @@ static firewall_rule_t* match_rule(const ip_header_t* ip, uint16_t src_port,
     uint32_t src_ip = ntohl(*(uint32_t*)ip->src_ip);
     uint32_t dst_ip = ntohl(*(uint32_t*)ip->dest_ip);
 
-    /* Sort rules by priority */
+    /* Scan by priority, and within one priority band consider DROP rules
+     * before ACCEPT rules (pass 0 = deny actions, pass 1 = the rest).
+     * Without this, two rules at the same priority are resolved by array
+     * order, i.e. by which was added first -- so an ACCEPT installed at boot
+     * silently outranked a DROP added later by firewall_block_ip(). Fail
+     * closed on a tie instead. */
     for (uint32_t prio = 0; prio < 1000; prio++) {
+      for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < rule_count; i++) {
             firewall_rule_t* rule = &rules[i];
             if (!rule->enabled || rule->priority != prio) continue;
+
+            bool is_deny = (rule->action == FW_ACTION_DROP ||
+                            rule->action == FW_ACTION_REJECT ||
+                            rule->action == FW_ACTION_LOG_DROP);
+            if ((pass == 0) != is_deny) continue;
 
             /* Check protocol */
             if (rule->protocol != 0 && rule->protocol != ip->protocol) continue;
@@ -505,6 +553,7 @@ static firewall_rule_t* match_rule(const ip_header_t* ip, uint16_t src_port,
             }
             return rule;
         }
+      }
     }
 
     return NULL;  /* No match - default deny */
@@ -872,33 +921,44 @@ void firewall_clear_connections(void) {
 /*=============================================================================
  * Convenience Functions
  *===========================================================================*/
+/*=============================================================================
+ * firewall_allow_outgoing() / firewall_allow_established() install NO RULE.
+ *
+ * Both used to add a firewall_rule_t whose every match field was left zero.
+ * match_rule() reads zero as "any" on all of them -- ip_matches() and
+ * port_matches() return true for a zero rule value, and the protocol test is
+ * skipped when rule->protocol is 0 -- and firewall_add_rule() sets
+ * enabled = true unconditionally, so the zeroed enabled field in {0} did not
+ * hold them back. The result was two rules matching EVERY inbound packet at
+ * priorities 100 and 10, the two lowest numbers scanned first, which made the
+ * "Default: DENY ALL" at the bottom of firewall_check_packet() unreachable
+ * for anything that cleared the bogon and rate-limit checks.
+ *
+ * The priority-10 one also shadowed firewall_block_ip(), which uses the same
+ * priority and is appended at a higher array index, so match_rule()'s
+ * insertion-order inner loop found the wildcard ACCEPT first. That is the
+ * IDS's only enforcement action, so a matched BLOCK signature blocked nothing.
+ *
+ * Neither rule was expressible in the first place: firewall_rule_t has no
+ * direction field, so "outgoing" and "established" cannot be written as a
+ * match. Both concerns are now handled where they belong -- egress flows are
+ * recorded by firewall_track_outgoing() and their replies admitted by the
+ * connection-tracking branch of firewall_check_packet(), which runs BEFORE
+ * match_rule() and is exactly what the deleted rule's own comment claimed to
+ * rely on.
+ *
+ * The functions are kept as no-ops so the boot sequence and its banner text
+ * stay intact; callers need no change.
+ *===========================================================================*/
 void firewall_allow_outgoing(void) {
-    firewall_rule_t rule = {0};
-    rule.action = FW_ACTION_ACCEPT;
-    rule.priority = 100;
-    safe_strcpy(rule.description, "Allow all outgoing", sizeof(rule.description) - 1);
-    firewall_add_rule(&rule);
+    /* Intentionally empty: see the comment above. Outgoing flows are tracked
+     * by firewall_track_outgoing() from the egress path, not by a rule. */
 }
 
 void firewall_allow_established(void) {
-    /*=========================================================================
-     * Allow packets from established connections
-     *
-     * This allows response packets to pass through. Works with stateful
-     * connection tracking - if we initiated an outgoing connection,
-     * allow the response packets back in.
-     *
-     * SECURITY: This doesn't open new inbound connections, only allows
-     * responses to connections we initiated.
-     *=======================================================================*/
-    firewall_rule_t rule = {0};
-    rule.action = FW_ACTION_ACCEPT;
-    rule.priority = 10;  /* High priority - check established first */
-    safe_strcpy(rule.description, "Allow established/related", sizeof(rule.description) - 1);
-    firewall_add_rule(&rule);
-
-    /* Note: The actual connection state check happens in firewall_check_packet()
-     * via the connection tracking table. This rule just sets the policy. */
+    /* Intentionally empty: see the comment above firewall_allow_outgoing().
+     * The established-connection check is the conn->state test in
+     * firewall_check_packet(), which needs no rule to function. */
 }
 
 void firewall_allow_port(uint16_t port, uint8_t protocol, const char* description) {
@@ -926,7 +986,11 @@ void firewall_block_ip(uint32_t ip) {
     rule.src_ip = ip;
     rule.src_ip_mask = 0xFFFFFFFF;
     rule.action = FW_ACTION_DROP;
-    rule.priority = 10;
+    /* Priority 0, ahead of every ACCEPT this file installs. A block that
+     * shares a priority band with an ACCEPT is decided by array order, which
+     * is how this rule -- the IDS's only enforcement action -- previously lost
+     * to a wildcard ACCEPT added earlier at the same priority 10. */
+    rule.priority = 0;
     safe_strcpy(rule.description, "Blocked IP", sizeof(rule.description) - 1);
     firewall_add_rule(&rule);
 }

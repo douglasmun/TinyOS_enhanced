@@ -263,6 +263,17 @@ bool net_netd_is_claimed(void);
  * printed — a remote host drives this path. */
 void net_get_netd_stats(uint32_t* routed, uint32_t* dropped, bool* claimed);
 void net_get_syscall_stats(uint32_t* rx_frames, uint32_t* tx_frames);
+
+/**
+ * @brief UDP RX counters that replaced handle_udp()'s per-packet kprintf
+ *        sites. Surfaced by ifconfig.
+ *
+ * @param accepted      Well-formed datagrams that reached dispatch
+ * @param drop_length   Dropped: forged/short UDP or IP length field
+ * @param drop_checksum Dropped: UDP checksum mismatch
+ */
+void udp_get_rx_stats(uint32_t* accepted, uint32_t* drop_length,
+                      uint32_t* drop_checksum);
 void net_count_tcp_no_connection(void);
 uint32_t net_get_tcp_no_connection(void);
 

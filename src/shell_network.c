@@ -204,11 +204,37 @@ void cmd_ifconfig(void) {
      * them is happening. See doc/NETDAEMON_DESIGN.md. */
     uint32_t dns_ok = 0, dns_spoof = 0, dns_tid = 0;
     uint32_t dns_question = 0, dns_malformed = 0, dns_noanswer = 0;
+    uint32_t dns_nameptr = 0, dns_namelabel = 0;
     dns_get_rx_stats(&dns_ok, &dns_spoof, &dns_tid,
-                     &dns_question, &dns_malformed, &dns_noanswer);
+                     &dns_question, &dns_malformed, &dns_noanswer,
+                     &dns_nameptr, &dns_namelabel);
     kprintf("  DNS rx:       %u resolved, %u no-answer\n", dns_ok, dns_noanswer);
     kprintf("  DNS drops:    %u src-ip, %u tid, %u question, %u malformed\n",
             dns_spoof, dns_tid, dns_question, dns_malformed);
+    /* skip_dns_name() signatures. Separate from `malformed` above because
+     * they are reached from the ANSWER section, which no earlier check
+     * filters -- a forged response drives them directly. */
+    kprintf("  DNS name:     %u bad-pointer, %u bad-label\n",
+            dns_nameptr, dns_namelabel);
+
+    /* DHCP RX counters. Firewall-exempt inbound path, so all of these are
+     * remote-driven; `replies` is the positive control. */
+    uint32_t dh_ok = 0, dh_short = 0, dh_cookie = 0;
+    uint32_t dh_opts = 0, dh_rogue = 0, dh_clamp = 0;
+    dhcp_get_rx_stats(&dh_ok, &dh_short, &dh_cookie,
+                      &dh_opts, &dh_rogue, &dh_clamp);
+    kprintf("  DHCP rx:      %u replies, %u short, %u cookie\n",
+            dh_ok, dh_short, dh_cookie);
+    kprintf("  DHCP drops:   %u options, %u rogue-server, %u lease-clamp\n",
+            dh_opts, dh_rogue, dh_clamp);
+
+    /* UDP RX counters. `accepted` is the positive control: the drop counters
+     * alone are satisfied perfectly by a handle_udp() that refuses every
+     * datagram. */
+    uint32_t udp_ok = 0, udp_len = 0, udp_csum = 0;
+    udp_get_rx_stats(&udp_ok, &udp_len, &udp_csum);
+    kprintf("  UDP rx:       %u accepted, %u bad-length, %u bad-checksum\n",
+            udp_ok, udp_len, udp_csum);
 
     /* SYS_NETRX/SYS_NETTX traffic (doc/NETDAEMON_DESIGN.md PR B). These read 0
      * on a stock boot: the boundary exists, but the parser has not moved to

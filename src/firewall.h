@@ -249,6 +249,24 @@ void firewall_allow_outgoing(void);
 void firewall_allow_established(void);
 
 /**
+ * @brief Record an outgoing flow so its reply is admitted on the way back.
+ *
+ * firewall_check_packet() only runs on ingress, so without this the
+ * connection table can never learn about a query WE sent, and the stateful
+ * branch that admits replies has nothing to match. Call from the egress path
+ * after the addresses and ports are known.
+ *
+ * @param src_ip   Our address, host byte order
+ * @param dst_ip   Peer address, host byte order
+ * @param src_port Our port, host byte order
+ * @param dst_port Peer port, host byte order
+ * @param protocol IPPROTO_TCP or IPPROTO_UDP (others ignored)
+ */
+void firewall_track_outgoing(uint32_t src_ip, uint32_t dst_ip,
+                             uint16_t src_port, uint16_t dst_port,
+                             uint8_t protocol);
+
+/**
  * @brief Allow incoming connections on specific port
  *
  * @param port Port number

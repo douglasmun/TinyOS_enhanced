@@ -8,6 +8,35 @@
 #include "net.h"
 #include "dhcp.h"
 #include "kprintf.h"
+
+/* DHCP RX counters. DHCP is the one inbound path the firewall is exempt from
+ * (the lease has to arrive before any policy can name our address), so every
+ * site below is driven by any host on the segment -- count, never print
+ * (doc/NETWORK_ISOLATION.md). Grouped by attacker position rather than by
+ * source line, and the whole file is swept, not just handle_dhcp():
+ * dhcp_parse_options() is reached from the same frame.
+ *
+ * The XID check is NOT a trust boundary here -- an on-segment attacker sees
+ * our DISCOVER, so a print above OR below it is equally remote-driven.
+ * `dhcp_replies_ok` is the positive control. */
+static uint32_t dhcp_replies_ok = 0;      /* valid BOOTREPLY for our XID   */
+static uint32_t dhcp_drop_short = 0;      /* truncated frame / header      */
+static uint32_t dhcp_drop_cookie = 0;     /* bad magic cookie              */
+static uint32_t dhcp_drop_options = 0;    /* malformed option TLV stream   */
+static uint32_t dhcp_drop_rogue = 0;      /* ACK from a different server   */
+static uint32_t dhcp_clamp_lease = 0;     /* lease time clamped (wrap DoS) */
+
+void dhcp_get_rx_stats(uint32_t* replies, uint32_t* drop_short,
+                       uint32_t* drop_cookie, uint32_t* drop_options,
+                       uint32_t* drop_rogue, uint32_t* clamp_lease) {
+    if (replies)      *replies      = dhcp_replies_ok;
+    if (drop_short)   *drop_short   = dhcp_drop_short;
+    if (drop_cookie)  *drop_cookie  = dhcp_drop_cookie;
+    if (drop_options) *drop_options = dhcp_drop_options;
+    if (drop_rogue)   *drop_rogue   = dhcp_drop_rogue;
+    if (clamp_lease)  *clamp_lease  = dhcp_clamp_lease;
+}
+
 #include "util.h"
 #include "dns.h"
 #include "firewall.h"
@@ -86,7 +115,7 @@ static void parse_dhcp_options(const uint8_t* options, size_t options_len,
     while (i < options_len) {
         /* Safety: Prevent infinite loop from malformed options */
         if (++iterations > MAX_DHCP_OPTION_ITERATIONS) {
-            kprintf("DHCP: Warning - excessive option iterations, stopping parse\n");
+            dhcp_drop_options++;
             break;
         }
 
@@ -102,7 +131,7 @@ static void parse_dhcp_options(const uint8_t* options, size_t options_len,
 
         /* SECURITY: Ensure we can read the length byte */
         if (i >= options_len) {
-            kprintf("DHCP: Malformed options - truncated length field\n");
+            dhcp_drop_options++;
             break;
         }
 
@@ -117,8 +146,8 @@ static void parse_dhcp_options(const uint8_t* options, size_t options_len,
          *===================================================================*/
         // First check: ensure we can safely add len to i without overflow
         if (len > (options_len - i)) {
-            kprintf("DHCP: Malformed option %d - length %d exceeds remaining %u bytes\n",
-                    option, len, (unsigned int)(options_len - i));
+            /* Same signature as the two tests above: one forged TLV stream. */
+            dhcp_drop_options++;
             break;
         }
 
@@ -370,7 +399,7 @@ void handle_dhcp(const uint8_t* data, size_t len) {
     // kprintf("[DHCP] Received packet (%u bytes)\n", (unsigned int)len);
 
     if (len < sizeof(dhcp_header_t)) {
-        kprintf("[DHCP] Packet too short (need %u bytes)\n", (unsigned int)sizeof(dhcp_header_t));
+        dhcp_drop_short++;
         return;
     }
 
@@ -388,12 +417,11 @@ void handle_dhcp(const uint8_t* data, size_t len) {
         return;
     }
 
-    kprintf("[DHCP] Valid BOOTREPLY received (%u bytes, XID: 0x%x)\n",
-            (unsigned int)len, dhcp_client.xid);
+    dhcp_replies_ok++;
     
     // Check magic cookie
     if (ntohl(dhcp->magic_cookie) != DHCP_MAGIC_COOKIE) {
-        kprintf("DHCP: Invalid magic cookie\n");
+        dhcp_drop_cookie++;
         return;
     }
     
@@ -449,11 +477,8 @@ void handle_dhcp(const uint8_t* data, size_t len) {
                  * same server that sent the OFFER.
                  *===============================================================*/
                 if (memcmp(server_ip, dhcp_client.server_ip, 4) != 0) {
-                    kprintf("DHCP: SECURITY: ACK from different server! Expected %d.%d.%d.%d, got %d.%d.%d.%d\n",
-                            dhcp_client.server_ip[0], dhcp_client.server_ip[1],
-                            dhcp_client.server_ip[2], dhcp_client.server_ip[3],
-                            server_ip[0], server_ip[1], server_ip[2], server_ip[3]);
-                    kprintf("DHCP: Possible rogue DHCP server attack detected. Dropping ACK.\n");
+                    /* Never format the attacker's own server_ip back out. */
+                    dhcp_drop_rogue++;
                     return;
                 }
 
@@ -481,16 +506,13 @@ void handle_dhcp(const uint8_t* data, size_t len) {
                 // A zero/tiny lease would make t1_base and jitter_window zero,
                 // causing a divide-by-zero (#DE) in the modulo below.
                 if (dhcp_client.lease_time < 60) {
-                    kprintf("DHCP: WARNING - Lease time (%u sec) too small. Clamping to 600 sec.\n",
-                            dhcp_client.lease_time);
+                    dhcp_clamp_lease++;
                     dhcp_client.lease_time = 600;
                 }
 
                 if (dhcp_client.lease_time > MAX_DHCP_LEASE_SECONDS) {
-                    kprintf("DHCP: WARNING - Lease time (%u sec = %u days) exceeds maximum.\n",
-                            dhcp_client.lease_time, dhcp_client.lease_time / 86400);
-                    kprintf("DHCP: Clamping to %lu sec (30 days) to prevent integer wraparound DoS.\n",
-                            MAX_DHCP_LEASE_SECONDS);
+                    /* Both clamps are one forged-lease signature. */
+                    dhcp_clamp_lease++;
                     dhcp_client.lease_time = MAX_DHCP_LEASE_SECONDS;
                 }
 
@@ -583,7 +605,9 @@ void handle_dhcp(const uint8_t* data, size_t len) {
             break;
             
         case DHCP_NAK:
-            kprintf("DHCP: Received NAK - restarting discovery\n");
+            /* Remote-driven: any host can forge a NAK. Counted as a rogue
+             * signature rather than printed. */
+            dhcp_drop_rogue++;
             dhcp_client.state = DHCP_STATE_INIT;
             dhcp_start();
             break;

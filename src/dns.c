@@ -95,17 +95,26 @@ static uint32_t dns_drop_source_ip = 0;     /* not from our configured server */
 static uint32_t dns_drop_tid = 0;           /* transaction ID mismatch       */
 static uint32_t dns_drop_question = 0;      /* question-name mismatch/absent */
 static uint32_t dns_drop_malformed = 0;     /* short, truncated, bad RCODE   */
+/* skip_dns_name() signatures. Kept apart from dns_drop_malformed because they
+ * imply a different attacker position: these bytes are parsed from the ANSWER
+ * section, which -- unlike the question name -- is never pre-filtered by
+ * dns_label_to_domain(), so a spoofed response reaches them directly. */
+static uint32_t dns_drop_name_pointer = 0;  /* hostile compression pointer   */
+static uint32_t dns_drop_name_label = 0;    /* label length > 63, or > 127   */
 static uint32_t dns_drop_no_answer = 0;     /* well-formed, no A record      */
 
 void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
                       uint32_t* drop_tid, uint32_t* drop_question,
-                      uint32_t* drop_malformed, uint32_t* drop_no_answer) {
+                      uint32_t* drop_malformed, uint32_t* drop_no_answer,
+                      uint32_t* drop_name_ptr, uint32_t* drop_name_label) {
     if (responses)       *responses       = dns_responses_rx;
     if (drop_source_ip)  *drop_source_ip  = dns_drop_source_ip;
     if (drop_tid)        *drop_tid        = dns_drop_tid;
     if (drop_question)   *drop_question   = dns_drop_question;
     if (drop_malformed)  *drop_malformed  = dns_drop_malformed;
     if (drop_no_answer)  *drop_no_answer  = dns_drop_no_answer;
+    if (drop_name_ptr)   *drop_name_ptr   = dns_drop_name_pointer;
+    if (drop_name_label) *drop_name_label = dns_drop_name_label;
 }
 
 // Storage for last resolved IP address
@@ -312,7 +321,7 @@ static size_t skip_dns_name(const uint8_t* packet_start, const uint8_t* packet_e
     while (label_count < MAX_DNS_LABELS) {
         // Boundary check: ensure we can read the length byte
         if (current_pos >= packet_end) {
-            kprintf("[DNS] SECURITY: Name parsing exceeded packet boundary. Dropping.\n");
+            dns_drop_malformed++;
             return 0;  // Error: exceeded packet boundary
         }
 
@@ -329,7 +338,7 @@ static size_t skip_dns_name(const uint8_t* packet_start, const uint8_t* packet_e
             // It's a pointer (2 bytes total)
             // Boundary check: ensure we can read both bytes of the pointer
             if (current_pos + 1 >= packet_end) {
-                kprintf("[DNS] SECURITY: Compression pointer at packet boundary. Dropping.\n");
+                dns_drop_malformed++;
                 return 0;  // Error: pointer extends beyond packet
             }
 
@@ -354,15 +363,16 @@ static size_t skip_dns_name(const uint8_t* packet_start, const uint8_t* packet_e
 
             // Validate pointer stays within packet bounds
             if (packet_start + offset >= packet_end) {
-                kprintf("[DNS] SECURITY: Compression pointer (offset %u) points outside packet. Dropping.\n",
-                        offset);
+                /* Never format `offset` -- it is the attacker's own byte. */
+                dns_drop_name_pointer++;
                 return 0;  // Error: pointer points outside packet
             }
 
             // Validate pointer points backward (offset must be before current position)
             if (packet_start + offset >= current_pos) {
-                kprintf("[DNS] SECURITY: Compression pointer (offset %u) points forward or self. Dropping.\n",
-                        offset);
+                /* Same signature as the out-of-bounds pointer above: one hostile
+                 * pointer, so one counter. */
+                dns_drop_name_pointer++;
                 return 0;  // Error: pointer must point backward to prevent loops
             }
 
@@ -372,14 +382,13 @@ static size_t skip_dns_name(const uint8_t* packet_start, const uint8_t* packet_e
 
         // Normal label: validate length
         if (len > MAX_DNS_LABEL_LEN) {
-            kprintf("[DNS] SECURITY: Label length (%u) exceeds max (%u). Dropping.\n",
-                    len, MAX_DNS_LABEL_LEN);
+            dns_drop_name_label++;
             return 0;  // Error: invalid label length
         }
 
         // Boundary check: ensure we can read the entire label
         if (current_pos + len + 1 > packet_end) {
-            kprintf("[DNS] SECURITY: Label extends beyond packet boundary. Dropping.\n");
+            dns_drop_malformed++;
             return 0;  // Error: label extends beyond packet
         }
 
@@ -389,8 +398,7 @@ static size_t skip_dns_name(const uint8_t* packet_start, const uint8_t* packet_e
     }
 
     // Too many labels - possible infinite loop attack
-    kprintf("[DNS] SECURITY: Exceeded max labels (%d). Possible infinite loop attack. Dropping.\n",
-            MAX_DNS_LABELS);
+    dns_drop_name_label++;
     return 0;  // Error: too many labels
 }
 

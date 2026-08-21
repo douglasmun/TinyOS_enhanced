@@ -9,6 +9,7 @@
  *=============================================================================*/
 #include "tcp.h"
 #include "net.h"
+#include "firewall.h"   /* firewall_track_outgoing() on the egress path */
 #include "kernel.h"
 #include "kprintf.h"
 #include "util.h"
@@ -676,6 +677,12 @@ static void tcp_send_segment(tcp_connection_t* conn, uint8_t flags,
     tcp_hdr->checksum = htons(calculate_l4_checksum(my_ip, conn->remote_ip,
                                                      IPPROTO_TCP, tcp_hdr, tcp_len));
     ip_hdr->checksum = htons(calculate_checksum(ip_hdr, sizeof(ip_header_t)));
+
+    /* Track the flow so inbound segments of this connection are admitted by
+     * connection tracking under the default-deny policy. */
+    firewall_track_outgoing(ntohl(*(uint32_t*)my_ip),
+                            ntohl(*(uint32_t*)conn->remote_ip),
+                            conn->local_port, conn->remote_port, IPPROTO_TCP);
 
     // Send packet
     e1000_send(packet, packet_len);
