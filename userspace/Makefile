@@ -176,4 +176,32 @@ info: hello.elf
 	@echo "=== Sections ==="
 	i686-elf-readelf -S hello.elf
 
-.PHONY: all clean info
+# ---------------------------------------------------------------------------
+# Signing + kernel blob generation
+# ---------------------------------------------------------------------------
+#
+# Both steps used to be MANUAL, and that silently ships a stale binary: edit a
+# probe's .c, run make, and the kernel still embeds the previous build, because
+# nothing links foo.c -> foo.elf.signed -> foo_elf_data.c. Debugging that costs
+# a full QEMU boot and reads like a kernel bug (the probe reports behaviour its
+# source no longer has). These rules close the chain.
+#
+# `signed` is not part of `all`: signing needs the pinned dev key, and the
+# normal build must still work without it. The probes' _elf_data.c files are
+# tracked in git, so a plain build uses the committed blobs.
+
+SIGNED   := $(PROGRAMS:.elf=.elf.signed)
+BLOB_DIR := ../src
+
+%.elf.signed: %.elf
+	python3 ../tools/sign_elf.py $<
+
+$(BLOB_DIR)/%_elf_data.c: %.elf.signed
+	python3 ../tools/elf_to_c.py $< $(BLOB_DIR)/$*_elf_data.c $(BLOB_DIR)/$*_elf_data.h $*_elf_data
+
+# Regenerate every probe blob the kernel embeds.
+blobs: $(patsubst %.elf,$(BLOB_DIR)/%_elf_data.c,$(PROGRAMS))
+
+signed: $(SIGNED)
+
+.PHONY: all clean info signed blobs

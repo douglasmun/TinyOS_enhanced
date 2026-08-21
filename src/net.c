@@ -1105,8 +1105,14 @@ static void handle_arp(arp_header_t* arp_hdr, eth_header_t* eth_hdr) {
  * @param ip_len Total length of the IP datagram.
  */
 /* UDP RX counters. Every site below is driven by any host on the segment,
- * before the firewall, so these are counted and never printed
- * (doc/NETWORK_ISOLATION.md). Grouped by attacker position, not by source
+ * so these are counted and never printed (doc/NETWORK_ISOLATION.md). Note
+ * these sites are NOT before the firewall, despite where they sit in this
+ * file: the order inside handle_ip() is address gate ->
+ * firewall_check_packet() -> L4 dispatch -> handle_udp(). The firewall's
+ * default policy is DENY ALL, so an unsolicited inbound datagram to an
+ * arbitrary port is dropped ABOVE these counters and moves none of them --
+ * which is why verify-udp-rx-counters.sh injects on ports 68->67, the one
+ * direction the firewall's standing DHCP exception admits without a rule. Grouped by attacker position, not by source
  * line: the three length tests are one forged-length signature, so they
  * share one counter. `udp_accepted` is the positive control -- a counter
  * surface that only ever counts failures reads the same whether the parser

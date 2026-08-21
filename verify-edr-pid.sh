@@ -61,6 +61,30 @@ else
     ok "no 'EDR daemon task not found' warning"
 fi
 
+echo "== leg 2b: the daemon task actually RUNS =="
+# Legs 1-4 all key on strings printed on the BOOT path, before
+# scheduler_start(). task_create_kernel() allocates a task but does NOT
+# enqueue it, and edr_daemon_start() never called scheduler_add_task() -- so
+# the task was created, listed by `ps`, granted PRIORITY_HIGH and
+# CAP_UNKILLABLE, and announced as "started successfully", while
+# edr_daemon_main() never executed one instruction. Every leg above passes
+# identically either way, which is what made this harness a false pass.
+#
+# This string is the FIRST statement inside edr_daemon_main(), so it can only
+# appear if the task was scheduled. "Scan complete" is asserted too: reaching
+# the loop body proves the daemon is not merely entered but running, and it is
+# what makes the scans_performed counter on the secstatus line non-zero.
+if echo "$BOOT" | grep -q "Starting EDR background daemon"; then
+    ok "edr_daemon_main() entered (the task was actually scheduled)"
+else
+    bad "edr_daemon_main() never ran -- task created but never enqueued"
+fi
+if echo "$BOOT" | grep -q "\[EDR DAEMON\] Scan complete"; then
+    ok "the daemon's scan loop is executing (scans_performed advances)"
+else
+    bad "daemon entered but never completed a scan -- its counters stay 0"
+fi
+
 echo "== leg 3: the daemon's real pid is in the allocatable range =="
 # Proves 3 was never plausible, so the old code could not have worked.
 EPID=$(echo "$BOOT" | grep -o "Created daemon process PID [0-9]*" | grep -o "[0-9]*$" | head -1)

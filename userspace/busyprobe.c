@@ -30,7 +30,12 @@
  *===========================================================================*/
 #include "libc.h"
 
-#define BUSY_PATH "/busyprobe.tmp"
+/* /scratch is the boot-time 0777 directory (kernel.c). NOT "/": root is
+ * 0711, so an unprivileged probe cannot create there -- and since this
+ * branch also added the missing parent-directory write check on create,
+ * a probe rooted at "/" now fails at open() with -EACCES and never
+ * reaches the unlink legs at all. */
+#define BUSY_PATH "/scratch/busyprobe.tmp"
 
 int main(void) {
     int fd, rc;
@@ -64,7 +69,13 @@ int main(void) {
     printf("PROBE closed-unlink rc=%d\n", rc);
 
     /* --- Leg 3: the file is really gone -------------------------------- */
-    fd = open(BUSY_PATH, O_WRONLY);
+    /* O_RDONLY, and that is load-bearing. ramfs_open() creates on ANY
+     * write-mode open -- the `!node && (flags & RAMFS_FLAG_WRITE)` branch
+     * never consults O_CREAT, and ramfs_vfs_open does not even translate
+     * that flag. So an O_WRONLY reopen here CREATES the file it is meant to
+     * prove absent and reports a fresh fd, failing this leg against a
+     * perfectly correct kernel. Read mode has no create branch to hit. */
+    fd = open(BUSY_PATH, O_RDONLY);
     printf("PROBE reopen rc=%d\n", fd);
     if (fd >= 0) close(fd);
 

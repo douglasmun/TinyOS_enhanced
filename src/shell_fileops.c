@@ -1176,7 +1176,17 @@ void cmd_touch(int argc, char* argv[]) {
 
     int fd = ramfs_open(path, RAMFS_FLAG_WRITE);
     if (fd < 0) {
-        kprintf("Error: Cannot create file '%s'\n", path);
+        /* Report the permission refusal distinctly. ramfs_open returns the
+         * RAMFS_CREATE_EPERM sentinel when the parent directory's write bit
+         * denies the create, and ramfs_vfs.c already maps it to VFS_EACCES
+         * for the syscall path; collapsing every failure into one message
+         * here threw that away, so a refusal on a directory that plainly
+         * exists read the same as a missing path. */
+        if (fd == RAMFS_CREATE_EPERM) {
+            kprintf("touch: permission denied: '%s'\n", path);
+        } else {
+            kprintf("Error: Cannot create file '%s'\n", path);
+        }
         return;
     }
 

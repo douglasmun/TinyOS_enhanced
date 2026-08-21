@@ -128,8 +128,25 @@ trap cleanup_a EXIT
 # rejected by tcp_handle_packet's header validation, which runs in a different
 # file for a different reason, and the firewall would never see it -- the leg
 # would pass while measuring the wrong subsystem entirely.
+#
+# --dst-ip {GIP} is captured from the guest's own ifconfig below. On this
+# mcast netdev there is no DHCP server, so the guest self-assigns a per-boot
+# link-local 169.254.x.y rather than taking the 10.0.2.15 NAT lease the
+# injector defaults to. handle_ip's address gate runs BEFORE
+# firewall_check_packet(), so a frame addressed to 10.0.2.15 never reaches
+# the firewall at all and the dropped counter -- the thing this arm measures
+# -- would not move. That fails the leg rather than passing it, but for the
+# wrong reason entirely: it would read as "a wildcard ACCEPT is matching",
+# the exact bug this harness exists to detect.
+#
+# --src-ip is TEST-NET-3 (RFC 5737). It must NOT be RFC1918: is_bogon_ip()
+# drops 10/8 and friends earlier in firewall_check_packet(), which does
+# increment dropped -- so a bogon source would satisfy this arm's assertion
+# without the default-deny arm ever being reached. That is the same
+# unfalsifiable shape the two-arm structure above exists to rule out.
 export TINYOS_HOOK_SYNINJ="sleep 2; python3 tools/inject_frames.py \
     --mcast '$QEMU_MCAST' --dst $GUEST_MAC --mode tcp --tcp-data-offset 5 \
+    --dst-ip {GIP} --src-ip 203.0.113.9 \
     --tcp-dst-port 80 --count $N_SYN >/dev/null 2>&1; sleep 6; true"
 
 TINYOS_SERIAL="$SERIAL_A" \
@@ -139,6 +156,7 @@ TINYOS_FOLLOWUP_TIMEOUT=600 \
 TINYOS_EXEC_CMD="secstatus" \
 TINYOS_EXPECT="Firewall" \
 TINYOS_FOLLOWUP_CMDS="\
+ifconfig=>IP Address:@GIP=IP Address: +([0-9.]+);\
 >SYNINJ;\
 secstatus=>Firewall" \
 python3 tools/qemu_typist.py

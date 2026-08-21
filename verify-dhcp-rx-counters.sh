@@ -147,7 +147,24 @@ sleep 3
 XID=\$(grep -a "XID:" "$SERIAL" | tail -1 \
       | sed -n 's/.*XID: \(0x[0-9a-fA-F][0-9a-fA-F]*\).*/\1/p')
 
-INJ="python3 tools/inject_frames.py --mcast $QEMU_MCAST --dst $GUEST_MAC"
+# --dst-ip is the all-ones broadcast, and that is deliberate on two counts.
+# handle_ip's address gate runs BEFORE the firewall and accepts a frame only
+# if the destination is our own IP, 255.255.255.255, or a x.x.x.255 subnet
+# broadcast. This harness runs on a socket/mcast netdev with no DHCP server,
+# so the guest never gets the 10.0.2.15 NAT lease the injector defaults to --
+# it self-assigns a per-boot link-local 169.254.x.y. A unicast 10.0.2.15
+# frame is therefore addressed to nobody and dies at that gate, leaving every
+# counter at 0, which reads exactly like a dead parser. Broadcast sidesteps
+# the per-boot address entirely, needs no capture, and is what a real DHCP
+# reply to an unconfigured client uses anyway.
+#
+# --src-ip is TEST-NET-3 (RFC 5737) for symmetry with the UDP harness. The
+# firewall's DHCP exception (67<->68) returns true before is_bogon_ip(), so
+# an RFC1918 source would in fact survive here -- but relying on that couples
+# this harness to the ordering of two unrelated checks inside
+# firewall_check_packet(). A non-bogon source is correct at every gate.
+INJ="python3 tools/inject_frames.py --mcast $QEMU_MCAST --dst $GUEST_MAC \
+     --dst-ip 255.255.255.255 --src-ip 203.0.113.9"
 
 # The truncated leg needs no xid: drop_short is tested before the xid match.
 \$INJ --mode dhcp --dhcp-truncate --count $N_SHORT >/dev/null 2>&1

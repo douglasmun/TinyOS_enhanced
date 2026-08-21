@@ -398,6 +398,18 @@ static uint32_t pool_get_random(void) {
      * in-branch increment was there to do. */
     CRITICAL_SECTION_ENTER();
     bool need_stir = (++pool_counter >= POOL_STIR_THRESHOLD);
+    if (need_stir) {
+        /* Zero the counter HERE, under the same lock that latched
+         * need_stir, rather than relying on pool_stir()'s own reset.
+         * pool_stir() runs outside this critical section and re-enables
+         * interrupts between batches, so between the latch and that
+         * reset an interrupt-context caller can push the counter past
+         * the threshold and latch a second, redundant stir. Harmless --
+         * an extra stir only adds entropy -- but it is wasted work in
+         * interrupt context, and the invariant is cheaper to state than
+         * the window is to reason about. */
+        pool_counter = 0;
+    }
     CRITICAL_SECTION_EXIT();
 
     /* Stir pool if needed (outside critical section to allow batching) */
