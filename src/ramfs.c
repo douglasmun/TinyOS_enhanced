@@ -20,6 +20,10 @@ static ramfs_node_t* root = NULL;
 static ramfs_fd_t file_descriptors[RAMFS_MAX_FDS];
 static uint32_t total_nodes = 0;
 
+/* Set by ramfs_vfs.c so unlink/rmdir can also see directory handles held in
+ * its own pool. NULL until registered; see ramfs_node_is_busy(). */
+static ramfs_node_busy_fn external_busy_hook = NULL;
+
 /*=============================================================================
  * CONCURRENCY PROTECTION - MUTEX (v1.13 Migration)
  *=============================================================================*/
@@ -189,6 +193,46 @@ static void free_node(ramfs_node_t* node) {
 
     pmm_free((uint32_t)node);
     total_nodes--;
+}
+
+/*=============================================================================
+ * FUNCTION: ramfs_node_is_busy
+ * PURPOSE: Is any open descriptor still pointing at this node?
+ *
+ * free_node() releases the ramfs_node_t frame and all of its data pages back
+ * to the PMM immediately. There is no refcount, and neither ramfs_read nor
+ * ramfs_write revalidates its cached node pointer -- both check only in_use
+ * and the flag bits, and the stale pointer is non-NULL -- so unlinking a node
+ * out from under a descriptor turns every later read or write through that fd
+ * into an access to whatever the allocator handed the frame to next. That is a
+ * write of caller-chosen bytes into recycled kernel memory, reachable from
+ * ring 3 with no privilege at all.
+ *
+ * Refusing is the same answer fat32_unlink() already gives ("Busy: file is
+ * open"); doing otherwise needs a real unlink-on-last-close refcount.
+ *
+ * Callers must hold ramfs_mutex.
+ *===========================================================================*/
+static bool ramfs_node_is_busy(const ramfs_node_t* node) {
+    if (!node) return false;
+
+    for (int i = 0; i < RAMFS_MAX_FDS; i++) {
+        if (file_descriptors[i].in_use && file_descriptors[i].node == node) {
+            return true;
+        }
+    }
+
+    /* Directory handles live in ramfs_vfs.c's pool, which keeps a raw
+     * dir_node pointer that rmdir would otherwise dangle. */
+    if (external_busy_hook && external_busy_hook(node)) {
+        return true;
+    }
+
+    return false;
+}
+
+void ramfs_set_external_busy_hook(ramfs_node_busy_fn fn) {
+    external_busy_hook = fn;
 }
 
 /**
@@ -647,6 +691,29 @@ int ramfs_open(const char* path, uint8_t flags) {
                 return -9;  // Directory full (ENOSPC)
             }
 
+            /*=================================================================
+             * SECURITY: creating a file is a WRITE to the parent directory.
+             *
+             * Every other ramfs mutation that links or unlinks a child checks
+             * this -- mkdir, unlink, rmdir, rename all run the identical test
+             * against the parent -- and this branch did not, so any caller
+             * could plant a file in a directory it has no write permission on
+             * (a root-owned 0755 directory, from a uid-1000 ring-3 task) and
+             * exhaust its child_count budget. The child_count test above is a
+             * DoS bound, not an access check, and the permission test further
+             * down examines the NEW node, which the caller now owns, so it
+             * passes trivially.
+             *
+             * The check belongs here in the primitive rather than in
+             * ramfs_vfs_open() so the next caller inherits it -- the same
+             * reasoning that kept ramfs_chmod's ownership check correct when
+             * SYS_CHMOD arrived later.
+             *===============================================================*/
+            if (!ramfs_check_permission(parent, uid, gid, RAMFS_FLAG_WRITE)) {
+                mutex_unlock(&ramfs_mutex);
+                return RAMFS_CREATE_EPERM;
+            }
+
             // Create new file
             node = alloc_node(components[num_components - 1],
                               RAMFS_TYPE_FILE, uid, gid);
@@ -1050,6 +1117,13 @@ int ramfs_unlink(const char* path) {
         return -4;  // Permission denied
     }
 
+    /* Refuse while a descriptor still holds this node. Checked BEFORE the
+     * list surgery below so a refusal leaves the tree exactly as it was. */
+    if (ramfs_node_is_busy(node)) {
+        mutex_unlock(&ramfs_mutex);
+        return RAMFS_BUSY;
+    }
+
     /*=========================================================================
      * SECURITY: Bounded List Traversal for Node Removal (Corruption Safety)
      * Limit iterations when searching parent's children list to prevent
@@ -1201,6 +1275,13 @@ int ramfs_rmdir(const char* path) {
     if (!ramfs_check_permission(parent, uid, gid, RAMFS_FLAG_WRITE)) {
         mutex_unlock(&ramfs_mutex);
         return -5;  // Permission denied
+    }
+
+    /* Same interlock as unlink: ramfs_vfs.c's directory handles keep a raw
+     * dir_node pointer that readdir walks, and free_node() would dangle it. */
+    if (ramfs_node_is_busy(node)) {
+        mutex_unlock(&ramfs_mutex);
+        return RAMFS_BUSY;
     }
 
     /*=========================================================================
@@ -1402,6 +1483,28 @@ bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint
      *=======================================================================*/
     if (uid == 0) {
         return true;
+    }
+
+    /*=========================================================================
+     * An empty access mask must never grant.
+     *
+     * required_perms is built up only from the READ/WRITE/EXEC bits of
+     * `access`, so an `access` carrying none of them leaves it 0 and the final
+     * test becomes (node->mode & 0) == 0 -- true for every node, whatever its
+     * mode or owner. ramfs_vfs_open() produces exactly that for access mode 3
+     * (both O_WRONLY and O_RDWR bits set), which matches neither of its
+     * translation tests and so calls ramfs_open(path, 0).
+     *
+     * No bytes move on that path -- ramfs_read/ramfs_write test the stored
+     * flags separately -- but ramfs_fd_size() does not, so lseek(SEEK_END)
+     * became a size and existence oracle for files the caller cannot read.
+     * ramfs_vfs_stat() already closed the same leak for stat.
+     *
+     * Refusing here keeps the predicate from granting vacuously for any future
+     * caller that reaches it with a zero mask.
+     *=======================================================================*/
+    if ((access & (RAMFS_FLAG_READ | RAMFS_FLAG_WRITE | RAMFS_FLAG_EXEC)) == 0) {
+        return false;
     }
 
     uint16_t required_perms = 0;

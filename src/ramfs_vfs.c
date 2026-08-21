@@ -91,7 +91,34 @@ static void ramfs_free_handle(ramfs_fd_handle_t* handle) {
     if (handle) {
         handle->in_use = false;
         handle->ramfs_fd = -1;
+        /* Drop the directory reference too. ramfs_node_is_busy() gates on
+         * in_use so this is not load-bearing for the interlock, but leaving
+         * a freed node's address in the pool is how the next reader of this
+         * field gets a dangling pointer for free. */
+        handle->is_dir = false;
+        handle->dir_node = NULL;
+        handle->dir_pos = 0;
     }
+}
+
+/*=============================================================================
+ * FUNCTION: ramfs_vfs_node_busy
+ * PURPOSE: Does any live handle in this pool still reference the node?
+ *
+ * Registered with ramfs.c at init so ramfs_unlink()/ramfs_rmdir() can see the
+ * directory handles held here. Only directory handles matter: a file handle's
+ * node is reachable through ramfs.c's own file_descriptors[], which that side
+ * already scans, whereas dir_node exists only in this pool.
+ *===========================================================================*/
+static bool ramfs_vfs_node_busy(const ramfs_node_t* node) {
+    if (!node) return false;
+    for (int i = 0; i < RAMFS_VFS_MAX_HANDLES; i++) {
+        if (handle_pool[i].in_use && handle_pool[i].is_dir &&
+            handle_pool[i].dir_node == node) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /*=============================================================================
@@ -169,6 +196,13 @@ static int ramfs_vfs_open(const char* path, int flags, void** private_data) {
     int ramfs_fd = ramfs_open(path, ramfs_flags);
     if (ramfs_fd < 0) {
         // kprintf("[RAMFS VFS DEBUG] ramfs_open failed, fd=%d\n", ramfs_fd);
+        /* Distinguish the create-path permission refusal. Collapsing it into
+         * ENOENT would tell an unprivileged caller the directory it may not
+         * write to does not exist, and would make the refusal branch look
+         * like dead code from the shell. */
+        if (ramfs_fd == RAMFS_CREATE_EPERM) {
+            return VFS_EACCES;
+        }
         return VFS_ENOENT;  /* File not found or other error */
     }
 
@@ -341,6 +375,7 @@ static int ramfs_vfs_rmdir(const char* path) {
             case -2: return VFS_ENOTDIR;
             case -3: return VFS_ENOTEMPTY;
             case -5: return VFS_EACCES;
+            case RAMFS_BUSY: return VFS_EBUSY;
             default: return VFS_ENOENT;
         }
     }
@@ -361,6 +396,10 @@ static int ramfs_vfs_unlink(const char* path) {
         switch (ret) {
             case -2: return VFS_EISDIR;
             case -4: return VFS_EACCES;
+            /* Without this case RAMFS_BUSY would fall to ENOENT and the
+             * refusal would report the file does not exist -- the same
+             * sentinel collision RAMFS_CHMOD_EPERM was created to avoid. */
+            case RAMFS_BUSY: return VFS_EBUSY;
             default: return VFS_ENOENT;
         }
     }
@@ -575,6 +614,10 @@ int ramfs_vfs_init(void) {
         kprintf("[RAMFS_VFS] ERROR: Failed to register driver\n");
         return ret;
     }
+
+    /* Let unlink/rmdir see this pool's directory handles; without it a rmdir
+     * would free a node an open readdir cursor still walks. */
+    ramfs_set_external_busy_hook(ramfs_vfs_node_busy);
 
     kprintf("[RAMFS_VFS] Registered VFS driver [OK]\n");
     return 0;

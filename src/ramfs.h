@@ -229,6 +229,24 @@ int ramfs_truncate(int fd);
 void ramfs_close(int fd);
 int ramfs_unlink(const char* path);
 
+/*=============================================================================
+ * Open-descriptor interlock for unlink/rmdir.
+ *
+ * ramfs has no refcount on ramfs_node_t and free_node() releases the node
+ * frame plus every data page immediately, so deleting a node that a descriptor
+ * still points at leaves that descriptor aiming at PMM frames the allocator is
+ * free to hand to anyone. FAT32 refuses exactly this case (fat32.c, "Busy:
+ * file is open"); ramfs is given the same answer here.
+ *
+ * Two descriptor tables can hold a node: ramfs.c's own file_descriptors[]
+ * (checked internally) and ramfs_vfs.c's handle_pool[], whose directory
+ * handles keep a raw dir_node pointer. The latter lives in another
+ * translation unit, so it registers a predicate here at init; with no
+ * predicate registered only the local table is consulted.
+ *===========================================================================*/
+typedef bool (*ramfs_node_busy_fn)(const ramfs_node_t* node);
+void ramfs_set_external_busy_hook(ramfs_node_busy_fn fn);
+
 /* PHASE 13: Close-on-exec cleanup */
 void ramfs_close_on_exec(void);
 
@@ -327,6 +345,19 @@ ramfs_node_t* ramfs_get_root(void);
 /* ramfs_chmod() refusal for a non-root, non-owner caller. Deliberately not
  * -EPERM: EPERM is 1, and -1 is already ramfs_chmod's "file not found". */
 #define RAMFS_CHMOD_EPERM (-3)
+
+/* ramfs_unlink()/ramfs_rmdir() refusal for a node that some descriptor still
+ * has open. Both functions already spend -1..-6 on their own cases, so this
+ * gets its own out-of-range constant rather than colliding with one of them
+ * the way -EPERM once collided with "not found" (see RAMFS_CHMOD_EPERM).
+ * ramfs_vfs.c maps it onto VFS_EBUSY, which reaches ring 3 as -EBUSY. */
+#define RAMFS_BUSY (-7)
+
+/* ramfs_open()'s create path refusing a caller without write permission on the
+ * PARENT directory. ramfs_open already spends -1..-9 on its own failures, so
+ * this sits outside that range: reusing one would make the refusal report a
+ * different error, the collision RAMFS_CHMOD_EPERM exists to document. */
+#define RAMFS_CREATE_EPERM (-10)
 
 int ramfs_chmod(const char* path, uint16_t mode);
 bool ramfs_check_permission(ramfs_node_t* node, uint16_t uid, uint16_t gid, uint8_t access);
