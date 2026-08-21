@@ -41,17 +41,42 @@
 # writes the bytes verbatim (ordinary UDP multicast socket, no root, TTL
 # pinned to 1 so malformed frames cannot leave the host).
 #
-# That netdev has no NAT, so the guest gets no DHCP lease -- which is fine
-# here and deliberately so: handle_udp() validates lengths and the checksum
-# before any port dispatch or address state is consulted, so the counters move
-# without a lease. Do not "fix" this by switching to user-mode NAT; that would
-# silently stop the malformed frames from ever arriving and every leg would
-# read delta 0.
+# That netdev has no NAT, so the guest gets no DHCP lease and self-assigns a
+# per-boot link-local 169.254.x.y instead. The frames are therefore addressed
+# to {GIP}, captured from the guest's own ifconfig below, NOT to the
+# injector's 10.0.2.15 default -- handle_ip's address gate runs before all of
+# this and discards anything that is neither our IP nor a broadcast. Do not
+# "fix" the missing lease by switching to user-mode NAT; that would silently
+# stop the malformed frames from ever arriving and every leg would read
+# delta 0.
 #
-# The destination port is 9999, which has no handler, and that is deliberate:
-# udp_rx_accepted is incremented BEFORE dispatch, so the accepted leg measures
-# the parser rather than a service. A port with a handler would also drag DNS
-# or DHCP state into the result.
+# THE PORTS ARE 68 -> 67, AND THAT IS THE WHOLE TRICK.
+#
+# handle_udp() is NOT the first thing an inbound datagram meets, despite what
+# the counter block in src/net.c says about being "before the firewall". The
+# real order inside handle_ip() is: address gate -> firewall_check_packet()
+# -> L4 dispatch -> handle_udp(). The firewall's default policy is DENY ALL
+# (only outgoing, established and ICMP are allowed, and no shell command can
+# add a rule), so an unsolicited inbound datagram to an arbitrary port such
+# as 9999 is dropped one layer ABOVE these counters. Every delta then reads
+# 0 -- including the positive control -- which looks exactly like a dead
+# parser. That is how this harness first failed against correct counters.
+#
+# firewall_check_packet() has one standing exception that needs no rule: DHCP,
+# matched on ports 67<->68 in EITHER direction, returning accept before the
+# bogon test and before any rule lookup. So 68 -> 67 is the one unsolicited
+# inbound datagram this kernel lets through to handle_udp() by default.
+#
+# 67 would be wrong in the other direction: handle_udp() dispatches to
+# handle_dhcp() on `src_port == 67 && dest_port == 68`, so a 67 -> 68 frame
+# would be accepted AND then fed to the DHCP parser, moving the DHCP counters
+# and disturbing the lease -- coupling this harness to
+# verify-dhcp-rx-counters.sh. 68 -> 67 satisfies the firewall exception and
+# fails that dispatch test, so it falls through to no handler at all. src_port
+# 68 is also not DNS_PORT (53), so the DNS arm is missed as well.
+#
+# All four counters increment BEFORE the port dispatch, so routing the frames
+# through the DHCP-shaped hole measures the parser exactly as intended.
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
 # Logs: udprx.log (serial), udprx-trace.log.
@@ -139,7 +164,26 @@ trap cleanup EXIT
 # Host hook: four bursts, one per attacker position, all in one hook so the
 # ifconfig readings bracket the whole set. Ends in `true` -- the proof the
 # frames landed is the counter delta, not the sender's exit status.
-INJ="python3 tools/inject_frames.py --mcast '$QEMU_MCAST' --dst $GUEST_MAC"
+#
+# --dst-ip is {GIP}, captured from the guest's own ifconfig. It is NOT the
+# injector's 10.0.2.15 default: that is the NAT lease, and this harness runs
+# on a socket/mcast netdev with no DHCP server, so the guest fails discovery
+# and self-assigns a per-boot link-local 169.254.x.y. Frames sent to
+# 10.0.2.15 are addressed to nobody and handle_ip discards all of them
+# BEFORE handle_udp, so every counter -- including the accepted positive
+# control -- reads 0. That is indistinguishable from a dead parser, which is
+# exactly how this harness first failed against correct counters.
+#
+# --src-ip is TEST-NET-3 (RFC 5737), and that is load-bearing too. The
+# firewall runs BETWEEN handle_ip's address gate and handle_udp, and
+# is_bogon_ip() drops any source in 10/8, 172.16/12, 192.168/16 or
+# 169.254/16 unconditionally -- only DHCP is excepted. The injector's
+# 10.0.2.99 default is RFC1918, so every frame would be dropped by the
+# firewall instead, one gate further along than the addressing bug above
+# and with the same symptom: all four counters read 0.
+INJ="python3 tools/inject_frames.py --mcast '$QEMU_MCAST' --dst $GUEST_MAC \
+     --dst-ip {GIP} --src-ip 203.0.113.9 \
+     --udp-src-port 68 --udp-dst-port 67"
 export TINYOS_HOOK_UDPINJ="sleep 2; \
 $INJ --mode udp --udp-length 4    --count $N_SHORT >/dev/null 2>&1; \
 $INJ --mode udp --udp-length 5000 --count $N_OOB   >/dev/null 2>&1; \
@@ -155,6 +199,7 @@ TINYOS_FOLLOWUP_TIMEOUT=600 \
 TINYOS_EXEC_CMD="ifconfig" \
 TINYOS_EXPECT="UDP rx:" \
 TINYOS_FOLLOWUP_CMDS="\
+ifconfig=>UDP rx:@GIP=IP Address: +([0-9.]+);\
 >UDPINJ;\
 ifconfig=>UDP rx:" \
 python3 tools/qemu_typist.py
@@ -192,17 +237,24 @@ OK_LIST=$(extract "accepted")
 LEN_LIST=$(extract "bad-length")
 CSUM_LIST=$(extract "bad-checksum")
 
-nth() { printf '%s\n' "$2" | sed -n "$1p"; }
+# The LAST TWO readings, not the first two. There are three ifconfig runs in
+# this sequence: TINYOS_EXEC_CMD's, the follow-up that carries the @GIP
+# capture, and the post-injection one. Taking readings 1 and 2 compares two
+# PRE-injection baselines, so every delta is 0 and the harness reports a
+# missing length test against a kernel whose counters are perfect. Anchoring
+# on the tail keeps this correct however many baseline readings precede the
+# hook.
+last2() { printf '%s\n' "$1" | grep '[0-9]' | tail -2; }
 COUNT_OK=$(printf '%s\n' "$OK_LIST" | grep -c '[0-9]')
 
 if [ "$COUNT_OK" -lt 2 ]; then
-    fail_with "expected 2 ifconfig readings, got $COUNT_OK" \
+    fail_with "expected at least 2 ifconfig readings, got $COUNT_OK" \
         "The command sequence did not complete, so there is no baseline."
 fi
 
-OK_B=$(nth 1 "$OK_LIST");    OK_A=$(nth 2 "$OK_LIST")
-LEN_B=$(nth 1 "$LEN_LIST");  LEN_A=$(nth 2 "$LEN_LIST")
-CS_B=$(nth 1 "$CSUM_LIST");  CS_A=$(nth 2 "$CSUM_LIST")
+OK_B=$(last2 "$OK_LIST" | sed -n 1p);    OK_A=$(last2 "$OK_LIST" | sed -n 2p)
+LEN_B=$(last2 "$LEN_LIST" | sed -n 1p);  LEN_A=$(last2 "$LEN_LIST" | sed -n 2p)
+CS_B=$(last2 "$CSUM_LIST" | sed -n 1p);  CS_A=$(last2 "$CSUM_LIST" | sed -n 2p)
 
 OK_D=$((OK_A - OK_B)); LEN_D=$((LEN_A - LEN_B)); CS_D=$((CS_A - CS_B))
 

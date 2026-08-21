@@ -298,6 +298,23 @@ def main():
                     print(f"typist: no TINYOS_HOOK_{hookname} in the "
                           f"environment", file=sys.stderr)
                     return 2
+                # Substitute captures into the hook the same way typed
+                # commands get them. A hook often needs a value only the
+                # guest knows -- the UDP/DHCP counter harnesses inject at
+                # the guest's IP, which on a socket/mcast netdev has no
+                # DHCP server and so is a per-boot link-local 169.254.x.y,
+                # not the 10.0.2.15 NAT lease the injector defaults to.
+                # Without this the frames are addressed to nobody, and
+                # handle_ip drops all of them BEFORE the counters under
+                # test -- every delta reads 0, including the positive
+                # control, which looks like a dead parser rather than a
+                # misaddressed sender.
+                for k, v in captures.items():
+                    hookcmd = hookcmd.replace("{" + k + "}", v)
+                if "{" in hookcmd and "}" in hookcmd:
+                    print(f"typist: unresolved substitution in hook "
+                          f"{hookname}: {hookcmd}", file=sys.stderr)
+                    return 2
                 print(f"typist: host hook {hookname}: {hookcmd}")
                 rc = subprocess.call(hookcmd, shell=True)
                 if rc != 0:

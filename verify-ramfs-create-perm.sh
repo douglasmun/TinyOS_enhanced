@@ -111,10 +111,19 @@ trap cleanup EXIT
 # `su` keeps one task, so the uid change is visible to ramfs immediately):
 #
 #   as root : create $ROOTDIR 0755, root-owned
-#   as user : mkdir $OWNDIR -- there is no chown builtin, so the user makes
-#             their own directory; alloc_node() stamps the creating uid, which
-#             is what makes it theirs
-#             touch into $ROOTDIR      -> leg 1, must be refused
+#             create $OWNDIR 0777 -- the user's writable directory
+#
+#             $OWNDIR MUST be made by root, not by the user. RAMFS root is
+#             mode 0711 (ramfs.c:329): search, but no write, for non-owners.
+#             So an unprivileged `mkdir /ownplace` is correctly refused with
+#             -5, and doing it after `su` made leg 2 measure that refusal
+#             instead of the create path -- the positive control failed
+#             against a completely correct kernel. There is no chown builtin,
+#             hence 0777 rather than a uid change: the point of leg 2 is that
+#             the user can create where the PARENT's write bit allows it,
+#             which is exactly what the fix keys on.
+#
+#   as user : touch into $ROOTDIR      -> leg 1, must be refused
 #             redirect into $ROOTDIR   -> leg 1b, the OTHER entry point
 #             touch into $OWNDIR       -> leg 2, must succeed
 #             ls both                  -> the state, independent of messages
@@ -129,9 +138,10 @@ useradd $TESTUSER=>Enter password for new user;\
 !$TESTPASS=>created;\
 mkdir $ROOTDIR=>\$;\
 chmod 755 $ROOTDIR=>\$;\
+mkdir $OWNDIR=>\$;\
+chmod 777 $OWNDIR=>\$;\
 su $TESTUSER=>Now running as;\
 !id=>uid=;\
-mkdir $OWNDIR=>\$;\
 touch $ROOTDIR/planted.txt=>\$;\
 echo MARKREDIR > $ROOTDIR/redir.txt=>\$;\
 touch $OWNDIR/mine.txt=>\$;\
@@ -174,6 +184,37 @@ fail_with() {
 SPLIT=$(grep -n "LSOWNDIR" "$CLEAN" | tail -1 | cut -d: -f1)
 ROOT_LISTING=$(sed -n "1,${SPLIT}p" "$CLEAN")
 OWN_LISTING=$(sed -n "$((SPLIT+1)),\$p" "$CLEAN")
+
+# Drop the REFUSAL messages before grading the listing.
+#
+# The region above the marker holds the whole session, including the shell's
+# own error text -- "Error: Cannot create file '/rootonly/planted.txt'" and
+# "shell: cannot create /rootonly/redir.txt". Both NAME the file they refused
+# to create, so a bare `grep planted.txt` matches the proof that the fix
+# WORKED and reports it as the fix having failed. That is exactly what this
+# harness did on its first green-kernel run: legs 1 and 1b failed while the
+# serial log showed both creates correctly refused and `ls /rootonly` empty.
+#
+# The kernel shell does not echo commands to serial, so there is no reliable
+# "output of ls starts here" anchor; filtering the known refusal shapes is
+# what separates "the name appears in a listing" from "the name appears in
+# the sentence explaining it was blocked".
+#
+# The final `grep -v "/"` handles the OTHER source of false matches: the
+# typist echo-verifies each keystroke, so the typed redirection target comes
+# back on serial, line-wrapped by the console --
+#
+#     > /ro
+#     otonly/redir.txt
+#
+# which matches "redir.txt" while being the command, not a listing. `ls`
+# prints bare basenames with no path separator (see "mine.txt" in $OWNDIR),
+# so any candidate line containing '/' is echo or prose, never an entry.
+ROOT_LISTING=$(printf '%s\n' "$ROOT_LISTING" \
+    | grep -v "Error: Cannot create file" \
+    | grep -v "shell: cannot create" \
+    | grep -v "cannot access" \
+    | grep -v "/")
 
 # --- Leg 1: the plant must NOT be there -----------------------------------
 if printf '%s\n' "$ROOT_LISTING" | grep -q "planted.txt"; then
