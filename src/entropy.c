@@ -386,12 +386,18 @@ static uint32_t pool_get_random(void) {
      * BENEFIT: Allows pool_stir() to re-enable interrupts between batches
      *=======================================================================*/
 
-    /* Check if we need to stir (check with brief lock) */
+    /* Count this draw, then decide. The increment must be UNCONDITIONAL:
+     * it used to live inside the `need_stir` branch, so pool_counter could
+     * only advance once it had already reached the threshold -- and starting
+     * at 0 it never did. The pool was therefore never stirred after boot, no
+     * matter how many values were drawn, while stats.pool_stirs reported 0
+     * and looked like a pool that simply had not needed stirring yet.
+     *
+     * pool_stir() resets pool_counter to 0, which is what keeps this from
+     * re-triggering on every subsequent call -- that was the job the
+     * in-branch increment was there to do. */
     CRITICAL_SECTION_ENTER();
-    bool need_stir = (pool_counter >= POOL_STIR_THRESHOLD);
-    if (need_stir) {
-        pool_counter++;  /* Increment so we don't re-trigger */
-    }
+    bool need_stir = (++pool_counter >= POOL_STIR_THRESHOLD);
     CRITICAL_SECTION_EXIT();
 
     /* Stir pool if needed (outside critical section to allow batching) */

@@ -56,6 +56,15 @@ void scheduler_schedule(void);
 void scheduler_yield(void);
 
 /**
+ * @brief Drop a task as the lazy-FPU owner before its slot is freed.
+ *
+ * Must be called by every teardown path. fpu_owner is a raw pointer the next
+ * lazy FPU switch fxsave()s through, so a freed owner is a write into a
+ * recycled task slot.
+ */
+void scheduler_fpu_release(task_t* task);
+
+/**
  * @brief Get the currently running task
  * @return Pointer to current task, or NULL if no task is running
  */
