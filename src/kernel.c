@@ -37,6 +37,8 @@
 #include "credprobe_elf_data.h"
 #include "netprobe_elf_data.h"
 #include "msealprobe_elf_data.h"
+#include "callprobe_elf_data.h"
+#include "busyprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -901,6 +903,38 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(msealprobe_fd, msealprobe_elf_data, msealprobe_elf_data_len);
             ramfs_close(msealprobe_fd);
             ramfs_chmod("/msealprobe.elf", 0755);
+        }
+    }
+
+    /* callprobe.elf drives the syscall dispatcher's reject counters. An
+     * out-of-range syscall number reaches the range check with no libc
+     * wrapper, no builtin and no privilege behind it -- the number is the
+     * caller's own byte -- so nothing in the tree produced one and the three
+     * kprintf sites there went unnoticed, the same way SYS_MSEAL's sixteen
+     * did. 0755 is deliberate: the point is that an UNPRIVILEGED caller
+     * drives these counters. See verify-syscall-reject-counters.sh. */
+    {
+        int callprobe_fd = ramfs_open("/callprobe.elf", RAMFS_FLAG_WRITE);
+        if (callprobe_fd >= 0) {
+            ramfs_write(callprobe_fd, callprobe_elf_data, callprobe_elf_data_len);
+            ramfs_close(callprobe_fd);
+            ramfs_chmod("/callprobe.elf", 0755);
+        }
+    }
+
+    /* busyprobe.elf holds a descriptor open across an unlink, which no shell
+     * builtin does -- cmd_path_op opens nothing, and every builtin that opens
+     * a file closes it before returning. Without a driver the busy refusal has
+     * nothing to conflict with and a harness would pass against the unfixed
+     * kernel. 0755: an unprivileged caller must be able to drive it, since the
+     * use-after-free it prevents needed no privilege either.
+     * See verify-ramfs-unlink-busy.sh. */
+    {
+        int busyprobe_fd = ramfs_open("/busyprobe.elf", RAMFS_FLAG_WRITE);
+        if (busyprobe_fd >= 0) {
+            ramfs_write(busyprobe_fd, busyprobe_elf_data, busyprobe_elf_data_len);
+            ramfs_close(busyprobe_fd);
+            ramfs_chmod("/busyprobe.elf", 0755);
         }
     }
 
