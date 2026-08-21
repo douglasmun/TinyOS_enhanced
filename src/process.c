@@ -657,6 +657,9 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     if (stack_base == 0) {
         kprintf("[PROCESS] ERROR: Failed to allocate contiguous %d-page kernel stack\n",
                 KERNEL_TASK_STACK_PAGES);
+        /* This failure path is above the map_page() that creates the
+         * not-present PTE, so there is no mapping to restore. */
+        /* GUARD-UNMAPPED-OK */
         pmm_free(guard_page_phys);
         task->pid = 0;  // Release PID
         task_free_slot(slot);
@@ -916,6 +919,33 @@ int task_create_user_ex(uint32_t entry, const char* name, uint16_t stack_pages) 
  * PURPOSE: Create a new user-mode task (Ring 3) with configurable stack size
  *          and an argc/argv block written onto its user stack
  *=============================================================================*/
+/**
+ * @brief Return a kernel guard page to the PMM, restoring its identity
+ *        mapping first.
+ *
+ * Guard pages are identity-mapped NOT PRESENT in the kernel identity map that
+ * every address space shares. pmm_free()ing one in that state poisons the
+ * frame permanently: the PTE stays not-present, so the #PF lands on whoever
+ * pmm_alloc()s it next -- nowhere near the task that died. The boot-time
+ * "no holes" sweep cannot catch it either, since the hole appears at runtime.
+ *
+ * task_free_resources() has done this correctly since PR D2; these are the
+ * task_create_user_argv() failure paths, which freed the frame raw. Same
+ * sequence, factored so a fourth caller cannot get it wrong.
+ *
+ * Note this is for the KERNEL guard page only. The user guard page
+ * (user_guard_page_phys) is mapped into the per-task address space, which is
+ * torn down wholesale with the PDPT, so a raw free is correct there.
+ */
+static void guard_page_release(uint32_t guard_phys) {
+    if (guard_phys == 0) {
+        return;
+    }
+    map_page(guard_phys, guard_phys, PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
+    flush_tlb_single(guard_phys);
+    pmm_free(guard_phys);
+}
+
 int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages,
                           int argc, const char* const* argv) {
     /* Validate the argument vector before anything is allocated, so a bad
@@ -1065,6 +1095,9 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     uint32_t kernel_stack_base = pmm_alloc_contiguous(8);
     if (kernel_stack_base == 0) {
         kprintf("[PROCESS] ERROR: Failed to allocate contiguous 8-page kernel stack\n");
+        /* This failure path is above the map_page() that creates the
+         * not-present PTE, so there is no mapping to restore. */
+        /* GUARD-UNMAPPED-OK */
         pmm_free(guard_page_phys);
         task->pid = 0;  // Release PID
         task_free_slot(slot);
@@ -1143,7 +1176,7 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     if (task->page_directory == 0) {
         kprintf("[PROCESS] ERROR: Failed to create page directory\n");
         // Cleanup: free guard page and all stack pages
-        pmm_free(guard_page_phys);
+        guard_page_release(guard_page_phys);
         for (int i = 0; i < 8; i++) {
             pmm_free(kernel_stack_pages[i]);
         }
@@ -1157,7 +1190,7 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     if (user_guard_page_phys == 0) {
         kprintf("[PROCESS] ERROR: Failed to allocate user guard page\n");
         free_page_directory(task->page_directory);
-        pmm_free(guard_page_phys);
+        guard_page_release(guard_page_phys);
         for (int j = 0; j < 8; j++) {
             pmm_free(kernel_stack_pages[j]);
         }
@@ -1184,7 +1217,7 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
             // Clean up other resources
             pmm_free(user_guard_page_phys);
             free_page_directory(task->page_directory);
-            pmm_free(guard_page_phys);
+            guard_page_release(guard_page_phys);
             for (int j = 0; j < 8; j++) {
                 pmm_free(kernel_stack_pages[j]);
             }
@@ -1695,11 +1728,15 @@ void task_free_resources(task_t* task) {
      * that reliably frees a task and allocates again immediately afterwards, so
      * it turned an intermittent, long-latency corruption into a deterministic
      * fault on the very next allocation. */
+    /* Drop the lazy-FPU ownership before anything here is freed. The
+     * post-context-switch reaper already did this for a task that exits on
+     * its own; a task killed from outside reaches teardown without passing
+     * through it, and fpu_owner is a raw pointer the next FPU switch
+     * fxsave()s through. */
+    scheduler_fpu_release(task);
+
     if (task->guard_page_phys != 0) {
-        map_page(task->guard_page_phys, task->guard_page_phys,
-                 PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
-        flush_tlb_single(task->guard_page_phys);
-        pmm_free(task->guard_page_phys);
+        guard_page_release(task->guard_page_phys);
         task->guard_page_phys = 0;
     }
 
