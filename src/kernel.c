@@ -1181,6 +1181,21 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
      * from both status surfaces while nothing is actually being supervised. */
     scheduler_add_task(task_get((uint32_t)pid_supervisor));
 
+    /* Same omission as the supervisor line above, and it hid the same way:
+     * edr_daemon_start() creates the task, sets PRIORITY_HIGH and prints
+     * "EDR daemon started successfully", so the boot log, `ps` and the
+     * CAP_UNKILLABLE grant all show a healthy daemon -- while edr_daemon_main()
+     * had never executed a single instruction. Every EDR counter therefore
+     * read 0, which is indistinguishable from "scanned everything, found
+     * nothing". The daemon whose serial spam CLAUDE.md tells us to grep away
+     * was the syscall-path hook, not this task.
+     *
+     * Guarded because edr_daemon_start() returns -1 on failure, and
+     * task_get(-1) would not find a task to enqueue. */
+    if (pid_edr >= 0) {
+        scheduler_add_task(task_get((uint32_t)pid_edr));
+    }
+
     kprintf("[SHELL] Tinyshell is ready to play!  [OK]\n");
 
     // Start the scheduler (does not return)
