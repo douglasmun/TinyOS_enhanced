@@ -314,14 +314,25 @@ a way to **mutate its own uid in place**, and every ownership gate in the tree
 written against that uid. Don't reopen this by "just adding a subcommand"; reasoning in
 `doc/ROADMAP_NEXT.md`.
 
-Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**; item 4
-(userspace shell) has all its **implementation** done — what remains is `edit`, a design
-call, not typing (`su` is settled above; **`fatls` needed no migration** — ring 3 already
-lists FAT32 through the generic `ls`, since `SYS_OPEN`/`SYS_READDIR` dispatch on the
-drive letter into FAT32's full `file_operations_t`. `ls C:/` *is* `fatls`; harness
-`verify-ring3-fatls.sh`. Third instance of asking "does THIS component carry it?"
-instead of "is it reachable at all?" — after `whoami` and D1; trace the path before
-designing the migration). `fork()` was skipped deliberately (PAE, no COW pages).
+Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**, and
+**item 4 (userspace shell) is now closed** — all three of its open calls are settled and
+**none was a migration**. `su` is settled above; **`fatls` needed no migration** — ring 3
+already lists FAT32 through the generic `ls`, since `SYS_OPEN`/`SYS_READDIR` dispatch on
+the drive letter into FAT32's full `file_operations_t`. `ls C:/` *is* `fatls`; harness
+`verify-ring3-fatls.sh`. **`edit` stays kernel-shell only** — and note *which* half was
+the blocker, because the roadmap named the wrong one: write-back was never the problem
+(`sys_write` sends any file fd through `vfs_write`, which dispatches per-driver with no
+drive test, and FAT32 has a live `.write`; `editor.c` doesn't reference FAT32 at all).
+**Input is.** The editor is event-oriented — `keyboard_getchar_nonblock()` plus
+out-of-band codes like `KEY_UP` (`0x90`) — while ring 3's console read
+(`stdin_read`'s `STREAM_TYPE_CONSOLE`) is **line-oriented**: it blocks until `\n`,
+interprets only `\n`/`\b`, and stores `0x90` as text inside a line. Supplying raw mode
+means a **TTY discipline** (per-task terminal state, mode restoration on abnormal exit,
+echo control), i.e. a new ring-3-reachable subsystem bought for one builtin — which is
+why `top`, the other raw-key consumer, is kernel-only too without anyone proposing it
+move. Fourth instance of asking "does THIS component carry it?" instead of "is it
+reachable at all?" — after `whoami`, D1 and `fatls`; trace the path before designing the
+migration. `fork()` was skipped deliberately (PAE, no COW pages).
 Task-slot exhaustion is closed (per-uid cap + root reserve, both returning `-EAGAIN`, so
 only the printed message identifies which refused). `kprintf`→`stream_printf` conversion
 is **finished** — no console-only blocks remain.

@@ -223,11 +223,60 @@ Component-by-component review cannot answer that, because the answer lives in a
 path that runs through no single component in particular. Trace the path before
 designing the migration.
 
-**`edit` — still open.** It is the larger one, since a ring-3 editor needs a way
-to write back that does not simply re-expose the FAT32 write path.
+**`edit` — DECIDED: stays kernel-shell only.** Not deferred; the blocking
+constraint is structural rather than a matter of surface still to be written.
 
-One decision rather than typing remains — `edit`; `su` and `fatls` are settled
-above. One fact about the kernel shell's `su` outlives that decision and is
+The concern this entry used to carry — *"a ring-3 editor needs a way to write
+back that does not simply re-expose the FAT32 write path"* — turned out to be
+the wrong question, in exactly the way `whoami`, D1 and `fatls` were. Ring 3
+can **already** write back to both drives with no new surface: `sys_write`
+(`syscall.c:350`) routes any fd `>= TASK_FD_BASE` through `vfs_write`, which
+dispatches on the fd's registered `file_operations_t` with no drive test of its
+own (`vfs.c:829`), and FAT32 registers a live `.write = fat32_vfs_write`
+(`fat32_vfs.c:632`). Nothing needed re-exposing, because `SYS_OPEN` +
+`SYS_WRITE` are the FAT32 write path already — the same VFS dispatch that
+settled `fatls`. (The `-EXDEV` refusals in `sys_chmod` and `sys_redirect` are
+real, but neither is the write path: chmod has no FAT32 analogue, and the
+stream layer's `STREAM_TYPE_FILE` is hard-wired to RAMFS. An editor holds its
+own fd and touches neither.) Note also that `editor.c` contains **zero** FAT32
+references — it is RAMFS-only today, so the ring-3 version would start with
+*more* reach than the kernel one, not less.
+
+What actually blocks it is **input**, and it is not a missing syscall. The
+editor is event-oriented: `editor.c:745` calls `keyboard_getchar_nonblock()`
+and switches on out-of-band codes the keyboard driver invents — `KEY_UP` is
+`0x90` (`keyboard.h:54`), outside ASCII precisely so it cannot collide with
+text. Ring 3 reads the console through `sys_read` ‒ `stdin_read`, whose
+`STREAM_TYPE_CONSOLE` case (`stdio.c:320`) is **line-oriented**: it blocks in
+`keyboard_getchar()` and returns only on `\n` or a full buffer, interpreting
+just `\n` and `\b` and storing every other byte as text. A `0x90` therefore
+arrives as an ordinary character *inside a line*, delivered only once the user
+presses Enter. There is no non-blocking read, no timeout, no poll, and no
+per-keystroke echo — `userspace/shell.c` echoes the whole accepted line after
+`readline()` returns. All three raw-key consumers in the tree (`shell.c:1223`,
+`editor.c:745`, `shell_monitor.c:240` — the shell, the editor, `top`) are
+kernel-side for this reason.
+
+So the capability a ring-3 editor needs is a **raw/cbreak mode**: per-keystroke
+delivery, no line assembly, an escape or scancode encoding both sides agree on,
+and echo control. That is a TTY discipline — `stdin_read`'s own comment already
+says fixing the echo gap "means a real TTY discipline, not a printf here" — and
+it is a new, ring-3-reachable kernel subsystem carrying per-task terminal
+state, mode restoration on abnormal exit (an editor killed in raw mode leaves
+the *next* shell unusable), and interaction with the existing stream and
+redirection layers. Applying the standing test: what moving `edit` **buys** is
+one builtin; what it **costs** is a terminal subsystem plus its audit. That is
+the worst ratio of any item in this group, and `top` — the other raw-key
+consumer — stays kernel-shell-only on the same reasoning without anyone having
+proposed moving it.
+
+This closes item 4. If a TTY discipline is ever wanted for its own sake, `edit`
+becomes reachable as a consequence — but it must be that PR's *justification*,
+not a rider on this one, and it needs its own audit (CLAUDE.md: exposing a path
+to ring 3 turns latent bugs into corruption primitives).
+
+Item 4 is now closed: `su`, `fatls` and `edit` are all settled above, and none
+of the three ended up being a migration. One fact about the kernel shell's `su` outlives that decision and is
 worth keeping here, because it stays true of the implementation that remains:
 it changes credentials on the **same** task, so it must call
 `env_refresh_identity()` on **both** branches — the root fast path and the
@@ -336,8 +385,9 @@ protocol means the witness is broken or something moved that must not have.
 dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
 new-syscall group it once blocked on. The seven no-new-syscall builtins are
 done, and `unalias` has since landed with the ninth `SYS_ENV` subcommand it
-needed. What remains of item 4 is `edit` alone, which needs a design
-call rather than typing; `su` is decided and stays kernel-shell only, and
+needed. Item 4 is **closed**: `edit` is decided and stays kernel-shell only (it needs a
+raw-input TTY discipline, not a syscall — its write-back was already reachable);
+`su` is decided and stays kernel-shell only; and
 `fatls` needed no migration at all — ring 3 already lists FAT32 through the
 generic `ls` (see "Item 4: the su/fatls/edit group" above). AUDIT-8E is
 closed on both halves and was independent of that work. Networking is closed too
