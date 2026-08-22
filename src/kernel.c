@@ -806,10 +806,12 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         }
     }
 
-    /* shell.elf is the ring-3 shell (roadmap item 4). The kernel shell stays
-     * the default and is untouched; this one is reached with `exec /shell.elf`.
-     * It spawns other programs itself, so it must be readable by uid 1000 for
-     * the same reason as the binaries above. */
+    /* shell.elf is the ring-3 shell (roadmap item 4) and is the DEFAULT LOGIN
+     * SHELL since PR #51 -- login runs it directly (see shell.c's
+     * "Run /shell.elf as the ring-3 login shell"), and the kernel shell is now
+     * the fallback, reached with `kshell`. It spawns other programs itself, so
+     * it must be readable by uid 1000 for the same reason as the binaries
+     * above. */
     {
         int shell_fd = ramfs_open("/shell.elf", RAMFS_FLAG_WRITE);
         if (shell_fd >= 0) {
