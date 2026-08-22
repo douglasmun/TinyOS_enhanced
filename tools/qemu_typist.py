@@ -139,7 +139,19 @@ def type_verified(sock, s, timeout=40):
     Verifies char-by-char IN ORDER rather than as one contiguous match: a live
     background process writes to the same serial console, so its output
     interleaves into the echo ("jo[SYSCALL]...bs") and a contiguous search for
-    "jobs" would spuriously fail on a run that actually worked."""
+    "jobs" would spuriously fail on a run that actually worked.
+
+    ONLY VALID AT THE KERNEL SHELL AND THE LOGIN PROMPT. Those echo each
+    keystroke as it is accepted. The RING-3 shell does not: readline() collects
+    the whole line and echoes it only after Enter (src/stdio.c:336,
+    userspace/shell.c:2035), so the first per-character wait here can never
+    resolve and burns the full timeout instead.
+
+    The COMMAND paths below are safe at either shell: by the time a command is
+    typed the line echo has appeared, and since it echoes the whole line the
+    in-order per-character scan still resolves (verify-ring3-env.sh passes
+    11/11 this way). Only `kshell` is typed before any echo exists, which is
+    why that one call site -- and only that one -- must not verify."""
     start = max(0, len(read_serial()) - len(s) - 4)
     type_str(sock, s)
     cursor = start
@@ -223,7 +235,27 @@ def main():
         time.sleep(2)
         print("typist: sending 'kshell' (switch to the kernel shell)")
         mark = len(read_serial())
-        type_verified(sock, "kshell\n", timeout=60)
+        # Type it WITHOUT per-character echo verification.
+        #
+        # `kshell` is typed at the RING-3 shell, and that shell does not echo
+        # per keystroke: readline() collects the line and the whole thing is
+        # echoed only after Enter (src/stdio.c:336, userspace/shell.c:2035).
+        # Only the KERNEL shell echoes per character. So type_verified()'s
+        # first wait_for("k") could never resolve and always burned its full
+        # timeout -- "typist: TIMEOUT waiting for 'k'" -- which failed the run
+        # at the very first command, before any harness leg was exercised.
+        #
+        # It presented as a kernel fault: the boot log ends at "[ELF] Hash
+        # verification: PASS" with the shell loaded and simply never speaking,
+        # and four different harnesses died identically at 85s (chmod-owner,
+        # cred-deprecation, env-pertask, fat32-write), so it read as a
+        # regression in the shell rather than as one impossible wait.
+        #
+        # Nothing is lost by dropping the echo check here: the wait_for below
+        # is a STRICTER witness. "shell: exiting" is printed by the ring-3
+        # shell as it hands over, so it proves the line was received, parsed
+        # and acted on -- which a character echo would only have suggested.
+        type_str(sock, "kshell\n")
         # Wait for the ring-3 shell to actually exit before typing at the
         # kernel shell; "$" alone is no good as a marker, it is already all
         # over the boot log.
