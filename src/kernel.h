@@ -24,7 +24,7 @@
  * and /etc/motd still said v1.10. Bump TINYOS_VERSION here when cutting a
  * release and every consumer follows.
  *===========================================================================*/
-#define TINYOS_VERSION      "2.3"
+#define TINYOS_VERSION      "2.7"
 #define TINYOS_VERSION_NAME "TinyOS v" TINYOS_VERSION
 
 /*=============================================================================

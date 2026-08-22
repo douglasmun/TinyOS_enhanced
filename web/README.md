@@ -56,34 +56,62 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is built from `main` at **PR #69** (`ec51d3a`), and matches the
-signed `v2.6` release asset. It is a pinned image, not a rolling build of `main`:
-it only moves when someone runs the steps above, so expect it to fall behind
-again as work lands.
+The committed ISO is built from `main` at **PR #108** (`RELEASE_SHA`), and
+matches the signed `v2.7` release asset. It is a pinned image, not a rolling
+build of `main`: it only moves when someone runs the steps above, so expect it
+to fall behind again as work lands.
 
-**Login now drops straight into the ring-3 shell** (PR #51), which is what the
-demo shows. That shell has ~25 builtins against the kernel shell's ~70 — type
-`kshell` to hand over to the kernel shell for the privileged and introspection
-commands (`pae`, `mem`, `wxaudit`, `auditlog`, networking), and `exit` to log
-out. Note that the nine privileged commands are gated on **euid 0**, so a
-non-root user reaching the kernel shell still cannot run them.
+The previous image had gone badly stale — **v2.6 was 103 commits behind `main`**
+by the time this one was cut, so the demo was missing every fix listed below.
 
-Since the previous image (v2.5, PR #67) this adds a **privilege-escalation fix**
-(#69): `ramfs_chmod` had no ownership check, so any user could `chmod 666` a
-root-owned 0600 file and read it. That is reachable from the demo, because
-`kshell` is open to every user by design — so the v2.5 image is exploitable this
-way and this one is not. Before it, v2.5 added `cp`/`mv`/`touch` with the
-`open(O_TRUNC)` fix underneath them (#67); v2.4 and earlier brought `ps`/`kill`/
-`top` from ring 3 via `SYS_PSINFO`/`SYS_KILL` (#62) with the own-only visibility
-policy (#61), a per-uid task-slot cap (#60), `require_root` on the machine-state
-commands (#58), IDS payload-signature matching and credential-spray detection
-(#63, #65), and the `kprintf`→`stream_printf` conversion that makes redirection
-work for the system and security-test reports (#64, #66). It keeps FAT32
-subdirectories, ring-3 redirection and pipelines, the ring-3 credential
-commands, and the credential-syscall hardening from PRs #42–#55.
+**Login drops straight into the ring-3 shell** (PR #51), which is what the demo
+shows. That shell now has **40 builtins** against the kernel shell's ~70 (v2.6
+had ~25) — type `kshell` to hand over to the kernel shell for the privileged and
+introspection commands (`pae`, `mem`, `wxaudit`, `auditlog`, networking), and
+`exit` to log out. Note that the nine privileged commands are gated on **euid
+0**, so a non-root user reaching the kernel shell still cannot run them.
 
-SHA-256 `0dfdbedaefc925c5f76a7a106abe53ee32fb05893d34140ec91903ecad62e061` as of
-2026-08-16. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
+### What is new since v2.6
+
+The headline is that **the security audit behind this image found 16 issues and
+all 16 are fixed here** (PRs #103–#105) — one Critical, two High. Two of them are
+reachable from this demo:
+
+- **Critical — `ramfs_open` created files with no permission check on the parent
+  directory.** Creating a file is a write to its parent, but the create path
+  never asked; every *other* ramfs mutation did. An unprivileged user could
+  plant a file in a root-owned `0755` directory. Fixed in the primitive, so the
+  next caller inherits the check.
+- **High — the firewall had no reachable default-deny.** It now denies by
+  default, with an IDS that matches payload signatures and blocks the source.
+
+Also landed since v2.6:
+
+- **A memory leak on every process exit.** Teardown freed only what a `task_t`
+  field named, and nothing walked the PTEs — so each `exec` leaked its whole ELF
+  image (measured: 8 frames for `/hello.elf`). Since `SYS_SPAWN` is ungated and
+  the frames leak on *exit*, a spawn-and-wait loop drained memory without ever
+  holding two tasks at once, so the per-uid cap never fired.
+- **The EDR daemon never actually ran.** It was created but never enqueued —
+  `task_create_kernel()` allocates without scheduling, so it appeared in `ps`
+  and in every status surface while executing zero instructions.
+- **An editor data-loss bug**: `editor_insert_row` shifted rows before
+  allocating, so one OOM insert destroyed a line *and* lost two frames.
+- **Remote-driven console floods closed across the RX path** (`tcp.c`, `dns.c`,
+  `icmp.c`): any host on the segment could print to the kernel console, twice
+  from *before* the connection lookup. These are counters now, surfaced in
+  `ifconfig`.
+- **A supervised network daemon** (`knetd`) with restart rate-limiting, and RX
+  parsing moved into task context rather than the ISR.
+- **New ring-3 builtins**: `date`, `chmod`, `whoami`, `clear`, `history`,
+  `jobs`, `grep`, `find`, `man`, and the `env`/`alias` group via `SYS_ENV`.
+
+Note the demo has **no NIC attached**, so the networking fixes are not
+exercisable here — they matter for the QEMU configuration in the top-level
+README.
+
+SHA-256 `RELEASE_SHA256` as of
+2026-08-22. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs — this hash identifies
 the committed artifact, it is not reproducible from source.
 
