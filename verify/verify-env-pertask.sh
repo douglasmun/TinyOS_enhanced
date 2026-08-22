@@ -74,6 +74,7 @@
 # Logs: envpertask.log (serial), envpertask-trace.log.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/edr-rejoin.sh"
 
 PASSWORD="${TINYOS_TEST_PASSWORD:-${TINYOS_PASSWORD:-rootpass1}}"
 
@@ -317,12 +318,7 @@ fi
 # CRs with tr rather than writing \r into the pattern: `grep` on this machine
 # is ugrep, which rejects the $'...\r\?' form outright, and BSD grep does not
 # support GNU's \? in a BRE either. tr is portable across all three.
-if tr -d '\r' < "$SERIAL" \
-     | awk '/^\[EDR DAEMON\]/ { next }
-            /\[EDR DAEMON\]/  { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
-            { print buf $0; buf = "" }
-            END { if (buf != "") print buf }' \
-     | grep -A1 -E '^\$ myll$' | grep -q '^root$'; then
+if rejoin_edr < "$SERIAL" | grep -A1 -E '^\$ myll$' | grep -q '^root$'; then
     pass "user-defined alias was created AND invoked (free slots remain)"
 else
     # Do NOT name a cause here. This leg cannot distinguish a full alias table

@@ -160,28 +160,22 @@ echo "================ VERDICT ================"
 
 CLEAN=/tmp/tinyos-createperm-clean.log
 
-# SPLICE the EDR burst out; do not merely DROP the lines it touched.
-#
-# `grep -v "EDR DAEMON"` deletes the whole line, but the burst arrives
-# mid-character and fuses to real output, so whole-line deletion throws that
-# output away. Measured on this harness's own capture:
+# SPLICE the EDR burst out; do not merely DROP the lines it touched. The burst
+# arrives mid-character and fuses to real output, so whole-line deletion throws
+# that output away. Measured on this harness's own capture:
 #
 #     ch /rootonly/planted.t[EDR DAEMON] Starting threat scan...
 #     [EDR DAEMON] Scanning 6 active processes
 #     xt
 #     touch: permission denied: '/rootonly/planted.txt'
 #
-# The command echo is split across three lines and the first fragment would be
-# deleted outright. Two line kinds, and conflating them loses data: a line that
-# STARTS with the burst is pure noise (drop it); a line that merely CONTAINS it
-# carries real output in front (keep that prefix, splice on the continuation).
-# The END flush recovers a torn line with nothing following it.
-tr -d '\r' < "$SERIAL" \
-  | grep -va "Suspicious" \
-  | awk '/^\[EDR DAEMON\]/ { next }
-         /\[EDR DAEMON\]/  { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
-         { print buf $0; buf = "" }
-         END { if (buf != "") print buf }' > "$CLEAN"
+# This file used to carry its own copy of that awk, and that copy had every
+# defect the shared helper was written to fix -- it matched only [EDR DAEMON]
+# and never [EDR ADVANCED], it flushed on a blank line (which BRACKETS the
+# status report), and it lost a lone-prompt line. Use the helper; it is unit
+# tested. Note it strips CR itself, so do NOT pipe through `tr -d` as well.
+. "$(dirname "$0")/edr-rejoin.sh"
+rejoin_serial "$SERIAL" "$CLEAN"
 
 if ! grep -q "LSOWNDIR" "$CLEAN"; then
     echo "RESULT: INCONCLUSIVE — the command sequence did not complete."
