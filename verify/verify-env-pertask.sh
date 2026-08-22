@@ -170,6 +170,26 @@ python3 tools/qemu_typist.py >/dev/null
 
 TYPIST_RC=$?
 
+# Drain, then STOP the guest, before reading a single line.
+#
+# The typist returns as soon as it has sent the last keystroke and seen what it
+# was waiting for. The guest is still running at that moment and the tail of
+# the session is still in flight through QEMU's serial file buffer, so the last
+# few typed commands may not be on disk yet. This harness used to grep
+# immediately, and the legs it got wrong were exactly the ones typed LAST --
+# the `alias myll` / `myll` exchange at the end of the sequence -- while every
+# earlier leg passed because those lines had long since drained.
+#
+# That failure is worse than a flake because of what it SAYS: the alias leg
+# reports "alias table may be full (defaults >= max)", a specific and plausible
+# kernel diagnosis, when the alias in fact resolved correctly and the bytes
+# simply had not landed. Replaying the finished capture through the identical
+# grep chain passes. Every other harness in this suite already sleeps and calls
+# cleanup here; this one did not.
+sleep 3
+cleanup
+trap - EXIT
+
 echo "==> Typist finished (rc=$TYPIST_RC); analysing $SERIAL"
 
 if [ ! -s "$SERIAL" ]; then
@@ -305,7 +325,12 @@ if tr -d '\r' < "$SERIAL" \
      | grep -A1 -E '^\$ myll$' | grep -q '^root$'; then
     pass "user-defined alias was created AND invoked (free slots remain)"
 else
-    bad  "user alias did not resolve — alias table may be full (defaults >= max)"
+    # Do NOT name a cause here. This leg cannot distinguish a full alias table
+    # from an alias that was never created, a `myll` that never ran, or a log
+    # that had not finished draining -- and it spent a batch reporting the
+    # capacity theory for what turned out to be the drain race fixed above.
+    # State the observation; let the reader open the log.
+    bad  "user alias did not resolve: no 'root' line directly after '\$ myll'"
 fi
 
 # ---------------------------------------------------------------------------
