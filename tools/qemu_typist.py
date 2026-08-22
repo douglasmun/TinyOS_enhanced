@@ -16,6 +16,15 @@ import subprocess
 import sys
 import time
 
+# Line-buffer our own progress output.
+#
+# Every harness redirects this script's stdout to a file, which makes Python
+# block-buffer it: the "typist: sending ..." trail then sits unflushed until
+# exit, so a run that is alive and progressing looks identical to one that hung
+# at boot. That cost real diagnosis time -- a harness was declared stuck when
+# its log was merely empty. The 56 call sites do not need `python3 -u` for this.
+sys.stdout.reconfigure(line_buffering=True)
+
 SERIAL = os.environ["TINYOS_SERIAL"]
 MON_SOCK = os.environ["TINYOS_MON_SOCK"]
 PASSWORD = os.environ.get("TINYOS_PASSWORD", "rootpass1")
@@ -101,6 +110,43 @@ def read_serial():
         return ""
 
 
+def _despam(s):
+    """Remove EDR status-burst text, rejoining what it tore apart.
+
+    The EDR daemon writes to the same serial console as the shell, and it does
+    so mid-line: it cuts the shell's echo at an ARBITRARY character, including
+    inside the first word. Measured, at the kernel shell, which echoes per
+    keystroke:
+
+        $ w[EDR DAEMON] Starting threat scan...
+        rite /secret.txt ROO[EDR DAEMON] Starting threat scan...
+        TONLYDATA
+
+    No token of "write /secret.txt ROOTONLYDATA" survives contiguously -- not
+    the last ("ROOTONLYDATA" is split), not the first ("write" is split), so
+    neither a whole-line match nor any single-token fallback can work. The only
+    thing that does is to delete the burst and splice the halves back together,
+    which restores the original line exactly.
+
+    Lines that START with the marker are pure noise and are dropped whole;
+    lines that merely CONTAIN it carry real output before the burst, so that
+    prefix is kept and joined to what follows."""
+    out = []
+    buf = ""
+    for line in s.split("\n"):
+        if line.startswith("[EDR DAEMON]") or line.startswith("[EDR ADVANCED]"):
+            continue
+        m = re.search(r"\[EDR (?:DAEMON|ADVANCED)\]", line)
+        if m:
+            buf += line[:m.start()]
+            continue
+        out.append(buf + line)
+        buf = ""
+    if buf:
+        out.append(buf)
+    return "\n".join(out)
+
+
 def wait_for(text, timeout=240, since=0):
     """Wait until `text` appears in serial at/after byte offset `since`.
 
@@ -141,17 +187,19 @@ def type_verified(sock, s, timeout=40):
     interleaves into the echo ("jo[SYSCALL]...bs") and a contiguous search for
     "jobs" would spuriously fail on a run that actually worked.
 
-    ONLY VALID AT THE KERNEL SHELL AND THE LOGIN PROMPT. Those echo each
-    keystroke as it is accepted. The RING-3 shell does not: readline() collects
-    the whole line and echoes it only after Enter (src/stdio.c:336,
-    userspace/shell.c:2035), so the first per-character wait here can never
-    resolve and burns the full timeout instead.
+    ONLY VALID AT THE LOGIN PROMPT, which echoes each keystroke as it is
+    accepted. It is no longer used for shell commands at either shell --
+    type_echo_line() is, because this function has two weaknesses that only a
+    contiguous match fixes:
 
-    The COMMAND paths below are safe at either shell: by the time a command is
-    typed the line echo has appeared, and since it echoes the whole line the
-    in-order per-character scan still resolves (verify-ring3-env.sh passes
-    11/11 this way). Only `kshell` is typed before any echo exists, which is
-    why that one call site -- and only that one -- must not verify."""
+      - the scan starts at `len(serial) - len(s) - 4`, a window a few bytes
+        wide, so whether it resolves depends on what happens to sit in the tail
+        already. Both outcomes were seen on the SAME ring-3 path.
+      - an in-order per-character scan is a weak witness: any earlier text
+        containing those letters in order satisfies it.
+
+    The login prompt is safe because the string is short, fixed ("root"), and
+    typed at a point with no prior shell output to collide with."""
     start = max(0, len(read_serial()) - len(s) - 4)
     type_str(sock, s)
     cursor = start
@@ -159,6 +207,47 @@ def type_verified(sock, s, timeout=40):
         if ch == "\n":
             continue
         cursor = wait_for(ch, timeout=timeout, since=cursor)
+
+
+def type_echo_line(sock, s, timeout=60):
+    """Type a line and wait for the shell's echo of it, as a unit.
+
+    Correct at BOTH shells, and the only correct choice at ring 3.
+
+    type_verified() scans for each character in order starting from
+    `len(serial) - len(s) - 4`. That window is a few bytes wide, so whether it
+    resolves depends on which characters happen to sit in the tail already --
+    it is a coincidence, not a check. Both outcomes were observed on the SAME
+    ring-3 path: `help` "passed" only because the shell's own banner
+    ("TinyOS shell (ring 3) - 'help' for builtins, ...") is printed just above
+    and contains h,e,l,p in order, so the scan matched the BANNER and never
+    looked at the echo; `id` timed out because no 'i' fell inside its 7-byte
+    window. A check that passes by matching unrelated earlier text is worse
+    than no check.
+
+    The ring-3 shell does echo, just not per keystroke: readline() collects the
+    line and prints it once after Enter (src/stdio.c:336,
+    userspace/shell.c:2035), as "D:/ $ help". So take a mark BEFORE typing and
+    wait for the command text after it.
+
+    The EDR status burst tears that echo at an ARBITRARY character, so no
+    token-based fallback can be correct -- see _despam(), which has the
+    measured case where neither the first nor the last token survives intact.
+    Match on the spliced stream instead, which restores the line exactly.
+
+    The mark is taken on the spliced text before typing, so a match can only be
+    text this command produced, never an earlier identical line."""
+    mark = len(_despam(read_serial()))
+    type_str(sock, s)
+    body = s.rstrip("\n")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _despam(read_serial()).find(body, mark) >= 0:
+            return
+        time.sleep(0.4)
+    tail = _despam(read_serial())[-600:]
+    raise SystemExit(
+        f"typist: TIMEOUT waiting for echo of {body!r}\n--- serial tail ---\n{tail}")
 
 
 def main():
@@ -267,9 +356,34 @@ def main():
     #    (e.g. TINYOS_EXEC_CMD="exec C:/info.elf").
     exec_cmd = os.environ.get("TINYOS_EXEC_CMD", "exec /hello.elf")
     expect = os.environ.get("TINYOS_EXPECT", "Hello from ELF")
-    time.sleep(2)
+
+    # WAIT FOR THE RING-3 SHELL TO BE READY, don't sleep at it.
+    #
+    # On the kshell path the wait_for("shell: exiting") above already proves
+    # the kernel shell is up. Under TINYOS_STAY_IN_RING3 there was no such
+    # witness -- only a flat time.sleep(2) -- and 2 s is nowhere near enough
+    # under TCG, where login has to load and ECDSA-verify a 41 KB shell.elf.
+    # So the first command was typed into a shell that had not started
+    # reading, the keystrokes went nowhere, and the run died waiting for an
+    # echo that could never come. The serial log ends at
+    # "[ELF] Hash verification: PASS" with no banner and no prompt, which
+    # reads as the shell having failed to start rather than as the typist
+    # having jumped the gun.
+    #
+    # The banner is the right witness: the ring-3 shell prints
+    # "TinyOS shell (ring 3) - 'help' for builtins, ..." and then its prompt,
+    # so seeing it means readline() is running and will accept input.
+    if os.environ.get("TINYOS_STAY_IN_RING3", "") == "1":
+        end = wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
+        time.sleep(1)
+    else:
+        time.sleep(2)
     print(f"typist: sending '{exec_cmd}'")
-    type_verified(sock, exec_cmd + "\n", timeout=60)
+    # Same call at BOTH shells. The ring-3 shell echoes the whole line after
+    # Enter; the kernel shell echoes per keystroke. Either way the echoed text
+    # ends up contiguous in the SPLICED stream, which is what this matches --
+    # so there is no longer a per-shell branch to get wrong.
+    type_echo_line(sock, exec_cmd + "\n", timeout=60)
 
     # 5) Wait for the ENFORCE verify result + the program output
     try:
@@ -388,7 +502,7 @@ def main():
             if unverified:
                 type_str(sock, cmd + "\n")
             else:
-                type_verified(sock, cmd + "\n", timeout=60)
+                type_echo_line(sock, cmd + "\n", timeout=60)
             if want:
                 try:
                     # Same 240s as the first command's expect: a follow-up can
