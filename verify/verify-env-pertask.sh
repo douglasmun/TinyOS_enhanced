@@ -264,14 +264,43 @@ fi
 # ugrep, which rejects the $'...\r\?' form outright, and BSD grep does not
 # support GNU's \? in a BRE either. tr is portable across all three.
 # ---------------------------------------------------------------------------
-# Anchor at line start as well as after the prompt. The shell writes its
-# prompt with no trailing newline, so anything else reaching the serial port
-# in that window terminates the line and leaves the echo at column 0: the EDR
-# daemon's periodic status burst does exactly that, and this leg then FAILED
-# 2/2 reporting a full alias table against a run where the alias resolved
-# correctly ("myll" at column 0, "root" on the next line). The -A1 adjacency
-# is the real assertion here and is preserved.
-if tr -d '\r' < "$SERIAL" | grep -A1 -E '^(\$ )?myll$' | grep -q '^root$'; then
+# REJOIN the torn echo instead of trying to match its fragments.
+#
+# The shell writes its prompt with no trailing newline, so anything else
+# reaching the serial port in that window terminates the line. The EDR
+# daemon's periodic status burst does exactly that -- and it lands at an
+# ARBITRARY character, not at a word boundary. One run split this very
+# command as:
+#
+#     $ m[EDR DAEMON] Starting threat scan...
+#     [EDR DAEMON] Scanning 6 active processes
+#     [EDR DAEMON] Scan complete: 6 processes, duration 0 ticks
+#     yll
+#     root
+#
+# The residue is "yll", which matches neither `^myll$` nor `^\$ myll$`. An
+# earlier fix here anchored at column 0 to catch the whole-token case; that is
+# not enough, because the tear point is wherever the timer happened to fire.
+# Any pattern that reconstructs the typed text is fragile by construction.
+#
+# So repair the log first: strip the EDR text WITHOUT its preceding newline,
+# which splices each torn line back onto its own continuation. Verified on a
+# real capture -- all 7 torn echoes in that log reassemble, 0 residual tears,
+# and untorn lines are untouched. Ordinary anchors then work, and the -A1
+# adjacency (which is the real assertion) still carries the weight.
+#
+# awk rather than perl -0pe: no whole-file slurp, and no perl dependency in
+# a script that CI runs.
+#
+# The serial log uses CRLF, so `^root$` silently fails to match "root\r" and
+# reports a capacity failure that is really a line-ending mismatch. Strip the
+# CRs with tr rather than writing \r into the pattern: `grep` on this machine
+# is ugrep, which rejects the $'...\r\?' form outright, and BSD grep does not
+# support GNU's \? in a BRE either. tr is portable across all three.
+if tr -d '\r' < "$SERIAL" \
+     | awk '/\[EDR DAEMON\]/ { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
+            { print buf $0; buf = "" }' \
+     | grep -A1 -E '^\$ myll$' | grep -q '^root$'; then
     pass "user-defined alias was created AND invoked (free slots remain)"
 else
     bad  "user alias did not resolve — alias table may be full (defaults >= max)"
