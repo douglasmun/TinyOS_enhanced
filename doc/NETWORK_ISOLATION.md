@@ -234,8 +234,15 @@ being exactly `E1000_RX_PACKET_BUDGET`. A delta-only harness would have passed t
 kernel. The 16/4 split is also the tidiest statement of the original bug: the attacker's
 arrival rate decided how much of the parser ran with `IF=0`.
 
-Also re-ran `verify-ids-signature.sh`, which needs a DHCP lease and inbound UDP and so
-covers the boot-drain path this harness's NAT-less netdev cannot reach. Both pass.
+Also re-ran `verify-ids-signature.sh`, which at the time needed a DHCP lease and inbound
+UDP and so covered the boot-drain path this harness's NAT-less netdev cannot reach. Both
+pass.
+
+> **Since superseded (2026-08-22).** `verify-ids-signature.sh` was migrated to the mcast
+> netdev when the default-deny firewall stranded its UDP vehicle, and it no longer takes a
+> lease. The boot-drain witness is now `verify-firewall-default-deny.sh`, whose arm B
+> guards on the lease explicitly. The run recorded above was real; only the citation is
+> stale.
 
 ### 2. Remove the remotely-floodable `kprintf` sites — **DONE** (reopened for `tcp.c`, closed again)
 
