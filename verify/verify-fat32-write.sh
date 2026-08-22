@@ -65,51 +65,11 @@ if ! dd if="$RUN_DISK" bs=1 skip=82 count=8 status=none | grep -q "FAT32"; then
     exit 2
 fi
 
-# -----------------------------------------------------------------------------
-# run_boot <n> <exec_cmd> <expect> <followups>
-#   Boots QEMU headless against $RUN_DISK and drives the shell via the typist.
-#   Echoes nothing; sets globals SERIAL/TRACE for the caller to inspect.
-# -----------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# rejoin_serial -- repair command echoes torn by the EDR status burst.
-#
-# The shell writes its prompt with no trailing newline, so anything else
-# reaching the serial port in that window terminates the line. The EDR
-# daemon's periodic burst does exactly that, at an ARBITRARY character:
-#
-#     $ cat[EDR DAEMON] Starting threat scan...
-#     [EDR DAEMON] Scanning 6 active processes
-#     [EDR DAEMON] Scan complete: 6 processes, duration 0 ticks
-#      C:/PERSIST.TXT
-#     tinyos-fat32-write-ok
-#
-# `grep -n "cat $TESTFILE"` then matches ZERO lines, cat1_line comes back
-# empty, and this harness reported "marker never read back" against a run
-# where FAT32 wrote the file AND read it back correctly -- both visible in
-# its own serial log.
-#
-# Stripping the EDR text WITHOUT its preceding newline splices each torn line
-# back onto its continuation, after which the ordinary patterns work.
-#
-# TWO line types, and conflating them LOSES DATA. A line that merely CONTAINS
-# the burst carries real output before it ("tinyos-fat32-write-ok$ [EDR..." --
-# the marker is printed with no trailing newline, so it fuses with the next
-# prompt) and that prefix must be kept. A line that STARTS with the burst is
-# pure noise and must be dropped outright. Treating both as "strip and buffer"
-# makes consecutive EDR lines append empties to the buffer and the real prefix
-# resurfaces glued to the wrong line -- which silently ate this very marker in
-# an earlier version of this helper. Hence the separate `^\[EDR` rule, and the
-# END flush for a torn line with nothing after it. This is
-# preferable to loosening the patterns: the positional checks below are
-# load-bearing (the `write` echo contains the marker text, so a non-positional
-# match would pass on the echo alone) and rejoining keeps them exact.
-rejoin_serial() {
-    tr -d '\r' < "$1" \
-      | awk '/^\[EDR DAEMON\]/ { next }
-             /\[EDR DAEMON\]/  { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
-             { print buf $0; buf = "" }
-             END { if (buf != "") print buf }' > "$2"
-}
+# Repair command echoes torn by the EDR bursts. The three traps this
+# handles (ADVANCED as well as DAEMON, the status report's bracketing
+# blank lines, and a marker-free continuation line) are documented in
+# edr-rejoin.sh; edr-rejoin-test.sh is the case set.
+. "$(dirname "$0")/edr-rejoin.sh"
 
 run_boot() {
     local n="$1" exec_cmd="$2" expect="$3" followups="$4"

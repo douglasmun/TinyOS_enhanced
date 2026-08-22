@@ -130,18 +130,64 @@ def _despam(s):
 
     Lines that START with the marker are pure noise and are dropped whole;
     lines that merely CONTAIN it carry real output before the burst, so that
-    prefix is kept and joined to what follows."""
+    prefix is kept and joined to what follows.
+
+    Two further cases, both of which arise when the echo spans the 60-second
+    STATUS REPORT rather than a plain threat scan:
+
+        $ e[EDR DAEMON] Starting threat scan...
+        [EDR DAEMON] Scan complete: 6 processes, duration 0 ticks
+        cho                                    <-- fragment, NO marker on it
+        [EDR DAEMON] ========== STATUS REPORT ==========
+        ... 8 report lines ...
+        [EDR DAEMON] ===================================
+                                               <-- blank, part of the burst
+        MARKREDIR > /root[EDR DAEMON] Starting threat scan...
+        only/redir.txt
+
+    The BLANK lines are the report's own formatting -- edr_daemon.c:217 opens
+    with kprintf("\n[EDR DAEMON] ===...") and the closing rule adds another --
+    so a blank must not flush a pending fragment.
+
+    And "cho " carries no marker at all, so it cannot be told from real output
+    by content. It is told by POSITION: a line arriving while a tear is open,
+    whose SUCCESSOR is another burst line, is itself a fragment. That lookahead
+    fires only while a tear is open, so untorn output is never glued together.
+
+    Without those two rules this returned "MARKREDIR > /rootonly/redir.txt"
+    with the leading "echo " stranded on a line of its own, and the caller
+    timed out waiting for a command that had in fact run correctly.
+
+    Kept in step with verify/edr-rejoin.sh, which does the same repair for the
+    bash side; verify/edr-rejoin-test.sh is the shared set of cases."""
+    lines = s.split("\n")
+    marker = re.compile(r"\[EDR (?:DAEMON|ADVANCED)\]")
     out = []
     buf = ""
-    for line in s.split("\n"):
+    inburst = False
+    for i, line in enumerate(lines):
         if line.startswith("[EDR DAEMON]") or line.startswith("[EDR ADVANCED]"):
+            inburst = True
             continue
-        m = re.search(r"\[EDR (?:DAEMON|ADVANCED)\]", line)
+        m = marker.search(line)
         if m:
             buf += line[:m.start()]
+            inburst = True
+            continue
+        if line == "" and (inburst or buf):
+            continue
+        if not buf and re.match(r"^[A-Za-z]:/[^ ]* \$ $", line):
+            buf = line
+            inburst = True
+            continue
+        if (buf and i + 1 < len(lines) and marker.search(lines[i + 1])
+                and not buf.endswith("$ ")):
+            buf += line
+            inburst = False
             continue
         out.append(buf + line)
         buf = ""
+        inburst = False
     if buf:
         out.append(buf)
     return "\n".join(out)
@@ -335,7 +381,11 @@ def main():
         # its first prompt, so seeing it means readline() will accept input.
         # The STAY_IN_RING3 branch below already waits on it; this branch has
         # the same requirement and had only a sleep.
-        end = wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
+        # Do NOT advance `end` past the banner. It is a PRECONDITION (the
+        # shell is ready), not a result, and a harness may legitimately name
+        # the same string as its TINYOS_EXPECT -- consuming it here would make
+        # that harness wait forever for a second occurrence that never comes.
+        wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
         time.sleep(1)
         print("typist: sending 'kshell' (switch to the kernel shell)")
         mark = len(read_serial())
@@ -389,7 +439,12 @@ def main():
     # "TinyOS shell (ring 3) - 'help' for builtins, ..." and then its prompt,
     # so seeing it means readline() is running and will accept input.
     if os.environ.get("TINYOS_STAY_IN_RING3", "") == "1":
-        end = wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
+        # Same rule as above: wait on the banner, do not consume it.
+        # verify-mseal-counters.sh sets TINYOS_EXPECT to this exact string, so
+        # advancing the cursor past it made the expect below unsatisfiable and
+        # the harness reported INCONCLUSIVE against a shell that had started
+        # correctly and already answered `help`.
+        wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
         time.sleep(1)
     else:
         time.sleep(2)

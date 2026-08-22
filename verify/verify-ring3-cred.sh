@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-ring3-cred.sh — FULLY AUTOMATED check of RING-3 CREDENTIALS (SYS_CRED).
 #
@@ -179,6 +180,16 @@ pwd=>D:/" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 
@@ -194,7 +205,7 @@ fail_with() {
     echo "RESULT: FAIL — $1"
     shift
     for line in "$@"; do echo "  $line"; done
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 }
 
@@ -203,25 +214,25 @@ fail_with() {
 # The kernel printed its prompt into the RING-3 session's stream. If this is
 # missing but the user was still created, output routing regressed to kprintf
 # and an interactive user would see a shell that looks hung.
-n_prompt=$(grep -c "Enter password for new user" "$SERIAL" 2>/dev/null)
+n_prompt=$(grep -c "Enter password for new user" "$REJOINED" 2>/dev/null)
 [ "$n_prompt" -ge 1 ] || fail_with \
     "the kernel's password prompt never reached the ring-3 session" \
     "SYS_CRED must print through the caller's stream, not kprintf: an" \
     "interactive user would otherwise face a silent, apparently-hung shell."
 
-grep -q "useradd: user '$NEWUSER' created" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "useradd: user '$NEWUSER' created" "$REJOINED" 2>/dev/null || fail_with \
     "useradd did not create the user from ring 3" \
     "The success path is the whole chain: builtin -> SYS_CRED -> bounded" \
     "username copy -> kernel prompt -> user database write."
 
 # --- The refusals, as root -----------------------------------------------
 
-grep -q "userdel: cannot delete root user" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "userdel: cannot delete root user" "$REJOINED" 2>/dev/null || fail_with \
     "root deletion was not refused" \
     "The refusal must be by UID, not by the name 'root' — an account created" \
     "with uid 0 is root in every way that matters."
 
-grep -q "useradd: user '$NEWUSER' already exists" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "useradd: user '$NEWUSER' already exists" "$REJOINED" 2>/dev/null || fail_with \
     "a duplicate useradd was not refused" \
     "A second account under one name makes every later lookup ambiguous."
 
@@ -230,24 +241,24 @@ grep -q "useradd: user '$NEWUSER' already exists" "$SERIAL" 2>/dev/null || fail_
 # Proof the second login actually happened AND landed unprivileged. Without
 # this, every "permission denied" below could be a root session refusing for
 # some unrelated reason.
-grep -q "uid=1002" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "uid=1002" "$REJOINED" 2>/dev/null || fail_with \
     "the second login did not reach ring 3 as the new unprivileged user" \
     "Every non-root assertion below depends on this; without it they would" \
     "be checking a root session and could pass for the wrong reason."
 
-n_denied=$(grep -c "permission denied (must be root)" "$SERIAL" 2>/dev/null)
+n_denied=$(grep -c "permission denied (must be root)" "$REJOINED" 2>/dev/null)
 [ "$n_denied" -ge 2 ] || fail_with \
     "useradd/userdel were not refused for a non-root caller (saw $n_denied of 2)" \
     "THE check this harness exists for. The euid gate must live on the kernel" \
     "side of SYS_CRED: a shell that merely declines to offer the command still" \
     "leaves the syscall reachable by anything that calls it directly."
 
-grep -q "only root can change other users' passwords" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "only root can change other users' passwords" "$REJOINED" 2>/dev/null || fail_with \
     "a non-root user was not refused another user's password" \
     "The other half of the model: self-service passwd must stay allowed, so a" \
     "blanket root-only gate is the wrong fix and this check rejects it."
 
-grep -q "passwd: cannot be redirected" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "passwd: cannot be redirected" "$REJOINED" 2>/dev/null || fail_with \
     "a redirected credential command was not refused" \
     "'passwd > f' must be refused: the kernel prints its prompts into this" \
     "process's stdout, so redirecting them hides the prompt in a file while" \
@@ -258,7 +269,7 @@ grep -q "passwd: cannot be redirected" "$SERIAL" 2>/dev/null || fail_with \
 # THREE passwords in a row (current, new, retype) — so it proves the kernel's
 # prompt loop hands control back to the shell cleanly between reads rather than
 # leaving stray keystrokes queued.
-grep -q "passwd: password updated successfully" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "passwd: password updated successfully" "$REJOINED" 2>/dev/null || fail_with \
     "an unprivileged user could not change their OWN password" \
     "Self-service passwd must remain allowed; a refusal here means the euid" \
     "check is a blanket root-only gate rather than the intended policy."
@@ -268,25 +279,25 @@ grep -q "passwd: password updated successfully" "$SERIAL" 2>/dev/null || fail_wi
 # The trailing pwd is a barrier as much as a check: a kernel-side prompt reads
 # the keyboard directly, so a command that returned while the kernel was still
 # inside read_password would swallow this line instead of echoing it.
-grep -q "D:/" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "D:/" "$REJOINED" 2>/dev/null || fail_with \
     "the shell did not survive the refusals" \
     "Nothing echoed after the last refusal, so the session was left wedged —" \
     "most likely a path that returned while the kernel still held the keyboard."
 
-if grep -q "Triple fault\|PANIC\|triple fault" "$SERIAL" 2>/dev/null; then
+if grep -q "Triple fault\|PANIC\|triple fault" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — kernel panic/triple fault during the run"
-    grep -n "Triple fault\|PANIC\|triple fault" "$SERIAL" | head -5
+    grep -n "Triple fault\|PANIC\|triple fault" "$REJOINED" | head -5
     exit 2
 fi
 
 # A plaintext password must never appear on the serial console. The kernel echoes
 # '*' per keystroke and never prints the buffer, so a hit here means a password
 # reached a printf somewhere it should not have.
-if grep -qE "$NEWPASS|$NEWPASS2" "$SERIAL" 2>/dev/null; then
+if grep -qE "$NEWPASS|$NEWPASS2" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — a plaintext password appeared in the serial log"
     echo "  The kernel echoes '*' and never prints the buffer; a hit means a"
     echo "  password reached an output path it should never touch."
-    grep -nE "$NEWPASS|$NEWPASS2" "$SERIAL" | head -5
+    grep -nE "$NEWPASS|$NEWPASS2" "$REJOINED" | head -5
     exit 2
 fi
 
@@ -298,5 +309,5 @@ echo "RESULT: PASS — ring 3 administered credentials through SYS_CRED:" \
      "succeeded; a redirected passwd was refused; no plaintext reached the" \
      "console and the session was still alive at the end"
 grep -E "created \(uid|cannot delete root|already exists|permission denied|only root can change|cannot be redirected|password updated successfully|uid=1002" \
-     "$SERIAL" | head -12
+     "$REJOINED" | head -12
 exit 0

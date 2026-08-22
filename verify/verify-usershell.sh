@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-usershell.sh — FULLY AUTOMATED check of the RING-3 shell (roadmap 4).
 #
@@ -112,6 +113,16 @@ logout=>login" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 trap - EXIT
@@ -134,44 +145,44 @@ if grep -qE "^(cd|ls|cat|stat|write|mkdir|rm|pwd): .*(no such file|permission de
     exit 1
 fi
 
-if grep -q "not found (try 'help')" "$SERIAL" 2>/dev/null; then
+if grep -q "not found (try 'help')" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — the shell did not recognise a command it should have"
-    grep "not found (try" "$SERIAL" | tail -5
+    grep "not found (try" "$REJOINED" | tail -5
     exit 1
 fi
 
 # Ordered: a stale or duplicated line must not stand in for a missing one.
-l_start=$(grep -n "TinyOS shell (ring 3)" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_start=$(grep -n "TinyOS shell (ring 3)" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The prompt carries the cwd, so this line alone proves chdir moved the
 # process AND getcwd read it back.
-l_cd=$(grep -n "D:/scratch" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_cd=$(grep -n "D:/scratch" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # Content this shell wrote through open(O_CREAT)+write and read back with
 # open+read. An inert shell cannot produce it.
-l_cat=$(grep -n "rs-ok" "$SERIAL" 2>/dev/null | tail -1 | cut -d: -f1)
+l_cat=$(grep -n "rs-ok" "$REJOINED" 2>/dev/null | tail -1 | cut -d: -f1)
 # readdir found the file inside the directory the shell created...
-l_ls=$(grep -n "f\.txt" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_ls=$(grep -n "f\.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # ...and reported the directory itself AS a directory (the trailing slash is
 # emitted only for DT_DIR).
-l_lsdir=$(grep -n "usdir/" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_stat=$(grep -n "f\.txt  size=" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_lsdir=$(grep -n "usdir/" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_stat=$(grep -n "f\.txt  size=" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The REFUSAL. rmdir on a non-empty directory must fail; a driver that
 # removed it anyway would still satisfy every success check above.
-l_busy=$(grep -n "directory not empty" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_busy=$(grep -n "directory not empty" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # spawn + waitpid from ring 3, with argv reaching the child's main().
-l_spawn=$(grep -n "argv\[1\]=shellarg" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_exit=$(grep -n "shell: exiting" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_spawn=$(grep -n "argv\[1\]=shellarg" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_exit=$(grep -n "shell: exiting" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The kernel shell answered after `kshell`. `whoami` is a KERNEL-shell command
 # the ring-3 shell does not have, so its output proves the handover really
 # landed there rather than the ring-3 shell continuing to run.
 # Anchored at the start only: serial lines carry a trailing CR, so "^root$"
 # would never match.
-l_kshell=$(grep -n "^root[[:space:]]*$" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_kshell=$(grep -n "^root[[:space:]]*$" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
 # The ring-3 shell must have appeared with NO `exec` typed. The typist's first
 # command is an ordinary builtin, so if the banner shows up before any exec of
 # shell.elf, login went straight into it. A stray "exec /shell.elf" in the log
 # would mean the harness, not the kernel, put us there.
-if grep -q "exec /shell.elf" "$SERIAL" 2>/dev/null; then
+if grep -q "exec /shell.elf" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — shell.elf was exec'd explicitly; this harness must prove it is the DEFAULT login shell"
     exit 1
 fi
@@ -185,7 +196,7 @@ if [ -z "$l_start" ] || [ -z "$l_cd" ] || [ -z "$l_cat" ] || [ -z "$l_ls" ] \
          "rmdir-refused=${l_busy:-none} spawn=${l_spawn:-none}" \
          "exit=${l_exit:-none} kshell=${l_kshell:-none}"
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -193,12 +204,12 @@ if [ "$TYPIST_RC" -eq 0 ] && [ "$l_cd" -gt "$l_start" ] \
    && [ "$l_busy" -gt "$l_cat" ] && [ "$l_spawn" -gt "$l_busy" ] \
    && [ "$l_exit" -gt "$l_spawn" ] && [ "$l_kshell" -gt "$l_exit" ]; then
     echo "RESULT: PASS — login landed directly in the ring-3 shell, which ran builtins, refused rmdir on a non-empty dir, spawned a child with argv, and handed over to the kernel shell on 'kshell'"
-    grep -E "TinyOS shell \(ring 3\)|D:/scratch|rs-ok|usdir|argv\[1\]=|shell: exiting|Switching to the kernel shell" "$SERIAL" | head -25
+    grep -E "TinyOS shell \(ring 3\)|D:/scratch|rs-ok|usdir|argv\[1\]=|shell: exiting|Switching to the kernel shell" "$REJOINED" | head -25
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; out of order:" \
          "start=$l_start cd=$l_cd cat=$l_cat busy=$l_busy" \
          "spawn=$l_spawn exit=$l_exit kshell=$l_kshell)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi

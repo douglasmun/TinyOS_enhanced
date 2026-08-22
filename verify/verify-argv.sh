@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-argv.sh — FULLY AUTOMATED argc/argv check.
 #
@@ -72,6 +73,16 @@ TINYOS_EXPECT="argv[2]=beta" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 trap - EXIT
@@ -87,31 +98,31 @@ fi
 
 # Each line must be present AND in ascending order, so a stale/duplicated line
 # from an earlier command cannot stand in for a missing one.
-l0=$(grep -n "argv\[0\]=hello.elf" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l1=$(grep -n "argv\[1\]=alpha"     "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l2=$(grep -n "argv\[2\]=beta"      "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l0=$(grep -n "argv\[0\]=hello.elf" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l1=$(grep -n "argv\[1\]=alpha"     "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l2=$(grep -n "argv\[2\]=beta"      "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$l0" ] || [ -z "$l1" ] || [ -z "$l2" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC; argv0=${l0:-none} argv1=${l1:-none} argv2=${l2:-none})"
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
 # argc must be exactly 3: a fourth line would mean the trailing NULL terminator
 # was missed and main() walked off the end of the array.
-if grep -q "argv\[3\]=" "$SERIAL" 2>/dev/null; then
+if grep -q "argv\[3\]=" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — argv[3] present, so the NULL terminator was not honoured"
-    grep "argv\[" "$SERIAL" | tail -10
+    grep "argv\[" "$REJOINED" | tail -10
     exit 2
 fi
 
 if [ "$TYPIST_RC" -eq 0 ] && [ "$l1" -gt "$l0" ] && [ "$l2" -gt "$l1" ]; then
     echo "RESULT: PASS — argc/argv reached main() intact"
-    grep "argv\[" "$SERIAL" | head -5
+    grep "argv\[" "$REJOINED" | head -5
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; lines $l0 $l1 $l2 not in ascending order)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi

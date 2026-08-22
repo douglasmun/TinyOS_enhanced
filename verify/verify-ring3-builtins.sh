@@ -187,30 +187,13 @@ sleep 3
 cleanup
 trap - EXIT
 
-# Repair EDR-torn lines before any leg reads the log.
-#
-# The shell writes its prompt with NO trailing newline, so the EDR daemon's
-# periodic burst terminates the prompt line mid-command-echo and leaves the
-# remainder at column 0. PR #115 handled this by anchoring patterns as
-# '(^|\$ )cmd', which assumes the tear lands on a WORD BOUNDARY. It does not:
-# observed tears cut mid-token ('$ al', '$ m', '$ cat'), so '$ unalias envll'
-# can arrive as '$ una' + 'lias envll' and match NEITHER alternative.
-#
-# Splicing the pieces back together is strictly better than guessing where the
-# break fell, and it repairs every leg at once rather than one pattern at a
-# time. Two line kinds, and conflating them LOSES DATA: a line that STARTS with
-# the tag is pure noise and is dropped, while a line that merely CONTAINS it
-# carries real output before the burst and must have that prefix spliced onto
-# the continuation. The END flush matters because output printed without a
-# trailing newline (a bare marker) would otherwise be discarded.
-rejoin_edr() {
-    awk '/^\[EDR DAEMON\]/ { next }
-         /\[EDR DAEMON\]/  { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
-         { print buf $0; buf = "" }
-         END { if (buf != "") print buf }'
-}
+# Repair command echoes torn by the EDR bursts. The three traps this
+# handles (ADVANCED as well as DAEMON, the status report's bracketing
+# blank lines, and a marker-free continuation line) are documented in
+# edr-rejoin.sh; edr-rejoin-test.sh is the case set.
+. "$(dirname "$0")/edr-rejoin.sh"
 
-LOG="$(tr -d '\r' < "$SERIAL" | rejoin_edr)"
+LOG="$(rejoin_edr < "$SERIAL")"
 
 pass=0; fail=0
 ok()   { echo "  PASS: $1"; pass=$((pass+1)); }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-ring3-pipes.sh — FULLY AUTOMATED check of RING-3 PIPELINES (SYS_PIPE).
 #
@@ -132,6 +133,16 @@ id=>uid=" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 
@@ -145,13 +156,13 @@ fi
 
 # The consumer's report. This single line carries both halves of the proof: that
 # the data arrived, and how much of it.
-report=$(grep -o "counter: lines=[0-9]* bytes=[0-9]*" "$SERIAL" | head -1)
+report=$(grep -o "counter: lines=[0-9]* bytes=[0-9]*" "$REJOINED" | head -1)
 got_lines=$(echo "$report" | sed -n 's/.*lines=\([0-9]*\).*/\1/p')
 got_bytes=$(echo "$report" | sed -n 's/.*bytes=\([0-9]*\).*/\1/p')
 
 # The refusal for a builtin stage, and the still-alive console after it all.
-l_refusal=$(grep -c "pipelines connect two programs" "$SERIAL" 2>/dev/null)
-l_id=$(grep -c "uid=" "$SERIAL" 2>/dev/null)
+l_refusal=$(grep -c "pipelines connect two programs" "$REJOINED" 2>/dev/null)
+l_id=$(grep -c "uid=" "$REJOINED" 2>/dev/null)
 
 if [ -z "$report" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC)"
@@ -159,7 +170,7 @@ if [ -z "$report" ]; then
     echo "  still blocked on a pipe whose write end was never closed."
     echo "  refusal=$l_refusal id=$l_id"
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -40
+    grep -v "Suspicious" "$REJOINED" | tail -40
     exit 2
 fi
 
@@ -174,7 +185,7 @@ if [ "$got_lines" != "$EXPECT_LINES" ]; then
         echo "  about 290 lines, so a stop near there means the pipe truncated"
         echo "  at PIPE_BUFFER_SIZE instead of blocking the producer."
     fi
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -188,12 +199,12 @@ fi
 # The NEGATIVE: the piped data must not also have gone to the console. The
 # producer's own "producer: done" is checked separately below, so grep for the
 # numbered lines specifically.
-n_console=$(grep -c "pipe-line [0-9]" "$SERIAL" 2>/dev/null)
+n_console=$(grep -c "pipe-line [0-9]" "$REJOINED" 2>/dev/null)
 if [ "$n_console" -gt 0 ]; then
     echo "RESULT: FAIL — piped data reached the console ($n_console lines)"
     echo "  The producer's stdout was not bound to the pipe, so the shell ran"
     echo "  the two stages as ordinary commands instead of connecting them."
-    grep "pipe-line" "$SERIAL" | head -5
+    grep "pipe-line" "$REJOINED" | head -5
     exit 2
 fi
 
@@ -201,7 +212,7 @@ if [ "$l_refusal" -lt 1 ]; then
     echo "RESULT: FAIL — a builtin pipeline stage was not refused"
     echo "  'echo hi | /counter.elf' must be rejected with a reason: a builtin"
     echo "  runs inside the shell process, which cannot also be the other stage."
-    grep -v "Suspicious" "$SERIAL" | tail -20
+    grep -v "Suspicious" "$REJOINED" | tail -20
     exit 2
 fi
 
@@ -209,13 +220,13 @@ if [ "$l_id" -lt 1 ]; then
     echo "RESULT: FAIL — the shell did not return to a working console"
     echo "  Nothing echoed after the pipeline, so the shell's own stdin/stdout"
     echo "  were probably left bound to the pipe (missing PIPE_RESTORE)."
-    grep -v "Suspicious" "$SERIAL" | tail -20
+    grep -v "Suspicious" "$REJOINED" | tail -20
     exit 2
 fi
 
-if grep -q "Triple fault\|PANIC\|triple fault" "$SERIAL" 2>/dev/null; then
+if grep -q "Triple fault\|PANIC\|triple fault" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — kernel panic/triple fault during the run"
-    grep -n "Triple fault\|PANIC\|triple fault" "$SERIAL" | head -5
+    grep -n "Triple fault\|PANIC\|triple fault" "$REJOINED" | head -5
     exit 2
 fi
 
@@ -223,5 +234,5 @@ echo "RESULT: PASS — two ring-3 processes exchanged $got_bytes bytes" \
      "($got_lines lines) through a real pipe, more than PIPE_BUFFER_SIZE, so" \
      "the producer blocked and resumed; a builtin stage was refused; the" \
      "console was restored"
-grep -E "counter: lines=|pipelines connect|uid=" "$SERIAL" | head -10
+grep -E "counter: lines=|pipelines connect|uid=" "$REJOINED" | head -10
 exit 0

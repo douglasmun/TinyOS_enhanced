@@ -108,12 +108,8 @@ echo
 # along with the noise; rejoining the surviving halves restores the line.
 # Lines that START with the marker are pure noise and go whole.
 REJOINED="${SERIAL}.rejoined"
-tr -d '\r' < "$SERIAL" \
-  | awk '/^\[EDR (DAEMON|ADVANCED)\]/ { next }
-         /\[EDR (DAEMON|ADVANCED)\]/  { sub(/\[EDR (DAEMON|ADVANCED)\].*$/, "");
-                                          buf = buf $0; next }
-         { print buf $0; buf = "" }
-         END { if (buf != "") print buf }' > "$REJOINED"
+. "$(dirname "$0")/edr-rejoin.sh"
+rejoin_serial "$SERIAL" "$REJOINED"
 
 echo "================ RESULT ================"
 echo "--- transcript from the su onward ---"

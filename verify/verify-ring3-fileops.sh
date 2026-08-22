@@ -294,11 +294,8 @@ fi
 # output before the burst (keep that prefix and splice it onto the
 # continuation). The END flush recovers a torn line with nothing after it.
 REJOINED="${SERIAL}.rejoined"
-tr -d '\r' < "$SERIAL" \
-  | awk '/^\[EDR DAEMON\]/ { next }
-         /\[EDR DAEMON\]/  { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
-         { print buf $0; buf = "" }
-         END { if (buf != "") print buf }' > "$REJOINED"
+. "$(dirname "$0")/edr-rejoin.sh"
+rejoin_serial "$SERIAL" "$REJOINED"
 SERIAL="$REJOINED"
 
 after() {

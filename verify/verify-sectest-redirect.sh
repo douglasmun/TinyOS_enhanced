@@ -182,13 +182,23 @@ if grep -q "Triple fault" "$TRACE" 2>/dev/null; then
     exit 1
 fi
 
-cat_line=$(grep -n "cat /s.txt" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+# Read the REJOINED log. `cat /s.txt` is a typed echo, so the EDR burst tears
+# it and a raw grep returns nothing -- measured on the failing capture: raw
+# match 0, rejoined match 1, and all three markers land AFTER the cat with no
+# console copy, i.e. the kernel was correct and only this grep failed.
+# The three marker lookups below must read the SAME file, since their line
+# numbers are compared against cat_line.
+. "$(dirname "$0")/edr-rejoin.sh"
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
+cat_line=$(grep -n "cat /s.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$cat_line" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE — never saw the 'cat /s.txt' command echo"
     echo "  (typist rc=$TYPIST_RC) — the drive did not get far enough to measure."
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -199,7 +209,7 @@ fi
 # verify-ids-spray.sh; see its VALIDATION LOG.)
 check_marker() {
     label="$1"; pat="$2"; origin="$3"
-    first=$(grep -nE "$pat" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+    first=$(grep -nE "$pat" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
     if [ -z "$first" ]; then
         echo "RESULT: FAIL — $label never appeared at all."

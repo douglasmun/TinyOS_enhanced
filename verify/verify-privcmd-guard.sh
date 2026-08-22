@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-privcmd-guard.sh — FULLY AUTOMATED check that the kernel shell's
 # information-disclosure commands are refused for a NON-ROOT user.
@@ -129,6 +130,16 @@ auditlog --help=>Usage: auditlog" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 
@@ -145,7 +156,7 @@ fail_with() {
     shift
     for line in "$@"; do echo "  $line"; done
     echo "  --- last 30 serial lines ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 }
 
@@ -154,7 +165,7 @@ fail_with() {
 # Checked first. If the su did not happen we are still root, every command
 # below SUCCEEDS, and the refusal assertions fail for the wrong reason --
 # reporting a guard regression when the real problem is the harness.
-grep -q "Now running as" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "Now running as" "$REJOINED" 2>/dev/null || fail_with \
     "never became the unprivileged test user" \
     "The su did not complete, so the refusal checks below would be testing" \
     "root, not an unprivileged user. Nothing was proven."
@@ -164,7 +175,7 @@ grep -q "Now running as" "$SERIAL" 2>/dev/null || fail_with \
 # A guard that refuses everyone would satisfy every refusal assertion while
 # breaking the commands outright. Run before the refusals so a total breakage
 # is reported as breakage rather than as a passing guard.
-grep -q "PAE (Physical Address Extension) Status" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "PAE (Physical Address Extension) Status" "$REJOINED" 2>/dev/null || fail_with \
     "root did not get real 'pae' output" \
     "require_root must permit root. If this fails, the guard refuses everyone" \
     "and the refusal checks below are passing for the wrong reason."
@@ -174,7 +185,7 @@ grep -q "PAE (Physical Address Extension) Status" "$SERIAL" 2>/dev/null || fail_
 # Anchored to the command NAME, not a bare "permission denied": one command
 # refusing while five leak would satisfy an unanchored grep.
 for c in pae mem aslr wxaudit auditlog sectest; do
-    grep -q "$c: permission denied (must be root)" "$SERIAL" 2>/dev/null || fail_with \
+    grep -q "$c: permission denied (must be root)" "$REJOINED" 2>/dev/null || fail_with \
         "'$c' was NOT refused for the unprivileged user" \
         "require_root(\"$c\") is missing or placed after the command already" \
         "printed. Every one of these discloses kernel layout, account state, or" \
@@ -189,9 +200,9 @@ done
 #
 # Bounded to the post-su region of the log by line number: the same markers
 # legitimately appear earlier, from the root-side counter-check.
-SU_LINE=$(grep -n "Now running as" "$SERIAL" | tail -1 | cut -d: -f1)
+SU_LINE=$(grep -n "Now running as" "$REJOINED" | tail -1 | cut -d: -f1)
 if [ -n "${SU_LINE:-}" ]; then
-    POST=$(tail -n "+$SU_LINE" "$SERIAL")
+    POST=$(tail -n "+$SU_LINE" "$REJOINED")
 
     # One marker per guarded command, chosen to be unique to its real output.
     while IFS='|' read -r marker label; do
@@ -224,7 +235,7 @@ printf '%s\n' "${POST:-}" | grep -q "Usage: auditlog" || fail_with \
 
 # --- Sanity: no crash ------------------------------------------------------
 
-if grep -qi "triple fault\|PANIC" "$SERIAL" 2>/dev/null; then
+if grep -qi "triple fault\|PANIC" "$REJOINED" 2>/dev/null; then
     fail_with "kernel panicked or triple-faulted during the run"
 fi
 
