@@ -151,9 +151,31 @@ fi
 
 # The marker must appear AFTER the cat command, not merely somewhere in the log
 # (the `write` command line itself echoes the marker text as the user types it).
+#
+# "AFTER" is not the same as "on a later LINE". The kernel shell writes file
+# contents with NO newline after the command echo, so a successful readback
+# looks like this, all on one line:
+#
+#     $ cat C:/PERSIST.TXTtinyos-fat32-write-ok$
+#
+# A bare `NR>c` test scores that as "marker never read back" and FAILs a kernel
+# that wrote and read the file perfectly. So also accept the marker on the cat
+# line itself -- but only in the text FOLLOWING the command, which is what keeps
+# the `write` command's own echo from satisfying the test.
+#
+# marker_after <serial> <cat_line> <marker> <cmd> [line|text]
+marker_after() {
+    awk -v c="$2" -v m="$3" -v cmd="$4" -v mode="${5:-line}" '
+        NR>c && index($0,m){ print (mode=="text" ? $0 : NR); exit }
+        NR==c {
+            p=index($0,cmd); if(!p) next
+            rest=substr($0, p+length(cmd))
+            if(index(rest,m)){ print (mode=="text" ? rest : NR); exit }
+        }' "$1"
+}
+
 cat1_line=$(grep -n "cat $TESTFILE" "$BOOT1_SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-marker1_line=$(awk -v c="${cat1_line:-0}" -v m="$MARKER" \
-    'NR>c && index($0,m){print NR; exit}' "$BOOT1_SERIAL")
+marker1_line=$(marker_after "$BOOT1_SERIAL" "${cat1_line:-0}" "$MARKER" "cat $TESTFILE")
 
 if [ -z "$cat1_line" ] || [ -z "$marker1_line" ]; then
     echo "--- tail of $BOOT1_SERIAL ---"
@@ -191,8 +213,7 @@ fi
 
 # Marker must appear after boot 2's cat echo.
 cat2_line=$(grep -n "cat $TESTFILE" "$BOOT2_SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-marker2_line=$(awk -v c="${cat2_line:-0}" -v m="$MARKER" \
-    'NR>c && index($0,m){print NR; exit}' "$BOOT2_SERIAL")
+marker2_line=$(marker_after "$BOOT2_SERIAL" "${cat2_line:-0}" "$MARKER" "cat $TESTFILE")
 
 if [ -z "$cat2_line" ] || [ -z "$marker2_line" ]; then
     echo "--- tail of $BOOT2_SERIAL ---"
@@ -223,8 +244,7 @@ fi
 # text on the same line.
 rewrite_cat_line=$(grep -n "cat $TESTFILE" "$BOOT2_SERIAL" | sed -n '2p' | cut -d: -f1)
 if [ -n "$rewrite_cat_line" ]; then
-    rewrite_out=$(awk -v c="$rewrite_cat_line" -v m="$REWRITE" \
-        'NR>c && index($0,m){print; exit}' "$BOOT2_SERIAL")
+    rewrite_out=$(marker_after "$BOOT2_SERIAL" "$rewrite_cat_line" "$REWRITE" "cat $TESTFILE" text)
     if [ -z "$rewrite_out" ]; then
         echo "--- tail of $BOOT2_SERIAL ---"
         grep -v "Suspicious" "$BOOT2_SERIAL" | tail -30

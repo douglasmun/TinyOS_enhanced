@@ -250,7 +250,13 @@ fi
 # shell that never split `r3-delta>d.txt` still echoes that whole string, so the
 # marker appears either way. What distinguishes them is an occurrence with the
 # operator NOT attached — that can only come from `cat d.txt` reading the file.
-n_delta_bare=$(grep -c "r3-delta[^>]" "$REJOINED" 2>/dev/null)
+# `[^>]` alone requires a character AFTER the marker, but the successful
+# readback is `r3-delta` at END OF LINE with nothing following it -- so the
+# bracket cannot match and a CORRECT kernel scores 0. Alternate with `$`.
+# The discrimination is unchanged: in a shell that does not split, both
+# occurrences are `r3-delta>`, where neither end-of-line nor a non-'>'
+# character is available. Negative-controlled against exactly that log.
+n_delta_bare=$(grep -cE "r3-delta([^>]|$)" "$REJOINED" 2>/dev/null)
 if [ "$n_delta_bare" -lt 1 ]; then
     echo "RESULT: FAIL — 'echo r3-delta>d.txt' did not redirect (glued operator)"
     echo "  r3-delta seen $n_delta times, but never without '>' attached, so the"
