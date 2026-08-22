@@ -179,19 +179,27 @@ definition trips the first, and restoring only a `state = TCP_LISTEN` assignment
 would silently reopen remote SYN handling while every deleted function stayed
 deleted.
 
-**A TCP-over-NAT failure was found and is NOT this PR's.** `curl` reaches
-`SYN_SENT` and times out after 10010 ms with no SYN-ACK. Measured identically at
-three points: HEAD with the deletion, HEAD with the deletion stashed (server path
-fully intact), and `9fdf257` (before the entire network-isolation series). DHCP,
-ARP and DNS all work; the outbound SYN leaves and nothing returns. It therefore
-predates this work and needs its own investigation. This is why the harness
-asserts end-to-end on **DNS** rather than an HTTP body: DNS is real inbound
-traffic through the same `handle_packet` dispatch the branch was cut from, and it
-demonstrably works, so a failure there is attributable to this edit. Asserting on
-an HTTP body would fail on `main` too — measuring the pre-existing bug while
-looking like a regression report for this change. The TCP client path is
-consequently not covered end-to-end; that gap is stated in the harness header
-rather than papered over.
+**A TCP-over-NAT failure was believed to exist here, and it does not.**
+~~`curl` reaches `SYN_SENT` and times out after 10010 ms with no SYN-ACK.~~
+**RETRACTED.** That measurement came from this harness — a *server*-path
+harness that drives `dig` and never calls `tcp_connect` — and was carried
+forward as if it said something about outbound connections. It does not.
+
+The client path works, confirmed twice by packet capture (2026-08-16, and again
+at HEAD on 2026-08-22): `curl example.com` produces a clean SYN / SYN-ACK / ACK
+with correct sequence arithmetic, an 825-byte `HTTP/1.1 200 OK`, and a two-way
+FIN. Serial reports `TCP: Connection established!`.
+
+See "TCP-over-NAT was never broken" below, which is the same correction; this
+paragraph is where the false claim originated, so the retraction belongs here
+rather than only 120 lines further down. A whole session was spent planning a
+fix for this non-existent bug.
+
+DNS is still the right end-to-end assertion for that harness, but for a
+different reason than originally stated: it is inbound traffic through the same
+`handle_packet` dispatch the passive-open branch was cut from, so a failure is
+attributable to *that edit*. The TCP client path is simply out of scope for a
+server-path harness — not broken.
 
 **C1 (landed) — the read-only state queries, as one syscall.** `SYS_NETSTAT`
 (37) covers all seven accessors (`tcp_available`, `tcp_is_connected`,

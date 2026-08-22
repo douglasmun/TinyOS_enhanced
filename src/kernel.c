@@ -671,8 +671,16 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
      *=========================================================================*/
     kprintf("[CRYPTO] Initializing crypto subsystem.. [OK]\n");
     crypto_init();
-    kprintf("[CRYPTO] Initializing ECDSA P-256....... [OK]\n");
-    ecdsa_init();
+    kprintf("[CRYPTO] Initializing ECDSA P-256.......");
+    if (!ecdsa_init()) {
+        /* The generator point failed its on-curve check, which means the curve
+         * arithmetic is broken -- the same routine guards ecdsa_verify()'s
+         * check on the supplied public key, so ELF signature enforcement
+         * cannot be trusted. Refuse to continue rather than verify with it. */
+        kprintf(" [FAIL]\n");
+        kernel_panic("ECDSA P-256 self-test failed (generator point off curve)");
+    }
+    kprintf(" [OK]\n");
     kprintf("[AUDIT] Initializing audit logging......");
     audit_init();
     kprintf(" [OK]\n");

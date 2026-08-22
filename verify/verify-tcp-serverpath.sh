@@ -37,34 +37,46 @@
 #
 # WHAT THIS HARNESS DOES *NOT* PROVE, AND WHY (read before trusting it)
 #
-# It does not complete a TCP handshake, because THIS TREE CANNOT, and that is
-# not PR C's doing. Measured, not assumed:
+# It does not complete a TCP handshake, and that is a scope limit of THIS
+# harness -- not a defect in the tree. Read this carefully, because the text
+# here previously said the opposite and cost a full session of work.
 #
-#   HEAD with the deletion   curl -> SYN_SENT timeout after 10010 ms
-#   HEAD with the deletion
-#     stashed (server path
-#     fully intact)          curl -> SYN_SENT timeout after 10010 ms
-#   9fdf257, before the
-#     entire network-
-#     isolation series       curl -> SYN_SENT timeout after 10010 ms
+# This harness drives `dig` and asserts on the `TCP no-conn` counter. It
+# exercises the SERVER path: inbound segments arriving with no listener. It
+# never calls `tcp_connect`, so it says NOTHING about outbound connections in
+# either direction -- passing or failing.
 #
-# Identical at all three: same NAT lease (10.0.2.15), same DNS resolution of
-# neverssl.com to 34.223.124.45, same silence where the SYN-ACK should be. The
-# outbound SYN leaves and nothing comes back. So TCP-over-NAT is broken in this
-# tree independently of this PR, and a harness asserting on an HTTP body would
-# fail on `main` too -- it would be measuring that pre-existing bug, not this
-# change, while looking like a regression report for this change.
+# THE CLIENT PATH WORKS. Measured 2026-08-22 at HEAD with a filter-dump pcap,
+# driving `curl example.com` from the kernel shell:
 #
-# DNS is therefore the strongest END-TO-END signal available: it is real
-# inbound traffic through the same dispatch, and it demonstrably works, so a
-# failure here is attributable to this edit rather than to the TCP bug.
+#   10.0.2.15:49152 -> 104.20.23.154:80   SYN      seq=2655501428
+#   104.20.23.154:80 -> 10.0.2.15:49152   SYN|ACK  seq=128001 ack=2655501429
+#   10.0.2.15:49152 -> 104.20.23.154:80   ACK      seq=2655501429 ack=128002
+#   ... PSH with the request, 825 bytes of response, two-way FIN
 #
-# The TCP client path is consequently NOT covered end-to-end by this harness.
-# That gap is real and is stated rather than papered over, per
-# harness-design-principles: a harness implying more coverage than it has is
-# worse than one admitting the gap. Restoring TCP-over-NAT is its own
-# investigation and its own PR; when it lands, the natural follow-up is to
-# assert on an HTTP status line and body here.
+# Serial shows "TCP: Connection established!" then "HTTP/1.1 200 OK". Sequence
+# arithmetic is correct (server acks ISS+1). This matches an independent pcap
+# taken 2026-08-16.
+#
+# WHAT THE OLD TEXT CLAIMED, AND WHY IT WAS WRONG
+#
+# It stated that curl reached SYN_SENT and timed out after 10010 ms with no
+# SYN-ACK, "measured identically" at three commits, and concluded "TCP-over-NAT
+# is broken in this tree". That conclusion was drawn from THIS harness's own
+# results -- a server-path harness -- and carried forward as evidence about the
+# client path. Nobody re-ran an outbound connection. `doc/NETDAEMON_DESIGN.md`
+# recorded the correction ("TCP-over-NAT was never broken") but the retraction
+# never reached this file, so every run kept printing the disproved claim.
+#
+# The lesson, which is why this is spelled out at length: before fixing a
+# network bug, run the reproducer for the DIRECTION you think is broken. The
+# client and server paths share tcp.c and the counter vocabulary, so a
+# server-path harness reads like a TCP harness.
+#
+# DNS remains the end-to-end signal asserted here: it is real inbound traffic
+# through the same `handle_packet` dispatch the passive-open branch was cut
+# from, so a failure here is attributable to that edit. Asserting on an HTTP
+# body would exercise the client path, which this harness is not about.
 #
 # WHY NAT AND NOT A SOCKET NETDEV
 #
@@ -177,7 +189,7 @@ TINYOS_FOLLOWUP_TIMEOUT=600 \
 TINYOS_EXEC_CMD="ifconfig" \
 TINYOS_EXPECT="IP Address" \
 TINYOS_FOLLOWUP_CMDS="\
-dig $LOOKUP_NAME=>Resolved;\
+dig $LOOKUP_NAME=>IN      A;\
 ifconfig=>TCP no-conn" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
@@ -222,8 +234,20 @@ esac
 # print a failure, without any packet ever coming back. Requiring a dotted
 # quad is what separates a working dispatch from a command that merely
 # executed.
-RESOLVED=$(grep -a "Resolved IP for domain:\|Resolved to" "$SERIAL" | tail -1 \
-           | sed -n 's/.*[Rr]esolved[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+#
+# The witness is dig's OWN answer section ("IN      A       <quad>"), and it
+# has to be. This leg read "[DNS] Resolved IP for domain:" until 9fe3c8e --
+# the DNS RX kprintf sweep -- DELETED that line, since a remote host drove it
+# (the sweep was correct; see CLAUDE.md, "no per-packet kprintf"). The other
+# alternative, "Resolved to", is printed by ping and curl, never by dig. So
+# from 9fe3c8e until this commit BOTH witnesses were unprintable by the
+# command this harness types, and the leg failed unconditionally -- against a
+# kernel whose DNS path was working the whole time. Verified at c1fb096: the
+# serial log carried "example.com  300  IN  A  104.20.23.154" in the same run
+# the harness called a FAIL. If you re-point this string, re-point the
+# typist's =>expect on the dig line too; they must name the same output.
+RESOLVED=$(grep -a "IN      A       [0-9]" "$SERIAL" | tail -1 \
+           | sed -n 's/.*IN      A       \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
 if [ -z "$RESOLVED" ]; then
     fail_with "DNS did not resolve '$LOOKUP_NAME', so no inbound packet was delivered" \
         "The reply travels the same handle_packet dispatch the passive-open" \
@@ -262,9 +286,10 @@ echo "  server path:   ABSENT (source guard: no tcp_bind/tcp_listen/tcp_accept,"
 echo "                 nothing assigns TCP_LISTEN, no per-SYN print)"
 echo "  RX dispatch:   PROVEN end-to-end (real inbound reply through"
 echo "                 handle_packet, the function the branch was cut from)"
-echo "  TCP handshake: NOT COVERED — broken tree-wide, independently of this"
-echo "                 PR (identical SYN_SENT timeout at HEAD, at HEAD with"
-echo "                 the deletion stashed, and at 9fdf257). See header."
+echo "  TCP handshake: NOT EXERCISED HERE — this harness drives the SERVER"
+echo "                 path and never calls tcp_connect. The client path"
+echo "                 works: pcap at HEAD shows SYN/SYN-ACK/ACK and"
+echo "                 HTTP/1.1 200 OK. See header."
 echo ""
 echo "RESULT: PASS"
 exit 0
