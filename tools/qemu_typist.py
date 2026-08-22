@@ -321,7 +321,22 @@ def main():
     #    harnesses working unchanged: the shell they target did not move, only
     #    what login hands you first.
     if os.environ.get("TINYOS_STAY_IN_RING3", "") != "1":
-        time.sleep(2)
+        # Wait for the ring-3 shell to be READY, do not sleep a flat 2s at it.
+        #
+        # `kshell` is typed AT the ring-3 shell, so that shell has to be up and
+        # inside readline() first. Getting there means loading and
+        # ECDSA-verifying a 41 KB shell.elf, which under TCG takes far longer
+        # than 2s on a loaded host. Typing into a shell that is not reading yet
+        # drops the line, and the failure is indistinguishable from a kernel
+        # fault: the log ends at "[ELF] Hash verification: PASS" with the shell
+        # loaded and simply never speaking.
+        #
+        # The banner is the witness -- the shell prints it immediately before
+        # its first prompt, so seeing it means readline() will accept input.
+        # The STAY_IN_RING3 branch below already waits on it; this branch has
+        # the same requirement and had only a sleep.
+        end = wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
+        time.sleep(1)
         print("typist: sending 'kshell' (switch to the kernel shell)")
         mark = len(read_serial())
         # Type it WITHOUT per-character echo verification.
