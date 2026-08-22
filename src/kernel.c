@@ -715,6 +715,36 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     /* Note: DHCP ports 67/68 UDP are already handled by outgoing rule */
     /* Note: DNS port 53 UDP is handled by established connections */
 
+#ifdef TINYOS_FAULT_INJECT
+    /* verify-tcp-rx-counters.sh only.
+     *
+     * The harness injects crafted TCP segments to prove that malformed inbound
+     * headers are COUNTED rather than printed. Since c5fa987 made the firewall
+     * default-deny, those segments never reach the L4 dispatch at all: they die
+     * at firewall.c's `Default: DENY ALL`, one layer ABOVE tcp_handle_packet(),
+     * and every counter the harness reads stays 0 -- including its positive
+     * control. The harness FAILed with `malformed 0 (expected 20)` against a
+     * completely correct kernel, and contains no firewall reference to explain
+     * it. (`ifconfig`'s FW verdict line now makes that diagnosis immediate.)
+     *
+     * None of the four standing accept paths can carry it: firewall-disabled is
+     * not an option, the DHCP 68->67 exception returns true ABOVE match_rule()
+     * so it cannot exercise a rule, an ESTABLISHED flow does not exist for an
+     * injected segment, and no ACCEPT rule covers inbound TCP.
+     *
+     * So this is the vehicle, and it is deliberately the narrowest one: a
+     * single destination port, TCP only, at the same priority 50 as the
+     * standing ICMP rule -- NOT a loosening of the default deny, which stays
+     * exactly as it is for every other port and protocol. It is compiled out of
+     * every default build, like every other fault-injection hook.
+     *
+     * Port 80 matches tools/inject_frames.py's --tcp-dst-port default. If that
+     * default changes, this must change with it or the harness silently returns
+     * to reading zeroes. */
+    firewall_allow_port(80, IPPROTO_TCP, "FAULT_INJECT: TCP RX counter harness");
+    kprintf("[FIREWALL]   - TCP/80 inbound: ALLOW (TINYOS_FAULT_INJECT)\n");
+#endif
+
     kprintf("[FIREWALL] Configuration complete........ [OK]\n");
 
     ids_init();
