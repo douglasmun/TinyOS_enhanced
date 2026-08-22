@@ -56,8 +56,13 @@ jobs:
       - name: Build (must be warning-clean under -Werror)
         run: |
           GCCINC="$(i686-linux-gnu-gcc -print-file-name=include)"
+          GCCFIX="$(i686-linux-gnu-gcc -print-file-name=include-fixed)"
+          # include-fixed carries syslimits.h, which gcc's own limits.h reaches
+          # by #include_next. The bare-metal i686-elf cross ships that dir with
+          # nothing but a README (no syslimits needed), so this is a no-op
+          # there and load-bearing for the Linux-targeting cross.
           make -j"$(nproc)" CROSS=i686-linux-gnu- \
-               EXTRA_CFLAGS="-nostdinc -isystem $GCCINC" kernel.elf
+               EXTRA_CFLAGS="-nostdinc -isystem $GCCINC -isystem $GCCFIX" kernel.elf
 
       - name: Confirm the artifact is a 32-bit ELF
         run: |
@@ -77,7 +82,9 @@ jobs:
           rc=0
           for h in src/*.h userspace/*.h; do
             i686-linux-gnu-gcc -m32 -ffreestanding -Isrc -Iuserspace \
-              -nostdinc -isystem "$(i686-linux-gnu-gcc -print-file-name=include)" \
+              -nostdinc \
+              -isystem "$(i686-linux-gnu-gcc -print-file-name=include)" \
+              -isystem "$(i686-linux-gnu-gcc -print-file-name=include-fixed)" \
               -c -include "$h" /tmp/probe.c -o /tmp/probe.o 2>/tmp/err.txt \
               || { echo "NOT SELF-SUFFICIENT: $h"; sed -n '1,6p' /tmp/err.txt; rc=1; }
           done
