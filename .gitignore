@@ -39,6 +39,12 @@ qemu.log
 network_trace.txt
 log/
 firstexec-trials.log
+# Harness serial + QEMU trace captures. Named per harness, so enumerate rather
+# than blanket-ignoring *.log (doc/ and web/ may legitimately carry one).
+idsblock*.log
+fwdeny*.log
+udprx*.log
+dhcprx*.log
 
 # --- Personal ops scripts (not part of the OS; reference a specific GitHub repo) ---
 publish.sh
