@@ -254,7 +254,30 @@ inconclusive_with() {
 # ending mismatch. Do NOT fix that with '\r\?' — grep here is ugrep, which
 # rejects it as an empty subexpression. Strip once, up front, and work on the
 # stripped copy for every content assertion.
-CLEAN=$(tr -d '\r' < "$SERIAL")
+# Repair EDR-torn lines before any leg reads the log.
+#
+# The shell writes its prompt with NO trailing newline, so the EDR daemon's
+# periodic burst terminates the prompt line mid-command-echo and leaves the
+# remainder at column 0. PR #115 handled this by anchoring patterns as
+# '(^|\$ )cmd', which assumes the tear lands on a WORD BOUNDARY. It does not:
+# observed tears cut mid-token ('$ al', '$ m', '$ cat'), so '$ unalias envll'
+# can arrive as '$ una' + 'lias envll' and match NEITHER alternative.
+#
+# Splicing the pieces back together is strictly better than guessing where the
+# break fell, and it repairs every leg at once rather than one pattern at a
+# time. Two line kinds, and conflating them LOSES DATA: a line that STARTS with
+# the tag is pure noise and is dropped, while a line that merely CONTAINS it
+# carries real output before the burst and must have that prefix spliced onto
+# the continuation. The END flush matters because output printed without a
+# trailing newline (a bare marker) would otherwise be discarded.
+rejoin_edr() {
+    awk '/^\[EDR DAEMON\]/ { next }
+         /\[EDR DAEMON\]/  { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
+         { print buf $0; buf = "" }
+         END { if (buf != "") print buf }'
+}
+
+CLEAN=$(tr -d '\r' < "$SERIAL" | rejoin_edr)
 
 # Split at the su. Everything after it is the unprivileged session, and every
 # env assertion must be measured THERE: root's own ring-3 shell ran the same
