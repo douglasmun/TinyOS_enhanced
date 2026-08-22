@@ -121,7 +121,19 @@ if ! echo "$root_block" | grep -q "ROOTONLYDATA"; then
 fi
 echo "positive control OK: root created, chmod'd and read $SECRET"
 
-after_chmod=$(sed -n "/chmod 666 /,\$p" "$SERIAL" | tr -d '\r')
+# Anchor the slice on the `su`, NOT on the `chmod 666` echo.
+#
+# The EDR daemon's periodic burst lands mid-line and tears the command echo in
+# two: the log reads `$ chmod` / three EDR lines / ` 666 /secret.txt`, so the
+# pattern "chmod 666 " matches ZERO lines, the slice comes back empty, every
+# branch below falls through, and the harness reports INCONCLUSIVE against a
+# kernel that refused the chmod correctly. That is what it did until this fix.
+#
+# "Now running as: $TESTUSER" is safe to anchor on because it is kernel output
+# on its own line rather than a typed echo, and because the root-side positive
+# control completes entirely BEFORE the su -- so nothing it produced can leak
+# into this window and satisfy the escalation checks.
+after_chmod=$(sed -n "/Now running as: $TESTUSER/,\$p" "$SERIAL" | tr -d '\r')
 
 # The escalation itself: did the unprivileged user get the contents?
 if echo "$after_chmod" | grep -q "ROOTONLYDATA"; then

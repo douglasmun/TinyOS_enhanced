@@ -73,6 +73,11 @@ PASSWORD="${TINYOS_TEST_PASSWORD:-${TINYOS_PASSWORD:-rootpass1}}"
 # credprobe.c, and must never appear in the log.
 GUESS=guessguess
 
+# The probe must run as an UNPRIVILEGED user. See the escalation assertion
+# below for why running it as root made that leg unfalsifiable.
+TESTUSER=creduser
+TESTPASS=credpass1
+
 ISO=dist/tinyos.iso
 SERIAL=cred-deprecation.log
 TRACE=cred-deprecation-trace.log
@@ -105,18 +110,34 @@ QEMU_PID=$!
 cleanup() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; rm -f "$MON_SOCK"; }
 trap cleanup EXIT
 
-# Run the probe from the KERNEL shell (the typist types `kshell` by default).
-# `exec` runs it as a ring-3 process, which is what matters: the syscalls are
-# issued from CPL 3 through int 0x80.
+# The probe runs as an UNPRIVILEGED user, and that is the whole point of the
+# sequencing below. `exec` runs it as a ring-3 process, so the syscalls are
+# issued from CPL 3 through int 0x80 either way -- but the ESCALATION leg
+# ("the probe must not end up as root") can only be falsified if the probe
+# did not START as root. Run from the root shell, `PROBE uid=0` is the
+# probe's correct inherited state, so that assertion FAILS on a correct
+# kernel and could not pass on a broken one either. It was one-sided in
+# both directions, and it stood as a FAIL until this was fixed.
+#
+# The typist runs TINYOS_EXEC_CMD before the followups, so the account has to
+# be created in the followup list and the real probe exec'd after the `su`.
+# TINYOS_EXEC_CMD is therefore a throwaway that only gets us to a prompt.
 #
 # The trailing `whoami` is a barrier as much as a check — a syscall that wedged
-# instead of returning would eat these keystrokes.
+# instead of returning would eat these keystrokes. It must report the TEST
+# USER now, not root: that is what proves the refused syscalls left the
+# session's credentials untouched.
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_PASSWORD="$PASSWORD" \
-TINYOS_EXEC_CMD="exec /credprobe.elf" \
-TINYOS_EXPECT="PROBE VERDICT" \
-TINYOS_FOLLOWUP_CMDS="whoami=>root" \
+TINYOS_EXEC_CMD="exec /hello.elf" \
+TINYOS_EXPECT="Hello from ELF" \
+TINYOS_FOLLOWUP_CMDS="\
+useradd $TESTUSER=>Enter password for new user;\
+!$TESTPASS=>created;\
+su $TESTUSER=>Now running as;\
+exec /credprobe.elf=>PROBE VERDICT;\
+whoami=>$TESTUSER" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
@@ -174,9 +195,23 @@ grep -q "PROBE VERDICT refused" "$SERIAL" 2>/dev/null || fail_with \
     "the probe itself concluded the syscalls were reachable" \
     "The program computes this independently of the harness's own checks."
 
+# --- Positive control: the probe really was unprivileged ------------------
+#
+# This guard is what keeps the escalation leg below falsifiable. If the `su`
+# silently failed, the probe would run as root, `PROBE uid=0` would be its
+# correct inherited state, and the escalation assertion would be grading
+# nothing -- exactly the defect this harness shipped with. Assert the switch
+# landed BEFORE reading anything into the uid the probe reports.
+grep -q "Now running as: $TESTUSER" "$SERIAL" 2>/dev/null || fail_with \
+    "the su to $TESTUSER never completed, so the probe ran as root" \
+    "The escalation leg below is only meaningful for an unprivileged caller." \
+    "This is a harness failure, not a kernel finding."
+
 # --- The negative: no escalation ------------------------------------------
 #
-# The probe asked to become root. It must still be uid 1000.
+# The probe asked to become root. It must still be the unprivileged test user.
+# uid 0 is root, so any `PROBE uid=0` here is a committed credential change --
+# and the su guard above proves the probe did not simply start there.
 if grep -qE "PROBE uid=0" "$SERIAL" 2>/dev/null; then
     fail_with \
         "the ring-3 probe ended up as ROOT" \
@@ -185,8 +220,11 @@ if grep -qE "PROBE uid=0" "$SERIAL" 2>/dev/null; then
 fi
 
 # --- The session survived --------------------------------------------------
-
-grep -q "whoami" "$SERIAL" 2>/dev/null || fail_with \
+#
+# Match the OUTPUT of whoami, not the string "whoami" -- the latter matches
+# the command echo, which the shell prints before running anything, so it
+# survives a shell that wedged on the very next instruction.
+grep -qE "^$TESTUSER" "$SERIAL" 2>/dev/null || fail_with \
     "the shell did not survive the probe" \
     "A refused syscall must RETURN an errno, not fault or wedge the caller."
 
