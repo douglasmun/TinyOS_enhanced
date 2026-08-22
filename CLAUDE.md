@@ -32,9 +32,23 @@ look arbitrary until you know which failure produced them.
 - Headless boot: `qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom dist/tinyos.iso
   -boot d -m 256M -netdev user,id=net0 -device e1000,netdev=net0 -serial file:LOG -display none`.
 - The EDR daemon spams `[EDR ADVANCED] ... Suspicious memory` on serial — filter with
-  `grep -v Suspicious`.
-- First boot asks to set a root password, then login. Scripted keystrokes drop under
-  TCG load — echo-verify each char before advancing.
+  `grep -v Suspicious`. Its **60-second status report is a ~7-line burst**, and that
+  burst is why **no log pattern may be anchored on the shell prompt alone**: the shell
+  writes `D:/ $ ` with no trailing newline, so the burst terminates that line and leaves
+  the command echo at **column 0 with no prompt**. Anchor at line start too
+  (`grep -vE '(^|\$ )cmd'`, `sed -nE '/(^|\$ )cmd/,$p'`) — and note BSD `sed` does not
+  support the BRE alternation `\(^\|…\)`, so that form matches *neither* layout. Both
+  polarities break: filters that DROP the echo count a survivor, guards that REQUIRE it
+  do not find it, and **both fail as a FAIL on a correct kernel**. Five legs across four
+  harnesses failed this way (PR #115), each *deterministically* — which is why they read
+  as kernel regressions. The messages mislead: one said "alias table may be full",
+  another "the typist did not reach it".
+- First boot asks to set a root password, then login. **Do not try to echo-verify each
+  character**: the ring-3 shell echoes the whole accepted line *after* `readline()`
+  returns (`src/stdio.c:336`, `userspace/shell.c:2035`), so a per-char wait blocks on an
+  echo that cannot arrive and a resend loop types `kkkkshell` into a live boot. Only the
+  kernel shell echoes per keystroke. The typist is **not** the flaky part — measured
+  across ~45 boots, **zero** keystrokes dropped; every failure was a harness defect.
 
 Build flags are all **explicitly named opt-outs, never defaults**:
 `-DELF_PERMISSIVE_SIGNATURES` (warn-and-load unsigned binaries),

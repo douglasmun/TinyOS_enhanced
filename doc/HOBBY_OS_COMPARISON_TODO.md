@@ -77,14 +77,28 @@ withdrawn D1). Ask what adopting the idea **buys**, not whether it is possible.
       surface may matter more than the randomisation.
 - [ ] **SerenityOS — their bug/regression-test discipline.** Arguably the highest-value
       item in this whole file, given the "assurance still converging" verdict. How do
-      they stop a fixed bug from returning? TinyOS has 62 harnesses and, until
+      they stop a fixed bug from returning? TinyOS has 63 harnesses and, until
       PR #113, **no runner and no CI at all**. That is now partly closed: a
       ~25 s workflow gates the `-Werror` build, a standalone-header check, and
-      the two harnesses that boot nothing. **The other 60 remain ungated** --
-      they drive QEMU through a typist that drops keystrokes under TCG load,
-      and a flaky required check is worse than none. So the question stands in
-      its sharper form: how does SerenityOS gate tests that need a running
-      machine without the flake making the signal worthless?
+      (after PR #116) **all four** harnesses that boot nothing. **The other 58
+      remain ungated**, plus one that wraps an interactive GUI run.
+
+      The reason recorded here for leaving them out was that the typist "drops
+      keystrokes under TCG load". **That was measured and it is false**: across
+      ~45 boots (`auto-verify-exec.sh` 20/20, six harnesses at 2-5 runs each),
+      **zero** keystrokes dropped. Every failure was deterministic, and every
+      one was a defect in the harness rather than the guest -- six standing
+      failures across five files that had never been run end-to-end (PR #115).
+      "Flaky QEMU tests" was the story; **unrun tests** was the fact, which is
+      the same `unrun-harness-false-pass` class this file's own verdict warns
+      about.
+
+      So the question is no longer "how do you tolerate the flake" but the
+      plainer one: **58 guest boots is ~2.7 h serially** (median 169 s/run,
+      n=36 measured) -- how does SerenityOS gate tests that need a running
+      machine at that cost? Sharding, a nightly
+      non-blocking job, and a fast subset on PRs are the obvious answers; which
+      one they actually chose is the thing worth reading.
 - [ ] **AtomicOS — WCET / Tempo.** Almost certainly *not* adoptable (no language
       change is on the table), but the underlying question is: does TinyOS have any
       timing-side-channel posture? Note `doc/MSEAL_AUDIT.md` already measured one
@@ -129,8 +143,10 @@ of a real bug, so a good idea from another OS does not get to override them:
 ## Honest summary to keep on hand
 
 Strong defensive intent; unusually honest documentation of its own false-passes; single
-developer; no adversarial exposure; no fuzzing; CI gates the build and three
-source-level checks but not the 60 harnesses that need a running machine.
+developer; no adversarial exposure; no fuzzing; CI gates the build and four
+source-level checks but not the 58 harnesses that need a running machine --
+which is a cost problem (~2.7 h serially), not the flake problem this file
+used to claim.
 **"One of the most security-oriented" is defensible. "Most secure" needs hostile
 exposure, and there is no shortcut to it.**
 
