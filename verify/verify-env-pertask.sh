@@ -264,7 +264,14 @@ fi
 # ugrep, which rejects the $'...\r\?' form outright, and BSD grep does not
 # support GNU's \? in a BRE either. tr is portable across all three.
 # ---------------------------------------------------------------------------
-if tr -d '\r' < "$SERIAL" | grep -A1 '^\$ myll$' | grep -q '^root$'; then
+# Anchor at line start as well as after the prompt. The shell writes its
+# prompt with no trailing newline, so anything else reaching the serial port
+# in that window terminates the line and leaves the echo at column 0: the EDR
+# daemon's periodic status burst does exactly that, and this leg then FAILED
+# 2/2 reporting a full alias table against a run where the alias resolved
+# correctly ("myll" at column 0, "root" on the next line). The -A1 adjacency
+# is the real assertion here and is preserved.
+if tr -d '\r' < "$SERIAL" | grep -A1 -E '^(\$ )?myll$' | grep -q '^root$'; then
     pass "user-defined alias was created AND invoked (free slots remain)"
 else
     bad  "user alias did not resolve — alias table may be full (defaults >= max)"
