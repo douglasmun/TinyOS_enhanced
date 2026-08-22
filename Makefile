@@ -34,7 +34,16 @@ CFLAGS  := -m32 -ffreestanding -fno-pic -fno-builtin -fstack-protector-strong \
 # is milliseconds on real hardware but minutes under TCG/QEMU. For fast local
 # dev that accepts running UNSIGNED binaries, downgrade to warn-and-load with:
 #   make EXTRA_CFLAGS=-DELF_PERMISSIVE_SIGNATURES
-LDFLAGS := -T src/linker.ld -ffreestanding -nostdlib -Wl,--build-id=none
+# -no-pie and -z noexecstack are not stylistic: a Linux-targeting cross
+# (gcc-i686-linux-gnu, which CI uses) defaults to PIE, and the resulting
+# relocation sections shift the layout enough to trip linker.ld's own
+# W^X assertion ("Gap detected between .rodata and .data"). A kernel GRUB
+# loads at a fixed address is never position-independent, and its stack is
+# never executable, so both were always true and merely unstated. The
+# bare-metal i686-elf cross does not default to PIE, so these are no-ops
+# there -- kernel.elf is byte-identical with and without them.
+LDFLAGS := -T src/linker.ld -ffreestanding -nostdlib -Wl,--build-id=none \
+           -no-pie -Wl,-z,noexecstack
 
 SRC := \
   src/kernel.c \
