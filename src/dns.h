@@ -3,6 +3,16 @@
  *=============================================================================*/
 #pragma once
 
+/* This header declares bool/uint*_t/size_t in its own prototypes and struct
+ * fields, so it must supply them itself rather than relying on whatever the
+ * including .c happened to pull in first. It did rely on that until CI built
+ * the tree with i686-linux-gnu-gcc, where the transitive chain differs and
+ * dns.c failed on "unknown type name 'bool'" -- six of the eight includers
+ * were getting bool indirectly. Freestanding guarantees these three. */
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
 // ==============================================================================
 // DNS STRUCT DEFINITIONS
 // ==============================================================================

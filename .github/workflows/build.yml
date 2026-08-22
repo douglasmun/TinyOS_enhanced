@@ -1,0 +1,95 @@
+# Build + cheap invariant gate for TinyOS.
+#
+# SCOPE, and why it is this narrow: 58 of the 63 harnesses in verify/ boot a
+# QEMU guest and drive it with a scripted typist, which under TCG drops
+# keystrokes under load (see CLAUDE.md, "scripted keystrokes drop under TCG
+# load"). Those belong in CI only behind an explicit, retried, long-timeout
+# job -- a flaky required check trains people to ignore red, which is the
+# failure mode this whole repo's doc/ is a catalogue of. So this workflow runs
+# only what is deterministic:
+#
+#   1. the build, warning-clean under -Werror
+#   2. the two harnesses that read source and never boot anything
+#
+# The -Werror gate is the point. A clean build takes under a second locally,
+# so nothing but habit was enforcing it, and the flags are load-bearing:
+# -Werror=implicit-function-declaration and -Werror=uninitialized have each
+# caught real kernel bugs in this tree.
+#
+# TOOLCHAIN: the tree builds with any i686 ELF-targeting gcc. It includes only
+# genuine freestanding headers (stdarg/stdbool/stddef/stdint/limits -- the
+# lone <stdio.h> is in src/test_offset.c, which is not in OBJ), links with
+# -nostdlib against elf32-i386, and pulls only libgcc. So Ubuntu's packaged
+# gcc-i686-linux-gnu works and no source-built cross-compiler is needed.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-i686-linux-gnu binutils-i686-linux-gnu nasm
+
+      - name: Build (must be warning-clean under -Werror)
+        run: |
+          GCCINC="$(i686-linux-gnu-gcc -print-file-name=include)"
+          make -j"$(nproc)" CROSS=i686-linux-gnu- \
+               EXTRA_CFLAGS="-nostdinc -isystem $GCCINC" kernel.elf
+
+      - name: Confirm the artifact is a 32-bit ELF
+        run: |
+          file kernel.elf
+          i686-linux-gnu-readelf -h kernel.elf | grep -E 'Class:|Machine:'
+
+      # Each header must compile on its own. A header that names bool or
+      # uint32_t without including <stdbool.h>/<stdint.h> builds fine as long
+      # as every .c that includes it happens to pull those in FIRST -- so the
+      # breakage is invisible until an include order changes or the toolchain
+      # does. That is exactly how this workflow's first run failed: dns.h had
+      # declared bool since the initial release, and six of its eight
+      # includers were getting the type transitively.
+      - name: Every header compiles standalone
+        run: |
+          echo 'int ci_translation_unit;' > /tmp/probe.c
+          rc=0
+          for h in src/*.h userspace/*.h; do
+            i686-linux-gnu-gcc -m32 -ffreestanding -Isrc -Iuserspace \
+              -nostdinc -isystem "$(i686-linux-gnu-gcc -print-file-name=include)" \
+              -c -include "$h" /tmp/probe.c -o /tmp/probe.o 2>/tmp/err.txt \
+              || { echo "NOT SELF-SUFFICIENT: $h"; sed -n '1,6p' /tmp/err.txt; rc=1; }
+          done
+          exit $rc
+
+  source-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Both read the tree and assert on it; neither boots a guest, builds, or
+      # needs the cross toolchain, so they are deterministic in CI.
+      #
+      #   verify-arch-svg.sh          : the architecture diagram still matches
+      #                                 the tree (17 checks)
+      #   verify-shell-path-overflow.sh : the path-reserve arithmetic does not
+      #                                 overflow; runs its own pre-fix negative
+      #                                 control, so a vacuous pass is visible
+      - name: Architecture diagram matches the tree
+        run: bash verify/verify-arch-svg.sh
+
+      - name: Shell path-reserve overflow guard
+        run: bash verify/verify-shell-path-overflow.sh
