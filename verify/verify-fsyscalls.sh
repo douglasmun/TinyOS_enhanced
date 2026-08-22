@@ -32,6 +32,10 @@ cd "$(dirname "$0")/.."
 
 PASSWORD="${TINYOS_TEST_PASSWORD:-rootpass1}"
 ISO=dist/tinyos.iso
+# The probe must run UNPRIVILEGED -- see the su in the typist block below.
+TESTUSER=fsysuser
+TESTPASS=fsyspass1
+
 SERIAL=fsyscalls.log
 TRACE=fsyscalls-trace.log
 RUN_DISK=/tmp/tinyos-fsyscalls-disk.img
@@ -74,11 +78,36 @@ trap cleanup EXIT
 echo "==> Driving the boot flow (slow under TCG; be patient)..."
 # Wait on the program's LAST line: it is only reached after every check has
 # passed, including the stale-fd rejection.
+#
+# THE PROBE MUST RUN AS UID 1000, and the su below is what makes that true.
+#
+# fileio.c asserts that permission is enforced on the PARENT directory: /fio
+# is 0755 and root-owned (src/kernel.c:995), so an unprivileged process must
+# NOT be able to create inside it -- "without this check the syscalls would be
+# a filesystem-wide write primitive". But `cmd_exec` copies the CREATOR's
+# credentials into the child (src/shell_fileops.c, "task_create_user hardcodes
+# uid/gid 1000 and leaves it to the caller"), so a probe exec'd from the root
+# shell runs as uid 0, the mkdir correctly succeeds, and the probe aborts with
+# "mkdir in root-owned dir accepted" and exit status 1 -- against a kernel
+# that did exactly the right thing. That was a standing FAIL from 47ca930,
+# the commit that added those two checks, until this su was added.
+#
+# The typist runs TINYOS_EXEC_CMD before the followups, so the account is
+# created in the followup list and the probe exec'd after the su;
+# TINYOS_EXEC_CMD is a throwaway that only gets us to a prompt. /scratch is
+# 0777 for exactly this uid-1000 caller, which is where the probe's own
+# mkdir/rmdir/unlink legs operate.
 TINYOS_PASSWORD="$PASSWORD" \
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
-TINYOS_EXEC_CMD="exec /fileio.elf" \
-TINYOS_EXPECT="fileio: done" \
+TINYOS_EXEC_CMD="exec /hello.elf" \
+TINYOS_EXPECT="Hello from ELF" \
+TINYOS_FOLLOWUP_CMDS="\
+useradd $TESTUSER=>Enter password for new user;\
+!$TESTPASS=>created;\
+su $TESTUSER=>Now running as;\
+exec /fileio.elf=>fileio: done" \
+TINYOS_FOLLOWUP_TIMEOUT=420 \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
@@ -93,6 +122,22 @@ if grep -q "Triple fault" "$TRACE" 2>/dev/null; then
     echo "RESULT: FAIL — 'Triple fault' in $TRACE"
     grep -E "check_exception|v=0e|v=08|Triple fault|^EIP=|CR2=" "$TRACE" | tail -15
     exit 1
+fi
+
+# Positive control: the probe really was unprivileged.
+#
+# This is what keeps the root-owned-directory legs inside fileio.elf
+# meaningful. If the su silently failed, the probe runs as uid 0, its mkdir
+# into 0755 root-owned /fio succeeds legitimately, and it aborts reporting an
+# escalation that did not happen. Assert the switch landed before reading
+# anything into the probe's verdict.
+if ! grep -q "Now running as: $TESTUSER" "$SERIAL" 2>/dev/null; then
+    echo "RESULT: INCONCLUSIVE — the su to $TESTUSER never completed"
+    echo "  The probe would have run as root, where creating inside a"
+    echo "  root-owned directory is correct and its permission legs cannot"
+    echo "  fail. This is a harness failure, not a kernel finding."
+    grep -v "Suspicious" "$SERIAL" | tail -20
+    exit 3
 fi
 
 # Any of the program's own failure lines is a hard FAIL — it got far enough to
