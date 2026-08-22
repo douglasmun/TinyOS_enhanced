@@ -5,6 +5,7 @@
 #include "kprintf.h"
 #include "util.h"
 #include "net.h"
+#include "firewall.h"
 #include "supervisor.h"
 #include "tcp.h"
 #include "dns.h"
@@ -310,6 +311,32 @@ void cmd_ifconfig(void) {
     supervisor_get_stats(&sup_watched, &sup_restarts, &sup_gaveup);
     kprintf("  Supervisor:   %u watched, %u restarts, %u gave-up\n",
             sup_watched, sup_restarts, sup_gaveup);
+
+    /* Firewall verdicts. Reported here because a frame denied by policy is
+     * otherwise INVISIBLE on this surface: firewall_check_packet() runs at
+     * net.c:1605, BETWEEN handle_ip()'s address gate and the L4 dispatch, so a
+     * denied frame increments the RX ring counter, never reaches the
+     * proto-ring, and touches none of the RX drop counters. Every visible
+     * number stays 0 and the frame reads as "never arrived".
+     *
+     * That cost a full diagnosis pass: verify-tcp-rx-counters.sh FAILs with
+     * `malformed 0 (expected 20)` on a CORRECT kernel, because inbound TCP has
+     * no way past `Default: DENY ALL` (firewall.c:792) -- the only accept paths
+     * are firewall-disabled, the DHCP 68->67 exception, an ESTABLISHED flow,
+     * and a matched ACCEPT rule, none of which covers an injected segment to a
+     * closed port. With this line, `RX ring: N` rising while `FW: ... N denied`
+     * rises by the same N localises the drop to policy immediately.
+     *
+     * Cast to uint32_t deliberately: the stats are uint64_t but TinyOS's own
+     * vformat has NO 'l'/'ll' length modifier (src/kprintf.c), so "%llu" would
+     * print literally AND shift every later argument -- the same defect that
+     * shipped as %zu. Counters that realistically exceed 2^32 do not exist here.
+     */
+    firewall_stats_t fw;
+    firewall_get_stats(&fw);
+    kprintf("  FW verdicts:  %u total, %u accepted, %u denied\n",
+            (uint32_t)fw.packets_total, (uint32_t)fw.packets_accepted,
+            (uint32_t)fw.packets_dropped);
 
     kprintf("\n");
 }
