@@ -283,12 +283,46 @@ def type_echo_line(sock, s, timeout=60):
 
     The mark is taken on the spliced text before typing, so a match can only be
     text this command produced, never an earlier identical line."""
-    mark = len(_despam(read_serial()))
+    # Newlines are stripped from BOTH sides before matching, and that is not
+    # cosmetic -- it is the last tear case _despam() cannot close on its own.
+    #
+    # When the burst cuts a command that the shell wrote together with its
+    # prompt, the fragment before the tear is "$ ech": a prompt AND partial
+    # text on one line. _despam()'s two hold rules both miss it. The prompt
+    # rule requires the line to be ONLY a prompt; the lookahead requires a
+    # fragment to be already pending, and nothing is pending here. Generalising
+    # either rule to cover it glues untorn output together instead -- measured:
+    # it breaks both of edr-rejoin-test.sh's negative controls, turning
+    # "real two" + "real three" into "real tworeal three".
+    #
+    # The information that resolves it is not in the log at all, it is here: we
+    # know the exact string we typed. So drop newlines and search the
+    # single-line form. That cannot widen the match, because `body` is one
+    # typed command and contains no newline itself -- it only tolerates a
+    # newline the tear left INSIDE the echo we are looking for.
+    #
+    # It is not a free lunch: collapsing newlines does let a match span a line
+    # boundary in principle ("touch /a" + "ls /b" flattens to "touch /als /b",
+    # so a body of "/als" would hit). That needs a typed command that is
+    # exactly the concatenation of one line's tail and the next line's head,
+    # which no harness in the suite comes near -- and the search still starts
+    # at `mark`, so it can only match text this command produced. Weigh it
+    # against the alternative, which is a real, reproducible timeout that
+    # reports a correct kernel as INCONCLUSIVE.
+    #
+    # This was a real timeout, not a hypothetical: verify-ramfs-create-perm.sh
+    # reported INCONCLUSIVE on a kernel whose every leg was correct, because
+    # "echo MARKREDIR > /rootonly/redir.txt" was torn across TWO bursts into
+    # three fragments and the middle one began "$ ech".
+    def _flat(text):
+        return text.replace("\n", "")
+
+    mark = len(_flat(_despam(read_serial())))
     type_str(sock, s)
-    body = s.rstrip("\n")
+    body = _flat(s.rstrip("\n"))
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if _despam(read_serial()).find(body, mark) >= 0:
+        if _flat(_despam(read_serial())).find(body, mark) >= 0:
             return
         time.sleep(0.4)
     tail = _despam(read_serial())[-600:]

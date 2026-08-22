@@ -78,6 +78,34 @@ KEEPME" \
 D:/ \$ cat /t1.txt
 KEEPME"
 
+# KNOWN LIMIT, asserted so it cannot change silently.
+#
+# When the burst cuts a line the shell wrote as prompt-AND-text ("$ ech"),
+# neither hold rule fires: the prompt rule wants the line to be ONLY a prompt,
+# the lookahead wants a fragment already pending, and none is. So the leading
+# "$ ech" stays on its own line and the rest is spliced correctly beneath it.
+#
+# This is deliberate. Generalising either rule to cover it -- e.g. holding any
+# line whose successor is a burst -- glues untorn output together instead, and
+# both negative controls below catch it ("real two" + "real three" becomes
+# "real tworeal three"). The log alone cannot tell "cut mid-write" from "burst
+# happened to start after a complete line".
+#
+# The information that resolves it lives in the typist, which knows the exact
+# string it typed, so tools/qemu_typist.py matches with newlines stripped. Do
+# not "fix" this case here without re-running that harness -- the real failure
+# it caused was verify-ramfs-create-perm.sh reporting INCONCLUSIVE against a
+# kernel whose every leg was correct.
+chk "KNOWN LIMIT: prompt-plus-partial-text is not rejoined (typist handles it)" \
+"D:/ \$ ech
+[EDR DAEMON] ========== STATUS REPORT ==========
+[EDR DAEMON] Uptime: 60 seconds
+
+o MARKREDIR > /r[EDR DAEMON] Starting threat scan...
+ootonly/redir.txt" \
+"D:/ \$ ech
+o MARKREDIR > /rootonly/redir.txt"
+
 chk "NEGATIVE CONTROL: a prompt cut by a burst does not swallow the next command" \
 "D:/ \$ write /a.txt KEEP
 D:/ \$ [EDR DAEMON] Starting threat scan...
@@ -96,7 +124,7 @@ real three"
 
 echo
 if [ "$fail" -eq 0 ]; then
-    echo "RESULT: PASS -- edr-rejoin.sh behaves on all 9 cases"
+    echo "RESULT: PASS -- edr-rejoin.sh behaves on all 10 cases"
 else
     echo "RESULT: FAIL -- edr-rejoin.sh regressed"
 fi
