@@ -77,9 +77,14 @@ withdrawn D1). Ask what adopting the idea **buys**, not whether it is possible.
       surface may matter more than the randomisation.
 - [ ] **SerenityOS — their bug/regression-test discipline.** Arguably the highest-value
       item in this whole file, given the "assurance still converging" verdict. How do
-      they stop a fixed bug from returning? TinyOS has 63 harnesses and **no runner and
-      no CI at all** (no `.github/workflows/`), despite a ~0.8 s clean build and five
-      harnesses that need no QEMU.
+      they stop a fixed bug from returning? TinyOS has 62 harnesses and, until
+      PR #113, **no runner and no CI at all**. That is now partly closed: a
+      ~25 s workflow gates the `-Werror` build, a standalone-header check, and
+      the two harnesses that boot nothing. **The other 60 remain ungated** --
+      they drive QEMU through a typist that drops keystrokes under TCG load,
+      and a flaky required check is worse than none. So the question stands in
+      its sharper form: how does SerenityOS gate tests that need a running
+      machine without the flake making the signal worthless?
 - [ ] **AtomicOS — WCET / Tempo.** Almost certainly *not* adoptable (no language
       change is on the table), but the underlying question is: does TinyOS have any
       timing-side-channel posture? Note `doc/MSEAL_AUDIT.md` already measured one
@@ -124,6 +129,17 @@ of a real bug, so a good idea from another OS does not get to override them:
 ## Honest summary to keep on hand
 
 Strong defensive intent; unusually honest documentation of its own false-passes; single
-developer; no adversarial exposure; no fuzzing; no CI. **"One of the most
-security-oriented" is defensible. "Most secure" needs hostile exposure, and there is no
-shortcut to it.**
+developer; no adversarial exposure; no fuzzing; CI gates the build and three
+source-level checks but not the 60 harnesses that need a running machine.
+**"One of the most security-oriented" is defensible. "Most secure" needs hostile
+exposure, and there is no shortcut to it.**
+
+One data point for the thesis above, added the day CI landed: PR #113's own
+first four runs each failed on a **latent bug the local toolchain had masked**
+-- `dns.h` declaring `bool` while including nothing (since the initial public
+release), `<limits.h>` chaining into glibc under `-nostdinc`, and `linker.ld`'s
+W^X assertion firing because the Linux-targeting cross defaults to PIE. None
+was exploitable and `kernel.elf` stayed byte-identical through all four fixes.
+That is exactly the "one more auditor finds one more class" pattern this file
+argues for: the second compiler was a cheaper independent reviewer than any
+amount of re-reading by the same eyes.
