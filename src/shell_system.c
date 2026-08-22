@@ -27,7 +27,13 @@
 #include "elf.h"          /* elf_signatures_enforced: the real ELF gate */
 #include "stdio.h"  /* stream_printf / get_current_streams */
 #include <stdint.h>
-#include <limits.h>
+/* INT_MAX/INT_MIN from the compiler's own predefined macros rather than
+ * <limits.h>. limits.h is a freestanding header, but a Linux-targeting
+ * cross (gcc-i686-linux-gnu, which CI uses) reaches glibc's copy by
+ * #include_next, and under -nostdinc that chain has nowhere to go. The
+ * predefines are guaranteed by the compiler with no headers at all. */
+#define INT_MAX  __INT_MAX__
+#define INT_MIN  (-__INT_MAX__ - 1)
 #include <stdbool.h>
 
 /*=============================================================================

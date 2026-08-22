@@ -45,37 +45,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-i686-linux-gnu binutils-i686-linux-gnu nasm
 
-      - name: Toolchain include layout (diagnostic)
-        run: |
-          echo "include:       $(i686-linux-gnu-gcc -print-file-name=include)"
-          echo "include-fixed: $(i686-linux-gnu-gcc -print-file-name=include-fixed)"
-          ls -la "$(i686-linux-gnu-gcc -print-file-name=include)" || true
-          echo "--- include-fixed contents ---"
-          ls -la "$(i686-linux-gnu-gcc -print-file-name=include-fixed)" 2>&1 || true
-          echo "--- where does syslimits.h live? ---"
-          find /usr/lib/gcc-cross -name 'syslimits.h' 2>/dev/null || true
-          echo "--- default search path ---"
-          i686-linux-gnu-gcc -m32 -ffreestanding -E -v - </dev/null 2>&1 \
-            | sed -n '/#include <...>/,/End of search/p'
-
-      # -nostdinc, plus gcc's own freestanding header directory, is what makes
-      # a Linux-targeting cross usable here. Without it <limits.h> resolves to
-      # the HOST glibc header, which chains into bits/libc-header-start.h and
-      # dies -- the runner's glibc headers are 64-bit-only. A freestanding
-      # kernel should not be reaching host headers under any toolchain, so
-      # this is tightening the build rather than working around the runner:
-      # it guarantees only the compiler's own stdint/stdbool/stddef/limits
-      # can be found. Verified locally to produce a byte-identical kernel.elf.
       - name: Build (must be warning-clean under -Werror)
         run: |
           GCCINC="$(i686-linux-gnu-gcc -print-file-name=include)"
-          GCCFIX="$(i686-linux-gnu-gcc -print-file-name=include-fixed)"
-          # include-fixed carries syslimits.h, which gcc's own limits.h reaches
-          # by #include_next. The bare-metal i686-elf cross ships that dir with
-          # nothing but a README (no syslimits needed), so this is a no-op
-          # there and load-bearing for the Linux-targeting cross.
           make -j"$(nproc)" CROSS=i686-linux-gnu- \
-               EXTRA_CFLAGS="-nostdinc -isystem $GCCINC -isystem $GCCFIX" kernel.elf
+               EXTRA_CFLAGS="-nostdinc -isystem $GCCINC" kernel.elf
 
       - name: Confirm the artifact is a 32-bit ELF
         run: |
@@ -95,9 +69,7 @@ jobs:
           rc=0
           for h in src/*.h userspace/*.h; do
             i686-linux-gnu-gcc -m32 -ffreestanding -Isrc -Iuserspace \
-              -nostdinc \
-              -isystem "$(i686-linux-gnu-gcc -print-file-name=include)" \
-              -isystem "$(i686-linux-gnu-gcc -print-file-name=include-fixed)" \
+              -nostdinc -isystem "$(i686-linux-gnu-gcc -print-file-name=include)" \
               -c -include "$h" /tmp/probe.c -o /tmp/probe.o 2>/tmp/err.txt \
               || { echo "NOT SELF-SUFFICIENT: $h"; sed -n '1,6p' /tmp/err.txt; rc=1; }
           done
