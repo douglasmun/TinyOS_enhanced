@@ -1,15 +1,22 @@
 # Build + cheap invariant gate for TinyOS.
 #
-# SCOPE, and why it is this narrow: 58 of the 63 harnesses in verify/ boot a
-# QEMU guest and drive it with a scripted typist, which under TCG drops
-# keystrokes under load (see CLAUDE.md, "scripted keystrokes drop under TCG
-# load"). Those belong in CI only behind an explicit, retried, long-timeout
-# job -- a flaky required check trains people to ignore red, which is the
-# failure mode this whole repo's doc/ is a catalogue of. So this workflow runs
-# only what is deterministic:
+# SCOPE: 58 of the 63 harnesses in verify/ boot a QEMU guest and drive it with
+# a scripted typist. They are kept out of this workflow because a job that
+# boots 58 guests is slow and needs its own timeout/retry design, NOT because
+# the typist is unreliable -- that claim used to stand here and it was wrong.
+#
+# It said keystrokes "drop under TCG load", citing CLAUDE.md. Measured: across
+# ~45 boots (auto-verify-exec 20/20, plus six harnesses run 2-5x each) ZERO
+# keystrokes were dropped. Every failure was deterministic and every one was a
+# defect in the harness, not the guest: six standing failures across five files
+# that had never been run end-to-end (PR #115). "Flaky QEMU tests" was the
+# story; unrun tests was the fact. Anyone adding the QEMU suite here should
+# design for runtime, and should not expect to need retries.
+#
+# So this workflow runs what is both deterministic AND cheap:
 #
 #   1. the build, warning-clean under -Werror
-#   2. the two harnesses that read source and never boot anything
+#   2. the four harnesses that never boot a guest
 #
 # The -Werror gate is the point. A clean build takes under a second locally,
 # so nothing but habit was enforcing it, and the flags are load-bearing:
@@ -80,16 +87,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Both read the tree and assert on it; neither boots a guest, builds, or
-      # needs the cross toolchain, so they are deterministic in CI.
+      # None of these boots a guest, so all are deterministic in CI.
       #
       #   verify-arch-svg.sh          : the architecture diagram still matches
       #                                 the tree (17 checks)
       #   verify-shell-path-overflow.sh : the path-reserve arithmetic does not
       #                                 overflow; runs its own pre-fix negative
       #                                 control, so a vacuous pass is visible
+      #   verify-entropy-pool-stir.sh : pool_counter is incremented
+      #                                 unconditionally (source-level)
+      #   verify-elf-enforce-report.sh: secstatus reports the REAL ELF gate.
+      #                                 This one BUILDS -- twice, default and
+      #                                 -DELF_PERMISSIVE_SIGNATURES -- and
+      #                                 asserts the two disagree, so it carries
+      #                                 its own negative control. It needs the
+      #                                 toolchain, hence the install step and
+      #                                 the CROSS/OBJDUMP/EXTRA_CFLAGS it is
+      #                                 handed below.
+      #
+      # The fifth non-QEMU script, firstexec-trial.sh, is NOT here: it wraps
+      # the interactive GUI verify-exec.sh and blocks forever when batched.
       - name: Architecture diagram matches the tree
         run: bash verify/verify-arch-svg.sh
 
       - name: Shell path-reserve overflow guard
         run: bash verify/verify-shell-path-overflow.sh
+
+      - name: Entropy pool is actually stirred
+        run: bash verify/verify-entropy-pool-stir.sh
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-i686-linux-gnu binutils-i686-linux-gnu nasm
+
+      # It cleans and rebuilds twice, so it must not race the build job's tree;
+      # it runs in this separate job on its own checkout.
+      - name: secstatus reports the real ELF signature gate
+        run: |
+          GCCINC="$(i686-linux-gnu-gcc -print-file-name=include)"
+          CROSS=i686-linux-gnu- \
+          OBJDUMP=i686-linux-gnu-objdump \
+          EXTRA_CFLAGS="-nostdinc -isystem $GCCINC" \
+            bash verify/verify-elf-enforce-report.sh
