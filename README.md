@@ -115,8 +115,15 @@ qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed \
   -serial file:serial.log -display none
 
 # Or use the smoke-test harness (GUI, captures serial + verdict)
-./verify-exec.sh
+./verify/verify-exec.sh
+
+# Fully automated equivalent (headless; scripts first boot -> login -> exec)
+./verify/auto-verify-exec.sh
 ```
+
+The `verify/` folder holds ~60 such harnesses, one per invariant this project
+has had to defend. Each is standalone, prints its own `RESULT:` verdict, and can
+be run from anywhere — they locate the repo root themselves.
 
 On first boot you set a root password, then log in. Try `ls`, `ls C:`, `ls D:`, and `exec /hello.elf`.
 
@@ -142,7 +149,7 @@ Deeper documentation lives in [`doc/`](doc/) — start with [`doc/USER_GUIDE.md`
 
 - **Fail-closed signed-ELF secure boot** with key pinning — uncommon even among larger hobby OSes.
 - Survived an aggressive whole-kernel security review (memory safety, integer/locking/privilege-boundary, page-table correctness) with the findings fixed and adversarially re-audited.
-- Clean `-Werror` build with header-dependency tracking; a reproducible runtime smoke-test harness (`verify-exec.sh`).
+- Clean `-Werror` build with header-dependency tracking; a reproducible runtime smoke-test harness (`verify/verify-exec.sh`), plus ~60 invariant harnesses in `verify/`.
 
 ## Known limitations
 
