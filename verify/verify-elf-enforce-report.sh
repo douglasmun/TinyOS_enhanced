@@ -38,9 +38,23 @@ cd "$(dirname "$0")/.."
 OBJDUMP="${OBJDUMP:-i686-elf-objdump}"
 FAILED=0
 
+# Toolchain overrides, so CI can run this against a packaged i686 cross (see
+# .github/workflows/build.yml). CROSS reaches make; BASE_CFLAGS carries the
+# -nostdinc/-isystem pair that build needs there. EXTRA_CFLAGS is APPENDED to
+# CFLAGS by the Makefile, so the permissive build below must add its -D to
+# BASE_CFLAGS rather than replace it -- passing EXTRA_CFLAGS=-D... alone would
+# drop CI's include flags and the build would fail as INCONCLUSIVE.
+# NOTE the ${arr[@]+"${arr[@]}"} form at every use site: bash 3.2 (macOS
+# ships it) treats "${arr[@]}" on an EMPTY array as an unbound variable
+# under `set -u`, and the resulting error did NOT change the exit status --
+# the run printed an INCONCLUSIVE build failure and still returned 0.
+MAKE_ARGS=()
+[ -n "${CROSS:-}" ] && MAKE_ARGS+=("CROSS=$CROSS")
+BASE_CFLAGS="${EXTRA_CFLAGS:-}"
+
 # The permissive build leaves objects compiled with a flag that is NOT in the
 # dependency graph; leaving them poisons every other harness at link time.
-trap 'make clean >/dev/null 2>&1' EXIT
+trap 'make clean ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"} >/dev/null 2>&1' EXIT
 
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; shift; for l in "$@"; do echo "        $l"; done; FAILED=1; }
@@ -88,8 +102,8 @@ accessor_returns() {
 }
 
 echo "building default (enforce) ..."
-make clean >/dev/null 2>&1
-if ! make -j8 kernel.elf >/dev/null 2>&1; then
+make clean ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"} >/dev/null 2>&1
+if ! make -j8 kernel.elf ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"} EXTRA_CFLAGS="$BASE_CFLAGS" >/dev/null 2>&1; then
     echo "RESULT: INCONCLUSIVE - default build failed"; exit 3
 fi
 DEFAULT_RET=$(accessor_returns)
@@ -101,8 +115,9 @@ else
 fi
 
 echo "building -DELF_PERMISSIVE_SIGNATURES ..."
-make clean >/dev/null 2>&1
-if ! make -j8 kernel.elf EXTRA_CFLAGS="-DELF_PERMISSIVE_SIGNATURES" >/dev/null 2>&1; then
+make clean ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"} >/dev/null 2>&1
+if ! make -j8 kernel.elf ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"} \
+        EXTRA_CFLAGS="$BASE_CFLAGS -DELF_PERMISSIVE_SIGNATURES" >/dev/null 2>&1; then
     echo "RESULT: INCONCLUSIVE - permissive build failed"; exit 3
 fi
 PERM_RET=$(accessor_returns)
