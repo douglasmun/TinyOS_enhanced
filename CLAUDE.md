@@ -85,6 +85,25 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   `verify-rxdrop-counters.sh`, `verify-icmp-counters.sh`,
   `verify-dns-rx-counters.sh` (needs `-DTINYOS_FAULT_INJECT`; its `valid` leg is the
   positive control), `verify-tcp-rx-counters.sh`. Rationale: `doc/NETWORK_ISOLATION.md`.
+- **An injected frame must clear three gates before any protocol counter, and all three
+  fail as delta 0 — including the positive control.** `handle_ip()`'s address gate (on the
+  mcast netdev the guest self-assigns a link-local `169.254.x.y`, *not* the `10.0.2.15` NAT
+  lease injectors default to — capture it), `is_bogon_ip()` (so sources must be TEST-NET-3,
+  never RFC1918), and the firewall's **default DENY ALL**, which no shell command can add a
+  rule around. Diagnose with `ifconfig`: `RX ring: N cpl0` says frames arrived,
+  `RX proto-ring:` says they reached the L4 dispatch — a gap localises the drop above the
+  switch. Two vehicles get past the firewall, and **which one you need depends on what you
+  are testing**: UDP ports **68→67** take the standing DHCP exception, but that exception
+  `return true`s *above* `match_rule()`, so it is useless for testing any rule — a block
+  rule can never be consulted for a DHCP-port frame, and the leg passes whether the block
+  works or not. To exercise a **rule**, use ICMP: `firewall_allow_icmp()` admits it at
+  priority 50 via a real rule, and ICMP creates no connection entry, so established-flow
+  tracking cannot short-circuit above the rules either. Harnesses:
+  `verify-firewall-default-deny.sh` (default-deny reachable + replies still admitted),
+  `verify-ids-block-leg.sh` (a matched BLOCK signature must outrank that priority-50 ACCEPT,
+  drop **every** later frame from that source, and leave a **different** source untouched —
+  the clean-frame and different-source legs are what stop "blocks everything after an alert"
+  from passing).
 - **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
   `critical_section_exit()` only touches `IF` at depth 0, and that clause is deliberate
   (a `popfl` mid-ISR would corrupt the preempted thread's flags). So `e1000_poll_rx`'s

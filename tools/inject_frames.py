@@ -57,7 +57,7 @@ def checksum16(data):
 
 
 def build_icmp_frame(dst_mac, src_mac, src_ip, dst_ip, icmp_type,
-                     identifier, sequence, payload_len):
+                     identifier, sequence, payload_len, payload_bytes=None):
     """A well-formed Ethernet/IPv4/ICMP frame.
 
     Unlike build_frame() above, every layer here must actually validate: the
@@ -70,9 +70,15 @@ def build_icmp_frame(dst_mac, src_mac, src_ip, dst_ip, icmp_type,
     `identifier` matches its CSPRNG-chosen ping_identifier, which models an
     on-path attacker who has observed one outbound ping.
     """
-    payload = bytes(range(payload_len % 256)) [:payload_len] if payload_len else b""
-    if len(payload) < payload_len:
-        payload = (payload * (payload_len // max(len(payload), 1) + 1))[:payload_len]
+    if payload_bytes is not None:
+        # Caller-chosen payload, used to drive ids_inspect_payload(): the IDS
+        # scans the L4 payload for signature patterns, so the exact bytes are
+        # the point and the generated filler below would never match one.
+        payload = payload_bytes
+    else:
+        payload = bytes(range(payload_len % 256)) [:payload_len] if payload_len else b""
+        if len(payload) < payload_len:
+            payload = (payload * (payload_len // max(len(payload), 1) + 1))[:payload_len]
 
     icmp = struct.pack("!BBHHH", icmp_type, 0, 0, identifier, sequence) + payload
     icmp = icmp[:2] + struct.pack("!H", checksum16(icmp)) + icmp[4:]
@@ -327,6 +333,10 @@ def main():
     ap.add_argument("--src", type=parse_mac, default=parse_mac("52:54:00:aa:bb:cc"),
                     help="source MAC")
     ap.add_argument("--payload-len", type=int, default=46)
+    ap.add_argument("--payload-hex", default=None,
+                    help="Exact L4 payload as hex (--mode icmp only), "
+                         "e.g. '9090909031c0' for the IDS NOP-sled "
+                         "signature. Overrides --payload-len; spaces ignored.")
     args = ap.parse_args()
 
     try:
@@ -360,10 +370,15 @@ def main():
                                 args.tcp_data_offset, 0)
         desc = f"tcp data_offset {args.tcp_data_offset} words"
     elif args.mode == "icmp":
+        pb = None
+        if args.payload_hex:
+            pb = bytes.fromhex(args.payload_hex.replace(" ", ""))
         frame = build_icmp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
                                  args.icmp_type, args.icmp_id, 1,
-                                 args.payload_len)
+                                 args.payload_len, pb)
         desc = f"icmp type {args.icmp_type} id 0x{args.icmp_id:04x}"
+        if pb is not None:
+            desc += f" payload {pb.hex()}"
     else:
         frame = build_frame(args.dst, args.src, ethertype, args.payload_len)
         desc = f"ethertype 0x{ethertype:04x}"
