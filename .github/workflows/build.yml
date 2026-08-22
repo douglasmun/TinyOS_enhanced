@@ -96,6 +96,16 @@ jobs:
       #                                 control, so a vacuous pass is visible
       #   verify-entropy-pool-stir.sh : pool_counter is incremented
       #                                 unconditionally (source-level)
+      #   edr-rejoin-test.sh          : the shared EDR splice helper behaves on
+      #                                 all 9 cases. Pure text -- it feeds
+      #                                 fixtures through the awk and diffs the
+      #                                 output, so no guest and no toolchain.
+      #                                 Two of the nine are negative controls.
+      #                                 It gates the helper that 20 harnesses
+      #                                 now source: a regression there turns
+      #                                 correct kernels into FAILs across the
+      #                                 whole suite, and only this catches it
+      #                                 without booting anything.
       #   verify-elf-enforce-report.sh: secstatus reports the REAL ELF gate.
       #                                 This one BUILDS -- twice, default and
       #                                 -DELF_PERMISSIVE_SIGNATURES -- and
@@ -105,7 +115,7 @@ jobs:
       #                                 the CROSS/OBJDUMP/EXTRA_CFLAGS it is
       #                                 handed below.
       #
-      # The fifth non-QEMU script, firstexec-trial.sh, is NOT here: it wraps
+      # The sixth non-QEMU script, firstexec-trial.sh, is NOT here: it wraps
       # the interactive GUI verify-exec.sh and blocks forever when batched.
       - name: Architecture diagram matches the tree
         run: bash verify/verify-arch-svg.sh
@@ -115,6 +125,9 @@ jobs:
 
       - name: Entropy pool is actually stirred
         run: bash verify/verify-entropy-pool-stir.sh
+
+      - name: EDR splice helper unit tests
+        run: bash verify/edr-rejoin-test.sh
 
       - name: Install toolchain
         run: |
