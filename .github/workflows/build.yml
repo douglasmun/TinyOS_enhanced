@@ -53,6 +53,24 @@ jobs:
           file kernel.elf
           i686-linux-gnu-readelf -h kernel.elf | grep -E 'Class:|Machine:'
 
+      # Each header must compile on its own. A header that names bool or
+      # uint32_t without including <stdbool.h>/<stdint.h> builds fine as long
+      # as every .c that includes it happens to pull those in FIRST -- so the
+      # breakage is invisible until an include order changes or the toolchain
+      # does. That is exactly how this workflow's first run failed: dns.h had
+      # declared bool since the initial release, and six of its eight
+      # includers were getting the type transitively.
+      - name: Every header compiles standalone
+        run: |
+          echo 'int ci_translation_unit;' > /tmp/probe.c
+          rc=0
+          for h in src/*.h userspace/*.h; do
+            i686-linux-gnu-gcc -m32 -ffreestanding -Isrc -Iuserspace \
+              -c -include "$h" /tmp/probe.c -o /tmp/probe.o 2>/tmp/err.txt \
+              || { echo "NOT SELF-SUFFICIENT: $h"; sed -n '1,6p' /tmp/err.txt; rc=1; }
+          done
+          exit $rc
+
   source-guards:
     runs-on: ubuntu-latest
     steps:

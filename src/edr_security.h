@@ -23,6 +23,7 @@
 
 #include "process.h"
 #include "syscall.h"
+#include "vfs.h"      /* CAP_ALL, used by edr_capability_grant_all() below */
 #include <stdbool.h>
 
 /*=============================================================================
