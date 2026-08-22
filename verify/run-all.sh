@@ -97,7 +97,7 @@ echo ""
 # expected count first makes truncation detectable from the artifact alone.
 echo "$TOTAL" > "$OUTDIR/expected-total"
 
-PASS=0; FAIL=0; INCONCL=0
+PASS=0; FAIL=0; INCONCL=0; SKIP=0
 START_ALL=$(date +%s)
 
 for n in "${HARNESSES[@]}"; do
@@ -158,6 +158,15 @@ for n in "${HARNESSES[@]}"; do
         cls=PASS; PASS=$((PASS+1))
     elif [ "$rc" -eq 3 ]; then
         cls=INCONCL; INCONCL=$((INCONCL+1))
+    elif [ "$rc" -eq 77 ]; then
+        # 77 = "I am interactive and refuse to run unattended", which only
+        # verify-exec.sh returns. It is not a result: nothing was tested, and
+        # counting it as FAIL would put a permanent red row in every nightly
+        # run for a harness that is CORRECTLY declining. Before the guard
+        # existed this cost 900s and logged TIMEOUT, which was worse -- it read
+        # as a hung kernel. The automated equivalent is auto-verify-exec.sh,
+        # which the suite runs on its own.
+        cls=SKIP; SKIP=$((SKIP+1))
     else
         cls=FAIL; FAIL=$((FAIL+1))
     fi
@@ -173,8 +182,8 @@ done
 ELAPSED=$(( $(date +%s) - START_ALL ))
 echo ""
 echo "================ SUMMARY ================"
-printf 'pass %d  fail %d  inconclusive %d  of %d   (%dm %ds)\n' \
-       "$PASS" "$FAIL" "$INCONCL" "$TOTAL" $((ELAPSED/60)) $((ELAPSED%60))
+printf 'pass %d  fail %d  inconclusive %d  skipped %d  of %d   (%dm %ds)\n' \
+       "$PASS" "$FAIL" "$INCONCL" "$SKIP" "$TOTAL" $((ELAPSED/60)) $((ELAPSED%60))
 
 if [ "$FAIL" -gt 0 ]; then
     echo ""
@@ -185,6 +194,11 @@ if [ "$INCONCL" -gt 0 ]; then
     echo ""
     echo "INCONCLUSIVE (graded nothing -- not a pass):"
     awk -F'\t' '$4=="INCONCL" {printf "  %-38s %s\n", $1, $5}' "$OUTDIR/summary.tsv"
+fi
+if [ "$SKIP" -gt 0 ]; then
+    echo ""
+    echo "SKIPPED (declined to run unattended -- not a pass):"
+    awk -F'\t' '$4=="SKIP" {printf "  %-38s %s\n", $1, $5}' "$OUTDIR/summary.tsv"
 fi
 
 [ "$FAIL" -gt 0 ] && exit 1
