@@ -1,0 +1,117 @@
+# Nightly run of the QEMU harness suite.
+#
+# WHY THIS IS SEPARATE FROM build.yml, AND NOT A REQUIRED CHECK
+#
+# 57 of the 63 harnesses in verify/ boot a QEMU guest. That is ~2.7 h serially
+# (median 169 s/run, n=36 measured), which is far too slow to gate a PR. So it
+# runs on a schedule and never blocks a merge.
+#
+# It is NOT excluded for flake. The claim that the scripted typist "drops
+# keystrokes under TCG load" was the stated reason these stayed ungated, and it
+# was measured false: zero drops across ~45 boots. Every failure found was a
+# defect in the harness itself -- six standing failures across five files that
+# had never been run end to end (PR #115). Hence no retries here: a retry would
+# mask exactly the deterministic breakage this job exists to surface.
+#
+# TOOLCHAIN SHIMS, and why they are shims rather than harness edits: the
+# harnesses hardcode Homebrew's i686-elf-* names -- 57 call
+# i686-elf-grub-mkrescue, 16 i686-elf-nm, 10 i686-elf-objdump -- and 59 call a
+# bare `make` with no CROSS. Making all of that configurable means editing 59
+# files to serve one CI job, which risks the harnesses to suit the runner. Only
+# three names are involved, so the runner provides them instead: nm/objdump map
+# to the packaged i686-linux-gnu-* directly, and grub-mkrescue is invoked with
+# no target flag (plain GRUB 2.12 producing an i386-pc ISO), so Ubuntu's build
+# is the same tool under a different name.
+
+name: nightly-harnesses
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # 07:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'Glob to select harnesses (e.g. verify-ring3-*.sh); empty = all'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  harnesses:
+    runs-on: ubuntu-latest
+    # The suite is ~2.7 h; allow headroom for a slower runner without letting a
+    # hung job burn the full 6 h default.
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain, QEMU and GRUB
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-i686-linux-gnu binutils-i686-linux-gnu nasm \
+            qemu-system-x86 grub-pc-bin grub-common xorriso mtools python3
+
+      # See the note at the top. Three names, provided rather than patched.
+      - name: Shim the i686-elf-* names the harnesses expect
+        run: |
+          sudo ln -sf "$(command -v i686-linux-gnu-nm)"      /usr/local/bin/i686-elf-nm
+          sudo ln -sf "$(command -v i686-linux-gnu-objdump)" /usr/local/bin/i686-elf-objdump
+          sudo ln -sf "$(command -v grub-mkrescue)"          /usr/local/bin/i686-elf-grub-mkrescue
+          for t in i686-elf-nm i686-elf-objdump i686-elf-grub-mkrescue; do
+            command -v "$t" >/dev/null || { echo "missing shim: $t"; exit 1; }
+          done
+
+      # The harnesses call a bare `make`, which defaults to CROSS=i686-elf-.
+      # Provide that prefix too rather than editing 59 files.
+      - name: Shim the i686-elf- cross prefix
+        run: |
+          REAL_GCC="$(command -v i686-linux-gnu-gcc)"
+          GCCINC="$(i686-linux-gnu-gcc -print-file-name=include)"
+          # NOTE: gcc is deliberately NOT in this list. It gets a wrapper
+          # below, and symlinking it first would be actively destructive:
+          # `tee` FOLLOWS a symlink, so writing the wrapper through it would
+          # overwrite the real i686-linux-gnu-gcc binary with the wrapper
+          # text -- which then execs itself. Verified; the sanity build would
+          # fail with a baffling error and the cross compiler would be gone.
+          for t in ld objcopy nm objdump readelf ar as ranlib strip; do
+            src="$(command -v "i686-linux-gnu-$t" || true)"
+            [ -n "$src" ] && sudo ln -sf "$src" "/usr/local/bin/i686-elf-$t"
+          done
+          # i686-elf-gcc must carry the freestanding include path the packaged
+          # Linux cross needs; a bare symlink would pull glibc headers in.
+          sudo rm -f /usr/local/bin/i686-elf-gcc
+          printf '#!/bin/sh\nexec %s -nostdinc -isystem %s "$@"\n' \
+                 "$REAL_GCC" "$GCCINC" \
+            | sudo tee /usr/local/bin/i686-elf-gcc >/dev/null
+          sudo chmod +x /usr/local/bin/i686-elf-gcc
+          # Prove the wrapper is not self-referential before trusting it.
+          grep -q "^exec $REAL_GCC " /usr/local/bin/i686-elf-gcc \
+            || { echo "i686-elf-gcc wrapper does not exec the real cross"; exit 1; }
+          i686-elf-gcc --version | head -1
+
+      - name: Sanity-build before spending 2.7 h on boots
+        run: |
+          make -j"$(nproc)" kernel.elf
+          file kernel.elf
+
+      - name: Run the suite
+        run: |
+          bash verify/run-all.sh
+        env:
+          OUTDIR: verify-results
+          TIMEOUT_SECS: '900'
+          FILTER: ${{ github.event.inputs.filter }}
+
+      # Always upload: a failing run is precisely when the serial logs matter,
+      # and the next harness overwrites each one in the working tree.
+      - name: Upload harness logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-results
+          path: verify-results/
+          retention-days: 14
