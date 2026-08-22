@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-ring3-date.sh — FULLY AUTOMATED check that `date` works from the
 # RING-3 shell via SYS_TIME (39), for an UNPRIVILEGED user.
@@ -180,6 +181,16 @@ exec /shell.elf=>TinyOS shell (ring 3);\
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 
@@ -212,7 +223,7 @@ fail_with() {
 # brittle" would let that regression back in unnoticed. The DAY field is
 # genuinely space-padded -- cmd_date uses %2d there, matching `date(1)`.
 # ---------------------------------------------------------------------------
-DATE_LINES=$(grep -cE "^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}" "$SERIAL")
+DATE_LINES=$(grep -cE "^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}" "$REJOINED")
 if [ "$DATE_LINES" -lt 1 ]; then
     fail_with "ring-3 \`date\` never printed a well-formed timestamp" \
         "Expected a line like 'Mon Aug 17 09:14:22 2026'." \
@@ -237,7 +248,7 @@ fi
 # printing "not supported" one line below. Leg 1 caught the regression anyway,
 # but a leg that cannot fail for its own stated reason is not doing any work.
 # ---------------------------------------------------------------------------
-REJECTED=$(grep -Ec "Invalid syscall number|Unknown system call" "$SERIAL")
+REJECTED=$(grep -Ec "Invalid syscall number|Unknown system call" "$REJOINED")
 if [ "$REJECTED" -ne 0 ]; then
     fail_with "the dispatcher rejected a syscall ($REJECTED occurrence(s))" \
         "Either the range check refused the number before dispatch --" \
@@ -245,13 +256,13 @@ if [ "$REJECTED" -ne 0 ]; then
         "switch has no case for it. This is the bug that silently disabled" \
         "SYS_SLEEP and SYS_WAITPID for as long as it went unnoticed." \
         "Offending line(s):" \
-        "$(grep -Em2 'Invalid syscall number|Unknown system call' "$SERIAL")"
+        "$(grep -Em2 'Invalid syscall number|Unknown system call' "$REJOINED")"
 fi
 
 # ---------------------------------------------------------------------------
 # Leg 3: `date` is advertised in the ring-3 shell's help.
 # ---------------------------------------------------------------------------
-HELP_HIT=$(grep -c "print the date, time and uptime" "$SERIAL")
+HELP_HIT=$(grep -c "print the date, time and uptime" "$REJOINED")
 if [ "$HELP_HIT" -lt 1 ]; then
     fail_with "\`date\` is missing from the ring-3 shell's help output"
 fi
@@ -264,13 +275,13 @@ fi
 # the euid-gated raw-frame syscalls. Root's readings above cannot satisfy this
 # leg because the region is measured after the su.
 # ---------------------------------------------------------------------------
-SU_LINE=$(grep -n "Now running as" "$SERIAL" | head -1 | cut -d: -f1)
+SU_LINE=$(grep -n "Now running as" "$REJOINED" | head -1 | cut -d: -f1)
 if [ -z "$SU_LINE" ]; then
     fail_with "never reached the unprivileged account (no 'Now running as')" \
         "The su step did not complete, so the ungating was never exercised."
 fi
 
-USER_REGION=$(tail -n +"$SU_LINE" "$SERIAL")
+USER_REGION=$(tail -n +"$SU_LINE" "$REJOINED")
 
 USER_DATES=$(printf '%s\n' "$USER_REGION" \
     | grep -cE "^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}")

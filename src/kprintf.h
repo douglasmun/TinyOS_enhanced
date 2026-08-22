@@ -48,7 +48,7 @@ kprintf_capture_fn kprintf_set_capture(kprintf_capture_fn fn, void* ctx,
 #include <stddef.h>
 #include <stdint.h>
 
-void kprintf(const char* fmt, ...);
+void kprintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /**
  * @brief Variadic version of kprintf that takes va_list

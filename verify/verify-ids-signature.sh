@@ -46,14 +46,41 @@
 # bare "matches > 0" could in principle be satisfied by unrelated traffic. B/N/M
 # are read from the same counter in one boot, so the deltas are attributable.
 #
-# WHY THE PACKETS ARE SENT WITH `nc -u` FROM THE HOST
+# WHY THE PACKETS ARE ICMP ECHO REQUESTS, INJECTED ON A MCAST NETDEV
 #
-# QEMU user-mode NAT has no inbound path to the guest without an explicit
-# hostfwd, so this run adds `hostfwd=udp::$UDP_PORT-:9999`. The guest must have
-# an address first, hence the `dhcp` in the command sequence -- without it the
-# frame is dropped before handle_ip and both halves of the test read zero,
-# which is a PASS-shaped failure for the negative control and a FAIL for the
-# positive. The DHCP guard below exists for exactly that reason.
+# This harness originally sent UDP datagrams through a QEMU `hostfwd` with
+# `nc -u`. That vehicle DIED on 2026-08-22 with c5fa987 ("net: default-deny
+# firewall"): nothing installs a rule for the test port, firewall_check_packet()
+# now refuses it, and net.c:1605 returns one line ABOVE the IDS hook at
+# net.c:1615. Both datagrams arrived and both were dropped -- the run reported
+# "the NOP-sled packet did NOT move the match counter" while the matcher was
+# never handed a byte. The counter readings were 0/0/0 with the firewall's own
+# total climbing 0 -> 1 -> 2, all dropped, which is what identified it.
+#
+# ICMP is the vehicle that survives, and the reason is specific (see CLAUDE.md
+# and doc/NETWORK_ISOLATION.md): firewall_allow_icmp() installs a REAL ACCEPT
+# rule at priority 50 at boot, so echo requests are admitted by rule rather
+# than by exception. The standing DHCP 68->67 exception would also get a frame
+# through, but it `return true`s ABOVE match_rule(), which makes it useless
+# here. ICMP also creates no connection entry, so established-flow tracking
+# cannot short-circuit above the rules either.
+#
+# ids_analyze_packet() scans the L4 payload after the IP header and is
+# protocol-agnostic -- it never inspects ip_hdr->protocol -- so an ICMP echo
+# payload reaches ids_inspect_payload() exactly as a UDP one did. The
+# assertion is unchanged; only the transport is.
+#
+# ADDRESSING (the three upstream gates, all of which fail as delta 0):
+#
+#   - --dst-ip {GIP} is captured from the guest's own ifconfig. On the mcast
+#     netdev there is no DHCP server, so the guest self-assigns a per-boot
+#     link-local 169.254.x.y -- NOT the 10.0.2.15 the injector defaults to.
+#   - The source is TEST-NET-3 (RFC 5737), never RFC1918: is_bogon_ip() drops
+#     10/8 and friends above the rule engine.
+#
+# The DHCP guard the UDP version needed is therefore GONE, replaced by an
+# ifconfig address guard: on this netdev a lease is never offered, so waiting
+# for one would hang and "Offered IP" would be absent on a perfectly good run.
 #
 # VALIDATED BOTH WAYS (2026-08-16): see the block at the end of this file.
 #
@@ -69,23 +96,19 @@ SERIAL=idssig.log
 TRACE=idssig-trace.log
 RUN_DISK=/tmp/tinyos-idssig-disk.img
 MON_SOCK=/tmp/tinyos-idssig-mon.sock
-UDP_PORT=${TINYOS_IDS_UDP_PORT:-15999}
+GUEST_MAC=52:54:00:12:34:56
+QEMU_MCAST=230.0.0.2:1235
+SRC_IP=203.0.113.9
 
 # The signature from ids_load_default_signatures(): "Shellcode NOP Sled".
 # Kept as an explicit byte list rather than a printf escape so that a change to
 # the signature table shows up here as an obvious mismatch rather than as a
 # mysteriously failing positive.
-SLED_BYTES='\x90\x90\x90\x90\x31\xc0'
+SLED_HEX=9090909031c0
 # Same length, no signature bytes, and deliberately containing 0x90-adjacent
 # values (0x8f, 0x91) so a matcher with an off-by-one on the pattern compare
 # does not sail through the negative control.
-BENIGN_BYTES='\x8f\x91\x8f\x91\x30\xc1'
-
-command -v nc >/dev/null 2>&1 || {
-    echo "RESULT: INCONCLUSIVE — nc(1) not found; this harness needs it to"
-    echo "  inject the test datagrams."
-    exit 3
-}
+BENIGN_HEX=8f918f9130c1
 
 echo "==> Building kernel + userspace + ISO..."
 (cd userspace && make) >/dev/null || exit 1
@@ -118,12 +141,12 @@ if [ ! -f disk.img ]; then
 fi
 cp disk.img "$RUN_DISK"
 
-echo "==> Launching headless QEMU (monitor on $MON_SOCK, udp hostfwd $UDP_PORT)"
+echo "==> Launching headless QEMU (monitor on $MON_SOCK, mcast $QEMU_MCAST)"
 qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom "$ISO" \
     -boot d -m 256M \
     -drive file="$RUN_DISK",format=raw,if=ide \
-    -netdev user,id=net0,hostfwd=udp::"$UDP_PORT"-:9999 \
-    -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
+    -netdev socket,id=net0,mcast="$QEMU_MCAST" \
+    -device e1000,netdev=net0,mac=$GUEST_MAC \
     -serial "file:$SERIAL" \
     -monitor "unix:$MON_SOCK,server,nowait" \
     -no-reboot -d int,cpu_reset -D "$TRACE" -display none &
@@ -134,8 +157,8 @@ trap cleanup EXIT
 
 # Host hooks, run by the typist at the ">NAME" steps in the sequence below.
 # They fire BETWEEN two secstatus readings rather than racing them, which is
-# what makes the before/after deltas attributable to these packets and not to
-# the guest's own background NAT traffic.
+# what makes the before/after deltas attributable to these frames and not to
+# the guest's own background traffic.
 #
 # The sleeps bracket each send so the e1000 RX path can deliver and handle_ip
 # can run before the next secstatus snapshots the counter. Generous on purpose:
@@ -143,13 +166,17 @@ trap cleanup EXIT
 # POSITIVE -- the worst failure mode for a security harness, because the
 # natural reading of it is "the fix is flaky" rather than "the test is".
 #
-# Each ends in `true`: `nc -u -w1` exits nonzero on some platforms even when
-# the datagram went out (there is nothing to connect to and nothing to read
-# back), and the typist treats a nonzero hook as fatal -- correctly, since a
-# hook that did not fire leaves the following assertion measuring nothing. The
-# proof that the packet arrived is the counter delta, not nc's exit status.
-export TINYOS_HOOK_BENIGN="sleep 2; printf '$BENIGN_BYTES' | nc -u -w1 127.0.0.1 $UDP_PORT >/dev/null 2>&1; sleep 4; true"
-export TINYOS_HOOK_SLED="sleep 2; printf '$SLED_BYTES' | nc -u -w1 127.0.0.1 $UDP_PORT >/dev/null 2>&1; sleep 4; true"
+# {GIP} is substituted by the typist with the address captured from ifconfig.
+# --count 3 rather than 1: a single frame lost to a full RX ring would fail the
+# positive for a reason unrelated to matching. The matcher breaks on first hit
+# per signature per packet, so N frames give N matches, and the assertion is
+# still a strict delta.
+INJ="python3 tools/inject_frames.py --mcast '$QEMU_MCAST' --dst $GUEST_MAC --mode icmp"
+
+export TINYOS_HOOK_BENIGN="sleep 2; $INJ --dst-ip {GIP} --src-ip $SRC_IP \
+    --icmp-type 8 --payload-hex $BENIGN_HEX --count 3 >/dev/null 2>&1; sleep 5; true"
+export TINYOS_HOOK_SLED="sleep 2; $INJ --dst-ip {GIP} --src-ip $SRC_IP \
+    --icmp-type 8 --payload-hex $SLED_HEX --count 3 >/dev/null 2>&1; sleep 5; true"
 
 # This harness stays in the KERNEL shell: secstatus is a kernel-shell command
 # (shell_system.c) and has not been migrated to ring 3. That is the correct
@@ -157,13 +184,13 @@ export TINYOS_HOOK_SLED="sleep 2; printf '$SLED_BYTES' | nc -u -w1 127.0.0.1 $UD
 # the read through a ring-3 syscall would add a second thing that could be
 # broken without telling us anything about pattern matching.
 #
-#   dhcp      : the guest needs 10.0.2.15 before any inbound frame reaches
-#               handle_ip. Guarded below -- without a lease both readings are
-#               zero, which the negative control would happily call a pass.
+#   ifconfig  : capture the guest's self-assigned link-local into {GIP}. There
+#               is no DHCP server on a mcast netdev, so this replaces the
+#               `dhcp` step the hostfwd version needed.
 #   secstatus : BASELINE (B).
-#   >BENIGN   : host hook -- sends the benign datagram.
+#   >BENIGN   : host hook -- injects the benign frames.
 #   secstatus : NEGATIVE CONTROL (N). Must equal B.
-#   >SLED     : host hook -- sends the NOP-sled datagram.
+#   >SLED     : host hook -- injects the NOP-sled frames.
 #   secstatus : POSITIVE (M). Must exceed N.
 #
 # ">NAME" is a typist host-hook step: it runs $TINYOS_HOOK_NAME on the HOST
@@ -178,10 +205,11 @@ export TINYOS_HOOK_SLED="sleep 2; printf '$SLED_BYTES' | nc -u -w1 127.0.0.1 $UD
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_PASSWORD="$PASSWORD" \
-TINYOS_FOLLOWUP_TIMEOUT=600 \
-TINYOS_EXEC_CMD="dhcp" \
-TINYOS_EXPECT="Offered IP" \
+TINYOS_FOLLOWUP_TIMEOUT=900 \
+TINYOS_EXEC_CMD="secstatus" \
+TINYOS_EXPECT="Security Status" \
 TINYOS_FOLLOWUP_CMDS="\
+ifconfig=>IP Address:@GIP=IP Address: +([0-9.]+);\
 secstatus=>Security Status;\
 >BENIGN;\
 secstatus=>Security Status;\
@@ -205,6 +233,8 @@ fail_with() {
     echo "RESULT: FAIL — $1"
     shift
     for line in "$@"; do echo "  $line"; done
+    echo "  --- firewall readings (hint 1 above) ---"
+    grep -a "Firewall \.\+" "$SERIAL" | tr -d '\r'
     echo "  --- last 40 serial lines ---"
     tail -40 "$SERIAL"
     exit 1
@@ -212,14 +242,18 @@ fail_with() {
 
 # --- Guard: the guest actually has an address ----------------------------
 #
-# Without a lease the injected datagrams never reach handle_ip, every reading
-# is zero, and the negative control passes trivially while the positive fails
-# for a reason that has nothing to do with pattern matching. Distinguishing
-# those two situations is the entire point of this guard.
-if ! grep -qa "Offered IP" "$SERIAL"; then
-    echo "RESULT: INCONCLUSIVE — the guest never got a DHCP lease"
-    echo "  No 'Offered IP' in the serial log, so the injected packets could"
-    echo "  not have reached handle_ip() and neither reading means anything."
+# Without an address handle_ip()'s destination gate drops the injected frames,
+# every reading is zero, and the negative control passes trivially while the
+# positive fails for a reason that has nothing to do with pattern matching.
+# Distinguishing those two situations is the entire point of this guard.
+#
+# NOT "Offered IP": on the mcast netdev there is no DHCP server and no lease is
+# ever offered, so the old check would fire on a perfectly good run.
+if ! grep -qa "IP Address:" "$SERIAL"; then
+    echo "RESULT: INCONCLUSIVE — the guest never reported an address"
+    echo "  No 'IP Address:' in the serial log, so the injected frames could"
+    echo "  not have cleared handle_ip()'s destination gate and neither"
+    echo "  reading means anything."
     exit 3
 fi
 
@@ -229,19 +263,28 @@ fi
 #   IDS ................. 1 signatures, 0 matches, 0 alerts, 0 IPs blocked
 # Anchoring on "signatures, N matches" rather than a column position keeps this
 # working if a field is added to either side of it later.
+#
+# TAIL-anchored to the LAST THREE: TINYOS_EXEC_CMD is itself a secstatus, so
+# there are FOUR readings in the log and a head-anchored parser would compare
+# two pre-injection baselines against the benign one -- the exact mistake
+# verify-udp-rx-counters.sh made. Do not add another secstatus without
+# updating this.
+#
 # NOT `mapfile`: this runs under macOS's bash 3.2, where mapfile does not
 # exist. It is not a syntax error either -- bash reports "command not found",
 # leaves the array EMPTY, and with `set -u` unset the script would then compare
 # empty strings and fail in a way that reads like a broken fix.
-MATCH_LIST=$(grep -a "signatures, .* matches" "$SERIAL" \
+MATCH_ALL=$(grep -a "signatures, .* matches" "$SERIAL" \
              | sed -n 's/.*signatures, \([0-9][0-9]*\) matches.*/\1/p')
-MATCH_COUNT=$(printf '%s\n' "$MATCH_LIST" | grep -c '[0-9]')
+MATCH_COUNT=$(printf '%s\n' "$MATCH_ALL" | grep -c '[0-9]')
 
-if [ "$MATCH_COUNT" -lt 3 ]; then
-    fail_with "expected 3 secstatus readings, got $MATCH_COUNT" \
+if [ "$MATCH_COUNT" -lt 4 ]; then
+    fail_with "expected 4 secstatus readings, got $MATCH_COUNT" \
         "The command sequence did not complete, so there is no baseline to" \
-        "compare against. Readings seen: ${MATCH_LIST:-none}"
+        "compare against. Readings seen: ${MATCH_ALL:-none}"
 fi
+
+MATCH_LIST=$(printf '%s\n' "$MATCH_ALL" | grep '[0-9]' | tail -3)
 
 B=$(printf '%s\n' "$MATCH_LIST" | sed -n '1p')
 N=$(printf '%s\n' "$MATCH_LIST" | sed -n '2p')
@@ -270,10 +313,15 @@ if [ "$M" -le "$N" ]; then
         "guest and produced no match. This is AUDIT-8E itself: signatures are" \
         "loaded and reported but never compared against traffic." \
         "Check in this order:" \
-        "  1. is ids_inspect_payload() called at the end of ids_analyze_packet()?" \
-        "  2. did the firewall drop the datagram before the IDS hook in" \
-        "     handle_ip()? (the IDS check sits AFTER firewall_check_packet)" \
-        "  3. did the payload survive NAT to arrive byte-identical?"
+        "  1. did the firewall drop the frame before the IDS hook? net.c:1605" \
+        "     returns one line ABOVE the IDS call at net.c:1615, and this is" \
+        "     what killed the previous UDP vehicle. Read the Firewall line in" \
+        "     the tail below: a total that climbs while 'dropped' climbs with" \
+        "     it means the matcher was never handed a byte, and the ICMP" \
+        "     ACCEPT rule (priority 50) is gone or outranked." \
+        "  2. is ids_inspect_payload() called at the end of ids_analyze_packet()?" \
+        "  3. did the frames reach the guest at all? A zero Firewall total" \
+        "     means they died at handle_ip's address gate or is_bogon_ip()."
 fi
 
 # --- The alert actually fired -------------------------------------------
@@ -294,29 +342,21 @@ echo "  benign payload: no match ($B -> $N), sled payload: matched ($N -> $M),"
 echo "  and the hit generated an alert."
 exit 0
 
-# VALIDATION LOG — both ways, 2026-08-16. All three runs were real.
+# VALIDATION LOG
 #
-# PASS as written:  baseline=0  after-benign=0  after-sled=1
+# 2026-08-16, UDP/hostfwd vehicle, both ways. All three runs were real.
+#   PASS as written:  baseline=0  after-benign=0  after-sled=1
+#   (Superseded: that vehicle no longer reaches the IDS at all -- see below.)
 #
-# NEGATIVE VALIDATION #1 -- the fix is what makes it pass. The
-# `return ids_inspect_payload(...)` at the end of ids_analyze_packet() was
-# replaced with `return true;`, i.e. the pre-fix AUDIT-8E state. Result:
-#   baseline=0  after-benign=0  after-sled=0
-#   FAIL — the NOP-sled packet did NOT move the match counter (0 -> 0)
-# It failed on the positive and NOT on the negative control, which is the
-# discrimination that matters: the harness fails for the right reason, and only
-# when the matcher is actually absent.
+# 2026-08-22: FAILED as "the NOP-sled packet did NOT move the match counter",
+# baseline=0 after-benign=0 after-sled=0, with the firewall total climbing
+# 0 -> 1 -> 2 and ALL dropped. Root cause was c5fa987 (default-deny firewall,
+# landed 2026-08-22, six days after the validation above): nothing installs a
+# rule for the test UDP port, so firewall_check_packet() refused both datagrams
+# at net.c:1605, one line above the IDS hook at net.c:1615. NOT a kernel
+# defect -- verify-ids-block-leg.sh drove the IDENTICAL signature (9090909031c0)
+# over ICMP in the same batch and got 0 -> 1 matches, 1 alerts, independently
+# proving the matcher, the alert path and the counter all work.
 #
-# (Note for anyone repeating this: a bare `return true;` will not COMPILE --
-# -Werror=unused-function then fires on ids_inspect_payload. Keep a dead
-# reference, e.g. `if (0) { (void)ids_inspect_payload(...); }`, or the negative
-# validation stops at the build and never reaches the assertion it was meant to
-# exercise.)
-#
-# NEGATIVE VALIDATION #2 -- the negative control can actually fire. The compare
-# was forced to always match (`if (0 && memcmp(...) != 0)`). Result:
-#   baseline=0  after-benign=1  after-sled=2
-#   FAIL — the benign packet moved the match counter (0 -> 1)
-# and it reported that the positive was not evaluated. Without this second run
-# a negative control that could never fail would be indistinguishable from one
-# that works -- which is the AUDIT-8E lesson restated at the level of the test.
+# Migrated to the ICMP/mcast vehicle on 2026-08-22 for the reasons in the
+# header block.

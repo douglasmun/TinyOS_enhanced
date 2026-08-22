@@ -95,9 +95,25 @@ cleanup
 trap - EXIT
 
 echo
+# SPLICE the EDR burst out before reading anything. The burst lands mid-line
+# and cuts at an ARBITRARY character, so no token of a line is guaranteed to
+# survive contiguously -- measured here, at the kernel shell, which echoes per
+# keystroke:
+#
+#     $ w[EDR DAEMON] Starting threat scan...
+#     rite /secret.txt ROO[EDR DAEMON] Starting threat scan...
+#     TONLYDATA
+#
+# Deleting the marked lines outright would discard "$ w" and "rite ... ROO"
+# along with the noise; rejoining the surviving halves restores the line.
+# Lines that START with the marker are pure noise and go whole.
+REJOINED="${SERIAL}.rejoined"
+. "$(dirname "$0")/edr-rejoin.sh"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 echo "================ RESULT ================"
 echo "--- transcript from the su onward ---"
-sed -n '/su '"$TESTUSER"'/,$p' "$SERIAL" | tr -d '\r' | grep -vE "^\[(EDR|IDS)" | head -30
+sed -n '/su '"$TESTUSER"'/,$p' "$REJOINED" | head -30
 echo "-------------------------------------"
 
 # The unprivileged chmod is the whole question. Look at what followed it.
@@ -106,7 +122,12 @@ echo "-------------------------------------"
 # drive, and every downstream "denied" below is meaningless -- a non-existent
 # file refuses everyone equally. This check is what makes the probe able to
 # fail honestly rather than pass by absence.
-root_block=$(sed -n "/chmod 600 /,/su $TESTUSER/p" "$SERIAL" | tr -d '\r')
+# Anchor the root block's OPEN on "Switching to the kernel shell", not on the
+# `chmod 600` echo. That is kernel output on its own line; the echo is typed
+# text the burst can tear, and a torn open anchor makes this slice come back
+# EMPTY -- which reports INCONCLUSIVE against a kernel that did everything
+# right. This harness did exactly that on four consecutive runs.
+root_block=$(sed -n "/Switching to the kernel shell/,/su $TESTUSER/p" "$REJOINED")
 
 if ! echo "$root_block" | grep -q "rw-------"; then
     echo "RESULT: INCONCLUSIVE — root's own 'chmod 600' did not succeed."
@@ -121,7 +142,19 @@ if ! echo "$root_block" | grep -q "ROOTONLYDATA"; then
 fi
 echo "positive control OK: root created, chmod'd and read $SECRET"
 
-after_chmod=$(sed -n "/chmod 666 /,\$p" "$SERIAL" | tr -d '\r')
+# Anchor the slice on the `su`, NOT on the `chmod 666` echo.
+#
+# The EDR daemon's periodic burst lands mid-line and tears the command echo in
+# two: the log reads `$ chmod` / three EDR lines / ` 666 /secret.txt`, so the
+# pattern "chmod 666 " matches ZERO lines, the slice comes back empty, every
+# branch below falls through, and the harness reports INCONCLUSIVE against a
+# kernel that refused the chmod correctly. That is what it did until this fix.
+#
+# "Now running as: $TESTUSER" is safe to anchor on because it is kernel output
+# on its own line rather than a typed echo, and because the root-side positive
+# control completes entirely BEFORE the su -- so nothing it produced can leak
+# into this window and satisfy the escalation checks.
+after_chmod=$(sed -n "/Now running as: $TESTUSER/,\$p" "$REJOINED")
 
 # The escalation itself: did the unprivileged user get the contents?
 if echo "$after_chmod" | grep -q "ROOTONLYDATA"; then

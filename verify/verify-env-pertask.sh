@@ -74,6 +74,7 @@
 # Logs: envpertask.log (serial), envpertask-trace.log.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/edr-rejoin.sh"
 
 PASSWORD="${TINYOS_TEST_PASSWORD:-${TINYOS_PASSWORD:-rootpass1}}"
 
@@ -170,6 +171,26 @@ python3 tools/qemu_typist.py >/dev/null
 
 TYPIST_RC=$?
 
+# Drain, then STOP the guest, before reading a single line.
+#
+# The typist returns as soon as it has sent the last keystroke and seen what it
+# was waiting for. The guest is still running at that moment and the tail of
+# the session is still in flight through QEMU's serial file buffer, so the last
+# few typed commands may not be on disk yet. This harness used to grep
+# immediately, and the legs it got wrong were exactly the ones typed LAST --
+# the `alias myll` / `myll` exchange at the end of the sequence -- while every
+# earlier leg passed because those lines had long since drained.
+#
+# That failure is worse than a flake because of what it SAYS: the alias leg
+# reports "alias table may be full (defaults >= max)", a specific and plausible
+# kernel diagnosis, when the alias in fact resolved correctly and the bytes
+# simply had not landed. Replaying the finished capture through the identical
+# grep chain passes. Every other harness in this suite already sleeps and calls
+# cleanup here; this one did not.
+sleep 3
+cleanup
+trap - EXIT
+
 echo "==> Typist finished (rc=$TYPIST_RC); analysing $SERIAL"
 
 if [ ! -s "$SERIAL" ]; then
@@ -264,17 +285,48 @@ fi
 # ugrep, which rejects the $'...\r\?' form outright, and BSD grep does not
 # support GNU's \? in a BRE either. tr is portable across all three.
 # ---------------------------------------------------------------------------
-# Anchor at line start as well as after the prompt. The shell writes its
-# prompt with no trailing newline, so anything else reaching the serial port
-# in that window terminates the line and leaves the echo at column 0: the EDR
-# daemon's periodic status burst does exactly that, and this leg then FAILED
-# 2/2 reporting a full alias table against a run where the alias resolved
-# correctly ("myll" at column 0, "root" on the next line). The -A1 adjacency
-# is the real assertion here and is preserved.
-if tr -d '\r' < "$SERIAL" | grep -A1 -E '^(\$ )?myll$' | grep -q '^root$'; then
+# REJOIN the torn echo instead of trying to match its fragments.
+#
+# The shell writes its prompt with no trailing newline, so anything else
+# reaching the serial port in that window terminates the line. The EDR
+# daemon's periodic status burst does exactly that -- and it lands at an
+# ARBITRARY character, not at a word boundary. One run split this very
+# command as:
+#
+#     $ m[EDR DAEMON] Starting threat scan...
+#     [EDR DAEMON] Scanning 6 active processes
+#     [EDR DAEMON] Scan complete: 6 processes, duration 0 ticks
+#     yll
+#     root
+#
+# The residue is "yll", which matches neither `^myll$` nor `^\$ myll$`. An
+# earlier fix here anchored at column 0 to catch the whole-token case; that is
+# not enough, because the tear point is wherever the timer happened to fire.
+# Any pattern that reconstructs the typed text is fragile by construction.
+#
+# So repair the log first: strip the EDR text WITHOUT its preceding newline,
+# which splices each torn line back onto its own continuation. Verified on a
+# real capture -- all 7 torn echoes in that log reassemble, 0 residual tears,
+# and untorn lines are untouched. Ordinary anchors then work, and the -A1
+# adjacency (which is the real assertion) still carries the weight.
+#
+# awk rather than perl -0pe: no whole-file slurp, and no perl dependency in
+# a script that CI runs.
+#
+# The serial log uses CRLF, so `^root$` silently fails to match "root\r" and
+# reports a capacity failure that is really a line-ending mismatch. Strip the
+# CRs with tr rather than writing \r into the pattern: `grep` on this machine
+# is ugrep, which rejects the $'...\r\?' form outright, and BSD grep does not
+# support GNU's \? in a BRE either. tr is portable across all three.
+if rejoin_edr < "$SERIAL" | grep -A1 -E '^\$ myll$' | grep -q '^root$'; then
     pass "user-defined alias was created AND invoked (free slots remain)"
 else
-    bad  "user alias did not resolve — alias table may be full (defaults >= max)"
+    # Do NOT name a cause here. This leg cannot distinguish a full alias table
+    # from an alias that was never created, a `myll` that never ran, or a log
+    # that had not finished draining -- and it spent a batch reporting the
+    # capacity theory for what turned out to be the drain race fixed above.
+    # State the observation; let the reader open the log.
+    bad  "user alias did not resolve: no 'root' line directly after '\$ myll'"
 fi
 
 # ---------------------------------------------------------------------------

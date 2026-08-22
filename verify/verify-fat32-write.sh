@@ -65,11 +65,12 @@ if ! dd if="$RUN_DISK" bs=1 skip=82 count=8 status=none | grep -q "FAT32"; then
     exit 2
 fi
 
-# -----------------------------------------------------------------------------
-# run_boot <n> <exec_cmd> <expect> <followups>
-#   Boots QEMU headless against $RUN_DISK and drives the shell via the typist.
-#   Echoes nothing; sets globals SERIAL/TRACE for the caller to inspect.
-# -----------------------------------------------------------------------------
+# Repair command echoes torn by the EDR bursts. The three traps this
+# handles (ADVANCED as well as DAEMON, the status report's bracketing
+# blank lines, and a marker-free continuation line) are documented in
+# edr-rejoin.sh; edr-rejoin-test.sh is the case set.
+. "$(dirname "$0")/edr-rejoin.sh"
+
 run_boot() {
     local n="$1" exec_cmd="$2" expect="$3" followups="$4"
     SERIAL="fat32w-boot${n}.log"
@@ -138,7 +139,8 @@ check_no_triple_fault() {
 echo "==> BOOT 1: writing $TESTFILE (slow under TCG; be patient)..."
 run_boot 1 "write $TESTFILE $MARKER" "Written to" "cat $TESTFILE=>$MARKER"
 BOOT1_RC=$TYPIST_RC
-BOOT1_SERIAL=$SERIAL
+BOOT1_SERIAL="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$BOOT1_SERIAL"
 check_no_triple_fault "fat32w-boot1-trace.log" "boot 1"
 
 if [ "$BOOT1_RC" -ne 0 ]; then
@@ -173,7 +175,8 @@ echo "==> BOOT 2: re-reading $TESTFILE from the SAME disk..."
 run_boot 2 "cat $TESTFILE" "$MARKER" \
     "fatls=>$FATLS_NAME;write $TESTFILE $REWRITE=>Written to;cat $TESTFILE=>$REWRITE"
 BOOT2_RC=$TYPIST_RC
-BOOT2_SERIAL=$SERIAL
+BOOT2_SERIAL="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$BOOT2_SERIAL"
 check_no_triple_fault "fat32w-boot2-trace.log" "boot 2"
 
 echo

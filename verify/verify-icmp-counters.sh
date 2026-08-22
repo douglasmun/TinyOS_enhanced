@@ -299,10 +299,14 @@ echo "  accounted for: $TOTAL of $FRAME_COUNT frames sent"
 # --- POSITIVE: every injected frame landed in exactly one bucket -----------
 if [ "$TOTAL" -eq 0 ]; then
     fail_with "the injected frames moved neither ICMP counter" \
-        "Either the frames never reached the ICMP handler (check the socket" \
-        "netdev bridging and that the guest's IP is still 192.168.0.80), or" \
-        "the handler is not counting. A malformed IP header would also do" \
-        "this -- the packet would be dropped before reaching icmp.c."
+        "Either the frames never reached the ICMP handler or the handler is" \
+        "not counting. Check the captured guest IP printed above: on this" \
+        "mcast netdev there is no DHCP, so the guest self-assigns a" \
+        "link-local 169.254.x.x and does NOT keep net.c's compiled-in" \
+        "192.168.0.80 -- addressing the frames to that default is what made" \
+        "the first version of this harness measure nothing. A malformed IP" \
+        "header would also do this: the packet is dropped at handle_ip()'s" \
+        "address gate, before ever reaching icmp.c."
 fi
 if [ "$TOTAL" -ne "$FRAME_COUNT" ]; then
     fail_with "counters account for $TOTAL frames, expected exactly $FRAME_COUNT" \

@@ -94,13 +94,25 @@ fi
 # The decisive check: "Hello from ELF!" must appear only AFTER the cat command
 # echoes. If it shows up before, the write bypassed the file and went to the
 # console, meaning redirection did not take effect.
-cat_line=$(grep -n "cat /out.txt" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-hello_line=$(grep -n "Hello from ELF" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+# Both greps must read the SAME file or the line numbers are not comparable,
+# and that file must be the REJOINED one. The `cat /out.txt` echo is typed
+# text, so the EDR burst tears it ("$ cat /ou" + burst + "t.txt") and a raw
+# grep returns cat_line=none -- reported as FAIL/INCONCLUSIVE against a kernel
+# that redirected correctly and printed the file. Measured on a real run:
+# raw match 0, rejoined match 1. "Hello from ELF" is kernel output on its own
+# line and survives either way, which is exactly why only one half of the
+# comparison looked broken.
+. "$(dirname "$0")/edr-rejoin.sh"
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
+cat_line=$(grep -n "cat /out.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+hello_line=$(grep -n "Hello from ELF" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$cat_line" ] || [ -z "$hello_line" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC; cat_line=${cat_line:-none} hello_line=${hello_line:-none})"
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -111,6 +123,6 @@ if [ "$TYPIST_RC" -eq 0 ] && [ "$hello_line" -gt "$cat_line" ]; then
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; 'Hello from ELF' at line $hello_line, cat at $cat_line)"
     echo "  If hello_line < cat_line, output reached the console => redirection did not apply."
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi

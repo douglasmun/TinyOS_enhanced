@@ -18,6 +18,21 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# REFUSE to run unattended. This harness is INTERACTIVE by design: it opens a
+# GUI QEMU window, waits for a human to type `exec /hello.elf`, and only reads
+# its result after that window is closed. Run from a batch it blocks until the
+# batch's own timeout kills it -- 900 s of nothing, reported as TIMEOUT, which
+# reads exactly like a hung kernel.
+#
+# The automated equivalent is verify/auto-verify-exec.sh. Note it is NOT picked
+# up by a `verify-*.sh` glob, so a batch runs this manual one and silently
+# skips the automated one -- which is how this trap keeps getting re-set.
+if [ ! -t 0 ] || [ -n "${CI:-}" ]; then
+    echo "verify-exec.sh is INTERACTIVE (GUI QEMU + human input) and cannot run"
+    echo "unattended. Use verify/auto-verify-exec.sh instead."
+    exit 77
+fi
+
 ISO=dist/tinyos.iso
 SRC_DISK=disk.img
 RUN_DISK=/tmp/tinyos-verify-disk.img   # throwaway copy so disk.img stays pristine

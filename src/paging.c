@@ -796,7 +796,7 @@ void unmap_user_memory(uint32_t virtual_addr) {
 // Set up a complete user process address space
 bool setup_user_process_paging(uint32_t code_phys_addr, size_t code_size) {
     kprintf("=== setup_user_process_paging START ===\n");
-    kprintf("  Code physical: 0x%08x, size: %d bytes\n", code_phys_addr, code_size);
+    kprintf("  Code physical: 0x%08x, size: %zu bytes\n", code_phys_addr, code_size);
     kprintf("  Code virtual:  0x%08x\n", USER_CODE_BASE);
     kprintf("  Stack virtual: 0x%08x\n", USER_STACK_BASE);
 
@@ -833,10 +833,10 @@ bool setup_user_process_paging(uint32_t code_phys_addr, size_t code_size) {
     
     kprintf("1. Mapping user code pages...\n");
     for (size_t i = 0; i < code_size; i += 4096) {
-        kprintf("   Page %d: virt=0x%08x -> phys=0x%08x\n", 
+        kprintf("   Page %zu: virt=0x%08zx -> phys=0x%08zx\n", 
                i/4096, code_virt + i, code_phys + i);
         map_user_memory(code_virt + i, code_phys + i, PAGE_READONLY);
-        kprintf("   Page %d mapped successfully\n", i/4096);
+        kprintf("   Page %zu mapped successfully\n", i/4096);
     }
     kprintf("   All code pages mapped\n");
     

@@ -263,6 +263,41 @@ fi
 # $2 selects WHICH occurrence (default 1) for commands that run more than once;
 # grep stops at the first match otherwise, so a later step would silently be
 # graded on an earlier step's output.
+# Repair EDR-torn lines before any leg reads the log.
+#
+# `after()` below matches the prompt+command as one string ("D:/ $ write
+# /m1.txt"). That only works while the echo actually follows the prompt on the
+# same line -- and the EDR status burst breaks exactly that. The shell writes
+# "D:/ $ " with NO trailing newline, so a burst arriving in that window
+# terminates the prompt line and leaves the command echo at column 0:
+#
+#     D:/ $ [EDR DAEMON] Starting threat scan...
+#     [EDR DAEMON] Scanning 7 active processes
+#     [EDR DAEMON] Scan complete: 7 processes, duration 0 ticks
+#     write /m1.txt MOVEME
+#
+# Measured on the failing capture: "$ write /m1.txt" occurs ZERO times, while
+# "^write /m1.txt" occurs once. So every after() lookup returned the empty
+# string and ELEVEN legs failed at once -- reported as "seed write did not
+# land (size=, want 31)", i.e. as a broken ramfs. The filesystem was correct
+# throughout; the same log shows `cat /self.txt` printing MOVEME.
+#
+# Splice rather than loosen the pattern. Anchoring on '(^|\$ )cmd' was tried
+# elsewhere (PR #115) and is incomplete: the tear lands at an ARBITRARY
+# character, so '$ write' can arrive as '$ wr' + 'ite'. Rejoining restores the
+# exact line the patterns already expect, and keeps after()'s prompt anchor --
+# which is load-bearing here, since a bare command match would also hit the
+# harness's own typed input.
+#
+# Two line kinds, and conflating them loses data: a line that STARTS with the
+# burst is pure noise (drop it); a line that merely CONTAINS it carries real
+# output before the burst (keep that prefix and splice it onto the
+# continuation). The END flush recovers a torn line with nothing after it.
+REJOINED="${SERIAL}.rejoined"
+. "$(dirname "$0")/edr-rejoin.sh"
+rejoin_serial "$SERIAL" "$REJOINED"
+SERIAL="$REJOINED"
+
 after() {
     nth="${2:-1}"
     grep -A1 -F "\$ $1" "$SERIAL" 2>/dev/null | grep -v "^--$" \

@@ -157,14 +157,27 @@ if grep -q "Triple fault" "$TRACE" 2>/dev/null; then
     exit 1
 fi
 
-cat_line=$(grep -n "cat /m.txt" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-first_marker=$(grep -n "$MARKER" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+# Both line numbers come from the REJOINED log, and they must come from the
+# SAME file or the comparison below is meaningless. `cat /m.txt` is a typed
+# echo, so the EDR burst tears it ("$ cat /m." + burst + "txt") while the
+# MARKER is command output on its own line and survives -- so only one side of
+# the comparison breaks. Two distinct false verdicts follow from that:
+# an empty cat_line exits 2 as "never saw the command echo", and a SHIFTED
+# cat_line can put first_marker before it, tripping the negative control into
+# accusing cmd_mem of still writing through kprintf. The identical raw-log
+# grep is what made verify-redirect.sh report FAIL against a correct kernel.
+. "$(dirname "$0")/edr-rejoin.sh"
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
+cat_line=$(grep -n "cat /m.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+first_marker=$(grep -n "$MARKER" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$cat_line" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE — never saw the 'cat /m.txt' command echo"
     echo "  (typist rc=$TYPIST_RC) — the drive did not get far enough to measure anything."
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -177,7 +190,7 @@ if [ -n "$first_marker" ] && [ "$first_marker" -lt "$cat_line" ]; then
     echo "  cmd_mem printed to the console during the redirected run, i.e. it is"
     echo "  still writing through kprintf and ignoring its stream context."
     echo "--- context ---"
-    grep -v "Suspicious" "$SERIAL" | sed -n "$((first_marker > 4 ? first_marker - 4 : 1)),$((first_marker + 6))p"
+    grep -v "Suspicious" "$REJOINED" | sed -n "$((first_marker > 4 ? first_marker - 4 : 1)),$((first_marker + 6))p"
     exit 1
 fi
 
@@ -187,7 +200,7 @@ if [ -z "$first_marker" ]; then
     echo "  the report did not reach /m.txt. Redirection bound the stream and the"
     echo "  command wrote nowhere."
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 1
 fi
 
@@ -199,7 +212,7 @@ if [ "$TYPIST_RC" -eq 0 ] && [ "$first_marker" -gt "$cat_line" ]; then
 fi
 
 echo "RESULT: FAIL (typist rc=$TYPIST_RC; marker at $first_marker, cat at $cat_line)"
-grep -v "Suspicious" "$SERIAL" | tail -30
+grep -v "Suspicious" "$REJOINED" | tail -30
 exit 2
 
 # =============================================================================

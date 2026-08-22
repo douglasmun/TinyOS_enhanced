@@ -159,7 +159,23 @@ echo "================ VERDICT ================"
 [ -s "$SERIAL" ] || { echo "RESULT: FAIL — no serial output (typist rc=$TYPIST_RC)"; exit 2; }
 
 CLEAN=/tmp/tinyos-createperm-clean.log
-tr -d '\r' < "$SERIAL" | grep -va "EDR DAEMON\|Suspicious" > "$CLEAN"
+
+# SPLICE the EDR burst out; do not merely DROP the lines it touched. The burst
+# arrives mid-character and fuses to real output, so whole-line deletion throws
+# that output away. Measured on this harness's own capture:
+#
+#     ch /rootonly/planted.t[EDR DAEMON] Starting threat scan...
+#     [EDR DAEMON] Scanning 6 active processes
+#     xt
+#     touch: permission denied: '/rootonly/planted.txt'
+#
+# This file used to carry its own copy of that awk, and that copy had every
+# defect the shared helper was written to fix -- it matched only [EDR DAEMON]
+# and never [EDR ADVANCED], it flushed on a blank line (which BRACKETS the
+# status report), and it lost a lone-prompt line. Use the helper; it is unit
+# tested. Note it strips CR itself, so do NOT pipe through `tr -d` as well.
+. "$(dirname "$0")/edr-rejoin.sh"
+rejoin_serial "$SERIAL" "$CLEAN"
 
 if ! grep -q "LSOWNDIR" "$CLEAN"; then
     echo "RESULT: INCONCLUSIVE — the command sequence did not complete."
@@ -210,11 +226,29 @@ OWN_LISTING=$(sed -n "$((SPLIT+1)),\$p" "$CLEAN")
 # which matches "redir.txt" while being the command, not a listing. `ls`
 # prints bare basenames with no path separator (see "mine.txt" in $OWNDIR),
 # so any candidate line containing '/' is echo or prose, never an entry.
+#
+# ENUMERATING THE REFUSAL SHAPES IS THE WRONG FILTER, and this list already
+# missed one. The kernel's touch path prints
+#
+#     touch: permission denied: '/rootonly/planted.txt'      (shell_fileops.c:1186)
+#
+# which is NOT "Error: Cannot create file" and NOT "shell: cannot create".
+# It survived all three prose filters, and it NAMES planted.txt -- so leg 1
+# matched the very line proving the create was refused and reported
+# "an unprivileged user created planted.txt", against a kernel whose serial
+# log showed the refusal, an empty `ls /rootonly`, and mine.txt present in
+# the user's own directory. All four legs were actually green.
+#
+# So filter by STRUCTURE, which does not rot when a message is reworded: an
+# `ls` entry is a bare basename, so any line containing '/' or ':' is prose,
+# echo, or a path -- never a listing row. The prose greps are kept below as a
+# narrowing pass, but the structural test is what makes the leg sound.
 ROOT_LISTING=$(printf '%s\n' "$ROOT_LISTING" \
     | grep -v "Error: Cannot create file" \
     | grep -v "shell: cannot create" \
+    | grep -v "permission denied" \
     | grep -v "cannot access" \
-    | grep -v "/")
+    | grep -v "[/:]")
 
 # --- Leg 1: the plant must NOT be there -----------------------------------
 if printf '%s\n' "$ROOT_LISTING" | grep -q "planted.txt"; then

@@ -145,7 +145,10 @@
 # Inherited trade-off: this netdev has no NAT, so the guest takes no DHCP lease
 # and boot generates no inbound traffic. The baseline therefore reads 0/0 and is
 # not load-bearing on this netdev; it is retained for the DHCP-carrying case.
-# verify-ids-signature.sh is the harness that actually requires a lease.
+# verify-firewall-default-deny.sh is the harness that actually requires a lease
+# -- its arm B boots on the NAT netdev and guards on the lease explicitly.
+# (Was verify-ids-signature.sh, which no longer takes a lease at all since it
+# moved to the mcast netdev on 2026-08-22.)
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
 # Logs: ring3.log (serial), ring3-trace.log.

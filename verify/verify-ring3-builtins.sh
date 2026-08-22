@@ -172,8 +172,28 @@ exec /shell.elf=>TinyOS shell (ring 3);\
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
-sleep 2
-LOG="$(tr -d '\r' < "$SERIAL")"
+# Drain, then STOP the guest, before any leg reads the log.
+#
+# qemu_typist.py returns as soon as it has sent the last keystroke and seen
+# what it waited for -- the guest is still running and the tail of the session
+# is still in QEMU's serial file buffer. Reading at that moment loses the
+# LAST-typed commands, and this harness's sequence ends on `history 2`, one of
+# the legs below. verify-env-pertask.sh failed exactly this way: it reported
+# "alias table may be full" for an alias that had resolved correctly, because
+# the bytes had not landed yet.
+#
+# sleep alone is not the fix -- the guest keeps writing during it. Kill it.
+sleep 3
+cleanup
+trap - EXIT
+
+# Repair command echoes torn by the EDR bursts. The three traps this
+# handles (ADVANCED as well as DAEMON, the status report's bracketing
+# blank lines, and a marker-free continuation line) are documented in
+# edr-rejoin.sh; edr-rejoin-test.sh is the case set.
+. "$(dirname "$0")/edr-rejoin.sh"
+
+LOG="$(rejoin_edr < "$SERIAL")"
 
 pass=0; fail=0
 ok()   { echo "  PASS: $1"; pass=$((pass+1)); }
