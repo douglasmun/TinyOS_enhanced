@@ -176,7 +176,7 @@ static void print_unsigned(fmt_sink_t* sk, uint64_t u, unsigned base,
 
 /*=============================================================================
  * FUNCTION: vformat - core printf engine with %, width, flags -,0 and
- * length l/ll, emitting through a sink (console or buffer).
+ * length l/ll/z, emitting through a sink (console or buffer).
  * Returns the number of characters produced (vsnprintf-style count).
  *=============================================================================*/
 static int vformat(fmt_sink_t* sk, const char* fmt, va_list ap) {
@@ -231,7 +231,21 @@ static int vformat(fmt_sink_t* sk, const char* fmt, va_list ap) {
             ++p;
         }
 
-        /* STEP 3: PARSE LENGTH MODIFIER */
+        /* STEP 3: PARSE LENGTH MODIFIER
+         *
+         * 'z' (size_t) is accepted and maps to LEN_DEF because this is a
+         * 32-bit i386 kernel, where size_t is unsigned int. It MUST be parsed
+         * even though it changes no width: without it 'z' fell through to the
+         * conversion switch's default arm, which prints "%z" literally and --
+         * the part that actually bites -- does NOT consume the vararg. Every
+         * argument after it then shifted by one. `%zu > %d` in dns.c:201
+         * rendered as "%zu > 300 bytes" instead of "300 > 253 bytes": the
+         * literal specifier, and the LIMIT field showing the offending LENGTH.
+         * 32 sites were affected, in dns.c, elf.c, e1000.c and ecdhe.c.
+         *
+         * 'h'/'hh' are deliberately NOT accepted: default argument promotion
+         * makes them int-sized here, so the only effect would be to silence a
+         * -Wformat diagnostic that is worth keeping. */
         enum { LEN_DEF, LEN_L, LEN_LL } len = LEN_DEF;
         if (*p == 'l') {
             if (*(p+1) == 'l') {
@@ -241,6 +255,8 @@ static int vformat(fmt_sink_t* sk, const char* fmt, va_list ap) {
                 len = LEN_L;
                 ++p;
             }
+        } else if (*p == 'z') {
+            ++p;
         }
 
         /* End of format string reached while parsing a specifier
@@ -315,7 +331,7 @@ static int vformat(fmt_sink_t* sk, const char* fmt, va_list ap) {
 }
 
 /*=============================================================================
- * FUNCTION: kprintf - printf with %, width, flags -,0 and length l/ll
+ * FUNCTION: kprintf - printf with %, width, flags -,0 and length l/ll/z
  *=============================================================================*/
 void kprintf(const char* fmt, ...) {
     va_list ap;
