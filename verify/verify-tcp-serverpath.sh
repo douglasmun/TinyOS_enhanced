@@ -189,7 +189,7 @@ TINYOS_FOLLOWUP_TIMEOUT=600 \
 TINYOS_EXEC_CMD="ifconfig" \
 TINYOS_EXPECT="IP Address" \
 TINYOS_FOLLOWUP_CMDS="\
-dig $LOOKUP_NAME=>Resolved;\
+dig $LOOKUP_NAME=>IN      A;\
 ifconfig=>TCP no-conn" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
@@ -234,8 +234,20 @@ esac
 # print a failure, without any packet ever coming back. Requiring a dotted
 # quad is what separates a working dispatch from a command that merely
 # executed.
-RESOLVED=$(grep -a "Resolved IP for domain:\|Resolved to" "$SERIAL" | tail -1 \
-           | sed -n 's/.*[Rr]esolved[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+#
+# The witness is dig's OWN answer section ("IN      A       <quad>"), and it
+# has to be. This leg read "[DNS] Resolved IP for domain:" until 9fe3c8e --
+# the DNS RX kprintf sweep -- DELETED that line, since a remote host drove it
+# (the sweep was correct; see CLAUDE.md, "no per-packet kprintf"). The other
+# alternative, "Resolved to", is printed by ping and curl, never by dig. So
+# from 9fe3c8e until this commit BOTH witnesses were unprintable by the
+# command this harness types, and the leg failed unconditionally -- against a
+# kernel whose DNS path was working the whole time. Verified at c1fb096: the
+# serial log carried "example.com  300  IN  A  104.20.23.154" in the same run
+# the harness called a FAIL. If you re-point this string, re-point the
+# typist's =>expect on the dig line too; they must name the same output.
+RESOLVED=$(grep -a "IN      A       [0-9]" "$SERIAL" | tail -1 \
+           | sed -n 's/.*IN      A       \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
 if [ -z "$RESOLVED" ]; then
     fail_with "DNS did not resolve '$LOOKUP_NAME', so no inbound packet was delivered" \
         "The reply travels the same handle_packet dispatch the passive-open" \
