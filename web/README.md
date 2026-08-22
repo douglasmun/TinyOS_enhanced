@@ -56,7 +56,7 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is built from `main` at **PR #108** (`RELEASE_SHA`), and
+The committed ISO is built from `main` at **PR #109** (`eaef86d`), and
 matches the signed `v2.7` release asset. It is a pinned image, not a rolling
 build of `main`: it only moves when someone runs the steps above, so expect it
 to fall behind again as work lands.
@@ -110,7 +110,7 @@ Note the demo has **no NIC attached**, so the networking fixes are not
 exercisable here — they matter for the QEMU configuration in the top-level
 README.
 
-SHA-256 `RELEASE_SHA256` as of
+SHA-256 `372f921c129a0afccbc3db206f924ba0bc27351938e18dde0ee0031f28bd8446` as of
 2026-08-22. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs — this hash identifies
 the committed artifact, it is not reproducible from source.
