@@ -629,7 +629,7 @@ static void dump_packet(const char* direction, const uint8_t* data, size_t len) 
         return;
     }
     
-    kprintf("\n[%s PACKET] Length: %d bytes\n", direction, len);
+    kprintf("\n[%s PACKET] Length: %zu bytes\n", direction, len);
     kprintf("----------------------------------------\n");
     
     // Limit dump to first 128 bytes to avoid overwhelming the output
@@ -637,7 +637,7 @@ static void dump_packet(const char* direction, const uint8_t* data, size_t len) 
     
     for (size_t i = 0; i < dump_len; i++) {
         if (i % 16 == 0) {
-            kprintf("%04x: ", i);
+            kprintf("%04zx: ", i);
         }
         kprintf("%02x ", data[i]);
         if ((i + 1) % 16 == 0) {
@@ -650,7 +650,7 @@ static void dump_packet(const char* direction, const uint8_t* data, size_t len) 
     }
     
     if (len > dump_len) {
-        kprintf("... (%d more bytes)\n", len - dump_len);
+        kprintf("... (%zu more bytes)\n", len - dump_len);
     }
     
     kprintf("----------------------------------------\n");
@@ -1226,7 +1226,7 @@ void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
 static bool e1000_dma_region_init(void) {
     uint32_t phys = pmm_alloc_contiguous(E1000_DMA_TOTAL_PAGES);
     if (!phys) {
-        kprintf("[E1000] FATAL: no contiguous run of %u pages for the DMA region\n",
+        kprintf("[E1000] FATAL: no contiguous run of %lu pages for the DMA region\n",
                 E1000_DMA_TOTAL_PAGES);
         return false;
     }
@@ -1254,7 +1254,7 @@ static bool e1000_dma_region_init(void) {
      * later, and the failure mode otherwise is the NIC DMAing into an
      * unmapped page on the first burst rather than at init. */
     if (cursor > dma_guard_hi) {
-        kprintf("[E1000] FATAL: DMA payload (%u bytes) overruns its %u pages\n",
+        kprintf("[E1000] FATAL: DMA payload (%u bytes) overruns its %lu pages\n",
                 (uint32_t)E1000_DMA_PAYLOAD_BYTES, E1000_DMA_PAYLOAD_PAGES);
         return false;
     }
@@ -1278,7 +1278,7 @@ static bool e1000_dma_region_init(void) {
     memset((void*)(uintptr_t)dma_payload_base, 0,
            E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE);
 
-    kprintf("[E1000] DMA region: %u KB at 0x%08x, guards 0x%08x / 0x%08x [OK]\n",
+    kprintf("[E1000] DMA region: %lu KB at 0x%08x, guards 0x%08x / 0x%08x [OK]\n",
             (E1000_DMA_PAYLOAD_PAGES * E1000_DMA_PAGE_SIZE) / 1024,
             dma_payload_base, dma_guard_lo, dma_guard_hi);
     return true;

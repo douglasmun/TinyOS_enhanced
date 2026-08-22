@@ -771,7 +771,7 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     if (test_fd >= 0) {
         const char* test_data = "Hello from VFS on D: drive (RAMFS)!\nVFS integration is working.\n";
         ssize_t bytes_written = vfs_write(test_fd, test_data, strlen(test_data));
-        kprintf("[TEST] VFS file created: fd=%d, wrote %zd bytes\n", test_fd, bytes_written);
+        kprintf("[TEST] VFS file created: fd=%d, wrote %d bytes\n", test_fd, bytes_written);
         vfs_close(test_fd);
         kprintf("[TEST] Test file D:/hello/test.txt created successfully via VFS [OK]\n");
     } else {

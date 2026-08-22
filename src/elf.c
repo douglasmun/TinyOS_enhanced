@@ -617,7 +617,7 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
      * prevent mis-parsing of header structures.
      *=========================================================================*/
     if (ehdr->e_phentsize != sizeof(elf32_phdr_t)) {
-        kprintf("[ELF] SECURITY: Invalid program header entry size: %d (expected %d)\n",
+        kprintf("[ELF] SECURITY: Invalid program header entry size: %d (expected %zu)\n",
                 ehdr->e_phentsize, sizeof(elf32_phdr_t));
         return -1;
     }
