@@ -19,7 +19,8 @@ look arbitrary until you know which failure produced them.
 | `SYS_MSEAL` audit: the disproved latency hypothesis, the 16 kprintf sites | `doc/MSEAL_AUDIT.md` |
 | Post-v2.2 roadmap with rationale | `doc/ROADMAP_NEXT.md` |
 | Security mechanism reference (17 mechanisms) | `doc/SECURITY_HARDENING.md` |
-| Security history index / latest audit | `doc/SECURITY_STATUS_COMPLETE.md`, `doc/MULTI_AGENT_SECURITY_AUDIT_2026.md` |
+| Latest audit: 16 findings, all fixed (PRs #103–#105) | `doc/SECURITY_AUDIT_2026-08.md` |
+| Security history index | `doc/SECURITY_STATUS_COMPLETE.md`, `doc/MULTI_AGENT_SECURITY_AUDIT_2026.md` |
 | Boot/login/shell/networking walkthrough | `doc/USER_GUIDE.md` |
 
 ## Build & run

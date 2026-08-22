@@ -49,7 +49,13 @@ This document provides a comprehensive overview of ALL security work performed o
 **Fixes**: 78 of 73 verified findings (15 CRITICAL, 23 HIGH, 22 MEDIUM, 13 LOW)
 **Report**: [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECURITY_AUDIT_2026.md)
 
-**Total Issues Addressed**: 99 security issues across 5 audit layers
+### Layer 6: Coverage-Gap Audit
+**Date**: 2026-08-21
+**Focus**: The *gaps between* previously-audited areas — a filesystem primitive every sibling function guards and this one did not; a `kprintf` sweep that stopped at the file that prompted it; a teardown fix applied to the exit path but not the three creation-failure paths beside it. Scope was the Makefile's `SRC :=` block; findings contradicting a documented decision were dropped rather than reported.
+**Fixes**: 16 of 16 findings (1 CRITICAL, 2 HIGH, 8 MEDIUM, 5 LOW), each with a harness
+**Report**: [`SECURITY_AUDIT_2026-08.md`](SECURITY_AUDIT_2026-08.md)
+
+**Total Issues Addressed**: 115 security issues across 6 audit layers
 
 ---
 
