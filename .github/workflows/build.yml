@@ -45,8 +45,19 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-i686-linux-gnu binutils-i686-linux-gnu nasm
 
+      # -nostdinc, plus gcc's own freestanding header directory, is what makes
+      # a Linux-targeting cross usable here. Without it <limits.h> resolves to
+      # the HOST glibc header, which chains into bits/libc-header-start.h and
+      # dies -- the runner's glibc headers are 64-bit-only. A freestanding
+      # kernel should not be reaching host headers under any toolchain, so
+      # this is tightening the build rather than working around the runner:
+      # it guarantees only the compiler's own stdint/stdbool/stddef/limits
+      # can be found. Verified locally to produce a byte-identical kernel.elf.
       - name: Build (must be warning-clean under -Werror)
-        run: make -j"$(nproc)" CROSS=i686-linux-gnu- kernel.elf
+        run: |
+          GCCINC="$(i686-linux-gnu-gcc -print-file-name=include)"
+          make -j"$(nproc)" CROSS=i686-linux-gnu- \
+               EXTRA_CFLAGS="-nostdinc -isystem $GCCINC" kernel.elf
 
       - name: Confirm the artifact is a 32-bit ELF
         run: |
@@ -66,6 +77,7 @@ jobs:
           rc=0
           for h in src/*.h userspace/*.h; do
             i686-linux-gnu-gcc -m32 -ffreestanding -Isrc -Iuserspace \
+              -nostdinc -isystem "$(i686-linux-gnu-gcc -print-file-name=include)" \
               -c -include "$h" /tmp/probe.c -o /tmp/probe.o 2>/tmp/err.txt \
               || { echo "NOT SELF-SUFFICIENT: $h"; sed -n '1,6p' /tmp/err.txt; rc=1; }
           done
