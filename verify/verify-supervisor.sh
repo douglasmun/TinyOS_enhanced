@@ -275,10 +275,6 @@ export TINYOS_HOOK_INJECT3="sleep 3; $INJECT_CMD >/dev/null 2>&1; sleep 6; true"
 # of the SUPERVISOR's own console lines -- which is the stronger check anyway,
 # since it is the supervisor's view of the death and the restart that must
 # disagree, not the harness's.
-TINYOS_SERIAL="$SERIAL" \
-TINYOS_MON_SOCK="$MON_SOCK" \
-TINYOS_PASSWORD="$PASSWORD" \
-TINYOS_FOLLOWUP_TIMEOUT=600 \
 # Do NOT put `kshell` here. tools/qemu_typist.py ALREADY hands over to the
 # kernel shell before it types anything (it prints "sending 'kshell' (switch to
 # the kernel shell)" and waits for "shell: exiting"). Naming it again as
@@ -298,6 +294,17 @@ TINYOS_FOLLOWUP_TIMEOUT=600 \
 # dead supervisor; the supervisor was in fact watching knetd normally and the
 # boot had zero panics. The first real command is the baseline ifconfig, so
 # make that the exec command and let its own expect witness the kernel shell.
+# NOTE ON PLACEMENT: this comment must stay ABOVE the assignments, not inside
+# them. A `#` line after a trailing backslash TERMINATES the continuation, so
+# the four TINYOS_* assignments became a bare assignment-only command that set
+# nothing and exited, and the typist ran with no TINYOS_SERIAL at all. QEMU was
+# then killed 3s later and the verdict read "the supervisor task never
+# announced itself" -- the same dead-supervisor misreport this comment was
+# added to prevent, arriving by a different route.
+TINYOS_SERIAL="$SERIAL" \
+TINYOS_MON_SOCK="$MON_SOCK" \
+TINYOS_PASSWORD="$PASSWORD" \
+TINYOS_FOLLOWUP_TIMEOUT=600 \
 TINYOS_EXEC_CMD="ifconfig" \
 TINYOS_EXPECT="Supervisor" \
 TINYOS_FOLLOWUP_CMDS="\
