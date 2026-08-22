@@ -46,14 +46,22 @@ FILTER="${FILTER:-}"
 #   run-all.sh          -- this file.
 EXCLUDE="verify-exec.sh firstexec-trial.sh run-all.sh"
 
-# These build with -DTINYOS_FAULT_INJECT, which is NOT in the make dependency
-# graph. Objects compiled with it linger and break every LATER harness at link
-# time with an error that points at the innocent harness. Most clean up after
-# themselves, but as a plain statement rather than a trap -- so a timeout or a
-# kill leaves the tree poisoned. The runner therefore `make clean`s after every
-# harness unconditionally; it costs one rebuild and removes the whole class.
-FAULT_INJECT="verify-editor-rowfail.sh verify-dns-rx-counters.sh
-              verify-netd-arbitration.sh verify-supervisor.sh"
+# Harnesses that build with -DTINYOS_FAULT_INJECT, which is NOT in the make
+# dependency graph. Objects compiled with it linger and break every LATER
+# harness at link time, with an error that points at the innocent harness.
+# Most clean up after themselves, but as a plain statement rather than a trap,
+# so a timeout or a kill leaves the tree poisoned. The runner therefore
+# `make clean`s after each of them regardless of how they exited.
+#
+# DERIVED, not hardcoded. A hardcoded list is correct exactly until someone
+# adds a fifth fault-inject harness, and its staleness would surface as a link
+# error blamed on whichever harness happened to run next -- the same
+# misattribution this cleanup exists to prevent. Grep is the source of truth.
+FAULT_INJECT=""
+for f in verify/*.sh; do
+    grep -q 'TINYOS_FAULT_INJECT' "$f" 2>/dev/null || continue
+    FAULT_INJECT="$FAULT_INJECT $(basename "$f")"
+done
 
 mkdir -p "$OUTDIR"
 : > "$OUTDIR/summary.tsv"
