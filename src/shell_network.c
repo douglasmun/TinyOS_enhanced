@@ -327,10 +327,11 @@ void cmd_ifconfig(void) {
      * closed port. With this line, `RX ring: N` rising while `FW: ... N denied`
      * rises by the same N localises the drop to policy immediately.
      *
-     * Cast to uint32_t deliberately: the stats are uint64_t but TinyOS's own
-     * vformat has NO 'l'/'ll' length modifier (src/kprintf.c), so "%llu" would
-     * print literally AND shift every later argument -- the same defect that
-     * shipped as %zu. Counters that realistically exceed 2^32 do not exist here.
+     * Cast to uint32_t deliberately. vformat DOES handle 'l'/'ll'
+     * (src/kprintf.c STEP 3), so "%llu" would print correctly -- but these are
+     * packet counters on a single-NIC 32-bit kernel, where 2^32 frames is not
+     * reachable in any session, and the narrower print keeps the line aligned
+     * with every other counter in this function.
      */
     firewall_stats_t fw;
     firewall_get_stats(&fw);

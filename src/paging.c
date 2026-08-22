@@ -833,10 +833,10 @@ bool setup_user_process_paging(uint32_t code_phys_addr, size_t code_size) {
     
     kprintf("1. Mapping user code pages...\n");
     for (size_t i = 0; i < code_size; i += 4096) {
-        kprintf("   Page %lu: virt=0x%08lx -> phys=0x%08lx\n", 
+        kprintf("   Page %zu: virt=0x%08zx -> phys=0x%08zx\n", 
                i/4096, code_virt + i, code_phys + i);
         map_user_memory(code_virt + i, code_phys + i, PAGE_READONLY);
-        kprintf("   Page %lu mapped successfully\n", i/4096);
+        kprintf("   Page %zu mapped successfully\n", i/4096);
     }
     kprintf("   All code pages mapped\n");
     
