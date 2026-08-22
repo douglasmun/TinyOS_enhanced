@@ -92,7 +92,20 @@ TESTPASS=cmpass1
 # Root's file: the FOREIGN object the test user must be refused on.
 ROOTFILE=D:/cmroot.txt
 # The test user's own file: the half that must SUCCEED.
-USERFILE=D:/cmuser.txt
+#
+# It must live in a directory the user can WRITE. The ramfs root is 0711
+# (src/ramfs.c:329) -- execute for others, no write bit -- so an unprivileged
+# user cannot create anything directly in D:/. This harness placed the file at
+# D:/cmuser.txt from the day it was written (6be2a71) and the leg therefore
+# NEVER passed: `write` was refused, chmod/stat then reported "no such file",
+# and the typist blocked the full 600s waiting for a mode= line that could not
+# come (771s per run, reproduced 2/2 with nothing else on the machine). The
+# kernel was correct throughout -- the exclusion leg above passes, so
+# SYS_CHMOD's ownership gate works; only the positive control was unrunnable.
+# Root creates USERDIR 0777 before `su`, mirroring /ownplace in the create-perm
+# harness.
+USERDIR=D:/cmplace
+USERFILE=D:/cmplace/cmuser.txt
 
 ISO=dist/tinyos.iso
 SERIAL=ring3chmod.log
@@ -198,6 +211,8 @@ TINYOS_FOLLOWUP_CMDS="\
 !stat $ROOTFILE=>mode=600;\
 !chmod 644 $ROOTFILE;\
 !stat $ROOTFILE=>mode=644;\
+!mkdir $USERDIR;\
+!chmod 777 $USERDIR;\
 useradd $TESTUSER=>Enter password for new user;\
 !$TESTPASS=>created;\
 kshell=>Switching to the kernel shell;\

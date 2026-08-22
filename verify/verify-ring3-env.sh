@@ -375,8 +375,25 @@ note_pass "\$VAR expanded client-side (round trip: set -> expand)"
 # result line below it. A bare `grep -m1 MARKER2` takes the echo, and the
 # "expanded to its own NAME" assertion below then fires on EVERY run, including
 # correct ones -- it did, on this harness's first run, against a shell whose
-# output was right. Drop any line containing a prompt before matching.
-MARKER2_LINE=$(printf '%s\n' "$USER_REGION" | grep 'MARKER2' | grep -v '\$ echo' | head -1)
+# output was right.
+#
+# ANCHOR THE FILTER AT LINE START AS WELL AS AFTER A PROMPT. The original
+# `grep -v '$ echo'` assumed the echo always shares the prompt's line, which
+# assumes the prompt is the last thing written before it. It is not: the shell
+# writes "D:/ $ " with NO trailing newline, so anything else reaching the
+# serial port in that window terminates the line and pushes the echo to
+# column 0 with no prompt on it. The EDR daemon's 60-second status report is a
+# ~7-line burst that does exactly that, and it is timer-aligned rather than
+# racy -- this leg FAILED 3/3 identically at ~172s, on a kernel whose output
+# was correct both times ("echo MARKER2 $ENVMARK" at line start, "MARKER2"
+# right below it). Same mechanism, same fix as verify-ring3-builtins.sh leg 5.
+#
+# Only NEGATIVE-polarity legs need this. Leg 5 above takes the same split and
+# passes regardless, because it requires the value to be PRESENT and finds the
+# correct line anyway; this leg requires a string to be ABSENT, so one
+# surviving echo is the whole failure. The filter was negative-controlled: a
+# shell that really did echo back '$ENVMARK' still leaves a survivor.
+MARKER2_LINE=$(printf '%s\n' "$USER_REGION" | grep 'MARKER2' | grep -vE '(^|\$ )echo ' | head -1)
 if [ -z "$MARKER2_LINE" ]; then
     fail_with "the \`echo MARKER2 \$ENVMARK\` line never appeared" \
         "Cannot tell whether unset worked; the command did not run."
@@ -442,7 +459,12 @@ note_pass "alias substituted client-side and ran (envll -> id)"
 # Leg 7 above already proved the alias fired BEFORE it, which is what makes the
 # count meaningful -- a zero here with no prior positive would also be produced
 # by an alias that never worked at all.
-UNALIAS_REGION=$(printf '%s\n' "$USER_REGION" | sed -n '/\$ unalias envll/,$p')
+# ANCHOR AT LINE START TOO -- see the MARKER2 note below. "$ unalias envll"
+# assumes the prompt shares the echo's line; the EDR daemon's periodic burst
+# terminates the prompt line first and leaves the echo at column 0, so this
+# range matched NOTHING and the harness reported "the typist did not reach
+# it" against a run whose alias sequence was entirely correct (observed 2/5).
+UNALIAS_REGION=$(printf '%s\n' "$USER_REGION" | sed -nE '/(^|\$ )unalias envll/,$p')
 
 if [ -z "$UNALIAS_REGION" ]; then
     fail_with "the unalias command never appeared in the log" \
@@ -459,7 +481,12 @@ fi
 # uid=" is trivially true. The first negative control of this leg passed for
 # precisely that reason. Assert the command was reached, THEN assert it did
 # not fire.
-if ! printf '%s\n' "$UNALIAS_REGION" | grep -q '\$ envll'; then
+# Anchored at line start as well: the EDR burst can terminate the prompt line
+# and leave this echo at column 0 (see the UNALIAS_REGION note above). Unlike
+# the filters elsewhere in this file, this leg requires the echo to be PRESENT,
+# so the split turns it into a false FAIL rather than a false pass -- observed
+# 3/3 against a run whose alias sequence was entirely correct.
+if ! printf '%s\n' "$UNALIAS_REGION" | grep -qE '(^|\$ )envll$'; then
     fail_with "the post-unalias \`envll\` was never typed" \
         "The log stops before it, so 'the alias did not fire' cannot be" \
         "concluded -- nothing was asked of it. A stall at the preceding" \

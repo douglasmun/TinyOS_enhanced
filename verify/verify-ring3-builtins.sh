@@ -222,11 +222,26 @@ esac
 # exactly the "match the echoed command line, not the output" trap described in
 # the header, hit from the other direction.
 #
-# So: drop the shell's own echo lines (they start with the "D:/ $" prompt) and
-# drop history's numbered listing (leading spaces then digits), then assert that
-# NOTHING remains. What is left could only have been printed by grep itself.
+# So: drop the shell's own echo lines and history's numbered listing (leading
+# spaces then digits), then assert that NOTHING remains. What is left could
+# only have been printed by grep itself.
+#
+# The echo filter must anchor at line-START as well as after the prompt. The
+# shell prints its prompt with NO trailing newline (userspace/shell.c:"%s $ "),
+# so the echo normally shares the prompt's line and '\$ grep ...' strips it.
+# But the EDR daemon's 60-SECOND STATUS REPORT is a ~10-line burst that lands
+# between the prompt and the echo, pushing the echo onto a line of its own with
+# no '$'. It then survived the filter and was counted as grep output, failing
+# this leg while grep was perfectly correct. That is not a race: this harness
+# reaches leg 5 at a consistent ~176s, so the collision is timer-aligned and
+# reproduced 5 runs out of 5. All 13 prompts are present and at line start --
+# none go missing; only their adjacency to the echo does.
+#
+# Negative-controlled before landing: this filter still leaves >=1 survivor for
+# a broken grep that prints a real match line, both with and without the EDR
+# burst interposed, so widening it does not blind the leg.
 NOSUCH=$(printf '%s' "$LOG" \
-    | grep -v '\$ grep NOSUCHSTRING' \
+    | grep -vE '(^|\$ )grep NOSUCHSTRING' \
     | grep -vE '^ *[0-9]+  ' \
     | grep -c "NOSUCHSTRING")
 if [ "$NOSUCH" -eq 0 ]; then
