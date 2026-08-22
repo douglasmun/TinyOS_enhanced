@@ -298,8 +298,10 @@ fi
 # is ugrep, which rejects the $'...\r\?' form outright, and BSD grep does not
 # support GNU's \? in a BRE either. tr is portable across all three.
 if tr -d '\r' < "$SERIAL" \
-     | awk '/\[EDR DAEMON\]/ { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
-            { print buf $0; buf = "" }' \
+     | awk '/^\[EDR DAEMON\]/ { next }
+            /\[EDR DAEMON\]/  { sub(/\[EDR DAEMON\].*$/, ""); buf = buf $0; next }
+            { print buf $0; buf = "" }
+            END { if (buf != "") print buf }' \
      | grep -A1 -E '^\$ myll$' | grep -q '^root$'; then
     pass "user-defined alias was created AND invoked (free slots remain)"
 else
