@@ -138,10 +138,21 @@ for n in "${HARNESSES[@]}"; do
     # rule reports them as FAIL and sends someone hunting a kernel bug that the
     # harness has already said it could not test for. The verdict line is the
     # harness's own considered statement; the code is an afterthought.
+    #
+    # The verdict test must ANCHOR on "RESULT: INCONCLUSIVE", not merely
+    # contain the word. Ten harnesses in this suite hedge with
+    # "RESULT: FAIL/INCONCLUSIVE" (verify-argv, verify-bgjobs, verify-pipes,
+    # verify-redirect, verify-fsyscalls, verify-ring3-pipes, ... ) because they
+    # cannot separate "the kernel is broken" from "the typist did not land the
+    # command". A substring match downgrades every one of those to INCONCL and
+    # HIDES a real failure -- which is the same "suite starts lying" this rule
+    # exists to prevent, just pointing the other way. A hedged verdict is
+    # treated as FAIL: it may not be a kernel bug, but it is not a pass, and it
+    # is the polarity that gets looked at rather than skipped.
     verdict=$(grep -a '^RESULT:' "$OUTDIR/$n.log" | head -1 | cut -c1-64)
     if [ "$rc" -eq 124 ]; then
         cls=TIMEOUT; FAIL=$((FAIL+1)); verdict="killed after ${TIMEOUT_SECS}s"
-    elif printf '%s' "$verdict" | grep -q 'INCONCLUSIVE'; then
+    elif printf '%s' "$verdict" | grep -q '^RESULT: *INCONCLUSIVE'; then
         cls=INCONCL; INCONCL=$((INCONCL+1))
     elif [ "$rc" -eq 0 ]; then
         cls=PASS; PASS=$((PASS+1))
