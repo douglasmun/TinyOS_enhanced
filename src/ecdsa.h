@@ -251,6 +251,8 @@ void ecdsa_export_signature(const ecdsa_signature_t* signature, uint8_t* bytes);
  */
 
 /* Initialize ECDSA subsystem (verify curve parameters) */
-void ecdsa_init(void);
+/* Boot-time known-answer self-test of the curve arithmetic. False = the
+ * generator point failed its on-curve check; the caller must not continue. */
+bool ecdsa_init(void);
 
 #endif /* ECDSA_H */

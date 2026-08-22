@@ -631,10 +631,24 @@ void ecdsa_export_signature(const ecdsa_signature_t* signature, uint8_t* bytes) 
     p256_int_to_bytes(&signature->s, bytes + P256_BYTES);
 }
 
-void ecdsa_init(void) {
-    /* Verify generator point is on curve */
-    /* TODO: Fix point-on-curve verification - currently disabled to allow boot */
-    /* if (!p256_point_on_curve(&p256_G)) {
-        while(1);
-    } */
+/* Self-test of the curve arithmetic against a known-answer input.
+ *
+ * This was commented out with "currently disabled to allow boot" and left that
+ * way, so ecdsa_init() became an empty function that reported success. It
+ * passes now -- p256_G is a compile-time constant holding the genuine NIST
+ * P-256 base point, and p256_point_on_curve() computes y^2 == x^3 + ax + b
+ * correctly -- so whatever made it hang during bring-up was fixed by one of the
+ * later arithmetic corrections and never revisited.
+ *
+ * It is worth restoring rather than deleting because it is a known-answer test
+ * of the SAME routine that guards the live verify path: ecdsa_verify() calls
+ * p256_point_on_curve() on the attacker-supplied public key (see the
+ * is_infinity check in that function). A silently broken curve check there
+ * would accept off-curve keys; here it is caught at boot instead.
+ *
+ * Returns false rather than spinning. The old `while(1)` hung with no output,
+ * which is indistinguishable from any other early-boot hang; the caller reports
+ * it and panics, so the failure names itself. */
+bool ecdsa_init(void) {
+    return p256_point_on_curve(&p256_G);
 }
