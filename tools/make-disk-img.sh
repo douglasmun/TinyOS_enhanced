@@ -78,6 +78,14 @@ mformat -i "$OUT" -F -T 262144 -h 16 -s 63 -c 2 -R 32 ::
 
 mcopy -i "$OUT" "$FIXTURE" ::HELLO.ELF
 
+# INFO.ELF was also present in the hand-made image. No harness or userspace
+# source opens it -- the only two mentions in the tree are a usage example in
+# qemu_typist.py and a comment in verify-exec-frame-leak.sh warning NOT to use
+# it (it is a larger image and would move that harness's expected page count).
+# Included anyway so the generated image is a faithful replacement rather than
+# a subset, which keeps "it worked before" from meaning something different.
+mcopy -i "$OUT" "$FIXTURE" ::INFO.ELF
+
 # Verify what we produced rather than trusting mformat's exit code: check the
 # same FAT32 signature verify-ring3-fatls.sh checks, and read the file back.
 if ! dd if="$OUT" bs=1 skip=82 count=8 status=none | grep -q "FAT32"; then
