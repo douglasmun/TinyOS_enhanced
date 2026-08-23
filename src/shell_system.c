@@ -1006,6 +1006,8 @@ void cmd_auditlog(int argc, char* argv[]) {
             stream_printf(ctx, "  auditlog --error      # Show only errors/critical\n");
             stream_printf(ctx, "  auditlog -s           # Show statistics\n");
             stream_printf(ctx, "  auditlog -v           # Verify integrity\n");
+            stream_printf(ctx, "\nNote: the audit log is held in RAM and is cleared\n");
+            stream_printf(ctx, "on reboot. It is not written to disk.\n");
             return;
         }
     }
@@ -1029,12 +1031,17 @@ void cmd_auditlog(int argc, char* argv[]) {
         audit_get_stats(&stats);
 
         stream_printf(ctx, "\n=== Audit Log Statistics ===\n");
-        stream_printf(ctx, "Total events logged:    %u\n", stats.total_events);
-        stream_printf(ctx, "Events in buffer:       %u\n", stats.events_in_buffer);
-        stream_printf(ctx, "Events dropped:         %u\n", stats.events_dropped);
-        stream_printf(ctx, "Tamper detections:      %u\n", stats.tamper_detections);
-        stream_printf(ctx, "Oldest sequence:        %u\n", stats.oldest_sequence);
-        stream_printf(ctx, "Newest sequence:        %u\n", stats.newest_sequence);
+        /* "since boot", not "total". The ring is in RAM and audit_init()
+         * memsets it on every boot, so a bare "Total events logged" reads as an
+         * all-time figure that this counter structurally cannot report. See
+         * doc/AUDIT_LOG_PERSISTENCE.md for why the log is not persisted. */
+        stream_printf(ctx, "Events logged (this boot): %u\n", stats.total_events);
+        stream_printf(ctx, "Events in buffer:          %u\n", stats.events_in_buffer);
+        stream_printf(ctx, "Events dropped:            %u\n", stats.events_dropped);
+        stream_printf(ctx, "Tamper detections:         %u\n", stats.tamper_detections);
+        stream_printf(ctx, "Oldest sequence:           %u\n", stats.oldest_sequence);
+        stream_printf(ctx, "Newest sequence:           %u\n", stats.newest_sequence);
+        stream_printf(ctx, "\nLog is VOLATILE: held in RAM, cleared on reboot.\n");
         stream_printf(ctx, "\n");
         return;
     }
