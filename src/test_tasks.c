@@ -219,10 +219,40 @@ void task_idle(void) {
  *          the interrupt-corruption bug that broke password login, ECDSA
  *          verification, and the SSH handshake.
  *=============================================================================*/
+#ifdef TINYOS_FAULT_INJECT
+/*
+ * Fault injection for verify-supervisor.sh step 6 (priority restoration).
+ *
+ * Same self-opt-out idiom as knetd_die_now below, and for the same reason: the
+ * victim clears its OWN CAP_UNKILLABLE so no production path learns to bypass
+ * the capability check.
+ *
+ * ktimerd rather than knetd because knetd is PRIORITY_NORMAL, which is also
+ * task_create_kernel()'s default -- so a restarted knetd reads back the correct
+ * priority whether or not the supervisor restores it, and the demotion bug is
+ * structurally invisible there. ktimerd is PRIORITY_HIGH, so it is the smallest
+ * task that can witness the difference.
+ */
+volatile int ktimerd_die_now = 0;
+#endif
+
 void task_ktimerd(void) {
     kprintf("[KTIMERD] Timer bottom-half task started [OK]\n");
     while (1) {
         timer_softirq_run();
+#ifdef TINYOS_FAULT_INJECT
+        if (ktimerd_die_now) {
+            task_t* self = scheduler_get_current_task();
+            ktimerd_die_now = 0;
+            if (self) {
+                kprintf("[KTIMERD] fault injection: exiting on request\n");
+                self->capabilities &= ~CAP_UNKILLABLE;
+                uint32_t self_pid = self->pid;
+                task_terminate(self_pid);
+                scheduler_yield();
+            }
+        }
+#endif
         /* Yield; we'll be rescheduled on the next tick. timer_softirq_run()
          * is cheap (a flag check) when nothing is pending. */
         scheduler_yield();

@@ -241,7 +241,13 @@ static void report_statistics(void) {
 /**
  * @brief Main EDR daemon loop
  */
-static void edr_daemon_main(void) {
+/*
+ * NOT static: the supervisor restarts a dead task by calling its entry point,
+ * so it needs a void(*)(void) it can store. Exposed via edr_ml.h alongside
+ * edr_daemon_start() rather than being called directly by anyone else --
+ * kernel.c still starts the daemon through edr_daemon_start().
+ */
+void edr_daemon_main(void) {
     task_t* self = task_current();
     kprintf("[EDR DAEMON] Starting EDR background daemon (PID %d)\n", self->pid);
 

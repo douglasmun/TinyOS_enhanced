@@ -25,7 +25,8 @@ void supervisor_init(void) {
     supervisor_total_restarts = 0;
 }
 
-bool supervisor_watch(const char* name, void (*entry)(void), uint32_t pid) {
+bool supervisor_watch(const char* name, void (*entry)(void), uint32_t pid,
+                      priority_t priority) {
     if (!name || !entry || pid == 0) {
         return false;
     }
@@ -50,6 +51,7 @@ bool supervisor_watch(const char* name, void (*entry)(void), uint32_t pid) {
         e->entry = entry;
         e->pid = pid;
         e->generation = task->generation;
+        e->priority = priority;
         e->restarts = 0;
         e->restarts_in_window = 0;
         e->window_start_ms = supervisor_now_ms();
@@ -119,6 +121,15 @@ static bool supervisor_restart(supervisor_entry_t* e) {
      * instruction: the RX counter simply stops advancing. Steps 1 and 2 of
      * verify-supervisor.sh both pass in that state, which is exactly why that
      * harness also asserts frames are parsed AFTER the restart. */
+    /* Restore the registered priority BEFORE enqueueing. task_create_kernel()
+     * assigns PRIORITY_NORMAL unconditionally, so a restarted ktimerd or
+     * edr_daemon would otherwise come back demoted from PRIORITY_HIGH -- alive,
+     * counted as a successful restart, and reported healthy by every status
+     * surface, with degraded latency as the only symptom. Set it here rather
+     * than at the call site so no future restart path can skip it, the same
+     * reason the rate limit lives in this function. */
+    task_set_priority(fresh, e->priority);
+
     scheduler_add_task(fresh);
 
     e->pid = (uint32_t)pid;
