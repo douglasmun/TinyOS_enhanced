@@ -128,6 +128,13 @@ jobs:
       #                                 correct kernels into FAILs across the
       #                                 whole suite, and only this catches it
       #                                 without booting anything.
+      #   preserve-serial-test.sh     : the shared preserve-on-failure helper
+      #                                 keeps a failing run's serial log and
+      #                                 leaves nothing on a passing one. Pure
+      #                                 shell, no guest. Test 5 is a negative
+      #                                 control asserting the trap $? clobber
+      #                                 is real -- without it, test 1 could
+      #                                 silently stop testing anything.
       #   verify-elf-enforce-report.sh: secstatus reports the REAL ELF gate.
       #                                 This one BUILDS -- twice, default and
       #                                 -DELF_PERMISSIVE_SIGNATURES -- and
@@ -137,8 +144,8 @@ jobs:
       #                                 the CROSS/OBJDUMP/EXTRA_CFLAGS it is
       #                                 handed below.
       #
-      # The sixth non-QEMU script, firstexec-trial.sh, is NOT here: it wraps
-      # the interactive GUI verify-exec.sh and blocks forever when batched.
+      # firstexec-trial.sh is the one non-QEMU script NOT here: it wraps the
+      # interactive GUI verify-exec.sh and blocks forever when batched.
       - name: Architecture diagram matches the tree
         run: bash verify/verify-arch-svg.sh
 
@@ -150,6 +157,9 @@ jobs:
 
       - name: EDR splice helper unit tests
         run: bash verify/edr-rejoin-test.sh
+
+      - name: Serial-log preservation helper unit tests
+        run: bash verify/preserve-serial-test.sh
 
       - name: Install toolchain
         run: |

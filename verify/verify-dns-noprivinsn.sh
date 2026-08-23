@@ -157,6 +157,7 @@ fi
 
 WORK=$(mktemp -d -t dnsverify.XXXXXX)
 SERIAL="$WORK/serial.log"
+. "$(dirname "${BASH_SOURCE[0]}")/preserve-serial.sh"
 MON_SOCK="$WORK/mon.sock"
 RUN_DISK="$WORK/disk.img"
 PASSWORD="${TINYOS_PASSWORD:-rootpass123}"
@@ -180,7 +181,7 @@ qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom dist/tinyos.iso \
 QEMU_PID=$!
 
 cleanup_qemu() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; }
-trap 'cleanup_qemu; rm -rf "$WORK"' EXIT
+trap 'rc=$?; cleanup_qemu; preserve_serial "$SERIAL" "" "$rc"; rm -rf "$WORK"' EXIT
 
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \

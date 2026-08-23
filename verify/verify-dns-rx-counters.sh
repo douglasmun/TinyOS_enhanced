@@ -130,6 +130,7 @@ i686-elf-grub-mkrescue -o dist/tinyos.iso iso >/dev/null 2>&1 \
 
 WORK=$(mktemp -d -t dnsrx.XXXXXX)
 SERIAL="$WORK/serial.log"
+. "$(dirname "${BASH_SOURCE[0]}")/preserve-serial.sh"
 MON_SOCK="$WORK/mon.sock"
 PASSWORD="${TINYOS_PASSWORD:-rootpass123}"
 
@@ -144,7 +145,7 @@ cleanup_qemu() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; }
 # make clean on EXIT: EXTRA_CFLAGS is not in the dependency graph, so leaving
 # fault-inject objects behind breaks the NEXT harness at LINK time, which reads
 # as a broken kernel rather than a dirty tree.
-trap 'cleanup_qemu; rm -rf "$WORK"; make clean >/dev/null 2>&1' EXIT
+trap 'rc=$?; cleanup_qemu; preserve_serial "$SERIAL" "" "$rc"; rm -rf "$WORK"; make clean >/dev/null 2>&1' EXIT
 
 # `dig` first: the forger echoes the last queried domain and transaction ID, so
 # without a prior real query it has nothing to build a matching packet from and
