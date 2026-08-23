@@ -579,9 +579,11 @@ void scheduler_start(void) {
 
 /*=============================================================================
  * FUNCTION: scheduler_tick
- * PURPOSE: Called by timer interrupt to update time slices (but NOT switch tasks)
- * NOTE: We don't do context switches from interrupts because context_switch
- *       uses 'ret' instead of 'iret', which would leave interrupts disabled.
+ * PURPOSE: Called by the timer interrupt to update time slices only.
+ * NOTE: This function does not switch tasks, but the timer ISR does --
+ *       scheduler_schedule_from_interrupt() preempts. Accounting is kept
+ *       separate from that decision; see its comment for how a preempted
+ *       task is suspended mid-ISR and later resumes through iret.
  *=============================================================================*/
 void scheduler_tick(void) {
     if (!scheduler_enabled || !current_running_task) {

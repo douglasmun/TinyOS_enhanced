@@ -526,10 +526,10 @@ void isr_common_handler(interrupt_regs_t* regs)
             /*=================================================================
              * PREEMPTIVE MULTITASKING WITH IRETD
              *
-             * Call scheduler with register pointer. The scheduler can modify
-             * the interrupt stack frame to switch to a different task.
-             * When we return and iret executes, the CPU will restore the
-             * (modified) register state, effectively switching tasks!
+             * The scheduler may suspend the current task here, mid-ISR, on
+             * its own kernel stack via context_switch(). It resumes later by
+             * finishing this ISR, so the interrupt frame is NOT rewritten;
+             * `regs` is passed only for ABI stability with isr.S.
              *
              * This is true preemptive scheduling - tasks are forcibly
              * switched even if they don't call yield().
