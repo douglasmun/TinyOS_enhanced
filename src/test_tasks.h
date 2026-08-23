@@ -28,6 +28,9 @@ void task_exit_test(void);
  */
 void task_idle(void);
 void task_ktimerd(void);  /* timer bottom-half task */
+#ifdef TINYOS_FAULT_INJECT
+extern volatile int ktimerd_die_now;
+#endif
 void task_knetd(void);    /* RX bottom-half task (doc/NETWORK_ISOLATION.md) */
 
 #ifdef TINYOS_FAULT_INJECT

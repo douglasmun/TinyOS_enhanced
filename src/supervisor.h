@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "process.h"   /* priority_t */
 
 /*=============================================================================
  * SYSTEM TASK SUPERVISOR (doc/NETDAEMON_DESIGN.md item 4, PR D2)
@@ -44,7 +45,13 @@
  * NETWORK_ISOLATION.md item 1's "did it run" flag was reverted for masking.
  *===========================================================================*/
 
-#define SUPERVISOR_MAX_TASKS      4
+/*
+ * Capacity. Was 4 when knetd was the only watched task; now 3 are watched
+ * (ktimerd, knetd, edr_daemon) and the header must leave room to add one
+ * without a silent "table full" -- supervisor_watch() prints and returns false
+ * in that case, which is visible in the boot log but easy to scroll past.
+ */
+#define SUPERVISOR_MAX_TASKS      8
 
 /*
  * Restart budget. Deliberately small: these are system tasks that should never
@@ -66,6 +73,15 @@ typedef struct {
     void (*entry)(void);
     uint32_t pid;
     uint32_t generation;
+    /*
+     * Priority to restore on restart. task_create_kernel() always assigns
+     * PRIORITY_NORMAL, so without this a restarted ktimerd or edr_daemon comes
+     * back DEMOTED from PRIORITY_HIGH -- it runs, every status surface reports
+     * a healthy restart, and the only symptom is worse latency under load.
+     * knetd never set a priority, so this was invisible while it was the only
+     * watched task.
+     */
+    priority_t priority;
     uint32_t restarts;           /* total, for the whole uptime */
     uint32_t restarts_in_window;
     uint32_t window_start_ms;
@@ -79,7 +95,8 @@ void supervisor_init(void);
  * restart can distinguish "still the task I registered" from "slot reused".
  * Returns false if the table is full or the pid is not live.
  */
-bool supervisor_watch(const char* name, void (*entry)(void), uint32_t pid);
+bool supervisor_watch(const char* name, void (*entry)(void), uint32_t pid,
+                      priority_t priority);
 
 /*
  * One supervision pass: check every watched task and restart the dead ones.

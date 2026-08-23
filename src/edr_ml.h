@@ -740,6 +740,11 @@ void edr_response_get_stats(uint32_t* total_responses, uint8_t* log_count);
  */
 int edr_daemon_start(void);
 
+/* The daemon's entry point. Exposed only so the supervisor can restart it
+ * (supervisor_watch needs the void(*)(void)); use edr_daemon_start() to
+ * create the task. */
+void edr_daemon_main(void);
+
 /**
  * @brief Stop the EDR daemon process
  *

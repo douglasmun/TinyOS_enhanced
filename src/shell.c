@@ -954,6 +954,15 @@ static void parse_and_execute(char* cmd_line) {
             kprintf("[FAULT] knetd death requested\n");
         }
     }
+    /* verify-supervisor.sh step 6 only. ktimerd rather than knetd because
+     * knetd is PRIORITY_NORMAL, the same value task_create_kernel() assigns by
+     * default -- restoring its priority and failing to restore it are
+     * indistinguishable. ktimerd is PRIORITY_HIGH, so `ps -l` can witness the
+     * demotion. */
+    else if (strcmp(argv[0], "killktimerd") == 0) {
+        ktimerd_die_now = 1;
+        kprintf("[FAULT] ktimerd death requested\n");
+    }
     /* verify-netd-arbitration.sh only, and gated for the same reason killknetd
      * is: it exists to drive a state no production path reaches yet.
      *
