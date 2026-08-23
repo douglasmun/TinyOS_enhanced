@@ -98,6 +98,20 @@ jobs:
           make -j"$(nproc)" kernel.elf
           file kernel.elf
 
+      # 51 harnesses copy disk.img to a scratch path and exit 2 without it. It
+      # is an untracked, gitignored 128 MB binary that had only ever been made
+      # by hand on one machine, so it simply did not exist on a runner: the
+      # first full nightly run lost most of the suite to "disk.img not found",
+      # which reads as a wall of kernel failures rather than a missing fixture.
+      #
+      # The fixture it copies in (userspace/info.elf.signed -- the 14144 bytes
+      # verify-fsyscalls.sh asserts on) is TRACKED, so this needs nothing from
+      # the build and the ordering here is not load-bearing.
+      - name: Build the FAT32 disk.img that the harnesses mount as drive C
+        run: |
+          bash tools/make-disk-img.sh
+          ls -l disk.img
+
       - name: Run the suite
         run: |
           bash verify/run-all.sh

@@ -120,7 +120,7 @@ run_case() {
     rm -f "$serial"
     mon=$(mktemp -u /tmp/tinyos-spray-mon.XXXXXX)
     disk=$(mktemp -u /tmp/tinyos-spray-disk.XXXXXX)
-    dd if=/dev/zero of="$disk" bs=1m count=16 >/dev/null 2>&1
+    dd if=/dev/zero of="$disk" bs=1M count=16 >/dev/null 2>&1
 
     qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom "$ISO" \
         -boot d -m 256M \

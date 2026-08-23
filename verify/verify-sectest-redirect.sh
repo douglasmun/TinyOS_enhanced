@@ -132,7 +132,7 @@ echo "==> Guard: scheduler_stats() prints only outside its critical section"
 
 echo "==> Fresh BLANK disk (forces first-boot password setup)"
 rm -f "$RUN_DISK" "$SERIAL" "$TRACE" "$MON_SOCK"
-dd if=/dev/zero of="$RUN_DISK" bs=1m count=128 status=none
+dd if=/dev/zero of="$RUN_DISK" bs=1M count=128 status=none
 
 echo "==> Launching headless QEMU (monitor on $MON_SOCK)"
 qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom "$ISO" \
