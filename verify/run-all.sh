@@ -44,7 +44,13 @@ FILTER="${FILTER:-}"
 #   firstexec-trial.sh  -- a wrapper that invokes verify-exec.sh once per trial,
 #                          so it inherits the same block.
 #   run-all.sh          -- this file.
-EXCLUDE="verify-exec.sh firstexec-trial.sh run-all.sh"
+#   edr-rejoin.sh       -- a LIBRARY, not a harness: 24 harnesses source it for
+#                          the shared EDR-tear splice. Run as a script it
+#                          defines two functions and exits 0, so the suite
+#                          counted it as a 64th PASS that graded nothing. Its
+#                          actual coverage is edr-rejoin-test.sh, which IS a
+#                          harness and is included.
+EXCLUDE="verify-exec.sh firstexec-trial.sh run-all.sh edr-rejoin.sh"
 
 # Harnesses that build with -DTINYOS_FAULT_INJECT, which is NOT in the make
 # dependency graph. Objects compiled with it linger and break every LATER
@@ -155,7 +161,17 @@ for n in "${HARNESSES[@]}"; do
     elif printf '%s' "$verdict" | grep -q '^RESULT: *INCONCLUSIVE'; then
         cls=INCONCL; INCONCL=$((INCONCL+1))
     elif [ "$rc" -eq 0 ]; then
-        cls=PASS; PASS=$((PASS+1))
+        # rc=0 with NO printed verdict is a pass on the exit code alone. That is
+        # exactly how a broken guard hides: verify-ids-spray.sh once continued
+        # past a comparison that errored on stderr and still printed PASS. A
+        # harness that grades nothing must not be counted as coverage, so say so
+        # rather than silently adding it to the PASS column.
+        if [ -z "$verdict" ]; then
+            verdict="(rc=0 but printed no RESULT: line -- graded nothing?)"
+            cls=INCONCL; INCONCL=$((INCONCL+1))
+        else
+            cls=PASS; PASS=$((PASS+1))
+        fi
     elif [ "$rc" -eq 3 ]; then
         cls=INCONCL; INCONCL=$((INCONCL+1))
     elif [ "$rc" -eq 77 ]; then
