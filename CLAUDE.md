@@ -54,6 +54,16 @@ look arbitrary until you know which failure produced them.
 - Harnesses live in `verify/`; `verify/run-all.sh` is the batch runner (~2.7 h serially,
   so it is nightly/manual, not a PR gate). A harness that has never been run end to end
   reports PASS and proves nothing — run new ones against the **unfixed** tree.
+- **A harness must not delete its own evidence.** Three put `SERIAL` inside a
+  `mktemp -d` dir and `rm -rf`'d it from an EXIT trap, which fires on *failure* too —
+  destroying exactly the panic dump PR #128 added for issue #126. Use the shared
+  **`verify/preserve-serial.sh`** (tests: `verify/preserve-serial-test.sh`), and key it
+  on the **exit status, not a parsed verdict**: a run killed by `set -e`, a QEMU
+  timeout or a typist TIMEOUT never prints a verdict, and those are the runs worth
+  keeping. Capture `rc=$?` as the trap's **first** action — any earlier command
+  (`cleanup_qemu`) succeeds and resets `$?`, so a helper reading `$?` itself silently
+  preserves nothing. Unit tests that call the helper first in the trap pass against
+  that bug; only the real trap shape catches it.
 
 Build flags are all **explicitly named opt-outs, never defaults**:
 `-DELF_PERMISSIVE_SIGNATURES` (warn-and-load unsigned binaries),
