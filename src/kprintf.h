@@ -2,6 +2,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /**
  * @brief Per-character sink used by the console capture hook.
@@ -47,6 +48,7 @@ kprintf_capture_fn kprintf_set_capture(kprintf_capture_fn fn, void* ctx,
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 void kprintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -164,5 +166,27 @@ void kputs_safe(const char* str);
  *   kprintf("\n");
  */
 void kputs_safe_limited(const char* str, size_t max_len);
+
+/*
+ * Verbosity gate for DIAGNOSTIC output only.
+ *
+ * TinyOS grew ~2,150 kprintf sites as a debugging tool. Almost all of them are
+ * silent error paths; the ones that actually fire are either the one-time boot
+ * banner (kept -- it is the machine stating its posture) or per-event traces
+ * that repeat every time a program is exec'd.
+ *
+ * kdbg() is for the latter: load traces, page-table plumbing, per-segment
+ * copies. It is NOT for anything a defender or an operator needs to see.
+ * Security verdicts (signature PASS/FAIL, W^X refusals, threat alerts),
+ * failures, and panics must stay on plain kprintf, because a verbosity flag
+ * that can hide a refusal turns "absent" and "denied" into the same output --
+ * the status-surface failure this codebase has hit four times already.
+ *
+ * Default is off: the trace is recoverable at runtime with `loglevel debug`
+ * in the kernel shell, so diagnosing a failed exec never needs a rebuild.
+ */
+extern bool kdbg_enabled;
+
+void kdbg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 #endif

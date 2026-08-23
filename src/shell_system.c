@@ -1340,3 +1340,39 @@ void cmd_secstatus(int argc, char* argv[]) {
     stream_printf(ctx, "  Details (root): aslr | pae | wxaudit | auditlog | sectest\n");
     stream_printf(ctx, "\n");
 }
+
+/*
+ * cmd_loglevel -- toggle kernel diagnostic trace verbosity at runtime.
+ *
+ * Root only, for the same reason `pae` and `wxaudit` are: the traces this
+ * unmasks print kernel physical addresses (PDPT/PD allocations, CR3 values,
+ * per-segment load addresses), which is ASLR-defeating material regardless of
+ * how mundane the lines look individually.
+ *
+ * This gates DIAGNOSTICS ONLY. Security verdicts, failures and panics do not
+ * route through kdbg() and cannot be silenced from here -- see kprintf.h.
+ */
+void cmd_loglevel(int argc, char* argv[]) {
+    stream_context_t* ctx = get_current_streams();
+
+    if (!require_root("loglevel")) {
+        return;
+    }
+
+    if (argc < 2) {
+        stream_printf(ctx, "Kernel diagnostic trace: %s\n",
+                      kdbg_enabled ? "debug" : "normal");
+        stream_printf(ctx, "Usage: loglevel [normal|debug]\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "debug") == 0) {
+        kdbg_enabled = true;
+        stream_printf(ctx, "Kernel diagnostic trace: debug (exec/page-table trace ON)\n");
+    } else if (strcmp(argv[1], "normal") == 0) {
+        kdbg_enabled = false;
+        stream_printf(ctx, "Kernel diagnostic trace: normal\n");
+    } else {
+        stream_printf(ctx, "loglevel: unknown level '%s' (expected normal|debug)\n", argv[1]);
+    }
+}

@@ -116,7 +116,7 @@ bool elf_validate(const void* elf_data) {
         return false;
     }
 
-    kprintf("[ELF] Validation passed: 32-bit x86 executable\n");
+    kdbg("[ELF] Validation passed: 32-bit x86 executable\n");
     return true;
 }
 
@@ -206,7 +206,7 @@ bool elf_verify_signature(const void* elf_data, size_t elf_size) {
         return false;
     }
 
-    kprintf("[ELF] Found signature (offset=%u, elf_size=%u)\n",
+    kdbg("[ELF] Found signature (offset=%u, elf_size=%u)\n",
             sig->sig_offset, sig->elf_size);
 
     /* Compute SHA-256 hash of ELF (without signature) with interrupts MASKED.
@@ -483,7 +483,7 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
  *=============================================================================*/
 int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
                           int argc, const char* const* argv) {
-    kprintf("[ELF] Loading process '%s' (file size: %zu bytes)...\n", name, elf_size);
+    kdbg("[ELF] Loading process '%s' (file size: %zu bytes)...\n", name, elf_size);
 
     /*=========================================================================
      * SECURITY FIX: Validate Actual File Size
@@ -654,7 +654,7 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
 
     const elf32_phdr_t* phdr = (const elf32_phdr_t*)((uint8_t*)elf_data + ehdr->e_phoff);
 
-    kprintf("[ELF] Found %d program headers\n", ehdr->e_phnum);
+    kdbg("[ELF] Found %d program headers\n", ehdr->e_phnum);
 
     /*=========================================================================
      * SECURITY: Memory Limits for Process Segments
@@ -787,7 +787,7 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
             if (start < min_vaddr) min_vaddr = start;
             if (end > max_vaddr) max_vaddr = end;
 
-            kprintf("[ELF]   LOAD segment %d: vaddr=0x%08x memsz=0x%x filesz=0x%x flags=0x%x\n",
+            kdbg("[ELF]   LOAD segment %d: vaddr=0x%08x memsz=0x%x filesz=0x%x flags=0x%x\n",
                     i, phdr[i].p_vaddr, phdr[i].p_memsz, phdr[i].p_filesz, phdr[i].p_flags);
         }
     }
@@ -859,11 +859,11 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
         return -1;
     }
 
-    kprintf("[ELF] Memory range: 0x%08x - 0x%08x (total: %d bytes)\n",
+    kdbg("[ELF] Memory range: 0x%08x - 0x%08x (total: %d bytes)\n",
             min_vaddr, max_vaddr, total_mem);
 
     // Create process FIRST so we have a user page directory to map into
-    kprintf("[ELF] Creating process with entry point 0x%08x\n", ehdr->e_entry);
+    kdbg("[ELF] Creating process with entry point 0x%08x\n", ehdr->e_entry);
     int pid = task_create_user_argv((uint32_t)ehdr->e_entry, name,
                                     USER_STACK_LARGE, argc, argv);
     if (pid < 0) {
@@ -905,7 +905,7 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
     __asm__ volatile("mov %%cr3, %0" : "=r"(kernel_cr3));
 
     // Switch to user page directory to map pages there
-    kprintf("[ELF] Switching to user page directory (CR3=0x%08x)\n", task->page_directory);
+    kdbg("[ELF] Switching to user page directory (CR3=0x%08x)\n", task->page_directory);
     __asm__ volatile("mov %0, %%cr3" :: "r"(task->page_directory) : "memory");
 
     /*=========================================================================
@@ -1119,7 +1119,7 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
         /* Calculate number of pages from address range */
         uint32_t num_pages = (end_page - start_page) / 0x1000;
 
-        kprintf("[ELF] Loading segment %d: vaddr=0x%08x, pages=%d, flags=0x%016llx (p_flags=0x%x)\n",
+        kdbg("[ELF] Loading segment %d: vaddr=0x%08x, pages=%d, flags=0x%016llx (p_flags=0x%x)\n",
                 i, vaddr, num_pages, page_flags, p_flags);
 
         // Allocate physical pages and map them
@@ -1287,12 +1287,12 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
             }
         }
 
-        kprintf("[ELF]   Copied %d bytes, zeroed BSS %d bytes, zeroed head %d / tail %d bytes\n",
+        kdbg("[ELF]   Copied %d bytes, zeroed BSS %d bytes, zeroed head %d / tail %d bytes\n",
                 filesz, memsz - filesz, head_size, tail_size);
     }
 
     // Switch back to kernel page directory
-    kprintf("[ELF] Switching back to kernel page directory\n");
+    kdbg("[ELF] Switching back to kernel page directory\n");
     __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
 
     /*=========================================================================
@@ -1350,6 +1350,6 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
     }
     task->image_pages = (uint16_t)num_allocated;
 
-    kprintf("[ELF] Process created successfully: PID=%d\n", pid);
+    kdbg("[ELF] Process created successfully: PID=%d\n", pid);
     return pid;
 }

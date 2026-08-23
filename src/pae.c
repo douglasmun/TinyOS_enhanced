@@ -1011,7 +1011,7 @@ void pae_dump_tables(uint32_t virt) {
  * @return Physical address of the new PDPT, or 0 on failure
  *===========================================================================*/
 uint32_t pae_create_user_pdpt(void) {
-    kprintf("[PAE] Creating new user PDPT...\n");
+    kdbg("[PAE] Creating new user PDPT...\n");
 
     /*=========================================================================
      * STEP 1: Allocate physical frames
@@ -1036,7 +1036,7 @@ uint32_t pae_create_user_pdpt(void) {
         kprintf("[PAE] Available frames: %u KB\n", (pmm_free_frames() * 4096) / 1024);
         kernel_panic("PAE initialization failed - insufficient memory");
     }
-    kprintf("[PAE] Allocated PDPT at phys=0x%08x\n", pdpt_phys);
+    kdbg("[PAE] Allocated PDPT at phys=0x%08x\n", pdpt_phys);
 
     /* Allocate 4 pages for the 4 page directories */
     uint32_t pd_phys[PAE_PDPT_ENTRIES];
@@ -1052,7 +1052,7 @@ uint32_t pae_create_user_pdpt(void) {
             /* No cleanup needed - kernel_panic() halts system */
             kernel_panic("PAE initialization failed - insufficient memory for page directories");
         }
-        kprintf("[PAE] Allocated PD[%d] at phys=0x%08x\n", i, pd_phys[i]);
+        kdbg("[PAE] Allocated PD[%d] at phys=0x%08x\n", i, pd_phys[i]);
     }
 
     /*=========================================================================
@@ -1069,7 +1069,7 @@ uint32_t pae_create_user_pdpt(void) {
          *===================================================================*/
         uint64_t pdpt_value = (uint64_t)pd_phys[i] | PAE_PRESENT;
         pae_atomic_write_pdpte(&new_pdpt[i], pdpt_value);
-        kprintf("[PAE] PDPT[%d] = 0x%016llx (PD at 0x%08x)\n",
+        kdbg("[PAE] PDPT[%d] = 0x%016llx (PD at 0x%08x)\n",
                 i, pdpt_value, pd_phys[i]);
     }
 
@@ -1103,7 +1103,7 @@ uint32_t pae_create_user_pdpt(void) {
         }
     }
 
-    kprintf("[PAE] Created user PDPT at phys=0x%08x\n", pdpt_phys);
+    kdbg("[PAE] Created user PDPT at phys=0x%08x\n", pdpt_phys);
     return pdpt_phys;
 }
 
