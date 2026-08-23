@@ -994,7 +994,7 @@ TinyOS v1.20 now implements **production-grade exploit mitigation** comparable t
 
 > **User-mode W^X is enforced as of the June 2026 NX fix.** Generic user mappings
 > previously passed 32-bit page flags that dropped the high `PAE_NX` bit before the
-> PAE mapper; `map_page()`/`map_user_memory()` now take `uint64_t` flags so NX
+> PAE mapper; `map_page()` now takes `uint64_t` flags so NX
 > survives. The ELF loader marks non-executable segments NX, rejects W+X segments,
 > and re-maps code read-only after copy; user stacks are `PAE_PAGE_STACK` (RW+NX).
 > Runtime-verified in ENFORCE mode (signed `hello.elf` runs in ring 3, data-segment

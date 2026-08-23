@@ -674,9 +674,8 @@ void unmap_page_range(uint32_t vaddr_start, uint32_t vaddr_end) {
  * This function was dangerous because it could make arbitrary kernel memory
  * user-accessible without validation. Removed to prevent privilege escalation.
  *
- * If you need to make specific memory user-accessible:
- * - Use map_user_memory() with explicit physical address and validation
- * - Or modify page table entries directly with proper bounds checking
+ * If you need to make specific memory user-accessible, use the PAE path:
+ * pae_map_page_into() with an explicit physical address and validation.
  *=============================================================================*/
 
 
@@ -738,126 +737,6 @@ uint32_t* get_page_table_entry(uint32_t virtual_addr) {
     // Get page table entry
     uint32_t page_table_index = (virtual_addr >> 12) & 0x3FF;
     return &page_table[page_table_index];
-}
-
-
-/*=============================================================================
- * New User Memory Functions
- *=============================================================================*/
-
-// Map memory accessible from user mode
-void map_user_memory(uint32_t virtual_addr, uint32_t physical_addr, uint64_t flags) {
-    kprintf("map_user_memory: virt=0x%08x -> phys=0x%08x, flags=0x%016llx\n",
-           virtual_addr, physical_addr, flags);
-    
-    // Ensure user flag is set
-    flags |= PAGE_USER;
-    
-    kprintf("  Calling map_page...\n");
-    
-    // Use your existing map_page function
-    map_page(virtual_addr, physical_addr, flags);
-    
-    kprintf("  map_page completed for 0x%08x\n", virtual_addr);
-}
-
-// Unmap user memory (for process termination)
-void unmap_user_memory(uint32_t virtual_addr) {
-    if (!is_user_address(virtual_addr)) {
-        kprintf("WARNING: Trying to unmap non-user address 0x%08x\n", virtual_addr);
-        return;
-    }
-
-    /*=========================================================================
-     * SECURITY FIX: TLB flush after unmapping
-     *
-     * CRITICAL: After clearing the present bit, the CPU's TLB may still cache
-     * the old translation. Without flushing, user code can continue accessing
-     * the unmapped page until something else evicts that TLB entry.
-     *
-     * This is a classic "use after unmap" / isolation failure that allows:
-     * - Reading freed memory (information leak)
-     * - Writing to freed memory (corruption if page is reallocated)
-     *
-     * FIX: Use INVLPG instruction to flush the specific TLB entry immediately.
-     *=======================================================================*/
-    uint32_t* pte = get_page_table_entry(virtual_addr);
-    if (pte && (*pte & PAGE_PRESENT)) {
-        *pte &= ~PAGE_PRESENT;
-
-        /* Flush TLB entry for this specific virtual address */
-        __asm__ volatile("invlpg (%0)" :: "r"(virtual_addr) : "memory");
-
-        kprintf("Unmapped user memory: 0x%08x (TLB flushed)\n", virtual_addr);
-    }
-}
-
-
-// Set up a complete user process address space
-bool setup_user_process_paging(uint32_t code_phys_addr, size_t code_size) {
-    kprintf("=== setup_user_process_paging START ===\n");
-    kprintf("  Code physical: 0x%08x, size: %zu bytes\n", code_phys_addr, code_size);
-    kprintf("  Code virtual:  0x%08x\n", USER_CODE_BASE);
-    kprintf("  Stack virtual: 0x%08x\n", USER_STACK_BASE);
-
-    // Verify recursive mapping is working
-    uint32_t* recursive_pde = (uint32_t*)0xfffff000;
-    if ((*recursive_pde & PAGE_PRESENT) == 0) {
-        kprintf("ERROR: Recursive PDE not present! Paging system is broken.\n");
-        return false;
-    }
-
-    // Ensure page directory entry for user space exists
-    uint32_t* user_pde = (uint32_t*)0xffc00000 + 32;
-    if ((*user_pde & PAGE_PRESENT) == 0) {
-        kprintf("Pre-allocating page table for user space (PDE 32)\n");
-        uint32_t new_pt_phys = pmm_alloc();
-        if (!new_pt_phys) {
-            kprintf("ERROR: Failed to allocate page table for user space\n");
-            return false;
-        }
-        
-        *user_pde = new_pt_phys | PAGE_PRESENT | PAGE_READWRITE | PAGE_USER;
-        
-        // Clear the new page table
-        uint32_t* new_pt = (uint32_t*)0xffc08000;
-        for (int i = 0; i < 1024; i++) {
-            new_pt[i] = 0;
-        }
-        kprintf("User page table initialized at phys=0x%08x\n", new_pt_phys);
-    }
-
-    // Map user code
-    uint32_t code_virt = USER_CODE_BASE;
-    uint32_t code_phys = code_phys_addr;
-    
-    kprintf("1. Mapping user code pages...\n");
-    for (size_t i = 0; i < code_size; i += 4096) {
-        kprintf("   Page %zu: virt=0x%08zx -> phys=0x%08zx\n", 
-               i/4096, code_virt + i, code_phys + i);
-        map_user_memory(code_virt + i, code_phys + i, PAGE_READONLY);
-        kprintf("   Page %zu mapped successfully\n", i/4096);
-    }
-    kprintf("   All code pages mapped\n");
-    
-    // Allocate and map user stack (grows down)
-    kprintf("2. Allocating user stack...\n");
-    uint32_t stack_phys = pmm_alloc();
-    if (!stack_phys) {
-        kprintf("ERROR: Failed to allocate user stack\n");
-        return false;
-    }
-    kprintf("   Stack physical: 0x%08x\n", stack_phys);
-    
-    // Map stack with read/write permissions
-    kprintf("3. Mapping user stack...\n");
-    uint32_t stack_virt = USER_STACK_BASE - 4096;
-    kprintf("   Stack virt: 0x%08x -> phys: 0x%08x\n", stack_virt, stack_phys);
-    map_user_memory(stack_virt, stack_phys, PAE_PAGE_STACK);
-    kprintf("   Stack mapped successfully\n");
-    
-    kprintf("=== setup_user_process_paging COMPLETE ===\n");
-    return true;
 }
 
 
