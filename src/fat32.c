@@ -750,7 +750,13 @@ int fat32_mount(void) {
     kprintf("[FAT32] Data starts at sector %u\n", data_start_sector);
     kprintf("[FAT32] Root directory cluster: %u\n", root_dir_cluster);
     kprintf("[FAT32] Sectors per cluster: %u\n", sectors_per_cluster);
-    kprintf("[FAT32] Volume label: %.11s\n", boot_sector.volume_label);
+    /* vformat has no precision support, so "%.11s" printed literally on every
+     * successful mount. The field is a non-NUL-terminated uint8_t[11], so plain
+     * %s would read past it -- copy and terminate instead. */
+    char vol_label[12];
+    memcpy(vol_label, boot_sector.volume_label, 11);
+    vol_label[11] = '\0';
+    kprintf("[FAT32] Volume label: %s\n", vol_label);
 
     fat32_mounted = true;
     kprintf("[FAT32] Mount successful [OK]\n");
