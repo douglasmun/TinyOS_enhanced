@@ -27,6 +27,26 @@
 #include "syscall.h"   /* sys_waitpid() — the login shell blocks on it */
 #include "critical.h"
 
+#ifdef TINYOS_FAULT_INJECT
+/* verify-double-fault.sh only. Deliberately recursive, deliberately NOT
+ * tail-callable: at -O2 a plain `f(n+1)` tail call becomes a jump that loops
+ * forever without growing the stack, so no fault ever occurs and the harness
+ * would hang rather than fault. The volatile array forces a real frame per
+ * call and using the callee's result keeps it out of tail position. */
+/* -Winfinite-recursion is RIGHT: the recursion is unbounded on purpose, since
+ * blowing the stack is the whole point. Suppressed here only, not globally. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winfinite-recursion"
+__attribute__((noinline))
+static uint32_t shell_smash_kernel_stack(uint32_t depth) {
+    volatile uint32_t pad[16];
+    for (unsigned i = 0; i < 16; i++) pad[i] = depth + i;
+    uint32_t deeper = shell_smash_kernel_stack(depth + 1);
+    return pad[0] + deeper;
+}
+#pragma GCC diagnostic pop
+#endif
+
 #define SHELL_BUFFER_SIZE 256
 #define MAX_ARGS 10
 
@@ -894,6 +914,24 @@ static void parse_and_execute(char* cmd_line) {
      * which real OOM is the only other way to reach. */
     else if (strcmp(argv[0], "rowtest") == 0) {
         editor_rowtest();
+    }
+    /* verify-double-fault.sh only. Not in the command table, so it never
+     * appears in `help`.
+     *
+     * Exhausts the kernel task stack by unbounded recursion. The overflow runs
+     * off the end of the stack into its guard page -> #PF; delivering that #PF
+     * needs to push a frame onto the same exhausted stack, which faults again
+     * -> #DF. That is the ONE case the old interrupt-gate handler could not
+     * survive, because isr_common's pushes hit the dead stack too and the CPU
+     * escalated straight to a triple fault (silent reboot, no diagnostics).
+     *
+     * With the task gate the CPU loads a whole new context from the DF TSS, so
+     * the handler runs on its own stack and can print. This command is
+     * therefore expected to HALT the machine with a #DF dump -- that is a PASS,
+     * not a crash. Nothing resumes afterwards. */
+    else if (strcmp(argv[0], "dftest") == 0) {
+        kprintf("[FAULT] exhausting kernel stack to force #DF...\n");
+        shell_smash_kernel_stack(0);
     }
     /* verify-supervisor.sh only. Not in the command table, so it never appears
      * in `help` -- see the rationale on knetd_die_now in test_tasks.c. */

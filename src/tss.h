@@ -63,6 +63,24 @@ tss_t* tss_get(void);
 uint32_t tss_get_double_fault_stack_top(void);
 
 /**
+ * @brief Build the double-fault TSS and install its GDT descriptor
+ * @param df_index    GDT index to place the DF TSS descriptor at
+ * @param handler_eip Entry point the CPU jumps to on the task switch
+ * @param cr3         Page directory base to load (use the KERNEL pdpt)
+ *
+ * Must be called AFTER pae_init(), and before idt_install_double_fault_gate().
+ */
+void tss_init_double_fault(uint16_t df_index, uint32_t handler_eip, uint32_t cr3);
+
+/**
+ * @brief Get the double-fault TSS (the CPU writes the backlink into it)
+ */
+tss_t* tss_get_double_fault_tss(void);
+
+/** Selector of the double-fault TSS; 0 until tss_init_double_fault() runs. */
+extern uint16_t df_tss_selector;
+
+/**
  * @brief Update kernel stack pointer in TSS (for task switching)
  * @param stack_top Top of kernel stack for current task
  *

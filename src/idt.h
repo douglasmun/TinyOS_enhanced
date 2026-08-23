@@ -39,6 +39,15 @@ struct interrupt_regs;
 /* Called by assembly stubs - receives pointer to interrupt stack frame */
 void isr_common_handler(struct interrupt_regs* regs);
 
+/**
+ * @brief Install vector 8 (#DF) as a task gate
+ * @param tss_sel Selector of the double-fault TSS
+ *
+ * Call after tss_init_double_fault(). A task gate is the only i386 mechanism
+ * that switches stacks on an exception; IST is x86-64 only.
+ */
+void idt_install_double_fault_gate(uint16_t tss_sel);
+
 // Exception handlers
 void default_handler(void);
 void divide_by_zero_handler(void);

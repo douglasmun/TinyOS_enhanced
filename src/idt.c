@@ -123,7 +123,10 @@ void idt_init(void) {
     // idt_set_gate(6, invalid_opcode_handler, 0x8E);
     idt_set_gate( 6, isr6,  0x8E);
     idt_set_gate( 7, isr7,  0x8E);
-    // idt_set_gate(8, double_fault_handler, 0x8E);
+    /* Vector 8 is installed LAST, by idt_install_double_fault_gate(), as a
+     * TASK gate rather than an interrupt gate. isr8 remains the fallback
+     * until then: an unhandled #DF during early boot is still better than
+     * a bare IDT entry. See idt_install_double_fault_gate() below. */
     idt_set_gate( 8, isr8,  0x8E);
     idt_set_gate( 9, isr9,  0x8E);
     idt_set_gate(10, isr10, 0x8E);
@@ -178,6 +181,33 @@ void idt_init(void) {
     __asm__ volatile ("jmp 1f\n1:" : : : "memory");
 
     // kprintf("IDT installed\n");
+}
+
+/*-----------------------------------------------------------------------------
+ * Install vector 8 (#DF) as a TASK GATE
+ *
+ * A task gate is the only mechanism on i386 that switches stacks on an
+ * exception (IST is x86-64). Its descriptor layout differs from the interrupt
+ * gates used everywhere else, which is why idt_set_gate() cannot express it:
+ *
+ *   selector = TSS selector    (NOT a code selector)
+ *   offset   = IGNORED by the CPU, must be 0
+ *   type     = 0x85            (present, DPL=0, type 0101 = task gate)
+ *
+ * DPL is 0 deliberately. #DF is never raised by an `int 8` from ring 3 -- and
+ * with DPL=0 such an attempt takes #GP instead, so user code cannot trigger a
+ * task switch into the DF context on demand.
+ *
+ * Call AFTER tss_init_double_fault(), which supplies the selector.
+ *---------------------------------------------------------------------------*/
+void idt_install_double_fault_gate(uint16_t tss_sel) {
+    idt[8].offset_low  = 0;
+    idt[8].selector    = tss_sel;
+    idt[8].zero        = 0;
+    idt[8].type_attr   = 0x85;
+    idt[8].offset_high = 0;
+
+    __asm__ volatile ("" : : : "memory");
 }
 
 
