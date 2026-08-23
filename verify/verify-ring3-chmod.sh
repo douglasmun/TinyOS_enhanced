@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-ring3-chmod.sh — FULLY AUTOMATED check that `chmod` works from the
 # RING-3 shell via SYS_CHMOD (40), and that its OWNERSHIP rule holds there.
@@ -226,6 +227,16 @@ exec /shell.elf=>TinyOS shell (ring 3);\
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 
@@ -254,14 +265,14 @@ inconclusive_with() {
 # Split the log at the su. Everything after it is the test user's session;
 # everything before it is root's. Root's successes must NOT be allowed to
 # satisfy the unprivileged legs, which is the whole reason for the split.
-SU_LINE=$(grep -n "Now running as" "$SERIAL" | head -1 | cut -d: -f1)
+SU_LINE=$(grep -n "Now running as" "$REJOINED" | head -1 | cut -d: -f1)
 if [ -z "$SU_LINE" ]; then
     inconclusive_with "never reached the unprivileged account (no 'Now running as')" \
         "The su step did not complete, so neither ownership leg was exercised."
 fi
 
-ROOT_REGION=$(head -n "$SU_LINE" "$SERIAL")
-USER_REGION=$(tail -n +"$SU_LINE" "$SERIAL")
+ROOT_REGION=$(head -n "$SU_LINE" "$REJOINED")
+USER_REGION=$(tail -n +"$SU_LINE" "$REJOINED")
 
 # ---------------------------------------------------------------------------
 # Leg 1: SYS_CHMOD dispatched at all.
@@ -272,18 +283,18 @@ USER_REGION=$(tail -n +"$SU_LINE" "$SERIAL")
 # "Unknown system call number N". A leg matching only the second reported 0
 # and passed vacuously during the SYS_TIME negative control; don't repeat it.
 # ---------------------------------------------------------------------------
-REJECTED=$(grep -Ec "Invalid syscall number|Unknown system call" "$SERIAL")
+REJECTED=$(grep -Ec "Invalid syscall number|Unknown system call" "$REJOINED")
 if [ "$REJECTED" -ne 0 ]; then
     fail_with "the dispatcher rejected a syscall ($REJECTED occurrence(s))" \
         "MAX_SYSCALL_NUM must cover SYS_CHMOD (40), not stop at 39." \
         "Offending line(s):" \
-        "$(grep -Em2 'Invalid syscall number|Unknown system call' "$SERIAL")"
+        "$(grep -Em2 'Invalid syscall number|Unknown system call' "$REJOINED")"
 fi
 
 # ---------------------------------------------------------------------------
 # Leg 2: `chmod` is advertised in the ring-3 shell's help.
 # ---------------------------------------------------------------------------
-HELP_HIT=$(grep -c "change permission bits" "$SERIAL")
+HELP_HIT=$(grep -c "change permission bits" "$REJOINED")
 if [ "$HELP_HIT" -lt 1 ]; then
     fail_with "\`chmod\` is missing from the ring-3 shell's help output"
 fi

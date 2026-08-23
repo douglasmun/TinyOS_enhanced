@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-spawn.sh — FULLY AUTOMATED SYS_SPAWN check.
 #
@@ -73,6 +74,16 @@ TINYOS_EXPECT="spawner: done status=" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 trap - EXIT
@@ -86,29 +97,29 @@ if grep -q "Triple fault" "$TRACE" 2>/dev/null; then
     exit 1
 fi
 
-if grep -q "spawner: spawn failed" "$SERIAL" 2>/dev/null; then
+if grep -q "spawner: spawn failed" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — spawn() returned an error"
-    grep "spawner:" "$SERIAL" | tail -5
+    grep "spawner:" "$REJOINED" | tail -5
     exit 1
 fi
 
 # Ordered, like verify-argv.sh: a stale or duplicated line must not be able to
 # stand in for a missing one.
-l_pid=$(grep -n "spawner: child pid=" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_pid=$(grep -n "spawner: child pid=" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The CHILD's argv, passed by the spawner through the syscall. "from"/"spawn"
 # come from spawner.c, so these lines cannot be produced by the shell's own
 # exec path — they prove the vector survived ring3 -> kernel -> new stack.
-l_a1=$(grep -n "argv\[1\]=from"  "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_a2=$(grep -n "argv\[2\]=spawn" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_hi=$(grep -n "Hello from ELF!" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_done=$(grep -n "spawner: done status=" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_a1=$(grep -n "argv\[1\]=from"  "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_a2=$(grep -n "argv\[2\]=spawn" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_hi=$(grep -n "Hello from ELF!" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_done=$(grep -n "spawner: done status=" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$l_pid" ] || [ -z "$l_a1" ] || [ -z "$l_a2" ] || [ -z "$l_hi" ] || [ -z "$l_done" ]; then
     echo "RESULT: FAIL/INCONCLUSIVE (typist rc=$TYPIST_RC)"
     echo "  child pid line=${l_pid:-none} argv1=${l_a1:-none} argv2=${l_a2:-none}" \
          "hello=${l_hi:-none} done=${l_done:-none}"
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -116,11 +127,11 @@ fi
 # parent was woken early and the "wait" proved nothing.
 if [ "$TYPIST_RC" -eq 0 ] && [ "$l_hi" -gt "$l_pid" ] && [ "$l_done" -gt "$l_a2" ]; then
     echo "RESULT: PASS — ring-3 spawn + argv + waitpid all work"
-    grep -E "spawner:|argv\[|Hello from ELF!" "$SERIAL" | head -12
+    grep -E "spawner:|argv\[|Hello from ELF!" "$REJOINED" | head -12
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; out of order:" \
          "pid=$l_pid a1=$l_a1 a2=$l_a2 hello=$l_hi done=$l_done)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi

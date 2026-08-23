@@ -244,7 +244,8 @@ stream_context_t* get_current_streams(void);
  *
  * Note: This wraps kprintf() but respects stdout redirection
  */
-int stream_printf(stream_context_t* ctx, const char* format, ...);
+int stream_printf(stream_context_t* ctx, const char* format, ...)
+    __attribute__((format(printf, 2, 3)));
 
 /**
  * @brief Simple string output to current stdout

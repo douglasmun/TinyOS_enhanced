@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-ring3-redirect.sh — FULLY AUTOMATED check of RING-3 redirection.
 #
@@ -141,6 +142,16 @@ id=>uid=" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 trap - EXIT
@@ -154,18 +165,18 @@ if grep -q "Triple fault" "$TRACE" 2>/dev/null; then
     exit 1
 fi
 
-if grep -q "not found (try 'help')" "$SERIAL" 2>/dev/null; then
+if grep -q "not found (try 'help')" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — the shell did not recognise a command it should have"
-    grep "not found (try" "$SERIAL" | tail -5
+    grep "not found (try" "$REJOINED" | tail -5
     exit 1
 fi
 
 # A redirection the shell could not apply. The C: case is EXPECTED to fail and
 # is checked separately below, so exclude it here by matching only D: targets.
-if grep -qE "^(>|>>|<): .*(no such file|permission denied|invalid)" "$SERIAL" 2>/dev/null; then
-    if grep -qE "^(>|>>|<): [^C]" "$SERIAL" 2>/dev/null; then
+if grep -qE "^(>|>>|<): .*(no such file|permission denied|invalid)" "$REJOINED" 2>/dev/null; then
+    if grep -qE "^(>|>>|<): [^C]" "$REJOINED" 2>/dev/null; then
         echo "RESULT: FAIL — a redirection onto D: was refused"
-        grep -E "^(>|>>|<): " "$SERIAL" | tail -10
+        grep -E "^(>|>>|<): " "$REJOINED" | tail -10
         exit 1
     fi
 fi
@@ -186,26 +197,26 @@ fi
 #   r3-gamma: 1 command echo + 1 from `cat r.txt`               = 2.  If `>`
 #             failed to truncate, the alpha/beta text would still be in the
 #             file afterwards, which the alpha count below would catch.
-n_alpha=$(grep -c "r3-alpha" "$SERIAL" 2>/dev/null)
-n_beta=$(grep -c "r3-beta" "$SERIAL" 2>/dev/null)
-n_gamma=$(grep -c "r3-gamma" "$SERIAL" 2>/dev/null)
+n_alpha=$(grep -c "r3-alpha" "$REJOINED" 2>/dev/null)
+n_beta=$(grep -c "r3-beta" "$REJOINED" 2>/dev/null)
+n_gamma=$(grep -c "r3-gamma" "$REJOINED" 2>/dev/null)
 #   r3-delta: the GLUED-operator case, `echo r3-delta>d.txt` with no spaces.
 #             The word must split at `>` the way the kernel shell splits it. If
 #             it does not, `echo` prints the whole "r3-delta>d.txt" to the
 #             console and nothing reaches a file, so `cat d.txt` fails — the
 #             count stays at the command echo alone instead of reaching 2.
-n_delta=$(grep -c "r3-delta" "$SERIAL" 2>/dev/null)
+n_delta=$(grep -c "r3-delta" "$REJOINED" 2>/dev/null)
 
 # Line numbers where ORDER is the point.
-l_cd=$(grep -n "D:/scratch" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_cd=$(grep -n "D:/scratch" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # hello.elf's output, which must appear only when the file is cat'd — proving
 # the CHILD inherited the redirected stdout rather than printing to the console.
-l_hello=$(grep -n "Hello from ELF" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_catcmd=$(grep -n "cat h\.txt" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_hello=$(grep -n "Hello from ELF" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_catcmd=$(grep -n "cat h\.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The refusal for a non-RAMFS target.
-l_xdev=$(grep -n "^>: C:/nope.txt" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_xdev=$(grep -n "^>: C:/nope.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The console still works after all the redirecting — the restore path ran.
-l_id=$(grep -n "uid=" "$SERIAL" 2>/dev/null | tail -1 | cut -d: -f1)
+l_id=$(grep -n "uid=" "$REJOINED" 2>/dev/null | tail -1 | cut -d: -f1)
 
 if [ -z "$l_cd" ] || [ -z "$l_hello" ] || [ -z "$l_catcmd" ] \
    || [ -z "$l_xdev" ] || [ -z "$l_id" ]; then
@@ -214,7 +225,7 @@ if [ -z "$l_cd" ] || [ -z "$l_hello" ] || [ -z "$l_catcmd" ] \
          "xdev=${l_xdev:-none} id=${l_id:-none}" \
          "counts: alpha=$n_alpha beta=$n_beta gamma=$n_gamma"
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -40
+    grep -v "Suspicious" "$REJOINED" | tail -40
     exit 2
 fi
 
@@ -224,14 +235,14 @@ if [ "$n_alpha" -lt 4 ]; then
     echo "RESULT: FAIL — '>>' did not append: r3-alpha appeared $n_alpha times, expected 4"
     echo "  (the text written with '>' did not survive the following '>>',"
     echo "   i.e. the append truncated the file instead of seeking to its end)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
 if [ "$n_beta" -lt 3 ] || [ "$n_gamma" -lt 2 ]; then
     echo "RESULT: FAIL — a redirected round-trip did not come back"
     echo "  counts: alpha=$n_alpha beta=$n_beta (want >=3) gamma=$n_gamma (want >=2)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -239,14 +250,20 @@ fi
 # shell that never split `r3-delta>d.txt` still echoes that whole string, so the
 # marker appears either way. What distinguishes them is an occurrence with the
 # operator NOT attached — that can only come from `cat d.txt` reading the file.
-n_delta_bare=$(grep -c "r3-delta[^>]" "$SERIAL" 2>/dev/null)
+# `[^>]` alone requires a character AFTER the marker, but the successful
+# readback is `r3-delta` at END OF LINE with nothing following it -- so the
+# bracket cannot match and a CORRECT kernel scores 0. Alternate with `$`.
+# The discrimination is unchanged: in a shell that does not split, both
+# occurrences are `r3-delta>`, where neither end-of-line nor a non-'>'
+# character is available. Negative-controlled against exactly that log.
+n_delta_bare=$(grep -cE "r3-delta([^>]|$)" "$REJOINED" 2>/dev/null)
 if [ "$n_delta_bare" -lt 1 ]; then
     echo "RESULT: FAIL — 'echo r3-delta>d.txt' did not redirect (glued operator)"
     echo "  r3-delta seen $n_delta times, but never without '>' attached, so the"
     echo "  tokenizer treated 'r3-delta>d.txt' as one argument and printed it"
     echo "  instead of writing d.txt. The kernel shell splits at '>' mid-word;"
     echo "  the ring-3 shell must agree."
-    grep -v "Suspicious" "$SERIAL" | grep "r3-delta" | head -10
+    grep -v "Suspicious" "$REJOINED" | grep "r3-delta" | head -10
     exit 2
 fi
 
@@ -256,16 +273,16 @@ fi
 # truncate flag and ramfs_write only grows node->size, so a `>` that merely
 # overwrote from offset 0 would leave the longer old tail readable, and every
 # other check in this harness would still pass.
-l_gammacmd=$(grep -n "echo r3-gamma > r\.txt" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_lastalpha=$(grep -n "r3-alpha" "$SERIAL" 2>/dev/null | tail -1 | cut -d: -f1)
-l_lastbeta=$(grep -n "r3-beta" "$SERIAL" 2>/dev/null | tail -1 | cut -d: -f1)
+l_gammacmd=$(grep -n "echo r3-gamma > r\.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_lastalpha=$(grep -n "r3-alpha" "$REJOINED" 2>/dev/null | tail -1 | cut -d: -f1)
+l_lastbeta=$(grep -n "r3-beta" "$REJOINED" 2>/dev/null | tail -1 | cut -d: -f1)
 
 if [ -n "$l_gammacmd" ] && { [ "$l_lastalpha" -gt "$l_gammacmd" ] \
                           || [ "$l_lastbeta" -gt "$l_gammacmd" ]; }; then
     echo "RESULT: FAIL — '>' did not truncate: old contents still readable after the overwrite"
     echo "  ('echo r3-gamma > r.txt' at line $l_gammacmd, but r3-alpha last seen at" \
          "$l_lastalpha and r3-beta at $l_lastbeta)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -276,7 +293,7 @@ fi
 if [ "$l_hello" -lt "$l_catcmd" ]; then
     echo "RESULT: FAIL — hello.elf printed to the console; the child did not inherit the redirected stdout"
     echo "  ('Hello from ELF' at line $l_hello, 'cat h.txt' at $l_catcmd)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
@@ -284,11 +301,11 @@ if [ "$TYPIST_RC" -eq 0 ] && [ "$l_xdev" -gt "$l_hello" ] \
    && [ "$l_id" -gt "$l_xdev" ]; then
     echo "RESULT: PASS — ring-3 '>' truncates, '>>' appends, '<' feeds stdin, a spawned child inherited the redirected stdout, a C: target was refused, and the console was restored"
     echo "  (marker counts: alpha=$n_alpha beta=$n_beta gamma=$n_gamma)"
-    grep -E "r3-alpha|r3-beta|r3-gamma|Hello from ELF|^>: C:|uid=" "$SERIAL" | head -25
+    grep -E "r3-alpha|r3-beta|r3-gamma|Hello from ELF|^>: C:|uid=" "$REJOINED" | head -25
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; out of order:" \
          "cd=$l_cd hello=$l_hello catcmd=$l_catcmd xdev=$l_xdev id=$l_id)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi

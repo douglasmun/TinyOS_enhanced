@@ -234,8 +234,15 @@ being exactly `E1000_RX_PACKET_BUDGET`. A delta-only harness would have passed t
 kernel. The 16/4 split is also the tidiest statement of the original bug: the attacker's
 arrival rate decided how much of the parser ran with `IF=0`.
 
-Also re-ran `verify-ids-signature.sh`, which needs a DHCP lease and inbound UDP and so
-covers the boot-drain path this harness's NAT-less netdev cannot reach. Both pass.
+Also re-ran `verify-ids-signature.sh`, which at the time needed a DHCP lease and inbound
+UDP and so covered the boot-drain path this harness's NAT-less netdev cannot reach. Both
+pass.
+
+> **Since superseded (2026-08-22).** `verify-ids-signature.sh` was migrated to the mcast
+> netdev when the default-deny firewall stranded its UDP vehicle, and it no longer takes a
+> lease. The boot-drain witness is now `verify-firewall-default-deny.sh`, whose arm B
+> guards on the lease explicitly. The run recorded above was real; only the citation is
+> stale.
 
 ### 2. Remove the remotely-floodable `kprintf` sites — **DONE** (reopened for `tcp.c`, closed again)
 
@@ -436,15 +443,25 @@ belong here because they correct the sketch above:
 ## Sequencing
 
 1. ~~**Item 2**~~ — **done**, `verify-rxdrop-counters.sh`.
-2. ~~**Item 1**~~ — **done**, `verify-rx-thread-context.sh` (+ `verify-ids-signature.sh`
-   for the DHCP/boot-drain path). The boot-path question was the sharp edge as
+2. ~~**Item 1**~~ — **done**, `verify-rx-thread-context.sh` (+
+   `verify-firewall-default-deny.sh` for the DHCP/boot-drain path — its arm B
+   guards on the lease explicitly). The boot-path question was the sharp edge as
    predicted; it is resolved with an explicit drain in `kernel.c`'s DHCP loop.
 3. ~~**Item 3**~~ — **done**, `verify-dma-guard.sh`.
-4. **Item 4** — its own roadmap entry, now unblocked (1–3 have landed), with its
-   harness designed up front. **Next up**, and the only multi-PR item of the four.
-   Design landed as `doc/NETDAEMON_DESIGN.md`; it proposes four PRs (audit → packet
-   syscalls → socket API → move to ring 3) and leaves four questions open, the
-   sharpest being whether `firewall.c`/`ids.c` belong on the ring-3 side at all.
+4. ~~**Item 4**~~ — **WITHDRAWN**, not next up. Design landed as
+   `doc/NETDAEMON_DESIGN.md` and proposed four PRs (audit → packet syscalls →
+   socket API → move to ring 3). The first three landed and stay correct; the
+   fourth — moving the parser to ring 3 — is **cancelled**. See "D1 re-scoped"
+   in `doc/NETDAEMON_DESIGN.md` before reopening this.
+
+   The short version: the plan asked "can this protocol move?" (privileged
+   instructions, TX path, stack budget) and never asked **"what does moving
+   buy?"** DNS, DHCP and ARP all produce results ring 0 consumes and acts on,
+   so moving them relocates the parse and hands the trust straight back through
+   a syscall a compromised daemon can call at will. ICMP passes that test and
+   still fails a second one: a responder must reply, so it needs `SYS_NETTX`,
+   and `e1000_send()` does no source validation — that is unrestricted frame
+   forgery (ARP poisoning, DHCP spoofing, TCP injection).
 
 ## Corrections to the first-pass assessment
 

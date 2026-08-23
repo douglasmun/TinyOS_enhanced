@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-cred-deprecation.sh — FULLY AUTOMATED check that the DEPRECATED
 # credential syscalls are UNREACHABLE FROM RING 3, and that the ones that
@@ -73,6 +74,11 @@ PASSWORD="${TINYOS_TEST_PASSWORD:-${TINYOS_PASSWORD:-rootpass1}}"
 # credprobe.c, and must never appear in the log.
 GUESS=guessguess
 
+# The probe must run as an UNPRIVILEGED user. See the escalation assertion
+# below for why running it as root made that leg unfalsifiable.
+TESTUSER=creduser
+TESTPASS=credpass1
+
 ISO=dist/tinyos.iso
 SERIAL=cred-deprecation.log
 TRACE=cred-deprecation-trace.log
@@ -105,20 +111,46 @@ QEMU_PID=$!
 cleanup() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; rm -f "$MON_SOCK"; }
 trap cleanup EXIT
 
-# Run the probe from the KERNEL shell (the typist types `kshell` by default).
-# `exec` runs it as a ring-3 process, which is what matters: the syscalls are
-# issued from CPL 3 through int 0x80.
+# The probe runs as an UNPRIVILEGED user, and that is the whole point of the
+# sequencing below. `exec` runs it as a ring-3 process, so the syscalls are
+# issued from CPL 3 through int 0x80 either way -- but the ESCALATION leg
+# ("the probe must not end up as root") can only be falsified if the probe
+# did not START as root. Run from the root shell, `PROBE uid=0` is the
+# probe's correct inherited state, so that assertion FAILS on a correct
+# kernel and could not pass on a broken one either. It was one-sided in
+# both directions, and it stood as a FAIL until this was fixed.
+#
+# The typist runs TINYOS_EXEC_CMD before the followups, so the account has to
+# be created in the followup list and the real probe exec'd after the `su`.
+# TINYOS_EXEC_CMD is therefore a throwaway that only gets us to a prompt.
 #
 # The trailing `whoami` is a barrier as much as a check — a syscall that wedged
-# instead of returning would eat these keystrokes.
+# instead of returning would eat these keystrokes. It must report the TEST
+# USER now, not root: that is what proves the refused syscalls left the
+# session's credentials untouched.
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_PASSWORD="$PASSWORD" \
-TINYOS_EXEC_CMD="exec /credprobe.elf" \
-TINYOS_EXPECT="PROBE VERDICT" \
-TINYOS_FOLLOWUP_CMDS="whoami=>root" \
+TINYOS_EXEC_CMD="exec /hello.elf" \
+TINYOS_EXPECT="Hello from ELF" \
+TINYOS_FOLLOWUP_CMDS="\
+useradd $TESTUSER=>Enter password for new user;\
+!$TESTPASS=>created;\
+su $TESTUSER=>Now running as;\
+exec /credprobe.elf=>PROBE VERDICT;\
+whoami=>$TESTUSER" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
+
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
 
 sleep 3
 cleanup
@@ -136,9 +168,9 @@ fail_with() {
     shift
     for line in "$@"; do echo "  $line"; done
     echo "  --- probe output ---"
-    grep "PROBE" "$SERIAL" | head -10
+    grep "PROBE" "$REJOINED" | head -10
     echo "  --- last 25 serial lines ---"
-    grep -v "Suspicious" "$SERIAL" | tail -25
+    grep -v "Suspicious" "$REJOINED" | tail -25
     exit 2
 }
 
@@ -146,7 +178,7 @@ fail_with() {
 #
 # Checked first: every assertion below would vacuously "pass" against a log in
 # which the probe never executed.
-grep -q "PROBE VERDICT" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "PROBE VERDICT" "$REJOINED" 2>/dev/null || fail_with \
     "the ring-3 probe never ran to completion" \
     "Nothing below was tested. Check that /credprobe.elf is seeded into RAMFS" \
     "at 0755 and that its signature verifies."
@@ -155,7 +187,7 @@ grep -q "PROBE VERDICT" "$SERIAL" 2>/dev/null || fail_with \
 #
 # -38 is -ENOSYS. Asserted EXACTLY: -EPERM would mean the call was dispatched
 # and then declined, which is a weaker property than never being dispatched.
-grep -q "PROBE switch_user rc=-38" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "PROBE switch_user rc=-38" "$REJOINED" 2>/dev/null || fail_with \
     "SYS_SWITCH_USER was REACHABLE from ring 3" \
     "It takes a plaintext password in a syscall argument register — the exact" \
     "exposure SYS_CRED was built to remove, and it cannot be hardened away" \
@@ -163,21 +195,35 @@ grep -q "PROBE switch_user rc=-38" "$SERIAL" 2>/dev/null || fail_with \
     "Ring-3 dispatch must return -ENOSYS (-38) unless the kernel was built" \
     "-DTINYOS_LEGACY_CRED_SYSCALLS."
 
-grep -q "PROBE change_password rc=-38" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "PROBE change_password rc=-38" "$REJOINED" 2>/dev/null || fail_with \
     "SYS_CHANGE_PASSWORD was REACHABLE from ring 3" \
     "Same class as SYS_SWITCH_USER above: a plaintext password crosses the" \
     "ring boundary in a register. Must be -ENOSYS (-38)."
 
 # The probe's independent verdict. Computed inside the program, so a drift
 # between it and the greps above is visible rather than silent.
-grep -q "PROBE VERDICT refused" "$SERIAL" 2>/dev/null || fail_with \
+grep -q "PROBE VERDICT refused" "$REJOINED" 2>/dev/null || fail_with \
     "the probe itself concluded the syscalls were reachable" \
     "The program computes this independently of the harness's own checks."
 
+# --- Positive control: the probe really was unprivileged ------------------
+#
+# This guard is what keeps the escalation leg below falsifiable. If the `su`
+# silently failed, the probe would run as root, `PROBE uid=0` would be its
+# correct inherited state, and the escalation assertion would be grading
+# nothing -- exactly the defect this harness shipped with. Assert the switch
+# landed BEFORE reading anything into the uid the probe reports.
+grep -q "Now running as: $TESTUSER" "$REJOINED" 2>/dev/null || fail_with \
+    "the su to $TESTUSER never completed, so the probe ran as root" \
+    "The escalation leg below is only meaningful for an unprivileged caller." \
+    "This is a harness failure, not a kernel finding."
+
 # --- The negative: no escalation ------------------------------------------
 #
-# The probe asked to become root. It must still be uid 1000.
-if grep -qE "PROBE uid=0" "$SERIAL" 2>/dev/null; then
+# The probe asked to become root. It must still be the unprivileged test user.
+# uid 0 is root, so any `PROBE uid=0` here is a committed credential change --
+# and the su guard above proves the probe did not simply start there.
+if grep -qE "PROBE uid=0" "$REJOINED" 2>/dev/null; then
     fail_with \
         "the ring-3 probe ended up as ROOT" \
         "A refused credential syscall must not commit a credential change." \
@@ -185,24 +231,27 @@ if grep -qE "PROBE uid=0" "$SERIAL" 2>/dev/null; then
 fi
 
 # --- The session survived --------------------------------------------------
-
-grep -q "whoami" "$SERIAL" 2>/dev/null || fail_with \
+#
+# Match the OUTPUT of whoami, not the string "whoami" -- the latter matches
+# the command echo, which the shell prints before running anything, so it
+# survives a shell that wedged on the very next instruction.
+grep -qE "^$TESTUSER" "$REJOINED" 2>/dev/null || fail_with \
     "the shell did not survive the probe" \
     "A refused syscall must RETURN an errno, not fault or wedge the caller."
 
 # --- Sweep: the guessed password never reached an output path -------------
 
-if grep -q "$GUESS" "$SERIAL" 2>/dev/null; then
+if grep -q "$GUESS" "$REJOINED" 2>/dev/null; then
     fail_with \
         "the password string passed to the kernel appeared in the serial log" \
         "The kernel must never print a password it was handed, even a wrong" \
         "one and even on a refusal path." \
-        "$(grep -n "$GUESS" "$SERIAL" | head -5)"
+        "$(grep -n "$GUESS" "$REJOINED" | head -5)"
 fi
 
 # --- Sanity: no crash ------------------------------------------------------
 
-if grep -qi "triple fault\|PANIC" "$SERIAL" 2>/dev/null; then
+if grep -qi "triple fault\|PANIC" "$REJOINED" 2>/dev/null; then
     fail_with "kernel panicked or triple-faulted during the run"
 fi
 
@@ -213,5 +262,5 @@ echo "  - SYS_CHANGE_PASSWORD refused at the boundary with -ENOSYS"
 echo "  - the probe's own verdict agrees: refused"
 echo "  - no privilege escalation: the probe never became root"
 echo "  - the shell survived; no plaintext password reached the log"
-grep "PROBE" "$SERIAL" | head -6
+grep "PROBE" "$REJOINED" | head -6
 exit 0

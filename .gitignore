@@ -45,6 +45,9 @@ idsblock*.log
 fwdeny*.log
 udprx*.log
 dhcprx*.log
+# Spliced copies a harness writes beside its serial log to repair EDR-torn
+# lines. Purely derived, so a blanket pattern is safe here.
+*.rejoined
 
 # --- Personal ops scripts (not part of the OS; reference a specific GitHub repo) ---
 publish.sh

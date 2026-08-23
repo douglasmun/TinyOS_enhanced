@@ -80,7 +80,7 @@ volume persists.
 Still limited to the **root directory** and to `fat32_create`'s first root
 cluster; subdirectory creation and multi-cluster root scans remain future work.
 
-## 4. Move the shell to userspace (capstone) — IN PROGRESS
+## 4. Move the shell to userspace (capstone) — CLOSED
 Deferred design item; depends on 1–3 (shell needs spawn, waitpid, file
 syscalls to live in ring 3). Once done, the kernel/user boundary becomes
 architecturally honest — the kernel stops containing its own UI. Largest

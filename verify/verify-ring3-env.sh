@@ -249,12 +249,13 @@ inconclusive_with() {
     exit 3
 }
 
-# The serial log is CRLF. A positional assertion like grep '^root$' silently
-# fails against "root\r" and reports a kernel failure that is really a line
-# ending mismatch. Do NOT fix that with '\r\?' — grep here is ugrep, which
-# rejects it as an empty subexpression. Strip once, up front, and work on the
-# stripped copy for every content assertion.
-CLEAN=$(tr -d '\r' < "$SERIAL")
+# Repair command echoes torn by the EDR bursts. The three traps this
+# handles (ADVANCED as well as DAEMON, the status report's bracketing
+# blank lines, and a marker-free continuation line) are documented in
+# edr-rejoin.sh; edr-rejoin-test.sh is the case set.
+. "$(dirname "$0")/edr-rejoin.sh"
+
+CLEAN=$(rejoin_edr < "$SERIAL")
 
 # Split at the su. Everything after it is the unprivileged session, and every
 # env assertion must be measured THERE: root's own ring-3 shell ran the same

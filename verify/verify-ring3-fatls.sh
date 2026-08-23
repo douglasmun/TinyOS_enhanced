@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-ring3-fatls.sh — does ring 3 already reach FAT32 through the generic
 # `ls`, with no `fatls` builtin and no new syscall?
@@ -186,6 +187,16 @@ exec /shell.elf=>TinyOS shell (ring 3);\
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
+
 sleep 3
 cleanup
 
@@ -226,14 +237,14 @@ fi
 # `fatls` output (and its `ls`, which routes to cmd_fatls for C:) sits in the
 # same log and satisfies the FAT32 legs while proving nothing about ring 3.
 # ---------------------------------------------------------------------------
-SU_LINE=$(grep -n "Now running as" "$SERIAL" | head -1 | cut -d: -f1)
+SU_LINE=$(grep -n "Now running as" "$REJOINED" | head -1 | cut -d: -f1)
 if [ -z "$SU_LINE" ]; then
     inconclusive_with "never reached the unprivileged account (no 'Now running as')" \
         "Every leg below is about what a NON-ROOT ring-3 caller can do," \
         "so root's own output must not be allowed to stand in for it."
 fi
 
-R3_REL=$(tail -n +"$SU_LINE" "$SERIAL" | grep -n "TinyOS shell (ring 3)" | head -1 | cut -d: -f1)
+R3_REL=$(tail -n +"$SU_LINE" "$REJOINED" | grep -n "TinyOS shell (ring 3)" | head -1 | cut -d: -f1)
 if [ -z "$R3_REL" ]; then
     inconclusive_with "the unprivileged account never reached a ring-3 shell" \
         "'exec /shell.elf' did not announce itself after the su, so the" \
@@ -241,7 +252,7 @@ if [ -z "$R3_REL" ]; then
 fi
 
 R3_LINE=$((SU_LINE + R3_REL - 1))
-USER_R3=$(tail -n +"$R3_LINE" "$SERIAL")
+USER_R3=$(tail -n +"$R3_LINE" "$REJOINED")
 
 # ---------------------------------------------------------------------------
 # Leg 1: nothing was rejected by the dispatcher.
@@ -253,11 +264,11 @@ USER_R3=$(tail -n +"$R3_LINE" "$SERIAL")
 # SYS_OPEN (20) and SYS_READDIR (22) are long-standing — which is precisely
 # the point being proven, so a rejection would mean the premise is wrong.
 # ---------------------------------------------------------------------------
-REJECTED=$(grep -Ec "Invalid syscall number|Unknown system call" "$SERIAL")
+REJECTED=$(grep -Ec "Invalid syscall number|Unknown system call" "$REJOINED")
 if [ "$REJECTED" -ne 0 ]; then
     fail_with "the dispatcher rejected a syscall ($REJECTED occurrence(s))" \
         "This test asserts NO new syscall is needed; a rejection refutes that." \
-        "$(grep -Em2 'Invalid syscall number|Unknown system call' "$SERIAL")"
+        "$(grep -Em2 'Invalid syscall number|Unknown system call' "$REJOINED")"
 fi
 
 # ---------------------------------------------------------------------------

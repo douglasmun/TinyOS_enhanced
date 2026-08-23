@@ -68,7 +68,15 @@ TRACE=tcprx-trace.log
 MON_SOCK=/tmp/tinyos-tcprx-mon.sock
 RUN_DISK=/tmp/tinyos-tcprx-disk.img
 GUEST_MAC=52:54:00:12:34:56
-SRC_IP=10.0.2.99
+# TEST-NET-3 (RFC 5737), matching the icmp and udp sibling harnesses.
+#
+# This was 10.0.2.99, which is RFC1918 and survived only because firewall.c's
+# 10.0.0.0/8 bogon check is commented out ("Disabled for LAN operation"). The
+# harness was therefore resting on a DISABLED check: re-enabling it -- which
+# that comment invites -- would have silently dropped every injected frame and
+# turned this into a second false FAIL, with the same delta-0 signature as the
+# firewall problem below. TEST-NET-3 is never a bogon here and never will be.
+SRC_IP=203.0.113.99
 
 BAD_COUNT=${TINYOS_TCP_BAD_FRAMES:-20}
 CTL_COUNT=${TINYOS_TCP_CTL_FRAMES:-7}   # deliberately != BAD_COUNT, so a
@@ -90,8 +98,24 @@ python3 tools/inject_frames.py --help 2>&1 | grep -q "tcp-data-offset" \
     || guard_fail "tools/inject_frames.py has no --tcp-data-offset; cannot craft
 a malformed TCP header."
 
+# The injected segments need a way past the firewall's default DENY ALL, which
+# sits ABOVE the L4 dispatch and so zeroes every counter this harness reads --
+# see the TINYOS_FAULT_INJECT block in src/kernel.c for why none of the four
+# standing accept paths can carry them. That rule is compiled out by default,
+# hence the flag.
+grep -q "TINYOS_FAULT_INJECT" src/kernel.c \
+    || guard_fail "src/kernel.c has no TINYOS_FAULT_INJECT firewall rule; injected
+TCP would die at the default deny and every counter would read 0."
+
 echo "==> Building kernel + ISO..."
-make >/dev/null || { echo "build failed"; exit 2; }
+# Clean both before and after: EXTRA_CFLAGS is not in the dependency graph, so a
+# default-built tree relinks stale objects that lack the rule, and the object
+# tree THIS run leaves behind is poisoned for every harness that builds without
+# the flag. The after-clean lives in cleanup() below rather than its own trap,
+# because this harness already has one and a second `trap ... EXIT` would
+# silently replace it, leaking the QEMU process.
+make clean >/dev/null 2>&1
+make EXTRA_CFLAGS=-DTINYOS_FAULT_INJECT >/dev/null || { echo "build failed"; exit 2; }
 cp kernel.elf iso/boot/kernel.elf
 i686-elf-grub-mkrescue -o "$ISO" iso >/dev/null 2>&1 || { echo "mkrescue failed"; exit 2; }
 
@@ -117,6 +141,9 @@ cleanup() {
     [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
     [ -n "${QEMU_PID:-}" ] && wait "$QEMU_PID" 2>/dev/null
     rm -f "$MON_SOCK" "$RUN_DISK"
+    # See the build step: this run's objects carry -DTINYOS_FAULT_INJECT and
+    # would be relinked into the next harness's kernel.
+    make clean >/dev/null 2>&1
     return 0
 }
 trap cleanup EXIT
@@ -219,8 +246,27 @@ if [ "$MAL_D" -ne "$BAD_COUNT" ]; then
             echo "  Zero, but no-conn rose by $NC_D: the frames DID arrive and parse."
             echo "  The malformed branch is not counting them (still printing?)."
         else
-            echo "  Zero, and no-conn did not move either: nothing arrived. Check the"
-            echo "  guest IP was discovered (this netdev has no DHCP) and the group."
+            echo "  Zero, and no-conn did not move either: nothing reached the TCP"
+            echo "  parser. Distinguish WHERE it died before blaming the kernel --"
+            echo "  every gate below reads as delta 0, including the positive control:"
+            echo
+            # The firewall reading is the discriminator. `RX ring` counts frames
+            # the NIC accepted; `FW verdicts ... denied` counts frames policy
+            # refused at net.c:1605, one layer ABOVE the L4 dispatch. Ring rising
+            # while denied rises by the same amount localises it to policy
+            # immediately -- which is the diagnosis this harness previously cost
+            # a full investigation to reach, reporting a correct kernel as broken.
+            grep -aE "RX ring:|RX proto-ring:|FW verdicts:|IP Address:" "$CLEAN" \
+                | tail -8 | sed 's/^/    /'
+            echo
+            echo "  - FW verdicts 'denied' rising in step with 'RX ring': the frames"
+            echo "    arrived and the FIREWALL dropped them. The TINYOS_FAULT_INJECT"
+            echo "    TCP/80 rule in src/kernel.c is missing or did not compile in."
+            echo "  - RX ring flat: nothing arrived at all. Check the guest IP was"
+            echo "    discovered (this netdev has no DHCP) and the mcast group."
+            echo "  - RX ring rising, FW denied flat, proto-ring flat: the drop is"
+            echo "    above the firewall -- handle_ip()'s address gate, or the bogon"
+            echo "    filter (SRC_IP must stay TEST-NET-3, never RFC1918)."
         fi
     fi
     FAIL=1

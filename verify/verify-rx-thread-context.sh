@@ -70,9 +70,17 @@
 # boot generates no inbound traffic to parse. The baseline reads 0 thread-ctx /
 # 0 irq-ctx, and the negative control failed on reading #2 rather than #1. So
 # the baseline assertion is NOT load-bearing on this netdev -- it is retained
-# for the DHCP-carrying case. verify-ids-signature.sh is the harness that
-# actually requires a lease and therefore actually exercises the boot drain;
-# run it as well when touching this path.
+# for the DHCP-carrying case. verify-firewall-default-deny.sh is the harness
+# that actually requires a lease -- its arm B boots on the NAT netdev and exits
+# INCONCLUSIVE if no lease appears -- and therefore actually exercises the boot
+# drain; run it as well when touching this path.
+#
+# (This used to cite verify-ids-signature.sh. That harness was migrated off the
+# NAT netdev on 2026-08-22 when the default-deny firewall stranded its UDP
+# vehicle, and it no longer takes a lease at all. Nothing failed when that
+# happened -- the boot-drain claim here simply became false, silently, which is
+# why the citation now names a harness with an explicit lease GUARD rather than
+# one that merely happens to boot with NAT.)
 #
 # HOW THE FRAMES ARE SENT
 #
@@ -86,8 +94,8 @@
 # The trade-off, inherited and deliberate: this netdev has no NAT, so the guest
 # gets no DHCP lease. That is fine -- the parse counters are bumped at the very
 # top of handle_packet(), before any address state is consulted. The boot-drain
-# path is separately covered by verify-ids-signature.sh, which DOES require a
-# lease and passes.
+# path is separately covered by verify-firewall-default-deny.sh, whose arm B
+# requires a lease and guards on it explicitly.
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
 # Logs: rxctx.log (serial), rxctx-trace.log.
@@ -353,12 +361,14 @@ exit 0
 #   so boot produces no inbound traffic to parse (the guest self-assigns
 #   169.254.82.90). The baseline check is therefore not load-bearing on THIS
 #   netdev -- it is retained for the DHCP-carrying case, where the boot-time
-#   drain in kernel.c is what it covers, and where verify-ids-signature.sh is
-#   the harness that actually exercises a lease.
+#   drain in kernel.c is what it covers, and where
+#   verify-firewall-default-deny.sh is the harness that actually exercises a
+#   lease.
 #
 # CROSS-CHECK, not covered here: this netdev has no NAT, so the guest never
 # takes a DHCP lease and the boot-drain path is exercised only by broadcast
-# chatter. verify-ids-signature.sh is the complement -- it requires a lease and
-# inbound UDP, and passes under knetd (lease obtained, benign 0->0, sled 0->1).
-# Run both when touching the RX path; neither alone covers it.
+# chatter. verify-firewall-default-deny.sh is the complement -- its arm B boots
+# on the NAT netdev, guards on the lease explicitly (INCONCLUSIVE if absent),
+# and then requires an inbound DNS reply to be admitted. Run both when touching
+# the RX path; neither alone covers it.
 # =============================================================================

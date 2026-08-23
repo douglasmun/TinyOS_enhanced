@@ -15,7 +15,8 @@
 #
 # So this workflow runs what is both deterministic AND cheap:
 #
-#   1. the build, warning-clean under -Werror
+#   1. the build, warning-clean under -Werror -- twice, since
+#      -DTINYOS_FAULT_INJECT compiles 15 blocks the default build never sees
 #   2. the four harnesses that never boot a guest
 #
 # The -Werror gate is the point. A clean build takes under a second locally,
@@ -70,6 +71,27 @@ jobs:
       # does. That is exactly how this workflow's first run failed: dns.h had
       # declared bool since the initial release, and six of its eight
       # includers were getting the type transitively.
+      # -DTINYOS_FAULT_INJECT guards 15 blocks across 8 files and is required by
+      # six harnesses -- and until now NOTHING in CI compiled any of it. The flag
+      # is deliberately absent from the make dependency graph (that is why
+      # run-all.sh `make clean`s after each fault-inject harness), so these blocks
+      # are invisible to every default build: a type error or a stale symbol
+      # inside one ships green and only surfaces when someone runs the harness
+      # locally, where it reads as that harness breaking rather than as a build
+      # error introduced weeks earlier.
+      #
+      # Compile-only, deliberately. Running the fault-inject harnesses needs a
+      # guest; proving the code still COMPILES needs only the toolchain, and
+      # that is where the whole failure mode lives.
+      - name: Fault-inject build is warning-clean too
+        run: |
+          make clean
+          GCCINC="$(i686-linux-gnu-gcc -print-file-name=include)"
+          make -j"$(nproc)" CROSS=i686-linux-gnu- \
+               EXTRA_CFLAGS="-nostdinc -isystem $GCCINC -DTINYOS_FAULT_INJECT" \
+               kernel.elf
+          make clean
+
       - name: Every header compiles standalone
         run: |
           echo 'int ci_translation_unit;' > /tmp/probe.c
@@ -96,6 +118,16 @@ jobs:
       #                                 control, so a vacuous pass is visible
       #   verify-entropy-pool-stir.sh : pool_counter is incremented
       #                                 unconditionally (source-level)
+      #   edr-rejoin-test.sh          : the shared EDR splice helper behaves on
+      #                                 all 9 cases. Pure text -- it feeds
+      #                                 fixtures through the awk and diffs the
+      #                                 output, so no guest and no toolchain.
+      #                                 Two of the nine are negative controls.
+      #                                 It gates the helper that 20 harnesses
+      #                                 now source: a regression there turns
+      #                                 correct kernels into FAILs across the
+      #                                 whole suite, and only this catches it
+      #                                 without booting anything.
       #   verify-elf-enforce-report.sh: secstatus reports the REAL ELF gate.
       #                                 This one BUILDS -- twice, default and
       #                                 -DELF_PERMISSIVE_SIGNATURES -- and
@@ -105,7 +137,7 @@ jobs:
       #                                 the CROSS/OBJDUMP/EXTRA_CFLAGS it is
       #                                 handed below.
       #
-      # The fifth non-QEMU script, firstexec-trial.sh, is NOT here: it wraps
+      # The sixth non-QEMU script, firstexec-trial.sh, is NOT here: it wraps
       # the interactive GUI verify-exec.sh and blocks forever when batched.
       - name: Architecture diagram matches the tree
         run: bash verify/verify-arch-svg.sh
@@ -115,6 +147,9 @@ jobs:
 
       - name: Entropy pool is actually stirred
         run: bash verify/verify-entropy-pool-stir.sh
+
+      - name: EDR splice helper unit tests
+        run: bash verify/edr-rejoin-test.sh
 
       - name: Install toolchain
         run: |

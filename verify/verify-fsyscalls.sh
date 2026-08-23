@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/edr-rejoin.sh"
 #
 # verify-fsyscalls.sh — FULLY AUTOMATED file-syscall check (SYS_OPEN/CLOSE/READDIR).
 #
@@ -32,6 +33,10 @@ cd "$(dirname "$0")/.."
 
 PASSWORD="${TINYOS_TEST_PASSWORD:-rootpass1}"
 ISO=dist/tinyos.iso
+# The probe must run UNPRIVILEGED -- see the su in the typist block below.
+TESTUSER=fsysuser
+TESTPASS=fsyspass1
+
 SERIAL=fsyscalls.log
 TRACE=fsyscalls-trace.log
 RUN_DISK=/tmp/tinyos-fsyscalls-disk.img
@@ -74,13 +79,48 @@ trap cleanup EXIT
 echo "==> Driving the boot flow (slow under TCG; be patient)..."
 # Wait on the program's LAST line: it is only reached after every check has
 # passed, including the stale-fd rejection.
+#
+# THE PROBE MUST RUN AS UID 1000, and the su below is what makes that true.
+#
+# fileio.c asserts that permission is enforced on the PARENT directory: /fio
+# is 0755 and root-owned (src/kernel.c:995), so an unprivileged process must
+# NOT be able to create inside it -- "without this check the syscalls would be
+# a filesystem-wide write primitive". But `cmd_exec` copies the CREATOR's
+# credentials into the child (src/shell_fileops.c, "task_create_user hardcodes
+# uid/gid 1000 and leaves it to the caller"), so a probe exec'd from the root
+# shell runs as uid 0, the mkdir correctly succeeds, and the probe aborts with
+# "mkdir in root-owned dir accepted" and exit status 1 -- against a kernel
+# that did exactly the right thing. That was a standing FAIL from 47ca930,
+# the commit that added those two checks, until this su was added.
+#
+# The typist runs TINYOS_EXEC_CMD before the followups, so the account is
+# created in the followup list and the probe exec'd after the su;
+# TINYOS_EXEC_CMD is a throwaway that only gets us to a prompt. /scratch is
+# 0777 for exactly this uid-1000 caller, which is where the probe's own
+# mkdir/rmdir/unlink legs operate.
 TINYOS_PASSWORD="$PASSWORD" \
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
-TINYOS_EXEC_CMD="exec /fileio.elf" \
-TINYOS_EXPECT="fileio: done" \
+TINYOS_EXEC_CMD="exec /hello.elf" \
+TINYOS_EXPECT="Hello from ELF" \
+TINYOS_FOLLOWUP_CMDS="\
+useradd $TESTUSER=>Enter password for new user;\
+!$TESTPASS=>created;\
+su $TESTUSER=>Now running as;\
+exec /fileio.elf=>fileio: done" \
+TINYOS_FOLLOWUP_TIMEOUT=420 \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
+
+# The 60-second EDR status report tears whatever line is in flight, at an
+# ARBITRARY character, so any witness can be split in two and stop matching.
+# Every read below is a POSITION comparison, and a torn witness reports as
+# absent -- i.e. as a kernel that never produced it. The tear is PROBABILISTIC
+# (it only bites when the burst lands on that particular line), so a green run
+# does NOT show the raw read is safe; it shows the burst missed this time.
+# Analyse the REJOINED copy. See verify/edr-rejoin.sh (cases: edr-rejoin-test.sh).
+REJOINED="${SERIAL}.rejoined"
+rejoin_serial "$SERIAL" "$REJOINED"
 
 sleep 3
 cleanup
@@ -95,38 +135,54 @@ if grep -q "Triple fault" "$TRACE" 2>/dev/null; then
     exit 1
 fi
 
+# Positive control: the probe really was unprivileged.
+#
+# This is what keeps the root-owned-directory legs inside fileio.elf
+# meaningful. If the su silently failed, the probe runs as uid 0, its mkdir
+# into 0755 root-owned /fio succeeds legitimately, and it aborts reporting an
+# escalation that did not happen. Assert the switch landed before reading
+# anything into the probe's verdict.
+if ! grep -q "Now running as: $TESTUSER" "$REJOINED" 2>/dev/null; then
+    echo "RESULT: INCONCLUSIVE — the su to $TESTUSER never completed"
+    echo "  The probe would have run as root, where creating inside a"
+    echo "  root-owned directory is correct and its permission legs cannot"
+    echo "  fail. This is a harness failure, not a kernel finding."
+    grep -v "Suspicious" "$REJOINED" | tail -20
+    exit 3
+fi
+
 # Any of the program's own failure lines is a hard FAIL — it got far enough to
 # report, so this is a real defect, not an inconclusive run.
-if grep -qE "fileio: (open for write failed|open for read failed|opendir failed|read failed|readdir failed|short write|content MISMATCH|stale fd accepted|marker\.txt NOT|fileio-test\.txt NOT|fat32 opendir failed|fat32 readdir failed|fat32 partial record|fat32 subdir wrongly accepted|getcwd failed|getcwd accepted a short buffer|chdir failed|relative create failed|relative create did not land in the cwd|absolute path broken by cwd|chdir \.\. failed|relative chdir failed|relative unlink failed|chdir to missing dir accepted|failed chdir moved cwd|chdir to a file accepted|chdir to a missing FAT32 directory accepted|chdir to C:/ failed|chdir back to D:/ failed|fat32 mkdir SUBA failed|fat32 nested mkdir failed|fat32 mkdir under missing parent accepted|fat32 create SUBFILE failed|fat32 mkdir under a file accepted|fat32 nested create failed|fat32 nested write short|fat32 nested reopen failed|fat32 nested read got|fat32 nested content|fat32 nested stat failed|fat32 nested stat size|fat32 nested file also visible in root|fat32 subdir open failed|fat32 subdir listing missing|fat32 O_DIRECTORY on a file accepted|fat32 chdir into subdir failed|fat32 cwd is|fat32 relative open in subdir failed|fat32 chdir back to D:/ failed|fat32 rmdir of non-empty parent accepted|fat32 rmdir of non-empty subdir accepted|fat32 nested unlink failed|fat32 nested rmdir failed|fat32 parent rmdir failed)" "$SERIAL" 2>/dev/null; then
+if grep -qE "fileio: (open for write failed|open for read failed|opendir failed|read failed|readdir failed|short write|content MISMATCH|stale fd accepted|marker\.txt NOT|fileio-test\.txt NOT|fat32 opendir failed|fat32 readdir failed|fat32 partial record|fat32 subdir wrongly accepted|getcwd failed|getcwd accepted a short buffer|chdir failed|relative create failed|relative create did not land in the cwd|absolute path broken by cwd|chdir \.\. failed|relative chdir failed|relative unlink failed|chdir to missing dir accepted|failed chdir moved cwd|chdir to a file accepted|chdir to a missing FAT32 directory accepted|chdir to C:/ failed|chdir back to D:/ failed|fat32 mkdir SUBA failed|fat32 nested mkdir failed|fat32 mkdir under missing parent accepted|fat32 create SUBFILE failed|fat32 mkdir under a file accepted|fat32 nested create failed|fat32 nested write short|fat32 nested reopen failed|fat32 nested read got|fat32 nested content|fat32 nested stat failed|fat32 nested stat size|fat32 nested file also visible in root|fat32 subdir open failed|fat32 subdir listing missing|fat32 O_DIRECTORY on a file accepted|fat32 chdir into subdir failed|fat32 cwd is|fat32 relative open in subdir failed|fat32 chdir back to D:/ failed|fat32 rmdir of non-empty parent accepted|fat32 rmdir of non-empty subdir accepted|fat32 nested unlink failed|fat32 nested rmdir failed|fat32 parent rmdir failed)" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL — fileio.elf reported an error"
-    grep "fileio:" "$SERIAL" | tail -10
+    grep "fileio:" "$REJOINED" | tail -10
     exit 1
 fi
 
 # C: must actually be mounted, or the FAT32 readdir check below would be
 # testing nothing and its absence would look like a pass.
-if ! grep -q "C: drive mounted as FAT32" "$SERIAL" 2>/dev/null; then
+if ! grep -q "C: drive mounted as FAT32" "$REJOINED" 2>/dev/null; then
     echo "RESULT: FAIL/INCONCLUSIVE — C: did not mount, FAT32 readdir untested"
-    grep -i "fat32\|C: drive" "$SERIAL" | tail -10
+    grep -i "fat32\|C: drive" "$REJOINED" | tail -10
     exit 2
 fi
 
 # Ordered: a stale or duplicated line must not stand in for a missing one.
-l_wfd=$(grep -n "fileio: write fd=" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_wfd=$(grep -n "fileio: write fd=" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The content read back in ring 3 must be exactly what ring 3 wrote. This is
 # the line that proves the write reached the FS and the read came back out.
-l_back=$(grep -n "fileio: read back: ring3-file-io-ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_dir=$(grep -n "fileio: found both entries" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_back=$(grep -n "fileio: read back: ring3-file-io-ok" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_dir=$(grep -n "fileio: found both entries" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The same syscall against the OTHER filesystem. C: had no .readdir at all
 # before this change, so an identical call worked on D: and failed on C:.
-l_fat=$(grep -n "fileio: fat32 entries=" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_fat=$(grep -n "fileio: fat32 entries=" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # stat() on both drives: size/type agree with what was written, a directory
 # reports as one, a missing path and a short buffer are both refused.
-l_stat=$(grep -n "fileio: stat ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_stat=$(grep -n "fileio: stat ok" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # lseek on both drives: SEEK_SET/CUR/END, negative displacement, past-EOF
 # clamp, and the rejected cases (before-start, bad whence, directory fd).
 # RAMFS had no seek at all before this, so the D: half could not have passed.
-l_seek=$(grep -n "fileio: seek ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_seek=$(grep -n "fileio: seek ok" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # mkdir/rmdir/unlink: create a dir, make a file in it, then prove the refusals
 # (duplicate mkdir, rmdir of a non-empty dir, unlink of a dir, rmdir of a file,
 # and creating/removing inside a root-owned 0755 dir as uid 1000).
@@ -134,21 +190,21 @@ l_seek=$(grep -n "fileio: seek ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1
 # FAT32's mkdir/rmdir/unlink were dead code carrying real corruption bugs
 # (rmdir was literally unlink — it freed a directory's chain without checking
 # emptiness) until this change wired them into the ops table.
-l_fatns=$(grep -n "fileio: fat32 namespace ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_ns=$(grep -n "fileio: namespace ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_fatns=$(grep -n "fileio: fat32 namespace ok" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_ns=$(grep -n "fileio: namespace ok" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # getcwd/chdir, and — the actual point of a cwd — relative paths resolving
 # through it: a file created as "cwdfile.txt" must land in the cwd, an absolute
 # path must ignore the cwd, ".." must clamp at the drive root, a failed chdir
 # must leave the cwd untouched, and a MISSING FAT32 directory must be refused
 # rather than silently accepted.
-l_cwd=$(grep -n "fileio: cwd ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_cwd=$(grep -n "fileio: cwd ok" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # FAT32 subdirectories: nested mkdir, I/O through a nested path, that the
 # nested file is NOT also visible in the root (the exact failure mode of the
 # old path-as-one-filename behaviour), subdirectory listing, chdir into a
 # subdir with relative resolution, and the refusals (missing parent, parent
 # that is a file, O_DIRECTORY on a file, rmdir of a non-empty directory).
-l_sub=$(grep -n "fileio: fat32 subdirs ok" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
-l_done=$(grep -n "fileio: done" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+l_sub=$(grep -n "fileio: fat32 subdirs ok" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+l_done=$(grep -n "fileio: done" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 
 if [ -z "$l_wfd" ] || [ -z "$l_back" ] || [ -z "$l_dir" ] || [ -z "$l_fat" ] \
    || [ -z "$l_stat" ] || [ -z "$l_seek" ] || [ -z "$l_ns" ] \
@@ -160,14 +216,14 @@ if [ -z "$l_wfd" ] || [ -z "$l_back" ] || [ -z "$l_dir" ] || [ -z "$l_fat" ] \
          "namespace=${l_ns:-none}" "cwd=${l_cwd:-none}" \
          "subdirs=${l_sub:-none}" "done=${l_done:-none}"
     echo "--- tail of $SERIAL ---"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi
 
 # The fd handed to userspace must be a per-task index (3+), NOT a raw global
 # VFS descriptor leaked straight through. fd 0/1/2 would mean the file landed
 # on a console stream instead of the fd table.
-wfd=$(grep -o "fileio: write fd=[0-9]*" "$SERIAL" | head -1 | cut -d= -f2)
+wfd=$(grep -o "fileio: write fd=[0-9]*" "$REJOINED" | head -1 | cut -d= -f2)
 if [ "${wfd:-0}" -lt 3 ]; then
     echo "RESULT: FAIL — open() returned fd=$wfd, expected a per-task fd >= 3"
     exit 1
@@ -176,7 +232,7 @@ fi
 # The size stat() reports must match the string the program actually wrote
 # (16 bytes of "ring3-file-io-ok"); a driver that always answers 0 would
 # otherwise still satisfy "stat ok".
-statsize=$(grep -o "fileio: stat size=[0-9]*" "$SERIAL" | head -1 | cut -d= -f2)
+statsize=$(grep -o "fileio: stat size=[0-9]*" "$REJOINED" | head -1 | cut -d= -f2)
 if [ "${statsize:-0}" -ne 16 ]; then
     echo "RESULT: FAIL — stat reported size=$statsize, expected 16"
     exit 1
@@ -184,7 +240,7 @@ fi
 
 # SEEK_END on C:/HELLO.ELF must report that file's real size. A driver that
 # answered 0 (or echoed the requested offset) would still print "seek ok".
-seekend=$(grep -o "fileio: fat32 seek end=[0-9]*" "$SERIAL" | head -1 | cut -d= -f2)
+seekend=$(grep -o "fileio: fat32 seek end=[0-9]*" "$REJOINED" | head -1 | cut -d= -f2)
 if [ "${seekend:-0}" -ne 14144 ]; then
     echo "RESULT: FAIL — fat32 SEEK_END reported $seekend, expected 14144"
     exit 1
@@ -196,13 +252,13 @@ if [ "$TYPIST_RC" -eq 0 ] && [ "$l_back" -gt "$l_wfd" ] && [ "$l_fat" -gt "$l_di
    && [ "$l_cwd" -gt "$l_ns" ] && [ "$l_sub" -gt "$l_cwd" ] \
    && [ "$l_done" -gt "$l_sub" ]; then
     echo "RESULT: PASS — ring-3 open/write/read/readdir/stat/lseek/mkdir/rmdir/unlink/getcwd/chdir work on both D: and C:, including nested FAT32 subdirectories (fd=$wfd)"
-    grep "fileio:" "$SERIAL" | head -40
+    grep "fileio:" "$REJOINED" | head -40
     exit 0
 else
     echo "RESULT: FAIL (typist rc=$TYPIST_RC; out of order:" \
          "wfd=$l_wfd back=$l_back dir=$l_dir fat32=$l_fat stat=$l_stat" \
          "seek=$l_seek fat32ns=$l_fatns namespace=$l_ns cwd=$l_cwd" \
          "subdirs=$l_sub done=$l_done)"
-    grep -v "Suspicious" "$SERIAL" | tail -30
+    grep -v "Suspicious" "$REJOINED" | tail -30
     exit 2
 fi

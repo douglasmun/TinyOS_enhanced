@@ -183,7 +183,7 @@ pos=$(grep -c "$MARKER" spray-pos.log 2>/dev/null)
 
 echo
 if [ "${neg:-0}" -ne 0 ]; then
-    echo "FAIL (negative control): the detector alerted on 3 failures against ONE"
+    echo "RESULT: FAIL (negative control): the detector alerted on 3 failures against ONE"
     echo "  username. That is the vertical attack user.c's per-account lockout"
     echo "  already handles -- firing here means this is duplicating that counter,"
     echo "  not detecting a spray."
@@ -193,13 +193,13 @@ fi
 echo "negative control OK: no spray alert for repeated failures on one username"
 
 if [ "${pos:-0}" -eq 0 ]; then
-    echo "FAIL (positive): 3 failures across 3 DISTINCT usernames raised no alert."
+    echo "RESULT: FAIL (positive): 3 failures across 3 DISTINCT usernames raised no alert."
     echo "  This is the horizontal case user.c cannot see; if it is silent here,"
     echo "  the gap is still open."
     exit 1
 fi
 if [ "${pos:-0}" -ne 1 ]; then
-    echo "FAIL: expected exactly 1 spray alert, got $pos."
+    echo "RESULT: FAIL: expected exactly 1 spray alert, got $pos."
     echo "  More than one means the once-per-window latch is broken and a spray"
     echo "  can flood the alert ring, evicting the alerts that identify it."
     grep -n "$MARKER" spray-pos.log | head -5
@@ -209,7 +209,7 @@ fi
 echo "positive OK: exactly 1 spray alert for 3 distinct usernames"
 grep -n "$MARKER" spray-pos.log | head -1
 echo
-echo "PASS"
+echo "RESULT: PASS -- spray detector alerts on distinct usernames, not on repeats"
 exit 0
 
 # =============================================================================

@@ -16,6 +16,15 @@ import subprocess
 import sys
 import time
 
+# Line-buffer our own progress output.
+#
+# Every harness redirects this script's stdout to a file, which makes Python
+# block-buffer it: the "typist: sending ..." trail then sits unflushed until
+# exit, so a run that is alive and progressing looks identical to one that hung
+# at boot. That cost real diagnosis time -- a harness was declared stuck when
+# its log was merely empty. The 56 call sites do not need `python3 -u` for this.
+sys.stdout.reconfigure(line_buffering=True)
+
 SERIAL = os.environ["TINYOS_SERIAL"]
 MON_SOCK = os.environ["TINYOS_MON_SOCK"]
 PASSWORD = os.environ.get("TINYOS_PASSWORD", "rootpass1")
@@ -101,6 +110,89 @@ def read_serial():
         return ""
 
 
+def _despam(s):
+    """Remove EDR status-burst text, rejoining what it tore apart.
+
+    The EDR daemon writes to the same serial console as the shell, and it does
+    so mid-line: it cuts the shell's echo at an ARBITRARY character, including
+    inside the first word. Measured, at the kernel shell, which echoes per
+    keystroke:
+
+        $ w[EDR DAEMON] Starting threat scan...
+        rite /secret.txt ROO[EDR DAEMON] Starting threat scan...
+        TONLYDATA
+
+    No token of "write /secret.txt ROOTONLYDATA" survives contiguously -- not
+    the last ("ROOTONLYDATA" is split), not the first ("write" is split), so
+    neither a whole-line match nor any single-token fallback can work. The only
+    thing that does is to delete the burst and splice the halves back together,
+    which restores the original line exactly.
+
+    Lines that START with the marker are pure noise and are dropped whole;
+    lines that merely CONTAIN it carry real output before the burst, so that
+    prefix is kept and joined to what follows.
+
+    Two further cases, both of which arise when the echo spans the 60-second
+    STATUS REPORT rather than a plain threat scan:
+
+        $ e[EDR DAEMON] Starting threat scan...
+        [EDR DAEMON] Scan complete: 6 processes, duration 0 ticks
+        cho                                    <-- fragment, NO marker on it
+        [EDR DAEMON] ========== STATUS REPORT ==========
+        ... 8 report lines ...
+        [EDR DAEMON] ===================================
+                                               <-- blank, part of the burst
+        MARKREDIR > /root[EDR DAEMON] Starting threat scan...
+        only/redir.txt
+
+    The BLANK lines are the report's own formatting -- edr_daemon.c:217 opens
+    with kprintf("\n[EDR DAEMON] ===...") and the closing rule adds another --
+    so a blank must not flush a pending fragment.
+
+    And "cho " carries no marker at all, so it cannot be told from real output
+    by content. It is told by POSITION: a line arriving while a tear is open,
+    whose SUCCESSOR is another burst line, is itself a fragment. That lookahead
+    fires only while a tear is open, so untorn output is never glued together.
+
+    Without those two rules this returned "MARKREDIR > /rootonly/redir.txt"
+    with the leading "echo " stranded on a line of its own, and the caller
+    timed out waiting for a command that had in fact run correctly.
+
+    Kept in step with verify/edr-rejoin.sh, which does the same repair for the
+    bash side; verify/edr-rejoin-test.sh is the shared set of cases."""
+    lines = s.split("\n")
+    marker = re.compile(r"\[EDR (?:DAEMON|ADVANCED)\]")
+    out = []
+    buf = ""
+    inburst = False
+    for i, line in enumerate(lines):
+        if line.startswith("[EDR DAEMON]") or line.startswith("[EDR ADVANCED]"):
+            inburst = True
+            continue
+        m = marker.search(line)
+        if m:
+            buf += line[:m.start()]
+            inburst = True
+            continue
+        if line == "" and (inburst or buf):
+            continue
+        if not buf and re.match(r"^[A-Za-z]:/[^ ]* \$ $", line):
+            buf = line
+            inburst = True
+            continue
+        if (buf and i + 1 < len(lines) and marker.search(lines[i + 1])
+                and not buf.endswith("$ ")):
+            buf += line
+            inburst = False
+            continue
+        out.append(buf + line)
+        buf = ""
+        inburst = False
+    if buf:
+        out.append(buf)
+    return "\n".join(out)
+
+
 def wait_for(text, timeout=240, since=0):
     """Wait until `text` appears in serial at/after byte offset `since`.
 
@@ -139,7 +231,21 @@ def type_verified(sock, s, timeout=40):
     Verifies char-by-char IN ORDER rather than as one contiguous match: a live
     background process writes to the same serial console, so its output
     interleaves into the echo ("jo[SYSCALL]...bs") and a contiguous search for
-    "jobs" would spuriously fail on a run that actually worked."""
+    "jobs" would spuriously fail on a run that actually worked.
+
+    ONLY VALID AT THE LOGIN PROMPT, which echoes each keystroke as it is
+    accepted. It is no longer used for shell commands at either shell --
+    type_echo_line() is, because this function has two weaknesses that only a
+    contiguous match fixes:
+
+      - the scan starts at `len(serial) - len(s) - 4`, a window a few bytes
+        wide, so whether it resolves depends on what happens to sit in the tail
+        already. Both outcomes were seen on the SAME ring-3 path.
+      - an in-order per-character scan is a weak witness: any earlier text
+        containing those letters in order satisfies it.
+
+    The login prompt is safe because the string is short, fixed ("root"), and
+    typed at a point with no prior shell output to collide with."""
     start = max(0, len(read_serial()) - len(s) - 4)
     type_str(sock, s)
     cursor = start
@@ -147,6 +253,81 @@ def type_verified(sock, s, timeout=40):
         if ch == "\n":
             continue
         cursor = wait_for(ch, timeout=timeout, since=cursor)
+
+
+def type_echo_line(sock, s, timeout=60):
+    """Type a line and wait for the shell's echo of it, as a unit.
+
+    Correct at BOTH shells, and the only correct choice at ring 3.
+
+    type_verified() scans for each character in order starting from
+    `len(serial) - len(s) - 4`. That window is a few bytes wide, so whether it
+    resolves depends on which characters happen to sit in the tail already --
+    it is a coincidence, not a check. Both outcomes were observed on the SAME
+    ring-3 path: `help` "passed" only because the shell's own banner
+    ("TinyOS shell (ring 3) - 'help' for builtins, ...") is printed just above
+    and contains h,e,l,p in order, so the scan matched the BANNER and never
+    looked at the echo; `id` timed out because no 'i' fell inside its 7-byte
+    window. A check that passes by matching unrelated earlier text is worse
+    than no check.
+
+    The ring-3 shell does echo, just not per keystroke: readline() collects the
+    line and prints it once after Enter (src/stdio.c:336,
+    userspace/shell.c:2035), as "D:/ $ help". So take a mark BEFORE typing and
+    wait for the command text after it.
+
+    The EDR status burst tears that echo at an ARBITRARY character, so no
+    token-based fallback can be correct -- see _despam(), which has the
+    measured case where neither the first nor the last token survives intact.
+    Match on the spliced stream instead, which restores the line exactly.
+
+    The mark is taken on the spliced text before typing, so a match can only be
+    text this command produced, never an earlier identical line."""
+    # Newlines are stripped from BOTH sides before matching, and that is not
+    # cosmetic -- it is the last tear case _despam() cannot close on its own.
+    #
+    # When the burst cuts a command that the shell wrote together with its
+    # prompt, the fragment before the tear is "$ ech": a prompt AND partial
+    # text on one line. _despam()'s two hold rules both miss it. The prompt
+    # rule requires the line to be ONLY a prompt; the lookahead requires a
+    # fragment to be already pending, and nothing is pending here. Generalising
+    # either rule to cover it glues untorn output together instead -- measured:
+    # it breaks both of edr-rejoin-test.sh's negative controls, turning
+    # "real two" + "real three" into "real tworeal three".
+    #
+    # The information that resolves it is not in the log at all, it is here: we
+    # know the exact string we typed. So drop newlines and search the
+    # single-line form. That cannot widen the match, because `body` is one
+    # typed command and contains no newline itself -- it only tolerates a
+    # newline the tear left INSIDE the echo we are looking for.
+    #
+    # It is not a free lunch: collapsing newlines does let a match span a line
+    # boundary in principle ("touch /a" + "ls /b" flattens to "touch /als /b",
+    # so a body of "/als" would hit). That needs a typed command that is
+    # exactly the concatenation of one line's tail and the next line's head,
+    # which no harness in the suite comes near -- and the search still starts
+    # at `mark`, so it can only match text this command produced. Weigh it
+    # against the alternative, which is a real, reproducible timeout that
+    # reports a correct kernel as INCONCLUSIVE.
+    #
+    # This was a real timeout, not a hypothetical: verify-ramfs-create-perm.sh
+    # reported INCONCLUSIVE on a kernel whose every leg was correct, because
+    # "echo MARKREDIR > /rootonly/redir.txt" was torn across TWO bursts into
+    # three fragments and the middle one began "$ ech".
+    def _flat(text):
+        return text.replace("\n", "")
+
+    mark = len(_flat(_despam(read_serial())))
+    type_str(sock, s)
+    body = _flat(s.rstrip("\n"))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _flat(_despam(read_serial())).find(body, mark) >= 0:
+            return
+        time.sleep(0.4)
+    tail = _despam(read_serial())[-600:]
+    raise SystemExit(
+        f"typist: TIMEOUT waiting for echo of {body!r}\n--- serial tail ---\n{tail}")
 
 
 def main():
@@ -220,10 +401,49 @@ def main():
     #    harnesses working unchanged: the shell they target did not move, only
     #    what login hands you first.
     if os.environ.get("TINYOS_STAY_IN_RING3", "") != "1":
-        time.sleep(2)
+        # Wait for the ring-3 shell to be READY, do not sleep a flat 2s at it.
+        #
+        # `kshell` is typed AT the ring-3 shell, so that shell has to be up and
+        # inside readline() first. Getting there means loading and
+        # ECDSA-verifying a 41 KB shell.elf, which under TCG takes far longer
+        # than 2s on a loaded host. Typing into a shell that is not reading yet
+        # drops the line, and the failure is indistinguishable from a kernel
+        # fault: the log ends at "[ELF] Hash verification: PASS" with the shell
+        # loaded and simply never speaking.
+        #
+        # The banner is the witness -- the shell prints it immediately before
+        # its first prompt, so seeing it means readline() will accept input.
+        # The STAY_IN_RING3 branch below already waits on it; this branch has
+        # the same requirement and had only a sleep.
+        # Do NOT advance `end` past the banner. It is a PRECONDITION (the
+        # shell is ready), not a result, and a harness may legitimately name
+        # the same string as its TINYOS_EXPECT -- consuming it here would make
+        # that harness wait forever for a second occurrence that never comes.
+        wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
+        time.sleep(1)
         print("typist: sending 'kshell' (switch to the kernel shell)")
         mark = len(read_serial())
-        type_verified(sock, "kshell\n", timeout=60)
+        # Type it WITHOUT per-character echo verification.
+        #
+        # `kshell` is typed at the RING-3 shell, and that shell does not echo
+        # per keystroke: readline() collects the line and the whole thing is
+        # echoed only after Enter (src/stdio.c:336, userspace/shell.c:2035).
+        # Only the KERNEL shell echoes per character. So type_verified()'s
+        # first wait_for("k") could never resolve and always burned its full
+        # timeout -- "typist: TIMEOUT waiting for 'k'" -- which failed the run
+        # at the very first command, before any harness leg was exercised.
+        #
+        # It presented as a kernel fault: the boot log ends at "[ELF] Hash
+        # verification: PASS" with the shell loaded and simply never speaking,
+        # and four different harnesses died identically at 85s (chmod-owner,
+        # cred-deprecation, env-pertask, fat32-write), so it read as a
+        # regression in the shell rather than as one impossible wait.
+        #
+        # Nothing is lost by dropping the echo check here: the wait_for below
+        # is a STRICTER witness. "shell: exiting" is printed by the ring-3
+        # shell as it hands over, so it proves the line was received, parsed
+        # and acted on -- which a character echo would only have suggested.
+        type_str(sock, "kshell\n")
         # Wait for the ring-3 shell to actually exit before typing at the
         # kernel shell; "$" alone is no good as a marker, it is already all
         # over the boot log.
@@ -235,9 +455,39 @@ def main():
     #    (e.g. TINYOS_EXEC_CMD="exec C:/info.elf").
     exec_cmd = os.environ.get("TINYOS_EXEC_CMD", "exec /hello.elf")
     expect = os.environ.get("TINYOS_EXPECT", "Hello from ELF")
-    time.sleep(2)
+
+    # WAIT FOR THE RING-3 SHELL TO BE READY, don't sleep at it.
+    #
+    # On the kshell path the wait_for("shell: exiting") above already proves
+    # the kernel shell is up. Under TINYOS_STAY_IN_RING3 there was no such
+    # witness -- only a flat time.sleep(2) -- and 2 s is nowhere near enough
+    # under TCG, where login has to load and ECDSA-verify a 41 KB shell.elf.
+    # So the first command was typed into a shell that had not started
+    # reading, the keystrokes went nowhere, and the run died waiting for an
+    # echo that could never come. The serial log ends at
+    # "[ELF] Hash verification: PASS" with no banner and no prompt, which
+    # reads as the shell having failed to start rather than as the typist
+    # having jumped the gun.
+    #
+    # The banner is the right witness: the ring-3 shell prints
+    # "TinyOS shell (ring 3) - 'help' for builtins, ..." and then its prompt,
+    # so seeing it means readline() is running and will accept input.
+    if os.environ.get("TINYOS_STAY_IN_RING3", "") == "1":
+        # Same rule as above: wait on the banner, do not consume it.
+        # verify-mseal-counters.sh sets TINYOS_EXPECT to this exact string, so
+        # advancing the cursor past it made the expect below unsatisfiable and
+        # the harness reported INCONCLUSIVE against a shell that had started
+        # correctly and already answered `help`.
+        wait_for("TinyOS shell (ring 3)", timeout=240, since=end)
+        time.sleep(1)
+    else:
+        time.sleep(2)
     print(f"typist: sending '{exec_cmd}'")
-    type_verified(sock, exec_cmd + "\n", timeout=60)
+    # Same call at BOTH shells. The ring-3 shell echoes the whole line after
+    # Enter; the kernel shell echoes per keystroke. Either way the echoed text
+    # ends up contiguous in the SPLICED stream, which is what this matches --
+    # so there is no longer a per-shell branch to get wrong.
+    type_echo_line(sock, exec_cmd + "\n", timeout=60)
 
     # 5) Wait for the ENFORCE verify result + the program output
     try:
@@ -356,7 +606,7 @@ def main():
             if unverified:
                 type_str(sock, cmd + "\n")
             else:
-                type_verified(sock, cmd + "\n", timeout=60)
+                type_echo_line(sock, cmd + "\n", timeout=60)
             if want:
                 try:
                     # Same 240s as the first command's expect: a follow-up can
