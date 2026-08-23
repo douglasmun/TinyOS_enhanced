@@ -75,10 +75,6 @@ bool validate_memory_range(uint32_t addr, uint32_t size, bool require_write);
 // Add this declaration:
 uint32_t* get_page_table_entry(uint32_t virtual_addr);
 
-// Only need these core functions to get user mode working
-void map_user_memory(uint32_t virtual_addr, uint32_t physical_addr, uint64_t flags);
-bool setup_user_process_paging(uint32_t code_phys_addr, size_t code_size);
-void unmap_user_memory(uint32_t virtual_addr);
 // Utility functions
 bool is_user_address(uint32_t addr);
 void print_user_memory_layout(void);
