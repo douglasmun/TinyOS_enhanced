@@ -179,6 +179,14 @@ grep -q "TINYOS_FAULT_INJECT" src/test_tasks.c \
     || guard_fail "src/test_tasks.c has no TINYOS_FAULT_INJECT hook; knetd cannot
   be made to die, so the restart path cannot be exercised at all"
 
+# Step 6's ktimerd hook. Guarded separately for the same reason: a tree without
+# it runs steps 1-5 perfectly and then fails step 6's "expected 2 ps -l rows"
+# with a message about parsing, which reads as a harness bug rather than a
+# missing hook.
+grep -q "ktimerd_die_now" src/test_tasks.c \
+    || guard_fail "src/test_tasks.c has no ktimerd_die_now hook; step 6 cannot
+  restart a PRIORITY_HIGH task, so priority restoration is NOT covered"
+
 # Step 5's repeat-death budget. Guarded separately from the flag above because a
 # tree with only the single-death hook runs steps 1-3 perfectly and then reports
 # gave-up == 0 at step 5a -- which is indistinguishable from a broken limiter.
@@ -257,6 +265,11 @@ export TINYOS_HOOK_SETTLE="sleep 8; true"
 # to witness that is to send frames and prove they are NOT parsed. A give-up
 # that still restarts is worse than no limiter at all, and the counter alone
 # cannot distinguish the two.
+# Step 6: let the supervisor observe ktimerd's death and restart it before the
+# second `ps -l` reads its priority back. No frames involved -- this leg is
+# about the restarted task's PRIORITY, not about networking.
+export TINYOS_HOOK_KTSETTLE="sleep 6; true"
+
 export TINYOS_HOOK_INJECT3="sleep 3; $INJECT_CMD >/dev/null 2>&1; sleep 6; true"
 
 # Sequence (in the KERNEL shell -- `killknetd` is a kshell builtin, and the
@@ -315,6 +328,9 @@ ifconfig=>Supervisor;\
 >INJECT2;\
 ifconfig=>RX ring;\
 ps -l=>knetd;\
+killktimerd=>ktimerd death requested;\
+>KTSETTLE;\
+ps -l=>ktimerd;\
 killknetd 8=>knetd death requested x8;\
 >SETTLE;\
 ifconfig=>Supervisor;\
@@ -561,6 +577,114 @@ if [ "$RX_GU_POST" -ne "$RX_GU_PRE" ]; then
 fi
 echo "  [step 5c] daemon stayed dead; no frames parsed after the give-up: OK"
 
+# ---------------------------------------------------------------------------
+# STEP 6: the restarted task comes back at its REGISTERED PRIORITY.
+#
+# WHY THIS IS NOT TESTED WITH knetd
+#
+# knetd is PRIORITY_NORMAL, which is also the value task_create_kernel()
+# assigns unconditionally. So a restarted knetd reads back the correct priority
+# whether or not supervisor_restart() restores it -- restoring and not
+# restoring are indistinguishable there, and steps 1-3 above pass either way.
+# That is exactly why the demotion bug survived: knetd was the only watched
+# task, and it is the one task that cannot witness this.
+#
+# ktimerd is PRIORITY_HIGH (3), so after a restart it must still read 3. A
+# supervisor that does not restore priority brings it back as PRIORITY_NORMAL
+# (2): the task RUNS, the restart counter rises, "has died" and "restarted"
+# both print, and every status surface reports a healthy recovery. The only
+# symptom is that the timer bottom-half -- TCP timers, DHCP renewal, EDR hooks,
+# CSPRNG reseed -- is now scheduled behind interactive work. That is a silent
+# latency regression, which is the shape of bug this suite exists to catch.
+#
+# Read from `ps -l` column 3 (PID STATE PRI ...), for the two samples taken
+# either side of the killktimerd.
+KT_PRI_SAMPLES=()
+while IFS= read -r line; do KT_PRI_SAMPLES+=("$line"); done < <(
+    grep -a "ktimerd" "$SERIAL" | tr -d '\r' \
+        | sed -n 's/^ *\([0-9][0-9]*\)  *[A-Za-z][A-Za-z]*  *\([0-9]\)  .*ktimerd.*/\1 \2/p')
+
+if [ "${#KT_PRI_SAMPLES[@]}" -lt 2 ]; then
+    fail_with "expected 2 'ps -l' rows for ktimerd, got ${#KT_PRI_SAMPLES[@]}" \
+        "Step 6 reads ktimerd's priority before and after its restart. Without" \
+        "both rows the comparison cannot be made, so priority restoration is" \
+        "NOT proven -- do not read this run as covering it." \
+        "" \
+        "rows seen: ${KT_PRI_SAMPLES[*]:-none}"
+fi
+
+# Index the LAST row explicitly rather than with [-1].
+#
+# macOS ships bash 3.2, which has no negative array subscripting, and under
+# `set -u` "${a[-1]}" is not merely empty -- it raises "bad array subscript" /
+# "unbound variable". That aborts the two assignments below, leaving
+# KT_PID_POST and KT_PRI_POST unset; the `-ne` comparisons in (b) and (c) then
+# fail on stderr WITHOUT stopping the script, so this step printed its "OK"
+# line and the harness printed RESULT: PASS while grading nothing at all.
+#
+# That is the exact false-pass shape this suite exists to prevent, and it was
+# invisible because the kernel was correct the whole time: the serial log
+# showed ktimerd restarting at priority 3 as intended, so the only evidence of
+# the defect was a stderr line nobody was reading.
+KT_LAST=$(( ${#KT_PRI_SAMPLES[@]} - 1 ))
+KT_PID_PRE=$(echo "${KT_PRI_SAMPLES[0]}" | awk '{print $1}')
+KT_PRI_PRE=$(echo "${KT_PRI_SAMPLES[0]}" | awk '{print $2}')
+KT_PID_POST=$(echo "${KT_PRI_SAMPLES[$KT_LAST]}" | awk '{print $1}')
+KT_PRI_POST=$(echo "${KT_PRI_SAMPLES[$KT_LAST]}" | awk '{print $2}')
+
+# Guard the parse itself. Every comparison below is an arithmetic `-ne`, which
+# treats an empty operand as a syntax error on stderr and CONTINUES -- so a
+# silently-empty field reaches the "OK" line as a pass. Assert the four fields
+# are non-empty and numeric before any of them is compared.
+for _f in "$KT_PID_PRE" "$KT_PRI_PRE" "$KT_PID_POST" "$KT_PRI_POST"; do
+    case "$_f" in
+        ''|*[!0-9]*)
+            fail_with "step 6 could not parse ktimerd's ps -l rows" \
+                "Parsed: pre PID='$KT_PID_PRE' pri='$KT_PRI_PRE'," \
+                "post PID='$KT_PID_POST' pri='$KT_PRI_POST'." \
+                "A non-numeric or empty field means the 'ps -l' column layout" \
+                "changed and the sed no longer matches. Priority restoration is" \
+                "NOT proven by this run." \
+                "" \
+                "rows seen: ${KT_PRI_SAMPLES[*]:-none}"
+            ;;
+    esac
+done
+echo "  ktimerd: pre PID=$KT_PID_PRE pri=$KT_PRI_PRE  post PID=$KT_PID_POST pri=$KT_PRI_POST"
+
+# (a) POSITIVE CONTROL: it must actually have been restarted. Without this the
+# priority comparison is vacuous -- an unchanged priority on a task that never
+# died proves nothing at all, and killktimerd failing silently would read as a
+# pass. Same false-pass shape as step 5c's control above.
+if [ "$KT_PID_PRE" = "$KT_PID_POST" ]; then
+    fail_with "ktimerd was NOT restarted (PID $KT_PID_PRE both times)" \
+        "The priority comparison below is vacuous unless the task actually" \
+        "died and came back. Either killktimerd did not land, or the" \
+        "supervisor is not watching ktimerd -- check for a" \
+        "\"[SUPERVISOR] watching 'ktimerd'\" line in the boot log."
+fi
+
+# (b) the baseline must be HIGH, or the comparison grades the wrong thing.
+if [ "$KT_PRI_PRE" -ne 3 ]; then
+    fail_with "ktimerd's pre-kill priority is $KT_PRI_PRE, expected 3 (PRIORITY_HIGH)" \
+        "kernel.c raises ktimerd to PRIORITY_HIGH after creating it. If it is" \
+        "not 3 here, this leg cannot distinguish a restored priority from a" \
+        "defaulted one, because PRIORITY_NORMAL (2) is what a demotion also" \
+        "produces."
+fi
+
+# (c) THE CLAIM.
+if [ "$KT_PRI_POST" -ne "$KT_PRI_PRE" ]; then
+    fail_with "ktimerd came back DEMOTED: priority $KT_PRI_PRE -> $KT_PRI_POST" \
+        "supervisor_restart() called task_create_kernel(), which assigns" \
+        "PRIORITY_NORMAL unconditionally, and did not restore the priority" \
+        "recorded by supervisor_watch(). The task is alive and the restart" \
+        "counter rose, so every status surface reports a healthy recovery --" \
+        "the only symptom is that the timer bottom-half now runs behind" \
+        "interactive work."
+fi
+echo "  [step 6] ktimerd restarted as PID $KT_PID_POST at priority $KT_PRI_POST (unchanged): OK"
+
 # Positive control for (c). Without this, 5c passes on a run where the third
 # injection never reached the guest at all -- "no frames parsed" and "no frames
 # sent" are the same reading, which is the failure mode recorded in memory
@@ -573,9 +697,10 @@ if [ "$RX_POST" -le "$RX_PRE" ]; then
 fi
 
 echo ""
-echo "RESULT: PASS — restart AND give-up both proven"
+echo "RESULT: PASS — restart, priority restoration AND give-up all proven"
 echo "  [1-3] knetd killed, observed dead, restarted as PID $NEW_PID (was $DIED_PID),"
 echo "        RX cpl0 $RX_PRE -> $RX_POST across the kill; gave-up 0 at that point."
+echo "  [6]   ktimerd restarted as PID $KT_PID_POST at priority $KT_PRI_POST, unchanged from $KT_PRI_PRE."
 echo "  [5]   8 back-to-back deaths exhausted the budget: gave-up $GU_GAVEUP, announced"
 echo "        on the console, and RX stayed pinned at $RX_GU_PRE across a further"
 echo "        injection -- the daemon stayed dead."

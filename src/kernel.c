@@ -1152,7 +1152,19 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
      * Registered here, watched by task_supervisor below.
      */
     supervisor_init();
-    supervisor_watch("knetd", task_knetd, (uint32_t)pid_knetd);
+    supervisor_watch("knetd", task_knetd, (uint32_t)pid_knetd, PRIORITY_NORMAL);
+
+    /* ktimerd is watched for the same reason knetd is, and the consequence of
+     * its death is broader: timer_softirq_run() drives the TCP timers, the DHCP
+     * renewal, the EDR periodic hooks and the CSPRNG reseed. Nothing notices it
+     * stop -- there is no "timer stalled" surface -- so an unwatched death is a
+     * slow, silent degradation rather than a visible fault.
+     *
+     * PRIORITY_HIGH is passed explicitly because task_create_kernel() assigns
+     * PRIORITY_NORMAL and kernel.c raises it separately below; the supervisor
+     * has to know the intended priority or it restores the wrong one. */
+    supervisor_watch("ktimerd", task_ktimerd, (uint32_t)pid_ktimerd,
+                     PRIORITY_HIGH);
 
     int pid_supervisor = task_create_kernel(task_supervisor, "supervisor");
     if (pid_supervisor < 0) {
@@ -1168,6 +1180,18 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
      * "[KERNEL] EDR daemon protected" line was the only evidence, and it reads
      * as a line that simply is not there rather than as a failure. */
     int pid_edr = edr_daemon_start();
+
+    /* Watched here rather than beside knetd/ktimerd above because the daemon
+     * does not exist until edr_daemon_start() returns -- supervisor_watch()
+     * refuses a pid that is not live, so registering it earlier would silently
+     * leave the EDR unsupervised.
+     *
+     * Guarded on >= 0: edr_daemon_start() returns -1 on failure, and watching
+     * pid (uint32_t)-1 would register a slot that can never validate. */
+    if (pid_edr >= 0) {
+        supervisor_watch("edr_daemon", edr_daemon_main, (uint32_t)pid_edr,
+                         PRIORITY_HIGH);
+    }
 
     /* Protect critical system processes with CAP_UNKILLABLE.
      *
