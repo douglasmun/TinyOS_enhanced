@@ -173,6 +173,7 @@ note "== Leg 3 TCP target: $TCP_TARGET_HOST -> $TCP_TARGET_IP =="
 
 WORK=$(mktemp -d -t netdarb.XXXXXX)
 SERIAL="$WORK/serial.log"
+. "$(dirname "${BASH_SOURCE[0]}")/preserve-serial.sh"
 MON_SOCK="$WORK/mon.sock"
 PASSWORD="${TINYOS_PASSWORD:-rootpass123}"
 
@@ -184,7 +185,7 @@ qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom dist/tinyos.iso \
     -no-reboot -display none &
 QEMU_PID=$!
 cleanup_qemu() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; }
-trap 'cleanup_qemu; rm -rf "$WORK"; make clean >/dev/null 2>&1' EXIT
+trap 'rc=$?; cleanup_qemu; preserve_serial "$SERIAL" "" "$rc"; rm -rf "$WORK"; make clean >/dev/null 2>&1' EXIT
 
 # Sequence, in one typist run so the ordering is guaranteed:
 #   ifconfig                 -> baseline
