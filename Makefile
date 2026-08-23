@@ -178,18 +178,16 @@ src/context_switch.o: src/context_switch.S
 # were removed from the build. The source is retained on disk (gitignored) but
 # is no longer compiled or linked. See .gitignore.
 #
-# Password hashing code (PBKDF2) has deep call stacks that cause stack overflow with stack protection
-# Disable stack protection entirely for this file, use -O1 for better codegen
-src/user.o: src/user.c src/kernel.h
-	$(CC) $(filter-out -O2 -fstack-protector-strong,$(CFLAGS)) -O1 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -MMD -MP -Isrc -c $< -o $@
-
-# Shell user functions call password hashing, disable stack protection
-src/shell_user.o: src/shell_user.c src/kernel.h
-	$(CC) $(filter-out -O2 -fstack-protector-strong,$(CFLAGS)) -O1 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -MMD -MP -Isrc -c $< -o $@
-
-# Shell task calls shell_user functions, disable stack protection
-src/shell.o: src/shell.c src/kernel.h
-	$(CC) $(filter-out -O2 -fstack-protector-strong,$(CFLAGS)) -O1 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -MMD -MP -Isrc -c $< -o $@
+# src/user.o, src/shell_user.o and src/shell.o used to be built with
+# -fno-stack-protector -U_FORTIFY_SOURCE -O1, because PBKDF2's deep call stacks
+# overflowed the kernel task stack when it was 64 KB. That stack is now 128 KB
+# (KERNEL_TASK_STACK_PAGES = 32 in src/process.h), so the exception is obsolete
+# and these three files -- the entire credential path, which parses attacker-
+# supplied passwords -- build with the same -fstack-protector-strong as the rest
+# of the kernel via the generic %.o rule above. Verified by
+# verify/verify-ring3-cred.sh, which drives useradd/passwd (and therefore
+# PBKDF2) end to end. Do not reintroduce the exception without re-measuring the
+# stack depth.
 
 # Link kernel ELF via gcc driver so libgcc is available if needed
 kernel.elf: $(OBJ)
