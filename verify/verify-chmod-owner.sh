@@ -53,7 +53,7 @@ cp kernel.elf iso/boot/kernel.elf
 i686-elf-grub-mkrescue -o "$ISO" iso >/dev/null 2>&1 || { echo "FAIL: ISO"; exit 2; }
 
 rm -f "$RUN_DISK" "$SERIAL" "$MON_SOCK"
-dd if=/dev/zero of="$RUN_DISK" bs=1m count=128 status=none
+dd if=/dev/zero of="$RUN_DISK" bs=1M count=128 status=none
 
 qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom "$ISO" \
     -boot d -m 256M \
