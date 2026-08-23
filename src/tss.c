@@ -47,6 +47,21 @@ const uint32_t double_fault_stack_size = DOUBLE_FAULT_STACK_SIZE;
 static tss_t tss __attribute__((aligned(4096)));
 
 /*=============================================================================
+ * DOUBLE FAULT TSS (hardware task switch on vector 8)
+ *
+ * i386 has no IST -- that is x86-64. On 32-bit the ONLY way to get a fresh,
+ * known-good stack on #DF is a hardware task switch through a task gate, which
+ * requires a second TSS holding the complete context for the CPU to load.
+ *
+ * The CPU loads esp/ss/eip/cr3/segments from THIS TSS, so none of them come
+ * from the faulting context. That is the whole point: when the kernel stack is
+ * exhausted -- the most common cause of #DF -- pushing an interrupt frame onto
+ * it is precisely what escalates #DF into a triple fault.
+ *=============================================================================*/
+static tss_t df_tss __attribute__((aligned(4096)));
+uint16_t df_tss_selector = 0;
+
+/*=============================================================================
  * EXTERNAL SYMBOLS
  *=============================================================================*/
 extern uint8_t stack_top[];  /* Defined in boot.s */
@@ -144,6 +159,65 @@ void tss_init(void) {
             tss_base, (uint32_t)sizeof(tss_t), tss_limit);
     kprintf("[TSS] Selector=0x%04x, GDT index=%u\n", tss_selector, tss_index);
     kprintf("[TSS] Initial esp0=0x%08x, ss0=0x%04x\n", tss.esp0, tss.ss0);
+}
+
+/*=============================================================================
+ * DOUBLE FAULT TSS INITIALIZATION
+ *
+ * Must run AFTER pae_init(): cr3 is captured here, and before PAE is enabled
+ * that value is a non-PAE page directory the CPU would load on #DF while
+ * CR4.PAE=1. We take the KERNEL pdpt deliberately -- it is valid in every
+ * address space, so a #DF taken inside a user process still lands on a page
+ * directory that maps the handler and its stack.
+ *
+ * eflags has IF CLEAR. A hardware task switch does not mask interrupts, so
+ * without this the DF task could be preempted onto a scheduler that is itself
+ * mid-collapse. Bit 1 is reserved and must be 1.
+ *=============================================================================*/
+void tss_init_double_fault(uint16_t df_index, uint32_t handler_eip, uint32_t cr3)
+{
+    memset(&df_tss, 0, sizeof(tss_t));
+
+    df_tss.cr3    = cr3;
+    df_tss.eip    = handler_eip;
+    df_tss.eflags = 0x00000002;   /* reserved bit 1 set, IF clear */
+
+    /* Fresh stack, both esp and ebp, so a frame-pointer walk terminates here
+     * rather than wandering back into the exhausted stack that caused this. */
+    df_tss.esp    = tss_get_double_fault_stack_top();
+    df_tss.ebp    = df_tss.esp;
+
+    df_tss.cs     = SEG_KCODE;
+    df_tss.ss     = SEG_KDATA;
+    df_tss.ds     = SEG_KDATA;
+    df_tss.es     = SEG_KDATA;
+    df_tss.fs     = SEG_KDATA;
+    df_tss.gs     = SEG_KDATA;
+
+    /* esp0/ss0 matter even though the handler never leaves ring 0: if the CPU
+     * ever needed an inner-privilege stack here it must not be 0. */
+    df_tss.esp0   = df_tss.esp;
+    df_tss.ss0    = SEG_KDATA;
+
+    df_tss.ldt        = 0;
+    df_tss.trap       = 0;
+    df_tss.iomap_base = sizeof(tss_t);
+
+    /* prev_tss is filled in BY THE CPU on the switch (the backlink). Leave 0. */
+
+    gdt_set_tss_descriptor(df_index, (uint32_t)&df_tss, sizeof(tss_t) - 1);
+    df_tss_selector = (uint16_t)(df_index * 8);
+
+    kprintf("[TSS] Double-fault TSS at 0x%08x, selector=0x%04x, stack top=0x%08x\n",
+            (uint32_t)&df_tss, df_tss_selector, df_tss.esp);
+}
+
+/*=============================================================================
+ * DOUBLE FAULT TSS ACCESSOR (for the handler's forensics)
+ *=============================================================================*/
+
+tss_t* tss_get_double_fault_tss(void) {
+    return &df_tss;
 }
 
 /*=============================================================================

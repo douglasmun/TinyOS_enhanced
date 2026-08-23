@@ -125,6 +125,14 @@ void gdt_init(void);
 void tss_load(void);
 void gdt_set_tss_descriptor(int num, uint32_t base, uint32_t limit);
 
+/**
+ * @brief Extend the GDT limit so the double-fault TSS descriptor is in bounds
+ * @param df_index GDT index the DF TSS descriptor occupies
+ *
+ * Panics if df_index exceeds the static GDT capacity.
+ */
+void gdt_grow_for_df_tss(uint16_t df_index);
+
 /*=============================================================================
  * SECURITY FIX (Issue 12.2): TSS Management Centralized in tss.c
  *

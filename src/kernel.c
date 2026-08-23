@@ -78,8 +78,9 @@
  * CRITICAL: This stack is used exclusively by the Double Fault handler
  * to ensure we can safely diagnose exceptions that corrupt the main stack
  *-----------------------------------------------------------------------------*/
-static uint8_t double_fault_stack[8192] __attribute__((aligned(16))) __attribute__((unused));
-#define DOUBLE_FAULT_STACK_TOP ((uint32_t)double_fault_stack + sizeof(double_fault_stack))
+/* The double-fault stack lives in tss.c, which owns the DF TSS that points
+ * at it. A second, unused 8 KB copy used to sit here. */
+void double_fault_task_entry(void);   /* src/interrupts.c */
 
 /*-----------------------------------------------------------------------------
  * Local Function Prototypes
@@ -386,6 +387,35 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     /* Only use recursive paging in 32-bit mode (not compatible with PAE) */
     if (!pae_is_active()) {
         init_recursive_paging();
+    }
+
+    /*=========================================================================
+     * DOUBLE FAULT TASK GATE
+     *
+     * Deliberately here, and not earlier: the DF TSS captures CR3, so it must
+     * be built after paging is live or the CPU would load a stale page
+     * directory on #DF -- exactly when it can least afford one. We hand it the
+     * KERNEL pdpt, which is valid in every address space, so a #DF taken
+     * inside a user process still finds the handler mapped.
+     *
+     * Until this runs, vector 8 is the ordinary isr8 interrupt gate installed
+     * by idt_init(); after it, #DF is a hardware task switch onto a dedicated
+     * stack. That is the only construct on i386 that survives a blown kernel
+     * stack (IST is x86-64 only).
+     *=======================================================================*/
+    {
+        uint32_t df_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(df_cr3));
+
+        /* Sits immediately after the main TSS, which gdt_init() sized the
+         * GDT limit to include; gdt_set_tss_descriptor() writes the entry and
+         * gdt_grow_for_df_tss() extends the limit to cover it. */
+        uint16_t df_index = (uint16_t)((tss_selector >> 3) + 1);
+
+        gdt_grow_for_df_tss(df_index);
+        tss_init_double_fault(df_index, (uint32_t)double_fault_task_entry, df_cr3);
+        idt_install_double_fault_gate(df_tss_selector);
+        kprintf("[IDT] Vector 8 (#DF) is a task gate on a dedicated stack [OK]\n");
     }
 
     /*=========================================================================

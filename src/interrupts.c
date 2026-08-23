@@ -10,6 +10,7 @@
 #include "scheduler.h"
 #include "keyboard.h"
 #include "interrupt_regs.h"
+#include "tss.h"  /* For the double-fault TSS and its stack */
 #include "util.h"  /* For kernel_panic() */
 #include "critical.h"  /* For interrupt context tracking */
 #include "audit.h"  /* For security audit logging */
@@ -25,7 +26,7 @@ extern void e1000_poll_rx(void);
 /*=============================================================================
  * Function Prototypes
  *============================================================================*/
-void double_fault_c_handler(interrupt_regs_t* regs);
+void double_fault_task_entry(void);
 
 static const char* exc_name[32] = {
     /* Vector 0-7 */
@@ -600,60 +601,99 @@ void isr_common_handler(interrupt_regs_t* regs)
  * stacks), this handler is CRITICAL for diagnosing kernel bugs and security
  * vulnerabilities in production systems.
  *=============================================================================*/
-void double_fault_c_handler(interrupt_regs_t* regs) {
-    /* At this point, we're running on the dedicated double fault stack */
-
+void double_fault_task_entry(void) {
     /*=========================================================================
-     * SECURITY FIX (Issue 7.1): Production Secure Panic Mode for Double Fault
+     * ENTERED BY A HARDWARE TASK SWITCH, NOT A CALL.
      *
-     * CRITICAL: Double Fault is the most serious exception. We apply the same
-     * secure panic policy as regular exceptions.
+     * There is no return address, no pushed error code and no register frame
+     * on this stack -- the CPU saved the interrupted context into the OUTGOING
+     * TSS and loaded ours. So this function takes no arguments and MUST NOT
+     * return: there is nothing to return to. It halts.
+     *
+     * The faulting state is read from the main TSS, which is where the CPU
+     * just wrote it. df_tss.prev_tss holds the backlink selector confirming
+     * which task was interrupted.
      *=======================================================================*/
+    tss_t* faulted = tss_get();
+    tss_t* self    = tss_get_double_fault_tss();
 
     #ifndef PRODUCTION_BUILD
-    /* DEVELOPMENT MODE: Full diagnostics for debugging */
-
     kprintf("\n");
     kprintf("*************************************************************\n");
-    kprintf("* CRITICAL SYSTEM FAILURE: DOUBLE FAULT EXCEPTION          *\n");
+    kprintf("* CRITICAL SYSTEM FAILURE: DOUBLE FAULT EXCEPTION           *\n");
     kprintf("*************************************************************\n");
     kprintf("\n");
-    kprintf("A Double Fault occurred, indicating the CPU encountered an\n");
-    kprintf("exception while handling a previous exception. Common causes:\n");
-    kprintf(" - Stack overflow or corruption\n");
+    kprintf("A Double Fault occurred: the CPU hit an exception while trying\n");
+    kprintf("to deliver a previous one. Common causes:\n");
+    kprintf(" - Kernel stack overflow or corruption\n");
     kprintf(" - Invalid exception handler\n");
     kprintf(" - Nested page faults\n");
     kprintf(" - Corrupt IDT, GDT, or TSS\n");
     kprintf("\n");
-
-    /* Print register dump for forensics */
-    kprintf("Register state at crash:\n");
+    kprintf("Handled via task gate on a dedicated stack (top=0x%08x),\n",
+            tss_get_double_fault_stack_top());
+    kprintf("so this dump survives even a fully exhausted kernel stack.\n");
+    kprintf("\n");
+    kprintf("Interrupted task state (read from the outgoing TSS):\n");
+    kprintf("  EIP=0x%08x  EFLAGS=0x%08x  CR3=0x%08x\n",
+            faulted->eip, faulted->eflags, faulted->cr3);
     kprintf("  EAX=0x%08x  EBX=0x%08x  ECX=0x%08x  EDX=0x%08x\n",
-            regs->eax, regs->ebx, regs->ecx, regs->edx);
-    kprintf("  ESI=0x%08x  EDI=0x%08x  EBP=0x%08x\n",
-            regs->esi, regs->edi, regs->ebp);
-    kprintf("  EIP=0x%08x  EFLAGS=0x%08x\n",
-            regs->eip, regs->eflags);
-    kprintf("  CS=0x%04x  DS=0x%04x  ES=0x%04x  FS=0x%04x  GS=0x%04x\n",
-            regs->cs, regs->ds, regs->es, regs->fs, regs->gs);
-    if (regs->cs & 0x03) {  /* If came from user mode */
-        kprintf("  User ESP=0x%08x  SS=0x%04x\n",
-                regs->useresp, regs->ss);
+            faulted->eax, faulted->ebx, faulted->ecx, faulted->edx);
+    kprintf("  ESI=0x%08x  EDI=0x%08x  EBP=0x%08x  ESP=0x%08x\n",
+            faulted->esi, faulted->edi, faulted->ebp, faulted->esp);
+    kprintf("  CS=0x%04x  SS=0x%04x  DS=0x%04x  ES=0x%04x  FS=0x%04x  GS=0x%04x\n",
+            (uint16_t)faulted->cs, (uint16_t)faulted->ss, (uint16_t)faulted->ds,
+            (uint16_t)faulted->es, (uint16_t)faulted->fs, (uint16_t)faulted->gs);
+    kprintf("  Ring: %u   esp0=0x%08x ss0=0x%04x\n",
+            (uint32_t)(faulted->cs & 3), faulted->esp0, (uint16_t)faulted->ss0);
+    kprintf("  Backlink (prev_tss in DF TSS) = 0x%04x\n",
+            (uint16_t)self->prev_tss);
+
+    /*=====================================================================
+     * Stack-overflow tell: ESP at or below the guard page of the task
+     * stack. Naming it matters -- this is the case that used to triple
+     * fault silently, so if it is what happened, say so explicitly.
+     *
+     * The test is DISTANCE FROM esp0, not page equality. esp0 is the TOP
+     * of the kernel stack and it grows DOWN, so an exhausted stack puts
+     * ESP as far BELOW esp0 as possible -- a same-page test would only
+     * ever fire on a stack that is nearly EMPTY, i.e. exactly backwards.
+     * Measured on a real dftest run: esp0=0x004d8000, ESP=0x00402ff0,
+     * which is 741 KB past the base of a 128 KB stack (it had run through
+     * the guard page and kept going).
+     *
+     * Anything at or below the base is past the guard page by definition.
+     * Report the depth either way: a plausible-looking ESP that is already
+     * 90% of the way down is worth seeing before it becomes the next #DF.
+     *===================================================================*/
+    kprintf("\n");
+    if (faulted->esp != 0 && faulted->esp0 != 0 && faulted->esp < faulted->esp0) {
+        uint32_t stack_bytes = (uint32_t)KERNEL_TASK_STACK_PAGES * 4096u;
+        uint32_t stack_base  = faulted->esp0 - stack_bytes;
+        uint32_t used        = faulted->esp0 - faulted->esp;
+
+        /* "used" can EXCEED the capacity: once ESP runs past the base it
+         * keeps descending, so this is the distance below esp0, not a
+         * percentage. A figure larger than the stack size is itself the
+         * overflow evidence -- label it so nobody reads it as a quota. */
+        kprintf("  Kernel stack: base=0x%08x top=0x%08x (%u KB capacity)\n",
+                stack_base, faulted->esp0, stack_bytes / 1024u);
+        kprintf("  ESP is %u KB below esp0%s\n", used / 1024u,
+                (used > stack_bytes) ? " -- PAST THE BASE" : "");
+
+        if (faulted->esp <= stack_base) {
+            kprintf("NOTE: faulting ESP is at or below the base of the kernel\n");
+            kprintf("      stack -- it ran through the guard page. Kernel\n");
+            kprintf("      stack exhaustion is the cause.\n");
+        } else if (used > (stack_bytes - stack_bytes / 8u)) {
+            kprintf("NOTE: over 87%% of the kernel stack was consumed --\n");
+            kprintf("      stack exhaustion is the likely cause.\n");
+        }
     }
-    kprintf("  Error Code: 0x%08x (always 0 for Double Fault)\n",
-            regs->err_code);
-
-    kprintf("\n");
     kprintf("The system has been halted to prevent further damage.\n");
-    kprintf("Please analyze the register dump to diagnose the issue.\n");
     kprintf("\n");
-
     #else
-    /* PRODUCTION MODE: Minimal output, no register dumps */
-
-    /* Generate unique crash ID (use error code as salt, though always 0) */
-    uint32_t crash_id = (uint32_t)(timer_ticks ^ (8ULL << 24) ^ regs->err_code);
-
+    uint32_t crash_id = (uint32_t)(timer_ticks ^ (8ULL << 24) ^ faulted->eip);
     kprintf("\n");
     kprintf("*************************************************************\n");
     kprintf("* CRITICAL SYSTEM FAILURE                                   *\n");
@@ -665,18 +705,12 @@ void double_fault_c_handler(interrupt_regs_t* regs) {
     kprintf("The system has encountered an unrecoverable error.\n");
     kprintf("Please contact technical support with the Crash ID above.\n");
     kprintf("\n");
-
-    /* Suppress detailed output */
-    (void)regs;  /* Suppress unused warning */
-
+    (void)self;
     #endif  /* PRODUCTION_BUILD */
 
-    /* Halt the system - Double Fault is an ABORT-class exception */
-    __asm__ volatile("cli");  /* Disable interrupts */
-    __asm__ volatile("hlt");  /* Halt CPU */
-
-    /* Should never reach here */
-    while(1) {
+    /* ABORT-class: never resume. Returning would IRET into a corrupt task. */
+    __asm__ volatile("cli");
+    while (1) {
         __asm__ volatile("hlt");
     }
 }

@@ -8,6 +8,7 @@
 #include "paging.h"    // For is_user_address
 #include "memory.h"    // For USER_CODE_BASE, USER_STACK_BASE, etc.
 #include "kprintf.h"   // For kprintf
+#include "util.h"      // For kernel_panic
 
 /*-----------------------------------------------------------------------------
  * GDT Table - Large enough for GRUB's entries + our additions
@@ -213,6 +214,35 @@ void gdt_init(void) {
     gdt_flush((uint32_t)&gdtr);
 }
 
+
+/*-----------------------------------------------------------------------------
+ * Extend the GDT limit to cover the double-fault TSS descriptor
+ *
+ * gdt_init() sizes gdtr.limit to end at the main TSS, so a descriptor written
+ * one slot past it is OUTSIDE the table as far as the CPU is concerned: the
+ * task gate would raise #GP(selector) instead of switching tasks, turning
+ * every #DF into a #GP -> triple fault. Growing the limit is what makes the
+ * new descriptor addressable, and the GDT must be reloaded for it to take.
+ *
+ * Bounds-checked against the static gdt[] array: silently writing past it
+ * would corrupt whatever the linker placed next.
+ *---------------------------------------------------------------------------*/
+void gdt_grow_for_df_tss(uint16_t df_index) {
+    if (df_index >= (uint16_t)(sizeof(gdt) / sizeof(gdt[0]))) {
+        kprintf("[GDT] ERROR: DF TSS index %u exceeds GDT capacity %u\n",
+                (uint32_t)df_index, (uint32_t)(sizeof(gdt) / sizeof(gdt[0])));
+        kernel_panic("GDT too small for double-fault TSS");
+    }
+
+    gdtr.limit = (uint16_t)((sizeof(struct gdt_entry) * (df_index + 1)) - 1);
+    gdtr.base  = (uint32_t)&gdt[0];
+
+    __asm__ volatile("" : : : "memory");
+    __asm__ volatile("lgdt %0" : : "m"(gdtr) : "memory");
+
+    kprintf("[GDT] Limit grown to 0x%04x for DF TSS at index %u\n",
+            (uint32_t)gdtr.limit, (uint32_t)df_index);
+}
 
 /*-----------------------------------------------------------------------------
  * Load TSS (must be called after gdt_init)
