@@ -21,6 +21,9 @@ look arbitrary until you know which failure produced them.
 | Security mechanism reference (17 mechanisms) | `doc/SECURITY_HARDENING.md` |
 | Latest audit: 16 findings, all fixed (PRs #103–#105) | `doc/SECURITY_AUDIT_2026-08.md` |
 | Security history index | `doc/SECURITY_STATUS_COMPLETE.md`, `doc/MULTI_AGENT_SECURITY_AUDIT_2026.md` |
+| RX path, counters, firewall/IDS vehicles | `doc/NETWORK_ISOLATION.md` |
+| `knetd`, the supervisor, why the D1 parser move was withdrawn | `doc/NETDAEMON_DESIGN.md` |
+| Why the audit log is volatile and stays that way | `doc/AUDIT_LOG_PERSISTENCE.md` |
 | Boot/login/shell/networking walkthrough | `doc/USER_GUIDE.md` |
 
 ## Build & run
@@ -32,23 +35,25 @@ look arbitrary until you know which failure produced them.
 - Headless boot: `qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom dist/tinyos.iso
   -boot d -m 256M -netdev user,id=net0 -device e1000,netdev=net0 -serial file:LOG -display none`.
 - The EDR daemon spams `[EDR ADVANCED] ... Suspicious memory` on serial — filter with
-  `grep -v Suspicious`. Its **60-second status report is a ~7-line burst**, and that
-  burst is why **no log pattern may be anchored on the shell prompt alone**: the shell
-  writes `D:/ $ ` with no trailing newline, so the burst terminates that line and leaves
-  the command echo at **column 0 with no prompt**. Anchor at line start too
-  (`grep -vE '(^|\$ )cmd'`, `sed -nE '/(^|\$ )cmd/,$p'`) — and note BSD `sed` does not
-  support the BRE alternation `\(^\|…\)`, so that form matches *neither* layout. Both
-  polarities break: filters that DROP the echo count a survivor, guards that REQUIRE it
-  do not find it, and **both fail as a FAIL on a correct kernel**. Five legs across four
-  harnesses failed this way (PR #115), each *deterministically* — which is why they read
-  as kernel regressions. The messages mislead: one said "alias table may be full",
-  another "the typist did not reach it".
+  `grep -v Suspicious`. Its periodic status report is a multi-line burst, and that burst
+  is why **no log pattern may be anchored on the shell prompt alone**: the shell writes
+  `D:/ $ ` with no trailing newline, so the burst tears that line at an arbitrary
+  character and leaves the command echo with no prompt in front of it. Both polarities
+  break — filters that DROP the echo count a survivor, guards that REQUIRE it do not find
+  it, and **both fail as a FAIL on a correct kernel** (five legs across four harnesses,
+  PR #115, each *deterministically*, so they read as kernel regressions). Don't hand-roll
+  the fix: use the shared splice in **`verify/edr-rejoin.sh`** (covered by
+  `verify/edr-rejoin-test.sh`), since all five earlier hand-copies had defects of their
+  own.
 - First boot asks to set a root password, then login. **Do not try to echo-verify each
   character**: the ring-3 shell echoes the whole accepted line *after* `readline()`
   returns (`src/stdio.c:336`, `userspace/shell.c:2035`), so a per-char wait blocks on an
   echo that cannot arrive and a resend loop types `kkkkshell` into a live boot. Only the
   kernel shell echoes per keystroke. The typist is **not** the flaky part — measured
   across ~45 boots, **zero** keystrokes dropped; every failure was a harness defect.
+- Harnesses live in `verify/`; `verify/run-all.sh` is the batch runner (~2.7 h serially,
+  so it is nightly/manual, not a PR gate). A harness that has never been run end to end
+  reports PASS and proves nothing — run new ones against the **unfixed** tree.
 
 Build flags are all **explicitly named opt-outs, never defaults**:
 `-DELF_PERMISSIVE_SIGNATURES` (warn-and-load unsigned binaries),
@@ -58,67 +63,52 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
 
 ## Rules that bite
 
-- **Don't add per-operation `kprintf` to a path ring 3 can reach.** With the shell at
-  ring 3 the kernel console and the user's own output are the same serial stream, so a
-  single typed command buries itself in kernel chatter. `-DTINYOS_TRACE_SYSCALLS` is off
-  by default and **must stay that way** (`readline()` costs one syscall per keystroke).
-  Same for routine FS errors: a failed `rmdir` is a userspace error the caller already
-  reports on its own stream.
-  **A syscall with no libc wrapper and no builtin is where this rule rots**, because
-  nothing in the tree drives it and no harness ever sees the sites: `SYS_MSEAL` (16)
-  carried **sixteen** of them (7 in `sys_mseal`, 9 in `pae_seal_memory_in`), all driven
-  by the caller's own argument, two from *inside* the page-walk loop, and the cheapest
-  (`size == 0`) rejected above any walk — no memory, no privilege, repeatable at syscall
-  rate. Group by **caller intent** and count successes too (`sealed`/`pages`), or the
-  surface reports only failures and an unused mechanism reads as a working one. The
-  harness needs its own ring-3 driver (`/msealprobe.elf`) and a **positive control**: the
-  rejection deltas are all satisfied perfectly by a `sys_mseal` that refuses everything.
-  Its two-pass walk inside one `CRITICAL_SECTION` **looks** like an unprivileged
-  interrupt-stall primitive and is not — measured against `get_timer_ticks()`, the tick
-  delta *falls* as the region grows (worst case ~10 ms under TCG); the two passes are
-  load-bearing for atomicity, so don't collapse them. Harness:
-  `verify-mseal-counters.sh`; rationale: `doc/MSEAL_AUDIT.md`.
+- **Don't add per-operation `kprintf` to a path ring 3 can reach.** The kernel console
+  and the ring-3 shell's output are one serial stream, so a single typed command buries
+  itself in kernel chatter. `-DTINYOS_TRACE_SYSCALLS` stays off by default
+  (`readline()` costs one syscall per keystroke). Routine FS errors too: a failed
+  `rmdir` is the caller's to report.
+  **A syscall with no libc wrapper and no builtin is where this rule rots** — nothing
+  drives it, so no harness sees the sites. `SYS_MSEAL` (16) carried sixteen. Group
+  counters by **caller intent** and count successes too, or the surface reports only
+  failures and an unused mechanism reads as a working one. Such a harness needs its own
+  ring-3 driver (`/msealprobe.elf`) and a **positive control** — the rejection deltas
+  are all satisfied by a `sys_mseal` that refuses everything. Its two-pass walk under
+  one `CRITICAL_SECTION` is *not* an interrupt-stall primitive (measured: tick delta
+  falls as the region grows) and the two passes are load-bearing — don't collapse them.
+  Harness: `verify-mseal-counters.sh`; rationale: `doc/MSEAL_AUDIT.md`.
 - **The RX path is stricter still: no per-packet `kprintf` at all.** Any host on the
   segment drives those sites, from the ISR, before the firewall. Count, don't print —
   counters surface in `ifconfig`; `stream_printf` is wrong here too (interrupt context
-  has no current user stream). Four sweeps were needed (the RX loops, then `icmp.c`,
-  then `handle_dns_response`'s 20 sites, then `tcp.c`'s nine — that last one *after* the
-  item had been marked DONE three times), so **sweep the protocol files, not just the
-  loops** — and keep distinct attack signatures as **separate** counters, since one
-  "dropped" total hides which attack is underway. A file-wide grep fails on correct
-  code: the rule is about what a *remote* host drives, so `dns.c`'s local-`dig`-driven
-  prints stay, as do `tcp.c` 800/815/1028 (once-per-connection transitions, bounded by
-  connection count, not packet rate). **`tcp.c`'s two `data_offset` sites were the worst
-  of the class**: they fire *before* `tcp_find_connection()`, so one malformed frame from
-  any host printed a line with no connection, port match, or local account. Two more were
-  self-defeating — the RST/FIN flood detectors printed once per flooding packet,
-  amplifying what they exist to absorb. Group counters by **attacker position**, not by
-  source line (both `data_offset` checks are one malformed header, so one counter), and
-  give a counter harness a **selectivity** leg — a well-formed frame matching no
-  connection must land on `no-conn`, not `malformed`, or a counter incrementing on
-  *every* inbound segment passes the exact-delta assertion perfectly. Harnesses:
-  `verify-rxdrop-counters.sh`, `verify-icmp-counters.sh`,
-  `verify-dns-rx-counters.sh` (needs `-DTINYOS_FAULT_INJECT`; its `valid` leg is the
-  positive control), `verify-tcp-rx-counters.sh`. Rationale: `doc/NETWORK_ISOLATION.md`.
+  has no current user stream). **Sweep the protocol files, not just the loops**: four
+  sweeps were needed, the last one on `tcp.c` *after* the item had read DONE three
+  times. Keep distinct attack signatures as **separate** counters — one "dropped" total
+  hides which attack is underway — and group by **attacker position**, not source line.
+  A file-wide grep fails on correct code: the rule is about what a *remote* host drives,
+  so `dns.c`'s local-`dig`-driven prints stay, as do once-per-connection transitions
+  bounded by connection count rather than packet rate. Give a counter harness a
+  **selectivity** leg — a well-formed frame matching no connection must land on
+  `no-conn`, not `malformed`, or a counter incrementing on *every* inbound segment
+  passes the exact-delta assertion perfectly. Harnesses: `verify-rxdrop-counters.sh`,
+  `verify-icmp-counters.sh`, `verify-dns-rx-counters.sh` (needs `-DTINYOS_FAULT_INJECT`;
+  its `valid` leg is the positive control), `verify-tcp-rx-counters.sh`. Rationale:
+  `doc/NETWORK_ISOLATION.md`.
 - **An injected frame must clear three gates before any protocol counter, and all three
-  fail as delta 0 — including the positive control.** `handle_ip()`'s address gate (on the
-  mcast netdev the guest self-assigns a link-local `169.254.x.y`, *not* the `10.0.2.15` NAT
-  lease injectors default to — capture it), `is_bogon_ip()` (so sources must be TEST-NET-3,
-  never RFC1918), and the firewall's **default DENY ALL**, which no shell command can add a
-  rule around. Diagnose with `ifconfig`: `RX ring: N cpl0` says frames arrived,
-  `RX proto-ring:` says they reached the L4 dispatch — a gap localises the drop above the
-  switch. Two vehicles get past the firewall, and **which one you need depends on what you
-  are testing**: UDP ports **68→67** take the standing DHCP exception, but that exception
-  `return true`s *above* `match_rule()`, so it is useless for testing any rule — a block
-  rule can never be consulted for a DHCP-port frame, and the leg passes whether the block
-  works or not. To exercise a **rule**, use ICMP: `firewall_allow_icmp()` admits it at
-  priority 50 via a real rule, and ICMP creates no connection entry, so established-flow
-  tracking cannot short-circuit above the rules either. Harnesses:
-  `verify-firewall-default-deny.sh` (default-deny reachable + replies still admitted),
-  `verify-ids-block-leg.sh` (a matched BLOCK signature must outrank that priority-50 ACCEPT,
-  drop **every** later frame from that source, and leave a **different** source untouched —
-  the clean-frame and different-source legs are what stop "blocks everything after an alert"
-  from passing).
+  fail as delta 0 — including the positive control.** `handle_ip()`'s address gate (on
+  the mcast netdev the guest self-assigns a link-local `169.254.x.y`, *not* the
+  `10.0.2.15` NAT lease injectors default to — capture it), `is_bogon_ip()` (sources must
+  be TEST-NET-3, never RFC1918), and the firewall's **default DENY ALL**, which no shell
+  command can add a rule around. Diagnose with `ifconfig`: `RX ring: N cpl0` says frames
+  arrived, `RX proto-ring:` says they reached L4 — a gap localises the drop above the
+  switch. **Which vehicle you need depends on what you are testing**: UDP 68→67 takes the
+  standing DHCP exception, but that `return true`s *above* `match_rule()`, so it is
+  useless for testing any rule. To exercise a **rule**, use ICMP — admitted at priority
+  50 via a real rule, and it creates no connection entry, so established-flow tracking
+  cannot short-circuit above the rules either. Harnesses:
+  `verify-firewall-default-deny.sh`, `verify-ids-block-leg.sh` (a matched BLOCK must
+  outrank that priority-50 ACCEPT, drop **every** later frame from that source, and leave
+  a **different** source untouched — those last two legs are what stop "blocks everything
+  after an alert" from passing).
 - **`E1000_UNLOCK()` does not re-enable interrupts on the IRQ11 path.**
   `critical_section_exit()` only touches `IF` at depth 0, and that clause is deliberate
   (a `popfl` mid-ISR would corrupt the preempted thread's flags). So `e1000_poll_rx`'s
@@ -127,15 +117,15 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   `doc/NETWORK_ISOLATION.md`.
 - **The RX path parses in *task* context, on `knetd` — keep it that way.** The ISR only
   copies each frame into `rx_softirq_ring`; `e1000_rx_softirq_run()` drains it and calls
-  `handle_packet()` with `IF=1`. Never reach the parser from an ISR — that is ~8,350
-  lines running interrupts-disabled at a remote host's chosen rate. Three things easy to
-  undo: the frame **must be copied** before RDT advances (the NIC refills that
-  descriptor, so a retained `rx_bufs[]` pointer is an attacker-timed UAF); the boot DHCP
-  loop in `kernel.c` **must keep its explicit `e1000_rx_softirq_run()` call** (`knetd`
-  does not exist yet there, and a "did it run" flag was tried and reverted — it masks a
-  stalled `knetd`); and ring overflow is **drop-newest**, counted, because drop-oldest
-  lets a fast sender evict accepted frames. `ifconfig`'s `irq-ctx` must read **0**.
-  Harness: `verify-rx-thread-context.sh`.
+  `handle_packet()` with `IF=1`. Never reach the parser from an ISR — that is ~8,350 lines
+  running interrupts-disabled at a remote host's chosen rate. Three things easy to undo:
+  the frame **must be copied** before RDT advances (the NIC refills that descriptor, so a
+  retained `rx_bufs[]` pointer is an attacker-timed UAF); the boot DHCP loop in `kernel.c`
+  **must keep its explicit `e1000_rx_softirq_run()` call** (`knetd` does not exist yet
+  there, and a "did it run" flag was tried and reverted — it masks a stalled `knetd`); and
+  ring overflow is **drop-newest**, counted, because drop-oldest lets a fast sender evict
+  accepted frames. `ifconfig`'s `irq-ctx` must read **0**. Harness:
+  `verify-rx-thread-context.sh`.
 - **`rx_softirq_ring` is single-consumer, and `knetd` is that consumer.** `SYS_NETRX`
   (`e1000_rx_dequeue`) must pop **`netd_ring`**, never `rx_softirq_ring` — pointing it
   back restores a race where a live ring-3 netd steals TCP segments from the kernel
@@ -169,51 +159,38 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   four PRs of prerequisites stay correct because none depended on the answer.
 - **Four traps around kernel task lifetime**, each of which reads as healthy when
   wrong. `task_create_kernel()` allocates but does **not** enqueue — every caller needs
-  `scheduler_add_task()`, or the task is created, listed by `ps`, counted by every
-  status surface, and never runs one instruction. It grants `CAP_ALL` (`0xFFFFFFFF`),
-  which **includes `CAP_UNKILLABLE`** — so every kernel task is unkillable, the explicit
-  `|= CAP_UNKILLABLE` grants in `kernel.c` are no-ops, and a test that plans to `kill`
-  one is grading a daemon that never died. And `task_exit()` is **inert** for
-  scheduler-run tasks (it reads `process.c`'s `current_task`, set only by
-  `task_switch_to`) — use `task_terminate(pid)`, capturing the pid first. Fourth: the
-  post-context-switch reaper must `scheduler_remove_task_locked()` **before**
-  `task_free_resources()`. A task that terminates *itself* defers the free to the reaper
-  and is still linked in the ready queue; freeing the slot left a self-linked corpse
-  there, and `scheduler_get_next_task()`'s later reject-and-remove hit the
-  `task->next == task` case, which nulled head **and** tail and discarded every live
-  task — panic "All tasks terminated" with five tasks alive. Invariant: *a freed slot is
-  never in the ready queue*. Found by the supervisor give-up control, not by anything
-  that existed before it.
+  `scheduler_add_task()`, or the task is created, listed by `ps`, counted by every status
+  surface, and never runs one instruction. It grants `CAP_ALL`, which **includes
+  `CAP_UNKILLABLE`**, so every kernel task is unkillable and a test that plans to `kill`
+  one is grading a daemon that never died. `task_exit()` is **inert** for scheduler-run
+  tasks — use `task_terminate(pid)`, capturing the pid first. And the post-context-switch
+  reaper must `scheduler_remove_task_locked()` **before** `task_free_resources()`:
+  invariant is *a freed slot is never in the ready queue*, and breaking it left a
+  self-linked corpse that nulled head **and** tail and panicked "All tasks terminated"
+  with five tasks alive.
 - **Allocate before you disturb the array — `editor_insert_row`'s ordering is
-  load-bearing.** It used to shift rows down *then* `pmm_alloc()`, so a failed
-  allocation returned with `E.rows[at]` a bitwise copy of `E.rows[at+1]` — same
-  `chars`, same `render`, both below `E.numrows`, both freed by
-  `editor_cleanup()`. `pmm_free`'s double-free guard (`pmm.c:963`) refuses the
-  second free, so the counter **falls** (2 frames lost per failed insert) rather
-  than rising, and a surviving row reads back `NULL` — one OOM hiccup silently
-  eats a line of the user's file. Three of the four callers append at
-  `E.numrows`, where the shift loop is empty and no alias exists, which is
-  exactly why this survived. Harness: `verify-editor-rowfail.sh` (needs
-  `-DTINYOS_FAULT_INJECT`), whose arms all insert **mid-file** for that reason,
-  and whose arm 1 is a positive control because "balanced frames" is otherwise
-  satisfied by an editor that allocated nothing.
+  load-bearing.** It used to shift rows down *then* `pmm_alloc()`, so a failed allocation
+  left `E.rows[at]` a bitwise copy of its neighbour — same `chars`, same `render`, both
+  freed at cleanup. `pmm_free`'s double-free guard refuses the second free, so the frame
+  counter **falls** rather than rising and a surviving row reads back `NULL`: one OOM
+  hiccup silently eats a line of the user's file. Three of the four callers append at
+  `E.numrows`, where the shift loop is empty and no alias exists, which is why this
+  survived. Harness: `verify-editor-rowfail.sh` (needs `-DTINYOS_FAULT_INJECT`), whose
+  arms all insert **mid-file** for that reason, and whose arm 1 is a positive control
+  because "balanced frames" is otherwise satisfied by an editor that allocated nothing.
 - **Teardown frees only what a `task_t` field names — including the ELF image.**
-  `task_free_resources()` walks `task->*_phys[]` arrays and `pae_free_user_pdpt()`
-  frees the PDs/PDPT/page tables; **nothing walks the PTEs to free what they point
-  at**. That leaked the whole image on every exit — measured at exactly 8 frames
-  per `exec /hello.elf`, its exact page count — and since `SYS_SPAWN` is ungated
-  and the frames leak on *exit*, a spawn-and-wait loop drained memory while never
-  holding two tasks at once, so the per-uid cap (which bounds *concurrent* tasks)
-  never fired. Now tracked in `task_t::image_pages_phys[256]`. **The ordering is
-  the invariant:** registration happens only on the success path, *after the last
-  failure return* (in `elf.c`, registration sits below every `return -1`), because every failure path already
-  `pmm_free`s these frames and *then* calls `elf_abort_load()` → `task_terminate()`
-  → `task_free_resources()` — registering earlier makes that a double-free. Image
-  frames are private `pmm_alloc()`s, so the COW kernel-shared-PT concern does
-  **not** apply to them (that is about page *tables*); an oversize image is
-  **refused**, never loaded untracked. Harness: `verify-exec-frame-leak.sh`,
-  whose assertion is **exact equality** of free frames, not a smaller delta — a
-  double-free shows as free frames *rising*.
+  `task_free_resources()` walks `task->*_phys[]` and frees the PDs/PDPT/page tables;
+  **nothing walks the PTEs to free what they point at**. That leaked the whole image on
+  every exit (8 frames per `exec /hello.elf`, measured), and since `SYS_SPAWN` is ungated
+  and frames leak on *exit*, a spawn-and-wait loop drained memory while never holding two
+  tasks at once — so the per-uid cap, which bounds *concurrent* tasks, never fired. Now
+  tracked in `task_t::image_pages_phys[256]`. **The ordering is the invariant:**
+  registration happens only on the success path, *after the last failure return*, because
+  every failure path already `pmm_free`s these frames and then unwinds through
+  `task_free_resources()` — registering earlier makes that a double-free. An oversize
+  image is **refused**, never loaded untracked. Harness: `verify-exec-frame-leak.sh`,
+  whose assertion is **exact equality** of free frames — a double-free shows as free
+  frames *rising*.
 - **Freeing a guard page requires restoring its mapping first.** They are
   identity-mapped **not present** in the kernel identity map every address space shares,
   so `pmm_free` without re-mapping poisons that frame permanently and the #PF lands on
@@ -221,31 +198,26 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
   holes" check can't catch it (runtime hole). User tasks have one too.
 - **`knetd` is supervised; the supervisor is `CAP_UNKILLABLE` and `knetd` is not.**
   `supervisor_run_once()` must use `task_get_validated(pid, generation)` — slots are
-  recycled, so a bare `task_get()` can match a *different* task in the same slot and
-  make a dead daemon look alive. The rate limit lives **inside** `supervisor_restart()`
-  so no second restart path skips it. Its give-up branch **is** now exercised
-  (`verify-supervisor.sh` step 5): `gave-up` rises, the line prints, and — the only
-  independent part — a further injection parses **zero** frames, so the daemon provably
-  stays dead. Step 5c asserts the RX counter is **pinned** while step 3 asserts it
-  **rises**: same counter, opposite directions, don't reconcile them. The deaths come
-  from `killknetd 8`, a countdown each restarted `knetd` decrements, because typing 8
-  commands under TCG misses the 10 s window and missing it fails **silently** — a
-  rolled-forward window reports `gave-up 0`, which is what a *broken* limiter reports
-  too. Harness: `verify-supervisor.sh` (needs
-  `-DTINYOS_FAULT_INJECT`, and `make clean`s on exit — that flag is not in the
-  dependency graph, so its objects break the *other* harnesses at link time).
-  Rationale in `doc/NETDAEMON_DESIGN.md`.
+  recycled, so a bare `task_get()` can match a *different* task in the same slot and make
+  a dead daemon look alive. The rate limit lives **inside** `supervisor_restart()` so no
+  second restart path skips it. Its give-up branch is exercised by
+  `verify-supervisor.sh` step 5, whose independent leg is that a further injection parses
+  **zero** frames. Step 5c asserts the RX counter is **pinned** while step 3 asserts it
+  **rises**: same counter, opposite directions, don't reconcile them. Deaths come from
+  `killknetd 8` because typing 8 commands under TCG misses the 10 s window, and missing
+  it fails **silently** — a rolled-forward window reports `gave-up 0`, which is what a
+  *broken* limiter reports too. Needs `-DTINYOS_FAULT_INJECT`, and `make clean`s on exit
+  (that flag is not in the dependency graph, so its objects break the *other* harnesses
+  at link time). Rationale: `doc/NETDAEMON_DESIGN.md`.
 - **The e1000 DMA buffers are a guarded PMM region, not `.bss`.**
   `e1000_dma_region_init()` carves 38 contiguous pages with an **unmapped guard page at
-  each end**; `rx_bufs/tx_bufs/rx_ring/tx_ring` are pointers into it. Three things to
-  know before touching it: allocation **must stay after `pae_init()`**, whose identity-map
-  sweep panics on any not-present page, so unmapping guards earlier is a boot panic;
-  `TDLEN`/`RDLEN` must be computed from the **element count**, never `sizeof(ring)` —
-  the rings are pointers now, so `sizeof` is 4 and the NIC would be told its ring is one
-  dword long (a clean `-Werror` build, caught only by clang-tidy); and raising
-  `NUM_RX_DESC`/`RX_BUF_SIZE` grows the payload, which the init-time bounds check
-  catches. Guard pages do **not** contain a malicious bus master — no IOMMU does that
-  here; they turn our own overruns into faults. Harness: `verify-dma-guard.sh`.
+  each end**; `rx_bufs/tx_bufs/rx_ring/tx_ring` are pointers into it. Allocation **must
+  stay after `pae_init()`**, whose identity-map sweep panics on any not-present page; and
+  `TDLEN`/`RDLEN` must be computed from the **element count**, never `sizeof(ring)` — the
+  rings are pointers now, so `sizeof` is 4 and the NIC would be told its ring is one dword
+  long (a clean `-Werror` build, caught only by clang-tidy). Guard pages do **not** contain
+  a malicious bus master — no IOMMU here; they turn our own overruns into faults. Harness:
+  `verify-dma-guard.sh`.
 - **Route user-facing output through `stream_printf(get_current_streams())`**, not
   `kprintf` — the latter goes to the kernel console, which a shell session doesn't show.
 - **`MAX_SYSCALL_NUM` must cover the highest syscall number**, not the highest in its own
@@ -269,20 +241,16 @@ trace), `-DTINYOS_LEGACY_CRED_SYSCALLS` (re-enable ring-3 dispatch of
 - **Enforce permissions in the ramfs primitive, not the command.** `ramfs_chmod` had no
   ownership check, so any user — `kshell` is ungated on purpose — could `chmod 666` a
   root-owned file and read it. Every other ramfs mutation routes through
-  `ramfs_check_permission()`; that is what made this one exploitable, since the mode
-  bits are only load-bearing *because* the rest is enforced. Putting the check in
-  `cmd_chmod` would have left the primitive open to the next caller (a future
-  `SYS_CHMOD`). Boot-time callers pass because `ramfs_get_current_credentials()`
-  returns uid 0 with no current task. Harness: `verify-chmod-owner.sh`.
-  **That future caller has now arrived and the placement paid off**: `SYS_CHMOD`
-  (40) inherited the refusal with no uid test of its own — `sys_chmod` only maps
-  ramfs's private sentinels (`-1` not-found, `-2` bad mode, `RAMFS_CHMOD_EPERM`)
-  onto errnos, and passing them through raw would have handed ring 3 a `-1` its
-  libc reads as `-EPERM`, inverting the two cases that matter. Don't add a second
-  uid check at the boundary. Harness: `verify-ring3-chmod.sh`, whose two adjacent
-  legs are deliberately **opposite** — the same unprivileged user must be refused
-  on root's file and must succeed on their own — because a filter that refuses
-  everything passes the exclusion half alone.
+  `ramfs_check_permission()`; the mode bits are only load-bearing *because* the rest is
+  enforced. Putting the check in `cmd_chmod` would have left the primitive open to the
+  next caller. Boot-time callers pass because `ramfs_get_current_credentials()` returns
+  uid 0 with no current task. **That next caller has arrived and the placement paid off**:
+  `SYS_CHMOD` (40) inherited the refusal with no uid test of its own — `sys_chmod` only
+  maps ramfs's private sentinels onto errnos. Don't add a second uid check at the
+  boundary. Harnesses: `verify-chmod-owner.sh`, `verify-ring3-chmod.sh`, whose two
+  adjacent legs are deliberately **opposite** — the same unprivileged user must be refused
+  on root's file and must succeed on their own — because a filter that refuses everything
+  passes the exclusion half alone.
 - **Check sentinel collisions before returning an errno.** `EPERM` is 1, so `-EPERM`
   is `-1` — already `ramfs_chmod`'s "file not found". Returning it made the refusal
   print "No such file or directory" and the new branch dead code, with the kernel
@@ -306,51 +274,35 @@ The **ring-3 shell is the default login shell** (PR #51); the kernel shell is th
 fallback (`kshell` hands over, `exit` logs out). ~35 builtins against the kernel shell's
 ~70 — redirection, pipelines, credentials, `ps`/`kill`/`top`, `cp`/`mv`/`touch`,
 `date`/`chmod`, the env/alias group, and
-`clear`/`history`/`jobs`/`grep`/`find`/`man`/`whoami` have landed. Those last seven
-needed **no new syscall**. `whoami` is the one to remember: it was deferred as needing a
-uid→username path across the boundary, and that was wrong — `env_refresh_identity()`
-already resolves the name kernel-side and exports it as `$USER`, so ring 3 reads its own
-identity through `SYS_ENV` and there is no account-enumeration primitive to weigh (the
-kernel resolves `self->uid` and nothing else). `unalias` genuinely did need surface —
-`SYS_ENV` had no alias-delete subcommand — so it took a ninth
-(`ENV_OP_ALIAS_UNSET`, 8) and shipped separately with an audit of `alias_unset`. `history`/`jobs` are
-ring-3-local by design, not migrations: sharing the kernel shell's buffers would leak one
-session's command lines to another user. The machine-state commands (`pae`,
-`mem`, `wxaudit`, `auditlog`, networking and security tooling) stay kernel-shell only,
-~20 of them by design — together they are an ASLR defeat (PR #58).
+`clear`/`history`/`jobs`/`grep`/`find`/`man`/`whoami`. `history`/`jobs` are ring-3-local
+**by design, not migrations** — sharing the kernel shell's buffers would leak one
+session's command lines to another user. The machine-state commands (`pae`, `mem`,
+`wxaudit`, `auditlog`, networking and security tooling) stay kernel-shell only, ~20 of
+them by design: together they are an ASLR defeat (PR #58).
 
-**`su` stays kernel-shell only — decided, not deferred.** PR #55 already refused
-`SYS_SWITCH_USER` (15) from ring 3 with `-ENOSYS`, because a ring-3 caller must hold the
-**plaintext password** to make the call — the exposure `SYS_CRED` (32) exists to remove,
-since there the kernel prompts and reads the keystrokes itself. The alternative that
-avoids the plaintext (a `CRED_OP_SU` where the kernel prompts) is worse: it hands ring 3
-a way to **mutate its own uid in place**, and every ownership gate in the tree
-(`SYS_CHMOD`, `SYS_TCPSOCK`, `task_visible_to_current()`, the per-uid task cap) is
-written against that uid. Don't reopen this by "just adding a subcommand"; reasoning in
-`doc/ROADMAP_NEXT.md`.
+**Roadmap items 1–4 are closed**, and item 4's three open calls all resolved to *no
+migration*: `su` and `edit` stay kernel-shell only, and `fatls` never needed one (`ls
+C:/` *is* `fatls`, since `SYS_OPEN`/`SYS_READDIR` dispatch on the drive letter into
+FAT32's `file_operations_t`; harness `verify-ring3-fatls.sh`). Two of these are worth not
+reopening:
 
-Roadmap items 1–3 (background jobs, SYS_SPAWN + pipes, FAT32 write) are **done**, and
-**item 4 (userspace shell) is now closed** — all three of its open calls are settled and
-**none was a migration**. `su` is settled above; **`fatls` needed no migration** — ring 3
-already lists FAT32 through the generic `ls`, since `SYS_OPEN`/`SYS_READDIR` dispatch on
-the drive letter into FAT32's full `file_operations_t`. `ls C:/` *is* `fatls`; harness
-`verify-ring3-fatls.sh`. **`edit` stays kernel-shell only** — and note *which* half was
-the blocker, because the roadmap named the wrong one: write-back was never the problem
-(`sys_write` sends any file fd through `vfs_write`, which dispatches per-driver with no
-drive test, and FAT32 has a live `.write`; `editor.c` doesn't reference FAT32 at all).
-**Input is.** The editor is event-oriented — `keyboard_getchar_nonblock()` plus
-out-of-band codes like `KEY_UP` (`0x90`) — while ring 3's console read
-(`stdin_read`'s `STREAM_TYPE_CONSOLE`) is **line-oriented**: it blocks until `\n`,
-interprets only `\n`/`\b`, and stores `0x90` as text inside a line. Supplying raw mode
-means a **TTY discipline** (per-task terminal state, mode restoration on abnormal exit,
-echo control), i.e. a new ring-3-reachable subsystem bought for one builtin — which is
-why `top`, the other raw-key consumer, is kernel-only too without anyone proposing it
-move. Fourth instance of asking "does THIS component carry it?" instead of "is it
-reachable at all?" — after `whoami`, D1 and `fatls`; trace the path before designing the
-migration. `fork()` was skipped deliberately (PAE, no COW pages).
-Task-slot exhaustion is closed (per-uid cap + root reserve, both returning `-EAGAIN`, so
-only the printed message identifies which refused). `kprintf`→`stream_printf` conversion
-is **finished** — no console-only blocks remain.
+- **`su`** — a ring-3 caller must hold the **plaintext password**, which is the exposure
+  `SYS_CRED` (32) exists to remove. The alternative that avoids the plaintext (a
+  `CRED_OP_SU` where the kernel prompts) is worse: it hands ring 3 a way to **mutate its
+  own uid in place**, and every ownership gate in the tree is written against that uid.
+  Don't reopen this by "just adding a subcommand".
+- **`edit`** — the blocker is **input**, not write-back (the roadmap named the wrong
+  half; `vfs_write` dispatches per-driver with no drive test and FAT32 has a live
+  `.write`). The editor is event-oriented while ring 3's console read is line-oriented,
+  so moving it means a **TTY discipline** — a new ring-3-reachable subsystem bought for
+  one builtin. `top` is kernel-only for the same reason.
+
+Both are the same lesson as `whoami` and D1: ask **"does THIS component carry it?"**, not
+"is it reachable at all?" — trace the path before designing the migration. Reasoning in
+`doc/ROADMAP_NEXT.md`. `fork()` was skipped deliberately (PAE, no COW pages). Task-slot
+exhaustion is closed (per-uid cap + root reserve, both returning `-EAGAIN`, so only the
+printed message identifies which refused). `kprintf`→`stream_printf` conversion is
+**finished**.
 
 Invariants worth keeping in mind before touching these areas — each is the residue of a
 real bug, and `doc/RING3_MIGRATION.md` has the reasoning and the harness traps:
