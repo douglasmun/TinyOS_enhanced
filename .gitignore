@@ -259,3 +259,5 @@ udprx.log
 udprx-trace.log
 dhcprx.log
 dhcprx-trace.log
+entropy-stir.log
+kprintfzu.log
