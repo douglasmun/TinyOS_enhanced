@@ -297,6 +297,45 @@ void page_fault_handler(struct regs* r) {
     kprintf("EIP: 0x%08x\n", r->eip);
     kprintf("CS: 0x%04x\n", r->cs);
 
+    /* WHO faulted, and WHERE it was called from.
+     *
+     * Without these, an EIP=0 fault is undiagnosable: the dump below shows
+     * that address 0 was entered, but not which task was running nor how it
+     * got there. Four nightly-CI panics (issue #126) all reported EIP=0 with
+     * an instruction fetch and nothing to distinguish them, and the fault
+     * point differed between runs, so the log alone could not tell a bad
+     * indirect call from a context switch into a corrupted saved EIP.
+     *
+     * useresp is NOT usable on a CPL=0 fault: the CPU pushes it only on a
+     * privilege change, so that slot then holds whatever followed the frame.
+     * The kernel ESP at fault time is the address of the hardware-pushed
+     * portion of the frame instead. */
+    if (current_task) {
+        kprintf("Task: PID=%d '%s'%s\n", current_task->pid, current_task->name,
+                current_task->is_kernel_task ? " (kernel)" : "");
+    } else {
+        kprintf("Task: <none> (pre-scheduler or no current task)\n");
+    }
+
+    if ((r->err_code & 0x04) == 0) {
+        uint32_t kesp = (uint32_t)(uintptr_t)&r->eip;
+        kprintf("ESP(kernel): 0x%08x\n", kesp);
+        /* Caller trail. On a fault at EIP=0 the return address of whatever
+         * transferred control is typically still near the top of the stack,
+         * so print a few words and let the reader match them against nm.
+         * Bounded to kernel-mapped addresses: this runs inside the fault
+         * handler and must not itself fault. */
+        kprintf("Stack near ESP:");
+        for (int i = 0; i < 8; i++) {
+            uint32_t addr = kesp + (uint32_t)(i * 4);
+            if (addr < 0x100000u || addr >= 0x00800000u) break;
+            kprintf(" %08x", *(volatile uint32_t*)(uintptr_t)addr);
+        }
+        kprintf("\n");
+    } else {
+        kprintf("ESP(user): 0x%08x SS: 0x%04x\n", r->useresp, r->ss);
+    }
+
     // Print current CR3
     uint32_t current_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
