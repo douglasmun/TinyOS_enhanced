@@ -341,6 +341,24 @@ void kprintf(const char* fmt, ...) {
 }
 
 /*=============================================================================
+ * FUNCTION: kdbg - diagnostic trace, suppressed unless kdbg_enabled
+ *
+ * Off by default. See the contract in kprintf.h: this is for repeating
+ * per-event traces only, never for a security verdict, a failure or a panic.
+ *=============================================================================*/
+bool kdbg_enabled = false;
+
+void kdbg(const char* fmt, ...) {
+    if (!kdbg_enabled) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vkprintf(fmt, ap);
+    va_end(ap);
+}
+
+/*=============================================================================
  * FUNCTION: vkprintf - Variadic version of kprintf that takes va_list
  *
  * This function is used by stream_printf() and other functions that need

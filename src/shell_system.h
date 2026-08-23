@@ -116,6 +116,7 @@ void cmd_pae(int argc, char* argv[]);
  * @param argv Argument array
  */
 void cmd_wxaudit(int argc, char* argv[]);
+void cmd_loglevel(int argc, char* argv[]);
 
 /**
  * @brief Run security hardening test suite

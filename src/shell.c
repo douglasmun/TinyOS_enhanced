@@ -111,6 +111,7 @@ static const shell_command_t command_table[] = {
     { "aslr",    CAT_SECURITY, "aslr",           "Show ASLR statistics" },
     { "pae",     CAT_SECURITY, "pae",            "Show PAE/W^X status" },
     { "wxaudit", CAT_SECURITY, "wxaudit",        "Audit W^X violations" },
+    { "loglevel",CAT_SECURITY, "loglevel [normal|debug]", "Kernel diagnostic verbosity" },
     { "auditlog",CAT_SECURITY, "auditlog [opts]","View security audit logs" },
     { "sectest", CAT_SECURITY, "sectest",        "Run security hardening test suite" },
 
@@ -812,6 +813,9 @@ static void parse_and_execute(char* cmd_line) {
 
     } else if (strcmp(argv[0], "wxaudit") == 0) {
         cmd_wxaudit(argc, argv);
+
+    } else if (strcmp(argv[0], "loglevel") == 0) {
+        cmd_loglevel(argc, argv);
 
     } else if (strcmp(argv[0], "kill") == 0) {
         cmd_kill(argc, argv);
