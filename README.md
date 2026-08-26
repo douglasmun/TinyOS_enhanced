@@ -6,17 +6,6 @@ A from-scratch, security-focused **32-bit (i386) operating system kernel**, writ
 
 ---
 
-## ⚠️ Status: educational / research kernel — NOT production
-
-TinyOS Enhanced is a single-developer **hobby and learning OS**. It is single-core, 32-bit, console-only, and intended to run under QEMU. It is **not** hardened for, or intended for, production or internet-facing use.
-
-- ✅ **Safe for:** OS/kernel learning, security-mechanism study, lab/VM experimentation, coursework.
-- ❌ **Not for:** production deployment, untrusted networks, storing sensitive data.
-
-The cryptography is implemented from scratch for educational purposes and has not had external cryptographic review.
-
----
-
 ## Architecture
 
 <p align="center">
