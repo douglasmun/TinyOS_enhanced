@@ -220,7 +220,8 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac);
 /* ARP RX counters (ifconfig). learned = new mapping answering our request;
  * unsolicited = new mapping refused, nothing pending; change_refused =
  * existing mapping's MAC change refused, nothing pending. */
-void arp_get_rx_stats(uint32_t* learned, uint32_t* unsolicited, uint32_t* change_refused);
+void arp_get_rx_stats(uint32_t* learned, uint32_t* unsolicited, uint32_t* change_refused,
+                      uint32_t* evicted);
 /* 255.255.255.255, or our subnet's directed broadcast (my_ip | ~mask). */
 bool net_is_broadcast_ip(const uint8_t* ip);
 bool arp_security_self_test(void);

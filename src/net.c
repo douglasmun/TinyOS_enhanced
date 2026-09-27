@@ -88,11 +88,16 @@ static uint32_t arp_requests_dropped = 0;  // Counter for dropped requests (moni
 static uint32_t arp_learned = 0;          /* new mapping, request pending   */
 static uint32_t arp_unsolicited_new = 0;  /* new mapping, nothing pending   */
 static uint32_t arp_change_refused = 0;   /* different MAC, nothing pending */
+/* A learn that displaced the LRU entry. Counted, not printed: it is reached
+ * from an ARP reply on the RX path. */
+static uint32_t arp_evicted = 0;
 
-void arp_get_rx_stats(uint32_t* learned, uint32_t* unsolicited, uint32_t* change_refused) {
+void arp_get_rx_stats(uint32_t* learned, uint32_t* unsolicited, uint32_t* change_refused,
+                      uint32_t* evicted) {
     if (learned) *learned = arp_learned;
     if (unsolicited) *unsolicited = arp_unsolicited_new;
     if (change_refused) *change_refused = arp_change_refused;
+    if (evicted) *evicted = arp_evicted;
 }
 
 typedef enum {
@@ -485,9 +490,7 @@ static arp_update_result_t arp_cache_update_status(const uint8_t* ip, const uint
     }
 
     // Replace LRU entry with new mapping
-    kprintf("ARP: Cache full, evicting LRU entry %d.%d.%d.%d\n",
-            arp_cache[lru_index].ip[0], arp_cache[lru_index].ip[1],
-            arp_cache[lru_index].ip[2], arp_cache[lru_index].ip[3]);
+    arp_evicted++;
 
     memcpy(arp_cache[lru_index].ip, ip, 4);
     memcpy(arp_cache[lru_index].mac, mac, 6);
