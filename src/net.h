@@ -217,6 +217,12 @@ void send_arp_request(uint8_t* target_ip);
 uint8_t* arp_lookup(const uint8_t* ip);
 void arp_cache_dump(void);
 void arp_cache_update(const uint8_t* ip, const uint8_t* mac);
+/* ARP RX counters (ifconfig). learned = new mapping answering our request;
+ * unsolicited = new mapping refused, nothing pending; change_refused =
+ * existing mapping's MAC change refused, nothing pending. */
+void arp_get_rx_stats(uint32_t* learned, uint32_t* unsolicited, uint32_t* change_refused);
+/* 255.255.255.255, or our subnet's directed broadcast (my_ip | ~mask). */
+bool net_is_broadcast_ip(const uint8_t* ip);
 bool arp_security_self_test(void);
 void send_test_arp(const char *target_ip_str);
 
@@ -298,6 +304,9 @@ void e1000_get_stats(uint32_t* tx_count, uint32_t* rx_count);
  * per-packet kprintf sites that any host on the segment could flood. */
 void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
                           uint32_t* backlog_count);
+/* Interrupts that drained past E1000_RX_PACKET_BUDGET, and the frames drained
+ * beyond it. Replaced a once-per-interrupt kprintf any host could drive. */
+void e1000_get_budget_stats(uint32_t* overrun_irqs, uint32_t* overrun_frames);
 
 /* Drains queued RX frames and parses them in TASK context. Called by knetd,
  * and by the boot-time DHCP loop before the scheduler exists. Must NEVER be

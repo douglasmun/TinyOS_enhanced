@@ -42,9 +42,11 @@ void icmp_init(void);
  * @param echo_requests Echo requests received and answered
  * @param rate_limited  Echo requests dropped by the ICMP rate limiter
  * @param oversize      Echo requests whose reply would exceed one frame
+ * @param broadcast     Echo requests sent to a broadcast address (not answered)
  */
 void icmp_get_rx_stats(uint32_t* echo_replies, uint32_t* echo_requests,
-                       uint32_t* rate_limited, uint32_t* oversize);
+                       uint32_t* rate_limited, uint32_t* oversize,
+                       uint32_t* broadcast);
 
 /**
  * @brief Handle received ICMP packet with full context for proper replies

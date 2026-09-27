@@ -277,6 +277,12 @@ static volatile uint32_t rx_softirq_tail = 0;  /* consumer: knetd     */
  * itself is the bottleneck, which is a different diagnosis and a different
  * fix, so it gets its own counter rather than being folded into the others. */
 static uint32_t rx_drop_backlog = 0;
+/* Interrupts that found more than E1000_RX_PACKET_BUDGET frames waiting, and
+ * the frames drained past the budget. This was a kprintf per such interrupt --
+ * a remote-driven console flood, since a burst of >16 small frames from any
+ * host on the segment triggers it. Counted, shown by ifconfig. */
+static uint32_t rx_budget_overrun_irqs = 0;
+static uint32_t rx_budget_overrun_frames = 0;
 
 
 
@@ -1159,10 +1165,10 @@ void e1000_poll_rx(void) {
             if (extra_processed >= NUM_RX_DESC) break;  // Safety limit
         }
 
-        // Log if we processed packets beyond budget (attack detection)
+        // Count, don't print: a remote host picks how often this fires.
         if (extra_processed > 0) {
-            kprintf("E1000: Micro-packet DoS detected - processed %u packets beyond budget\n",
-                    extra_processed);
+            rx_budget_overrun_irqs++;
+            rx_budget_overrun_frames += extra_processed;
         }
     } else {
         E1000_UNLOCK();
@@ -1200,6 +1206,15 @@ void e1000_get_drop_stats(uint32_t* err_count, uint32_t* badlen_count,
     if (err_count) *err_count = rx_drop_errors;
     if (badlen_count) *badlen_count = rx_drop_badlen;
     if (backlog_count) *backlog_count = rx_drop_backlog;
+}
+
+/*=============================================================================
+ * FUNCTION: e1000_get_budget_stats
+ * PURPOSE: Report interrupts that drained past the RX packet budget
+ *============================================================================*/
+void e1000_get_budget_stats(uint32_t* overrun_irqs, uint32_t* overrun_frames) {
+    if (overrun_irqs) *overrun_irqs = rx_budget_overrun_irqs;
+    if (overrun_frames) *overrun_frames = rx_budget_overrun_frames;
 }
 
 /*=============================================================================

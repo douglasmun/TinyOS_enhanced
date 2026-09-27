@@ -81,6 +81,31 @@ typedef struct {
 static arp_pending_request_t arp_pending_requests[ARP_MAX_PENDING_REQUESTS];
 static uint32_t arp_requests_dropped = 0;  // Counter for dropped requests (monitoring)
 
+/* ARP cache learning counters (ifconfig "ARP rx:"). A new mapping is learned
+ * only in answer to a request TinyOS sent; anything else is counted here.
+ * Counted only for ARP packets -- the inbound-IP refresh calls in handle_ip()
+ * would otherwise count every packet from a peer we never talked to. */
+static uint32_t arp_learned = 0;          /* new mapping, request pending   */
+static uint32_t arp_unsolicited_new = 0;  /* new mapping, nothing pending   */
+static uint32_t arp_change_refused = 0;   /* different MAC, nothing pending */
+
+void arp_get_rx_stats(uint32_t* learned, uint32_t* unsolicited, uint32_t* change_refused) {
+    if (learned) *learned = arp_learned;
+    if (unsolicited) *unsolicited = arp_unsolicited_new;
+    if (change_refused) *change_refused = arp_change_refused;
+}
+
+typedef enum {
+    ARP_UPD_IGNORED = 0,      /* invalid sender, or our own IP              */
+    ARP_UPD_REFRESHED,        /* existing entry, same MAC, or MAC changed
+                               * while a request was pending               */
+    ARP_UPD_LEARNED,          /* new entry, request pending                 */
+    ARP_UPD_UNSOLICITED,      /* new entry refused: nothing pending         */
+    ARP_UPD_CHANGE_REFUSED    /* MAC change refused: nothing pending        */
+} arp_update_result_t;
+
+static arp_update_result_t arp_cache_update_status(const uint8_t* ip, const uint8_t* mac);
+
 static bool arp_pending_request_matches(const uint8_t* ip);
 static void arp_pending_request_clear(const uint8_t* ip);
 static int arp_cache_find_index(const uint8_t* ip);
@@ -208,8 +233,13 @@ uint8_t* get_route_mac(const uint8_t* dest_ip) {
     }
     
     if (is_local) {
-        // Destination is on local network - try to get its MAC
-        // Removed verbose routing log to reduce console noise
+        /* The cache learns a peer only in answer to our own request, so a
+         * local miss must send one -- arp_lookup() may still return the
+         * gateway's MAC for THIS packet, and would hide the miss. Rate
+         * limited per IP inside send_arp_request(). */
+        if (!arp_cache_contains_ip(dest_ip) && !is_invalid_arp_sender_ip(dest_ip)) {
+            send_arp_request((uint8_t*)dest_ip);
+        }
         uint8_t* dest_mac = arp_lookup(dest_ip);
         if (!dest_mac) {
             // Need to ARP for the destination
@@ -377,23 +407,26 @@ uint8_t* arp_lookup(const uint8_t* ip) {
  * SECURITY: Implements LRU eviction to prevent cache exhaustion attacks
  */
 void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
+    (void)arp_cache_update_status(ip, mac);
+}
+
+static arp_update_result_t arp_cache_update_status(const uint8_t* ip, const uint8_t* mac) {
     if (!ip || !mac) {
-        return;
+        return ARP_UPD_IGNORED;
     }
 
     if (is_invalid_arp_sender_ip(ip) ||
         !is_valid_arp_ip(ip) ||
         !is_valid_arp_sender_mac(mac)) {
-        return;
+        return ARP_UPD_IGNORED;
     }
 
     if (memcmp(ip, my_ip, 4) == 0) {
-        return;
+        return ARP_UPD_IGNORED;
     }
 
     uint32_t current_ticks = get_timer_ticks();
     bool has_pending_request = arp_pending_request_matches(ip);
-    bool is_gateway = (memcmp(ip, gateway_ip, 4) == 0);
 
     // Check if entry exists and update it
     int existing_index = arp_cache_find_index(ip);
@@ -402,7 +435,7 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
 
         if (memcmp(entry->mac, mac, 6) != 0) {
             if (!has_pending_request) {
-                return;
+                return ARP_UPD_CHANGE_REFUSED;
             }
 
             memcpy(entry->mac, mac, 6);
@@ -410,15 +443,20 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
 
         entry->last_used = current_ticks;
         arp_pending_request_clear(ip);
-        return;
+        return ARP_UPD_REFRESHED;
     }
 
     /*
-     * Gateway poisoning changes the route for off-subnet traffic. Only learn a
-     * new gateway mapping after TinyOS sent an ARP request for that gateway.
+     * A NEW mapping is learned only in answer to a request TinyOS sent, for
+     * every IP -- not just the gateway. Learning passively (from any ARP
+     * request, or from any inbound IP packet's source) let a host on the
+     * segment pre-seed a mapping for a peer TinyOS had not contacted yet, the
+     * DNS server included; the MAC-change rule above then made the forged
+     * entry stick against the real host's replies. get_route_mac() sends the
+     * request on a local miss, so peers are still resolved -- on demand.
      */
-    if (is_gateway && !has_pending_request) {
-        return;
+    if (!has_pending_request) {
+        return ARP_UPD_UNSOLICITED;
     }
 
     // Find first invalid slot
@@ -430,12 +468,8 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
             arp_cache[i].valid = true;
             arp_pending_request_clear(ip);
             // kprintf("ARP: Added new cache entry for IP %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
-            return;
+            return ARP_UPD_LEARNED;
         }
-    }
-
-    if (!has_pending_request) {
-        return;
     }
 
     // Cache is full - evict LRU (Least Recently Used) entry
@@ -462,6 +496,17 @@ void arp_cache_update(const uint8_t* ip, const uint8_t* mac) {
     arp_pending_request_clear(ip);
 
     // kprintf("ARP: Added new cache entry for IP %d.%d.%d.%d (via LRU)\n", ip[0], ip[1], ip[2], ip[3]);
+    return ARP_UPD_LEARNED;
+}
+
+/* Counts the outcome of an update driven by an ARP packet. */
+static void arp_count_update(arp_update_result_t r) {
+    switch (r) {
+        case ARP_UPD_LEARNED:        arp_learned++;         break;
+        case ARP_UPD_UNSOLICITED:    arp_unsolicited_new++; break;
+        case ARP_UPD_CHANGE_REFUSED: arp_change_refused++;  break;
+        default: break;
+    }
 }
 
 bool arp_security_self_test(void) {
@@ -528,16 +573,18 @@ bool arp_security_self_test(void) {
             gateway_poison_rejected ? "PASSED" : "FAILED");
     passed = passed && gateway_poison_rejected;
 
-    arp_cache_update(local_ip, local_mac);
-    int local_index = arp_cache_find_index(local_ip);
-    bool local_learned = (local_index >= 0 &&
-                          memcmp(arp_cache[local_index].mac, local_mac, 6) == 0);
-    stream_printf(ctx, "[ARP] Passive local peer learned: %s\n",
-            local_learned ? "PASSED" : "FAILED");
-    passed = passed && local_learned;
-
     arp_cache_update(local_ip, attacker_mac);
-    local_index = arp_cache_find_index(local_ip);
+    bool unsolicited_refused = (arp_cache_find_index(local_ip) < 0);
+    stream_printf(ctx, "[ARP] Unsolicited local peer refused: %s\n",
+            unsolicited_refused ? "PASSED" : "FAILED");
+    passed = passed && unsolicited_refused;
+
+    memcpy(arp_pending_requests[1].ip, local_ip, 4);
+    arp_pending_requests[1].last_request_time = get_timer_ticks();
+    arp_pending_requests[1].pending = true;
+    arp_cache_update(local_ip, local_mac);
+    arp_cache_update(local_ip, attacker_mac);
+    int local_index = arp_cache_find_index(local_ip);
     bool local_poison_rejected = (local_index >= 0 &&
                                   memcmp(arp_cache[local_index].mac, local_mac, 6) == 0);
     stream_printf(ctx, "[ARP] Unsolicited local change rejected: %s\n",
@@ -879,10 +926,37 @@ uint16_t calculate_l4_checksum(uint8_t* src_ip, uint8_t* dest_ip, uint8_t protoc
  * @brief Check if IP address is broadcast or multicast
  * @return true if IP is invalid for ARP sender
  */
-static bool is_invalid_arp_sender_ip(const uint8_t* ip) {
-    /* Broadcast addresses */
+/**
+ * @brief True for the limited broadcast (255.255.255.255) or OUR subnet's
+ * directed broadcast (my_ip | ~subnet_mask). Another subnet's x.x.x.255 is not
+ * a broadcast for us -- it is somebody else's address, or unicast (a /23 has a
+ * host ending in .255). Before an address is configured there is no subnet, so
+ * only the limited broadcast qualifies.
+ */
+bool net_is_broadcast_ip(const uint8_t* ip) {
     if (ip[0] == 255 && ip[1] == 255 && ip[2] == 255 && ip[3] == 255) {
-        return true;  /* 255.255.255.255 */
+        return true;
+    }
+    if (my_ip[0] == 0 && my_ip[1] == 0 && my_ip[2] == 0 && my_ip[3] == 0) {
+        return false;
+    }
+    /* A /32 or /31 has no directed broadcast. */
+    if ((subnet_mask[0] & subnet_mask[1] & subnet_mask[2]) == 0xFF &&
+        (subnet_mask[3] & 0xFE) == 0xFE) {
+        return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (ip[i] != (uint8_t)(my_ip[i] | (uint8_t)~subnet_mask[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_invalid_arp_sender_ip(const uint8_t* ip) {
+    /* Broadcast addresses: limited, and our subnet's directed broadcast */
+    if (net_is_broadcast_ip(ip)) {
+        return true;
     }
 
     /* All zeros (used during DHCP discovery) */
@@ -1041,8 +1115,11 @@ static void handle_arp(arp_header_t* arp_hdr, eth_header_t* eth_hdr) {
             return;
         }
 
-        /* Update cache from ARP requests (defensive learning) */
-        arp_cache_update(arp_hdr->sender_ip, arp_hdr->sender_mac);
+        /* Refreshes an existing mapping only: a request is not an answer to
+         * anything we asked, so it never creates one (see arp_cache_update).
+         * Our reply below is addressed from the frame, not the cache. */
+        arp_count_update(arp_cache_update_status(arp_hdr->sender_ip,
+                                                 arp_hdr->sender_mac));
 
         /* If the request is for our IP, send a reply */
         if (memcmp(arp_hdr->target_ip, my_ip, 4) == 0) {
@@ -1074,26 +1151,12 @@ static void handle_arp(arp_header_t* arp_hdr, eth_header_t* eth_hdr) {
     } else if (op == ARP_OP_REPLY) {
         /*=====================================================================
          * SECURITY: Only accept ARP replies for pending requests
-         * Unsolicited ARP replies (gratuitous ARP) are a common attack vector
-         *
-         * We ONLY update cache if:
-         * 1. We have a pending ARP request for this IP, OR
-         * 2. The IP is already in our cache (updating existing entry)
+         * Unsolicited ARP replies (gratuitous ARP) are a common attack vector.
+         * arp_cache_update enforces it: a new mapping or a changed MAC needs a
+         * pending request; a same-MAC reply for a cached IP only refreshes.
          *===================================================================*/
-
-        bool should_update = false;
-
-        should_update = arp_pending_request_matches(arp_hdr->sender_ip);
-
-        /* Check if IP is already in cache (update existing entry) */
-        if (!should_update && arp_cache_contains_ip(arp_hdr->sender_ip)) {
-            should_update = true;
-        }
-
-        /* Update cache only if validated */
-        if (should_update) {
-            arp_cache_update(arp_hdr->sender_ip, arp_hdr->sender_mac);
-        }
+        arp_count_update(arp_cache_update_status(arp_hdr->sender_ip,
+                                                 arp_hdr->sender_mac));
     }
 }
 
@@ -1568,12 +1631,17 @@ static void handle_ip(uint8_t* eth_frame, ip_header_t* ip_hdr, size_t eth_len, s
     }
 
     // 2. Destination IP check - accept unicast (our IP) or broadcast
-    uint8_t broadcast_ip[4] = {255, 255, 255, 255};
     int is_for_us = (memcmp(dest_ip, my_ip, 4) == 0);
-    int is_broadcast = (memcmp(dest_ip, broadcast_ip, 4) == 0);
-
-    // Also accept subnet broadcasts (x.x.x.255) which DHCP servers commonly use
-    int is_subnet_broadcast = (dest_ip[3] == 255);
+    /* Limited broadcast, or OUR subnet's directed broadcast. This used to
+     * accept any x.x.x.255, so a packet for another subnet's broadcast (or a
+     * unicast host ending in .255 on a /23) was processed as ours -- and an
+     * echo request to it was answered. */
+    int is_broadcast = net_is_broadcast_ip(dest_ip);
+    /* Before an address is configured there is no subnet to compute from, and
+     * a DHCP server may address its OFFER to the subnet broadcast it is about
+     * to assign. Keep the old x.x.x.255 acceptance for that window only. */
+    int unconfigured = (my_ip[0] == 0 && my_ip[1] == 0 && my_ip[2] == 0 && my_ip[3] == 0);
+    int is_subnet_broadcast = unconfigured && (dest_ip[3] == 255);
 
     // kprintf("IP: Checking dest=%d.%d.%d.%d (my_ip=%d.%d.%d.%d) for_us=%d bcast=%d\n",
     //         dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3],

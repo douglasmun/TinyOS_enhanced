@@ -48,13 +48,21 @@ static uint32_t icmp_echo_requests_rx = 0;  /* echo requests we answered      */
  * capped at 1514, so a 1515-1518 byte request reaches this from any host on
  * the segment. It used to print one console line each. */
 static uint32_t icmp_echo_oversize = 0;
+/* Echo requests addressed to a broadcast (limited, or our subnet's directed
+ * broadcast). Never answered: replying makes this host a smurf amplifier --
+ * one spoofed request to the broadcast draws a reply from every host that
+ * answers, all aimed at the forged source. RFC 1122 3.2.2.6 permits silently
+ * discarding these. */
+static uint32_t icmp_echo_broadcast = 0;
 
 void icmp_get_rx_stats(uint32_t* echo_replies, uint32_t* echo_requests,
-                       uint32_t* rate_limited, uint32_t* oversize) {
+                       uint32_t* rate_limited, uint32_t* oversize,
+                       uint32_t* broadcast) {
     if (echo_replies) *echo_replies = icmp_echo_replies_rx;
     if (echo_requests) *echo_requests = icmp_echo_requests_rx;
     if (rate_limited) *rate_limited = icmp_replies_dropped;
     if (oversize) *oversize = icmp_echo_oversize;
+    if (broadcast) *broadcast = icmp_echo_broadcast;
 }
 
 /*=============================================================================
@@ -247,10 +255,17 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
         const size_t reply_ip_len   = ip_header_len + reply_icmp_len;
         const size_t reply_total    = 14 + reply_ip_len;
 
+        /* First: a broadcast request is never answered at any size, and must
+         * not consume the rate limiter's slot either. The four echo-request
+         * buckets (answered, rate-limited, oversize, broadcast) are disjoint. */
+        if (net_is_broadcast_ip(ip_hdr + 16)) {
+            icmp_echo_broadcast++;
+            return;
+        }
+
         /* Checked BEFORE the rate limiter: a request we can never answer must
          * not take the reply slot from one we can. Counted, not printed -- a
-         * remote host picks the rate. The three echo-request buckets
-         * (answered, rate-limited, oversize) are disjoint. */
+         * remote host picks the rate. */
         if (reply_total > 1514) {
             icmp_echo_oversize++;
             return;
