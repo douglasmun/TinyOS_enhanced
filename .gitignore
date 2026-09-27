@@ -265,3 +265,4 @@ kprintfzu.log
 arppoison*.log
 icmpbcast*.log
 e1000budget*.log
+csprngorder*.log
