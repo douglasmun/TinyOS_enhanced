@@ -262,3 +262,6 @@ dhcprx.log
 dhcprx-trace.log
 entropy-stir.log
 kprintfzu.log
+arppoison*.log
+icmpbcast*.log
+e1000budget*.log

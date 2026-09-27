@@ -173,6 +173,12 @@ void cmd_ifconfig(void) {
     /* Separate line: a backlog drop means knetd fell behind, which is a
      * different diagnosis from any hardware-side drop above. */
     kprintf("  RX backlog:   %u dropped (softirq ring full)\n", backlog_drops);
+    /* Not a drop: frames past the per-interrupt budget are still delivered.
+     * Replaced the "Micro-packet DoS detected" print, one per interrupt. */
+    uint32_t budget_irqs = 0, budget_frames = 0;
+    e1000_get_budget_stats(&budget_irqs, &budget_frames);
+    kprintf("  RX budget:    %u overrun-irqs, %u frames-past-budget\n",
+            budget_irqs, budget_frames);
     /* irq-ctx must read 0. Nonzero means the parser ran inside an ISR, i.e.
      * doc/NETWORK_ISOLATION.md item 1 has been undone. */
     kprintf("  RX parsed:    %u thread-ctx, %u irq-ctx\n", parse_thread, parse_irq);
@@ -200,10 +206,18 @@ void cmd_ifconfig(void) {
      * particular was NOT rate limited before — see doc/NETDAEMON_DESIGN.md
      * finding A1. */
     uint32_t icmp_replies = 0, icmp_requests = 0, icmp_limited = 0;
-    uint32_t icmp_oversize = 0;
-    icmp_get_rx_stats(&icmp_replies, &icmp_requests, &icmp_limited, &icmp_oversize);
-    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited, %u oversize\n",
-            icmp_replies, icmp_requests, icmp_limited, icmp_oversize);
+    uint32_t icmp_oversize = 0, icmp_bcast = 0;
+    icmp_get_rx_stats(&icmp_replies, &icmp_requests, &icmp_limited, &icmp_oversize,
+                      &icmp_bcast);
+    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited, %u oversize, %u broadcast\n",
+            icmp_replies, icmp_requests, icmp_limited, icmp_oversize, icmp_bcast);
+
+    /* ARP RX counters. A new mapping is learned only when it answers a request
+     * we sent; everything else is refused and counted by attacker shape. */
+    uint32_t arp_learned = 0, arp_unsol = 0, arp_change = 0;
+    arp_get_rx_stats(&arp_learned, &arp_unsol, &arp_change);
+    kprintf("  ARP rx:       %u learned, %u unsolicited, %u change-refused\n",
+            arp_learned, arp_unsol, arp_change);
 
     /* DNS RX counters. Same reasoning as the ICMP block above, at larger scale:
      * handle_dns_response() had 20 prints, and the spoof/TID/question ones are

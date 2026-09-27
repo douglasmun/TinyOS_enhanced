@@ -277,14 +277,32 @@ def build_dhcp_frame(dst_mac, src_mac, src_ip, dst_ip, xid,
     return frame
 
 
+def build_arp_frame(dst_mac, src_mac, op, sender_ip, target_ip, target_mac):
+    """An Ethernet/ARP frame. The ARP sender MAC is the Ethernet source.
+
+    op 1 = request, 2 = reply. Used to model an attacker claiming an IP it does
+    not own: the guest must only learn a new mapping that answers a request it
+    sent itself.
+    """
+    arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, op,
+                      src_mac, socket.inet_aton(sender_ip),
+                      target_mac, socket.inet_aton(target_ip))
+    frame = dst_mac + src_mac + struct.pack("!H", 0x0806) + arp
+    if len(frame) < 60:
+        frame += bytes(60 - len(frame))
+    return frame
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mcast", required=True, help="group:port, e.g. 230.0.0.1:1234")
+    ap.add_argument("--mcast", required=True,
+                    help="group:port, e.g. 230.0.0.1:1234 -- or host:port of a "
+                         "dgram netdev's local end (see tools/net_peer.py)")
     ap.add_argument("--count", type=int, default=20)
     ap.add_argument("--ethertype", default="0x88b5",
                     help="EtherType, e.g. 0x88b5 (ignored in --mode icmp)")
     ap.add_argument("--mode",
-                    choices=("ethertype", "icmp", "tcp", "udp", "dhcp"),
+                    choices=("ethertype", "icmp", "tcp", "udp", "dhcp", "arp"),
                     default="ethertype",
                     help="ethertype: raw frame with an unhandled EtherType. "
                          "icmp: well-formed IPv4/ICMP echo request or reply. "
@@ -293,7 +311,11 @@ def main():
                          "udp: valid IPv4/UDP whose length field and checksum "
                          "are chosen by --udp-length / --udp-corrupt-checksum. "
                          "dhcp: UDP 67->68 BOOTREPLY, optionally truncated or "
-                         "with a bad magic cookie.")
+                         "with a bad magic cookie. "
+                         "arp: ARP op --arp-op claiming --src-ip is at --src, "
+                         "target --dst-ip.")
+    ap.add_argument("--arp-op", type=int, default=1, choices=(1, 2),
+                    help="--mode arp: 1 = request, 2 = reply")
     ap.add_argument("--udp-src-port", type=int, default=40001)
     ap.add_argument("--udp-dst-port", type=int, default=9999,
                     help="default is a port with no handler: the accepted "
@@ -375,6 +397,12 @@ def main():
                                 args.tcp_src_port, args.tcp_dst_port,
                                 args.tcp_data_offset, 0)
         desc = f"tcp data_offset {args.tcp_data_offset} words"
+    elif args.mode == "arp":
+        tmac = args.dst if args.arp_op == 2 else bytes(6)
+        frame = build_arp_frame(args.dst, args.src, args.arp_op,
+                                args.src_ip, args.dst_ip, tmac)
+        desc = (f"arp {'request' if args.arp_op == 1 else 'reply'} "
+                f"{args.src_ip} is-at {args.src.hex(':')}")
     elif args.mode == "icmp" and args.payload_lens:
         lens = [int(x) for x in args.payload_lens.split(",") if x.strip()]
         frames = [build_icmp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
