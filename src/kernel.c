@@ -557,6 +557,21 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     ide_init();
 
     /*=========================================================================
+     * PHASE 7.5: CSPRNG SEED (BEFORE THE NETWORK!)
+     *=========================================================================*/
+    /*
+     * The network is the first CSPRNG consumer: icmp_init() draws the ping
+     * identifier and the boot DHCP exchange draws its XID. This ran in PHASE
+     * 10, after both. An unseeded context is a zero key, so its keystream is
+     * a fixed sequence: every boot pinged with id 0 and sent DHCP XID
+     * 0xd3053b52 -- both known to an off-path spoofer. Needs only the PIT
+     * (PHASE 6) and RDRAND/RDSEED. csprng_random_bytes() now panics on an
+     * unseeded context, so a consumer moved above this line fails loudly.
+     */
+    kprintf("[CRYPTO] Initializing crypto subsystem.. [OK]\n");
+    crypto_init();
+
+    /*=========================================================================
      * PHASE 8: NETWORK INITIALIZATION (AFTER INTERRUPTS READY!)
      *=========================================================================*/
     kprintf("[NET] Waking up the Network......... [OK]\n");
@@ -699,8 +714,7 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     /*=========================================================================
      * PHASE 10: CRYPTOGRAPHIC SUBSYSTEM INITIALIZATION
      *=========================================================================*/
-    kprintf("[CRYPTO] Initializing crypto subsystem.. [OK]\n");
-    crypto_init();
+    /* crypto_init() (the CSPRNG seed) ran before PHASE 8 -- see there. */
     kprintf("[CRYPTO] Initializing ECDSA P-256.......");
     if (!ecdsa_init()) {
         /* The generator point failed its on-curve check, which means the curve

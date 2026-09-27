@@ -68,6 +68,13 @@ def describe(frame):
             itype = frame[l4]
             ident = struct.unpack("!H", frame[l4 + 4:l4 + 6])[0]
             out += f" icmp type={itype} id=0x{ident:04x}"
+        elif proto == 17 and len(frame) >= l4 + 8:
+            sport, dport = struct.unpack("!HH", frame[l4:l4 + 4])
+            out += f" udp sport={sport} dport={dport}"
+            bootp = l4 + 8
+            if dport == 67 and len(frame) >= bootp + 8:
+                xid = struct.unpack("!I", frame[bootp + 4:bootp + 8])[0]
+                out += f" dhcp xid=0x{xid:08x}"
     return out
 
 

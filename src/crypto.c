@@ -569,6 +569,13 @@ void csprng_random_bytes(csprng_ctx_t* ctx, uint8_t* output, size_t len) {
     uint8_t block[64];
     size_t offset = 0;
 
+    /* SECURITY: an unseeded context is a zero key, so its keystream is the
+     * same fixed sequence on every boot. Refuse rather than hand it out (the
+     * ping id and boot DHCP XID were constants for exactly this reason). */
+    if (!ctx->initialized) {
+        kernel_panic("CSPRNG used before crypto_init()");
+    }
+
     /* SECURITY: The timer IRQ reseeds global_csprng via csprng_periodic_reseed.
      * Disable interrupts for the whole generation so a reseed (or preempting
      * thread) cannot rewrite ctx->state/counter mid-stream, which would emit
