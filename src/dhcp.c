@@ -25,6 +25,13 @@ static uint32_t dhcp_drop_cookie = 0;     /* bad magic cookie              */
 static uint32_t dhcp_drop_options = 0;    /* malformed option TLV stream   */
 static uint32_t dhcp_drop_rogue = 0;      /* ACK from a different server   */
 static uint32_t dhcp_clamp_lease = 0;     /* lease time clamped (wrap DoS) */
+/* Configuration checks (network audit finding 5, 2026-09). An
+ * OFFER is the only message that carries configuration into dhcp_client, so
+ * it is validated there, once, before anything is stored. */
+static uint32_t dhcp_drop_badcfg = 0;     /* OFFER: no server-ID / bad config */
+static uint32_t dhcp_drop_ack = 0;        /* ACK: yiaddr differs from OFFER  */
+static uint32_t dhcp_nak_ignored = 0;     /* NAK: wrong state or wrong server */
+static uint32_t dhcp_nak_honored = 0;     /* NAK: restarted discovery        */
 
 void dhcp_get_rx_stats(uint32_t* replies, uint32_t* drop_short,
                        uint32_t* drop_cookie, uint32_t* drop_options,
@@ -35,6 +42,14 @@ void dhcp_get_rx_stats(uint32_t* replies, uint32_t* drop_short,
     if (drop_options) *drop_options = dhcp_drop_options;
     if (drop_rogue)   *drop_rogue   = dhcp_drop_rogue;
     if (clamp_lease)  *clamp_lease  = dhcp_clamp_lease;
+}
+
+void dhcp_get_cfg_stats(uint32_t* bad_offer, uint32_t* bad_ack,
+                        uint32_t* nak_ignored, uint32_t* nak_honored) {
+    if (bad_offer)   *bad_offer   = dhcp_drop_badcfg;
+    if (bad_ack)     *bad_ack     = dhcp_drop_ack;
+    if (nak_ignored) *nak_ignored = dhcp_nak_ignored;
+    if (nak_honored) *nak_honored = dhcp_nak_honored;
 }
 
 #include "util.h"
@@ -99,8 +114,9 @@ static uint32_t generate_xid(void) {
  */
 static void parse_dhcp_options(const uint8_t* options, size_t options_len,
                                uint8_t* msg_type, uint8_t* server_ip,
-                               uint8_t* subnet_mask_out, uint8_t* router,
-                               uint8_t* dns_server, uint32_t* lease_time)
+                               uint8_t* subnet_mask_out, bool* mask_present,
+                               uint8_t* router, uint8_t* dns_server,
+                               uint32_t* lease_time)
 {
     size_t i = 0;
 
@@ -168,6 +184,11 @@ static void parse_dhcp_options(const uint8_t* options, size_t options_len,
                 break;
 
             case DHCP_OPTION_SUBNET_MASK:
+                /* Present even when malformed: a bad-length mask must be
+                 * refused, not replaced by the classful default. */
+                if (mask_present) {
+                    *mask_present = true;
+                }
                 if (len == 4 && subnet_mask_out) {
                     memcpy(subnet_mask_out, &options[i], 4);
                 }
@@ -390,6 +411,98 @@ void dhcp_start(void) {
     send_dhcp_message(DHCP_DISCOVER, NULL, NULL);
 }
 
+/*=============================================================================
+ * OFFER VALIDATION
+ *
+ * Everything an OFFER carries is applied at ACK time: the address, the mask
+ * (which decides what is "local" in get_route_mac()), the gateway and the DNS
+ * server. None of it was checked, so a mask of 0.0.0.0 made every address on
+ * the Internet look on-link (every destination ARPed for directly, where any
+ * host on the segment can answer), and 127.0.0.1 or 255.255.255.255 were
+ * accepted as our own address.
+ *
+ * An OFFER without a server identifier (option 54) is refused outright: the
+ * ACK and NAK checks below compare against the stored server-ID, and a stored
+ * 0.0.0.0 matched an ACK that also omitted it (0 == 0).
+ *============================================================================*/
+static bool dhcp_ip_is_zero(const uint8_t* ip) {
+    return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0;
+}
+
+/* Not usable as anyone's unicast address: 0/8, loopback, link-local is fine
+ * (APIPA uses it), multicast 224/4, class E 240/4 incl. 255.255.255.255. */
+static bool dhcp_ip_is_special(const uint8_t* ip) {
+    return ip[0] == 0 || ip[0] == 127 || ip[0] >= 224;
+}
+
+/* A contiguous mask with a prefix between /8 and /30. 0.0.0.0 (/0) is the
+ * "everything is local" mask; /31 and /32 leave no room for a gateway. */
+static bool dhcp_mask_is_valid(const uint8_t* mask) {
+    uint32_t m = ((uint32_t)mask[0] << 24) | ((uint32_t)mask[1] << 16) |
+                 ((uint32_t)mask[2] << 8) | (uint32_t)mask[3];
+    uint32_t inv = ~m;
+    if ((inv & (inv + 1)) != 0) {
+        return false;                       /* holes: not contiguous */
+    }
+    return (m & 0xFF000000u) == 0xFF000000u && (m & 0x3u) == 0;
+}
+
+/* Host part all-zeros (network) or all-ones (directed broadcast). */
+static bool dhcp_ip_is_net_or_bcast(const uint8_t* ip, const uint8_t* mask) {
+    bool all_zero = true, all_ones = true;
+    for (int i = 0; i < 4; i++) {
+        uint8_t host = ip[i] & (uint8_t)~mask[i];
+        if (host != 0) all_zero = false;
+        if (host != (uint8_t)~mask[i]) all_ones = false;
+    }
+    return all_zero || all_ones;
+}
+
+static bool dhcp_same_subnet(const uint8_t* a, const uint8_t* b, const uint8_t* mask) {
+    for (int i = 0; i < 4; i++) {
+        if ((a[i] & mask[i]) != (b[i] & mask[i])) return false;
+    }
+    return true;
+}
+
+/* Fills `mask` with the classful default when the OFFER carried none.
+ * Returns false if the offered configuration must not be used. */
+static bool dhcp_offer_is_valid(const uint8_t* yiaddr, const uint8_t* server_id,
+                                uint8_t* mask, bool mask_present,
+                                const uint8_t* router, const uint8_t* dns) {
+    if (dhcp_ip_is_zero(server_id)) {
+        return false;
+    }
+    if (dhcp_ip_is_special(yiaddr)) {
+        return false;
+    }
+    if (!mask_present) {
+        /* Option 1 absent: RFC 2131 leaves the mask to the client. The
+         * classful default is at worst narrower than the real subnet, which
+         * sends on-link traffic via the gateway -- never the reverse. */
+        mask[0] = 255;
+        mask[1] = (yiaddr[0] >= 128) ? 255 : 0;
+        mask[2] = (yiaddr[0] >= 192) ? 255 : 0;
+        mask[3] = 0;
+    } else if (!dhcp_mask_is_valid(mask)) {
+        return false;
+    }
+    if (dhcp_ip_is_net_or_bcast(yiaddr, mask)) {
+        return false;
+    }
+    if (!dhcp_ip_is_zero(router)) {
+        if (!dhcp_same_subnet(router, yiaddr, mask) ||
+            memcmp(router, yiaddr, 4) == 0 ||
+            dhcp_ip_is_net_or_bcast(router, mask)) {
+            return false;
+        }
+    }
+    if (!dhcp_ip_is_zero(dns) && dhcp_ip_is_special(dns)) {
+        return false;
+    }
+    return true;
+}
+
 /**
  * @brief Handle received DHCP packet
  */
@@ -436,13 +549,23 @@ void handle_dhcp(const uint8_t* data, size_t len) {
     uint8_t dns_server[4] = {0};
     uint32_t lease_time = 0;
 
+    bool mask_present = false;
     parse_dhcp_options(options, options_len, &msg_type, server_ip,
-                      dhcp_subnet_mask, router, dns_server, &lease_time);
+                      dhcp_subnet_mask, &mask_present, router, dns_server,
+                      &lease_time);
 
     // Handle based on message type
     switch (msg_type) {
         case DHCP_OFFER:
             if (dhcp_client.state == DHCP_STATE_SELECTING) {
+                /* Refused offers leave the client SELECTING, so a later
+                 * valid OFFER for the same DISCOVER is still taken. */
+                if (!dhcp_offer_is_valid(dhcp->yiaddr, server_ip, dhcp_subnet_mask,
+                                         mask_present, router, dns_server)) {
+                    dhcp_drop_badcfg++;
+                    return;
+                }
+
                 // Save offered configuration
                 memcpy(dhcp_client.offered_ip, dhcp->yiaddr, 4);
                 memcpy(dhcp_client.server_ip, server_ip, 4);
@@ -476,9 +599,20 @@ void handle_dhcp(const uint8_t* data, size_t len) {
                  * network configurations by verifying the ACK comes from the
                  * same server that sent the OFFER.
                  *===============================================================*/
-                if (memcmp(server_ip, dhcp_client.server_ip, 4) != 0) {
-                    /* Never format the attacker's own server_ip back out. */
+                if (dhcp_ip_is_zero(server_ip) ||
+                    memcmp(server_ip, dhcp_client.server_ip, 4) != 0) {
+                    /* Never format the attacker's own server_ip back out.
+                     * The zero test is belt and braces: a zero server-ID
+                     * can no longer be stored (dhcp_offer_is_valid). */
                     dhcp_drop_rogue++;
+                    return;
+                }
+
+                /* The address applied below is the ACK's yiaddr, but only
+                 * the OFFER's was validated -- and it is the one we asked
+                 * for. An ACK for a different address is not ours. */
+                if (memcmp(dhcp->yiaddr, dhcp_client.offered_ip, 4) != 0) {
+                    dhcp_drop_ack++;
                     return;
                 }
 
@@ -599,17 +733,31 @@ void handle_dhcp(const uint8_t* data, size_t len) {
                 kprintf("    Lease:    %u days\n", dhcp_client.lease_time / 86400);
                 kprintf("~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~\n\n");
 
-                // Use DNS from DHCP (router knows best)
-                set_dns_server(dhcp_client.dns_server);
+                // Use DNS from DHCP (router knows best). An offer without
+                // option 6 keeps the current server instead of zeroing it.
+                if (!dhcp_ip_is_zero(dhcp_client.dns_server)) {
+                    set_dns_server(dhcp_client.dns_server);
+                }
             }
             break;
             
         case DHCP_NAK:
-            /* Remote-driven: any host can forge a NAK. Counted as a rogue
-             * signature rather than printed. */
-            dhcp_drop_rogue++;
-            dhcp_client.state = DHCP_STATE_INIT;
-            dhcp_start();
+            /* Remote-driven: any host can forge a NAK, and one used to
+             * reset the client from ANY state -- including BOUND, where no
+             * REQUEST is outstanding -- from any source. RFC 2131 4.4: a NAK
+             * answers a REQUEST, so it is honoured only while one is
+             * outstanding and only from the server that REQUEST went to. */
+            if ((dhcp_client.state == DHCP_STATE_REQUESTING ||
+                 dhcp_client.state == DHCP_STATE_RENEWING ||
+                 dhcp_client.state == DHCP_STATE_REBINDING) &&
+                !dhcp_ip_is_zero(server_ip) &&
+                memcmp(server_ip, dhcp_client.server_ip, 4) == 0) {
+                dhcp_nak_honored++;
+                dhcp_client.state = DHCP_STATE_INIT;
+                dhcp_start();
+            } else {
+                dhcp_nak_ignored++;
+            }
             break;
     }
 }

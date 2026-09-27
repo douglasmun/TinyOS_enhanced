@@ -214,10 +214,10 @@ void cmd_ifconfig(void) {
 
     /* ARP RX counters. A new mapping is learned only when it answers a request
      * we sent; everything else is refused and counted by attacker shape. */
-    uint32_t arp_learned = 0, arp_unsol = 0, arp_change = 0;
-    arp_get_rx_stats(&arp_learned, &arp_unsol, &arp_change);
-    kprintf("  ARP rx:       %u learned, %u unsolicited, %u change-refused\n",
-            arp_learned, arp_unsol, arp_change);
+    uint32_t arp_learned = 0, arp_unsol = 0, arp_change = 0, arp_evict = 0;
+    arp_get_rx_stats(&arp_learned, &arp_unsol, &arp_change, &arp_evict);
+    kprintf("  ARP rx:       %u learned, %u unsolicited, %u change-refused, %u evicted\n",
+            arp_learned, arp_unsol, arp_change, arp_evict);
 
     /* DNS RX counters. Same reasoning as the ICMP block above, at larger scale:
      * handle_dns_response() had 20 prints, and the spoof/TID/question ones are
@@ -254,6 +254,10 @@ void cmd_ifconfig(void) {
             dh_ok, dh_short, dh_cookie);
     kprintf("  DHCP drops:   %u options, %u rogue-server, %u lease-clamp\n",
             dh_opts, dh_rogue, dh_clamp);
+    uint32_t dh_badoff = 0, dh_badack = 0, dh_nakign = 0, dh_nakok = 0;
+    dhcp_get_cfg_stats(&dh_badoff, &dh_badack, &dh_nakign, &dh_nakok);
+    kprintf("  DHCP config:  %u bad-offer, %u bad-ack, %u nak-ignored, %u nak-honored\n",
+            dh_badoff, dh_badack, dh_nakign, dh_nakok);
 
     /* UDP RX counters. `accepted` is the positive control: the drop counters
      * alone are satisfied perfectly by a handle_udp() that refuses every

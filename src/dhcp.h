@@ -159,3 +159,16 @@ void dhcp_tick(uint32_t current_time);
 void dhcp_get_rx_stats(uint32_t* replies, uint32_t* drop_short,
                        uint32_t* drop_cookie, uint32_t* drop_options,
                        uint32_t* drop_rogue, uint32_t* clamp_lease);
+
+/**
+ * @brief DHCP configuration-validation counters
+ *
+ * @param bad_offer   OFFERs refused: no server-ID, or an unusable address,
+ *                    mask, gateway or DNS server (nothing was stored)
+ * @param bad_ack     ACKs refused: yiaddr differs from the accepted OFFER
+ * @param nak_ignored NAKs ignored: no REQUEST outstanding, or not from the
+ *                    server it went to
+ * @param nak_honored NAKs that restarted discovery (positive control)
+ */
+void dhcp_get_cfg_stats(uint32_t* bad_offer, uint32_t* bad_ack,
+                        uint32_t* nak_ignored, uint32_t* nak_honored);
