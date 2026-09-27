@@ -54,15 +54,20 @@ static uint32_t icmp_echo_oversize = 0;
  * answers, all aimed at the forged source. RFC 1122 3.2.2.6 permits silently
  * discarding these. */
 static uint32_t icmp_echo_broadcast = 0;
+/* ICMP messages of any type whose checksum does not verify (network audit
+ * finding 6, 2026-09). They were never checked: a corrupted echo request was
+ * answered, and a corrupted echo reply counted as a ping response. */
+static uint32_t icmp_bad_checksum = 0;
 
 void icmp_get_rx_stats(uint32_t* echo_replies, uint32_t* echo_requests,
                        uint32_t* rate_limited, uint32_t* oversize,
-                       uint32_t* broadcast) {
+                       uint32_t* broadcast, uint32_t* bad_checksum) {
     if (echo_replies) *echo_replies = icmp_echo_replies_rx;
     if (echo_requests) *echo_requests = icmp_echo_requests_rx;
     if (rate_limited) *rate_limited = icmp_replies_dropped;
     if (oversize) *oversize = icmp_echo_oversize;
     if (broadcast) *broadcast = icmp_echo_broadcast;
+    if (bad_checksum) *bad_checksum = icmp_bad_checksum;
 }
 
 /*=============================================================================
@@ -227,6 +232,16 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
 {
     // Sanity: need enough for minimal headers
     if (eth_len < 14 || ip_len < 20 || icmp_len < sizeof(icmp_header_t)) {
+        return;
+    }
+
+    /* RFC 792: the checksum covers the whole ICMP message, the checksum field
+     * included, so a valid message sums to 0. Before any type dispatch: a
+     * message that fails it is not an echo request, an echo reply, or
+     * anything else. icmp_len comes from the IP total length, which net.c has
+     * already bounded by the frame. */
+    if (calculate_icmp_checksum(icmp_payload, icmp_len) != 0) {
+        icmp_bad_checksum++;
         return;
     }
 

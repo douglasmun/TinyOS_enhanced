@@ -20,7 +20,7 @@ was addressed to, which echo requests were answered -- run this alongside.
 
 Every frame whose Ethernet source is --guest is written to --out, one line:
 
-    dst=<mac> src=<mac> type=<ethertype> [arp op=N spa=IP tpa=IP]
+    len=<bytes> dst=<mac> src=<mac> type=<ethertype> [arp op=N spa=IP tpa=IP]
                                          [ip src=IP dst=IP [icmp type=N id=0xNNNN]]
 
 Only guest-sourced frames are logged: the group loops back every injected
@@ -51,7 +51,7 @@ def fmt_mac(b):
 def describe(frame):
     dst, src = frame[0:6], frame[6:12]
     etype = struct.unpack("!H", frame[12:14])[0]
-    out = f"dst={fmt_mac(dst)} src={fmt_mac(src)} type=0x{etype:04x}"
+    out = f"len={len(frame)} dst={fmt_mac(dst)} src={fmt_mac(src)} type=0x{etype:04x}"
     if etype == 0x0806 and len(frame) >= 42:
         op = struct.unpack("!H", frame[20:22])[0]
         spa = socket.inet_ntoa(frame[28:32])

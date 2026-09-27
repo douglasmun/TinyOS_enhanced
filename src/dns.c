@@ -102,6 +102,11 @@ static uint32_t dns_drop_malformed = 0;     /* short, truncated, bad RCODE   */
 static uint32_t dns_drop_name_pointer = 0;  /* hostile compression pointer   */
 static uint32_t dns_drop_name_label = 0;    /* label length > 63, or > 127   */
 static uint32_t dns_drop_no_answer = 0;     /* well-formed, no A record      */
+/* Well-formed, and it HAD an A record -- for a name we did not ask about (nor
+ * reached by a CNAME chain from it), or in a class other than IN. Kept apart
+ * from no-answer: that one is an honest NXDATA-style reply, this one is a
+ * server (or forger) handing us an address for something else. */
+static uint32_t dns_drop_answer_mismatch = 0;
 /* Query-binding signatures. Separate from dns_drop_tid because they cost an
  * attacker nothing to hit and say something different: a port mismatch is a
  * blind spoofer who has not found our ephemeral port, an unsolicited response
@@ -122,6 +127,10 @@ void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
     if (drop_no_answer)  *drop_no_answer  = dns_drop_no_answer;
     if (drop_name_ptr)   *drop_name_ptr   = dns_drop_name_pointer;
     if (drop_name_label) *drop_name_label = dns_drop_name_label;
+}
+
+void dns_get_answer_drop_stats(uint32_t* drop_answer_mismatch) {
+    if (drop_answer_mismatch) *drop_answer_mismatch = dns_drop_answer_mismatch;
 }
 
 void dns_get_query_drop_stats(uint32_t* drop_port, uint32_t* drop_unsolicited) {
@@ -686,7 +695,23 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
         return;
     }
 
-    // 3. Process Answer Section
+    /*=========================================================================
+     * 3. Process Answer Section
+     *
+     * An A record is taken only if its owner name is the name we asked about
+     * -- or the end of a CNAME chain that starts there -- and its class is
+     * IN. The first A record used to be taken whatever it was for, so any
+     * response that cleared the question check could carry an address for an
+     * unrelated name (or a CHAOS-class record) and have it used as ours.
+     * `target` follows the chain: a CNAME whose owner is the current target
+     * moves the target to its RDATA name. One pass, in record order, which is
+     * the order servers emit a chain in.
+     *=======================================================================*/
+    char target[MAX_DOMAIN_NAME_LEN + 1];
+    char owner[MAX_DOMAIN_NAME_LEN + 1];
+    SAFE_STRNCPY_ARR(target, last_queried_domain);
+    bool skipped_mismatch = false;
+
     for (int i = 0; i < ans_count; i++) {
 
         // Skip the Name field (often a 2-byte pointer 0xC0 XX)
@@ -694,6 +719,13 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
         if (name_len == 0) {
             dns_drop_malformed++;
             return;  // Error in skip_dns_name
+        }
+        /* skip_dns_name() validated the name; decoding it can still fail on
+         * a name too long for the buffer. */
+        if (!dns_label_to_domain(dns_data, packet_end, current_ptr,
+                                 owner, sizeof(owner))) {
+            dns_drop_malformed++;
+            return;
         }
         current_ptr += name_len;
 
@@ -708,7 +740,10 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
 
         // Ã¢Å“â€œ CORRECT The Resource Record (RR) header Byte Order
         uint16_t type = ntohs(rr->type);
+        uint16_t rclass = ntohs(rr->class);
         uint16_t data_len = ntohs(rr->data_len);
+        bool for_target = (rclass == DNS_QCLASS_IN) &&
+                          (strcasecmp(owner, target) == 0);
 
         current_ptr += sizeof(dns_rr_t);
 
@@ -718,8 +753,19 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
             return;
         }
 
+        if (type == DNS_QTYPE_CNAME && for_target) {
+            /* RDATA is a (possibly compressed) name inside the RDATA span. */
+            if (!dns_label_to_domain(dns_data, packet_end, current_ptr,
+                                     target, sizeof(target))) {
+                dns_drop_malformed++;
+                return;
+            }
+        } else if ((type == DNS_QTYPE_A || type == DNS_QTYPE_CNAME) && !for_target) {
+            skipped_mismatch = true;
+        }
+
         // We only care about A records (Type 1) with 4 bytes of data
-        if (type == DNS_QTYPE_A && data_len == 4) {
+        if (type == DNS_QTYPE_A && data_len == 4 && for_target) {
             // The RDATA (the IP address) starts at current_ptr
             uint8_t* ip = current_ptr;
 
@@ -737,7 +783,12 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
         current_ptr += data_len;
     }
 
-    dns_drop_no_answer++;
+    /* One bucket per response, so the two never double-count. */
+    if (skipped_mismatch) {
+        dns_drop_answer_mismatch++;
+    } else {
+        dns_drop_no_answer++;
+    }
 }
 
 
@@ -1048,13 +1099,58 @@ void dns_forge_response(const char* which) {
         off = 4;                            /* shorter than a DNS header */
     } else if (strcmp(which, "noanswer") == 0) {
         pkt[ans_off + 3] = 0x1C;            /* TYPE = AAAA, so no A record */
+    } else if (strcmp(which, "ansclass") == 0) {
+        pkt[ans_off + 5] = 0x03;            /* CLASS = CH, not IN */
+    } else if (strcmp(which, "ansname") == 0 || strcmp(which, "cname") == 0 ||
+               strcmp(which, "cnamebad") == 0) {
+        /*
+         * Rebuilt from ans_off. Every other name is written as one label in
+         * front of a pointer back to the question (compression pointers must
+         * point backward), so they are x.<qname> / y.<qname>:
+         *
+         *   ansname   x.<qname> A 203.0.113.8     -- not what we asked
+         *   cname     <qname> CNAME x.<qname>, x.<qname> A  -- the chain's end
+         *   cnamebad  <qname> CNAME x.<qname>, y.<qname> A  -- off the chain
+         */
+        off = ans_off;
+        bool chain = (strcmp(which, "ansname") != 0);
+        if (chain) {
+            h->ancount = htons(2);
+            pkt[off++] = 0xC0; pkt[off++] = 0x0C;   /* owner = qname */
+            pkt[off++] = 0x00; pkt[off++] = 0x05;   /* TYPE  = CNAME */
+            pkt[off++] = 0x00; pkt[off++] = 0x01;   /* CLASS = IN */
+            pkt[off++] = 0x00; pkt[off++] = 0x00;
+            pkt[off++] = 0x00; pkt[off++] = 0x3C;   /* TTL = 60 */
+            pkt[off++] = 0x00; pkt[off++] = 0x04;   /* RDLENGTH = 4 */
+            pkt[off++] = 1;    pkt[off++] = 'x';
+            pkt[off++] = 0xC0; pkt[off++] = 0x0C;   /* x.<qname> */
+        }
+        pkt[off++] = 1;
+        pkt[off++] = (strcmp(which, "cnamebad") == 0) ? 'y' : 'x';
+        pkt[off++] = 0xC0; pkt[off++] = 0x0C;       /* owner = ?.<qname> */
+        pkt[off++] = 0x00; pkt[off++] = 0x01;       /* TYPE  = A  */
+        pkt[off++] = 0x00; pkt[off++] = 0x01;       /* CLASS = IN */
+        pkt[off++] = 0x00; pkt[off++] = 0x00;
+        pkt[off++] = 0x00; pkt[off++] = 0x3C;       /* TTL = 60 */
+        pkt[off++] = 0x00; pkt[off++] = 0x04;       /* RDLENGTH = 4 */
+        pkt[off++] = 203;  pkt[off++] = 0;
+        pkt[off++] = 113;  pkt[off++] = 8;          /* RDATA = 203.0.113.8 */
     } else if (strcmp(which, "valid") != 0) {
-        kprintf("[FAULT] dnsforge: valid|srcip|port|stale|tid|question|malformed|noanswer\n");
+        kprintf("[FAULT] dnsforge: valid|srcip|port|stale|tid|question|malformed|noanswer|ansclass|ansname|cname|cnamebad\n");
         return;
     }
 
     kprintf("[FAULT] dnsforge %s injected\n", which);
     dns_query_outstanding = true;
     handle_dns_response(pkt, off, src, dport);
+
+    /* Which address the resolver now holds: the forged ones are all in
+     * 203.0.113.0/24, so a harness can tell an accepted forgery from the
+     * earlier real `dig` answer. */
+    uint8_t now[4];
+    if (dns_get_resolved_ip(now)) {
+        kprintf("[FAULT] dnsforge %s holds %u.%u.%u.%u\n", which,
+                now[0], now[1], now[2], now[3]);
+    }
 }
 #endif

@@ -46,6 +46,7 @@ typedef struct __attribute__((packed)) {
 // Query Type (QTYPE) constants - Big Endian
 #define DNS_QTYPE_A     0x0001 // A record (IPv4 address)
 #define DNS_QTYPE_AAAA  0x001C // AAAA record (IPv6 address)
+#define DNS_QTYPE_CNAME 0x0005 // CNAME record (alias)
 
 // Query Class (QCLASS) constants - Big Endian
 #define DNS_QCLASS_IN   0x0001 // Internet class
@@ -95,6 +96,13 @@ void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
  * @param drop_unsolicited Dropped: no query in flight (late or replayed answer)
  */
 void dns_get_query_drop_stats(uint32_t* drop_port, uint32_t* drop_unsolicited);
+
+/**
+ * @brief Answer-binding drop counter.
+ * @param drop_answer_mismatch Responses whose only A records were for a name
+ *        other than the query (or its CNAME chain), or not class IN
+ */
+void dns_get_answer_drop_stats(uint32_t* drop_answer_mismatch);
 
 #ifdef TINYOS_FAULT_INJECT
 /**

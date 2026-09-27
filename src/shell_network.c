@@ -206,11 +206,12 @@ void cmd_ifconfig(void) {
      * particular was NOT rate limited before — see doc/NETDAEMON_DESIGN.md
      * finding A1. */
     uint32_t icmp_replies = 0, icmp_requests = 0, icmp_limited = 0;
-    uint32_t icmp_oversize = 0, icmp_bcast = 0;
+    uint32_t icmp_oversize = 0, icmp_bcast = 0, icmp_badck = 0;
     icmp_get_rx_stats(&icmp_replies, &icmp_requests, &icmp_limited, &icmp_oversize,
-                      &icmp_bcast);
-    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited, %u oversize, %u broadcast\n",
-            icmp_replies, icmp_requests, icmp_limited, icmp_oversize, icmp_bcast);
+                      &icmp_bcast, &icmp_badck);
+    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited, %u oversize, %u broadcast, %u bad-checksum\n",
+            icmp_replies, icmp_requests, icmp_limited, icmp_oversize, icmp_bcast,
+            icmp_badck);
 
     /* ARP RX counters. A new mapping is learned only when it answers a request
      * we sent; everything else is refused and counted by attacker shape. */
@@ -230,7 +231,10 @@ void cmd_ifconfig(void) {
     dns_get_rx_stats(&dns_ok, &dns_spoof, &dns_tid,
                      &dns_question, &dns_malformed, &dns_noanswer,
                      &dns_nameptr, &dns_namelabel);
-    kprintf("  DNS rx:       %u resolved, %u no-answer\n", dns_ok, dns_noanswer);
+    uint32_t dns_ansmis = 0;
+    dns_get_answer_drop_stats(&dns_ansmis);
+    kprintf("  DNS rx:       %u resolved, %u no-answer, %u answer-mismatch\n",
+            dns_ok, dns_noanswer, dns_ansmis);
     kprintf("  DNS drops:    %u src-ip, %u tid, %u question, %u malformed\n",
             dns_spoof, dns_tid, dns_question, dns_malformed);
     /* skip_dns_name() signatures. Separate from `malformed` above because
