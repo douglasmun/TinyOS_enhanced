@@ -61,7 +61,10 @@ bool dns_get_resolved_ip(uint8_t* ip_out);
 
 bool dns_is_resolved(void);
 
-void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* source_ip);
+/* dest_port is the UDP destination port the response arrived on; it must
+ * match the ephemeral source port of the query in flight. */
+void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* source_ip,
+                         uint16_t dest_port);
 
 /**
  * @brief RX-path counters that replaced handle_dns_response()'s per-packet
@@ -85,10 +88,19 @@ void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
                       uint32_t* drop_malformed, uint32_t* drop_no_answer,
                       uint32_t* drop_name_ptr, uint32_t* drop_name_label);
 
+/**
+ * @brief Query-binding drop counters, kept out of dns_get_rx_stats() so its
+ *        eight existing out-parameters did not grow two more.
+ * @param drop_port        Dropped: not addressed to the in-flight query's port
+ * @param drop_unsolicited Dropped: no query in flight (late or replayed answer)
+ */
+void dns_get_query_drop_stats(uint32_t* drop_port, uint32_t* drop_unsolicited);
+
 #ifdef TINYOS_FAULT_INJECT
 /**
  * @brief Inject a synthetic DNS response (verify-dns-rx-counters.sh only).
- * @param which one of: valid, srcip, tid, question, malformed, noanswer
+ * @param which one of: valid, srcip, port, stale, tid, question, malformed,
+ *              noanswer
  *
  * Each variant differs from `valid` in exactly one respect, so a rise in one
  * counter identifies which branch ran. Requires a prior query (`dig`) to have

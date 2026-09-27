@@ -200,9 +200,10 @@ void cmd_ifconfig(void) {
      * particular was NOT rate limited before — see doc/NETDAEMON_DESIGN.md
      * finding A1. */
     uint32_t icmp_replies = 0, icmp_requests = 0, icmp_limited = 0;
-    icmp_get_rx_stats(&icmp_replies, &icmp_requests, &icmp_limited);
-    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited\n",
-            icmp_replies, icmp_requests, icmp_limited);
+    uint32_t icmp_oversize = 0;
+    icmp_get_rx_stats(&icmp_replies, &icmp_requests, &icmp_limited, &icmp_oversize);
+    kprintf("  ICMP rx:      %u echo-reply, %u echo-request, %u rate-limited, %u oversize\n",
+            icmp_replies, icmp_requests, icmp_limited, icmp_oversize);
 
     /* DNS RX counters. Same reasoning as the ICMP block above, at larger scale:
      * handle_dns_response() had 20 prints, and the spoof/TID/question ones are
@@ -223,6 +224,11 @@ void cmd_ifconfig(void) {
      * filters -- a forged response drives them directly. */
     kprintf("  DNS name:     %u bad-pointer, %u bad-label\n",
             dns_nameptr, dns_namelabel);
+    /* Query binding: a response not addressed to the in-flight query's port,
+     * or arriving when no query is in flight. */
+    uint32_t dns_port = 0, dns_unsolicited = 0;
+    dns_get_query_drop_stats(&dns_port, &dns_unsolicited);
+    kprintf("  DNS binding:  %u port, %u unsolicited\n", dns_port, dns_unsolicited);
 
     /* DHCP RX counters. Firewall-exempt inbound path, so all of these are
      * remote-driven; `replies` is the positive control. */

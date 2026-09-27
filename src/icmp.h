@@ -41,9 +41,10 @@ void icmp_init(void);
  * @param echo_replies  Echo replies received matching our ping identifier
  * @param echo_requests Echo requests received and answered
  * @param rate_limited  Echo requests dropped by the ICMP rate limiter
+ * @param oversize      Echo requests whose reply would exceed one frame
  */
 void icmp_get_rx_stats(uint32_t* echo_replies, uint32_t* echo_requests,
-                       uint32_t* rate_limited);
+                       uint32_t* rate_limited, uint32_t* oversize);
 
 /**
  * @brief Handle received ICMP packet with full context for proper replies
