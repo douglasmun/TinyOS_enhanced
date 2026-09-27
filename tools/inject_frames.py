@@ -57,7 +57,8 @@ def checksum16(data):
 
 
 def build_icmp_frame(dst_mac, src_mac, src_ip, dst_ip, icmp_type,
-                     identifier, sequence, payload_len, payload_bytes=None):
+                     identifier, sequence, payload_len, payload_bytes=None,
+                     bad_checksum=False):
     """A well-formed Ethernet/IPv4/ICMP frame.
 
     Unlike build_frame() above, every layer here must actually validate: the
@@ -69,6 +70,10 @@ def build_icmp_frame(dst_mac, src_mac, src_ip, dst_ip, icmp_type,
     matters for the unthrottled-print finding (A1): TinyOS accepts it only if
     `identifier` matches its CSPRNG-chosen ping_identifier, which models an
     on-path attacker who has observed one outbound ping.
+
+    bad_checksum corrupts ONLY the ICMP checksum (XOR 0x00FF, which can never
+    turn it into the other ones'-complement zero); the IP header stays valid,
+    so the frame reaches icmp.c and nothing earlier can drop it.
     """
     if payload_bytes is not None:
         # Caller-chosen payload, used to drive ids_inspect_payload(): the IDS
@@ -81,7 +86,8 @@ def build_icmp_frame(dst_mac, src_mac, src_ip, dst_ip, icmp_type,
             payload = (payload * (payload_len // max(len(payload), 1) + 1))[:payload_len]
 
     icmp = struct.pack("!BBHHH", icmp_type, 0, 0, identifier, sequence) + payload
-    icmp = icmp[:2] + struct.pack("!H", checksum16(icmp)) + icmp[4:]
+    csum = checksum16(icmp) ^ (0x00FF if bad_checksum else 0)
+    icmp = icmp[:2] + struct.pack("!H", csum) + icmp[4:]
 
     total_len = 20 + len(icmp)
     ip = struct.pack("!BBHHHBBH4s4s",
@@ -348,6 +354,8 @@ def main():
     ap.add_argument("--icmp-id", type=lambda s: int(s, 0), default=0,
                     help="ICMP identifier (must match the guest's "
                          "ping_identifier for an Echo Reply to be accepted)")
+    ap.add_argument("--icmp-bad-checksum", action="store_true",
+                    help="--mode icmp: corrupt the ICMP checksum only")
     ap.add_argument("--src-ip", default="10.0.2.99")
     ap.add_argument("--dst-ip", default="10.0.2.15")
     ap.add_argument("--dst", type=parse_mac, required=True,
@@ -425,8 +433,10 @@ def main():
             pb = bytes.fromhex(args.payload_hex.replace(" ", ""))
         frame = build_icmp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
                                  args.icmp_type, args.icmp_id, 1,
-                                 args.payload_len, pb)
+                                 args.payload_len, pb, args.icmp_bad_checksum)
         desc = f"icmp type {args.icmp_type} id 0x{args.icmp_id:04x}"
+        if args.icmp_bad_checksum:
+            desc += " BAD checksum"
         if pb is not None:
             desc += f" payload {pb.hex()}"
     else:

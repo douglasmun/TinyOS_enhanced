@@ -195,8 +195,8 @@ fail_with() {
 
 # --- Symptom first: where did the pings go? ------------------------------
 ECHO_LINES=$(grep "icmp type=8" "$PEER_LOG" | grep "dst=$VICTIM_IP ")
-TO_ATTACKER=$(printf '%s\n' "$ECHO_LINES" | grep -c "^dst=$ATTACKER_MAC ")
-TO_LEGIT=$(printf '%s\n' "$ECHO_LINES" | grep -c "^dst=$LEGIT_MAC ")
+TO_ATTACKER=$(printf '%s\n' "$ECHO_LINES" | grep -cE "^(len=[0-9]+ )?dst=$ATTACKER_MAC ")
+TO_LEGIT=$(printf '%s\n' "$ECHO_LINES" | grep -cE "^(len=[0-9]+ )?dst=$LEGIT_MAC ")
 WHO_HAS=$(grep -c "arp op=1 .*tpa=$VICTIM_IP\$" "$PEER_LOG")
 
 echo "  echo requests to V: $TO_LEGIT -> legit, $TO_ATTACKER -> attacker (expected 4, 0)"

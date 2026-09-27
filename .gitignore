@@ -267,3 +267,5 @@ icmpbcast*.log
 e1000budget*.log
 csprngorder*.log
 dhcpcfg*.log
+icmpcsum*.log
+icmpovr-peer.log

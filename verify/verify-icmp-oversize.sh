@@ -45,6 +45,14 @@
 # The boundary frame is the selectivity leg: without it a counter that counted
 # every echo request would pass the exact-delta assertion.
 #
+# THE REPLY ON THE WIRE (added 2026-09)
+#
+# echo-request is incremented BEFORE e1000_send(), whose result icmp.c does not
+# check, so the counter alone says the boundary request was accepted, not that
+# a 1514-byte reply left the NIC. The harness now runs on a dgram netdev with
+# tools/net_peer.py capturing the guest's frames, and asserts exactly one echo
+# reply, 1514 bytes long, and none of any other size.
+#
 # VALIDATION LOG (filled in from actual runs, not written in advance)
 #
 #   POSITIVE, fixed build, 10 pairs
@@ -64,8 +72,14 @@
 #     -> FAIL: oversize 21, echo-request 0 -- the boundary frame is what
 #     separates this from a correct kernel; without it both count 20.
 #
+#   2026-09-28, dgram netdev + capture (QEMU 11.1.1 TCG):
+#   - fixed tree: PASS, one 1514-byte echo reply captured.
+#   - negative control, the 1514-byte reply's e1000_send() skipped: FAIL on
+#     the capture leg alone -- every counter leg still passed, which is the
+#     gap the capture closes.
+#
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
-# Logs: icmpovr.log (serial), icmpovr-trace.log.
+# Logs: icmpovr.log (serial), icmpovr-trace.log, icmpovr-peer.log.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -74,6 +88,7 @@ PASSWORD="${TINYOS_TEST_PASSWORD:-${TINYOS_PASSWORD:-rootpass1}}"
 ISO=dist/tinyos.iso
 SERIAL=icmpovr.log
 TRACE=icmpovr-trace.log
+PEER_LOG=icmpovr-peer.log
 RUN_DISK=/tmp/tinyos-icmpovr-disk.img
 MON_SOCK=/tmp/tinyos-icmpovr-mon.sock
 
@@ -92,7 +107,11 @@ GUEST_MAC=52:54:00:12:34:56
 # verify-icmp-counters.sh for the two versions of that harness that measured
 # nothing by getting this and the destination wrong.
 SRC_IP=203.0.113.99
-QEMU_MCAST=230.0.0.2:1235
+# dgram, not socket,mcast=: on macOS the mcast netdev never puts the guest's
+# frames on the wire, so the reply could not be captured. See the header of
+# tools/net_peer.py.
+GUEST_EP=127.0.0.1:41285
+PEER_EP=127.0.0.1:41286
 
 guard_fail() { echo "RESULT: INCONCLUSIVE — $1"; exit 3; }
 
@@ -108,6 +127,8 @@ if grep -qa "Reply too large" src/icmp.c; then
 fi
 
 command -v python3 >/dev/null 2>&1 || guard_fail "python3 not found"
+grep -q "len={len(frame)}" tools/net_peer.py 2>/dev/null \
+    || guard_fail "tools/net_peer.py does not log frame lengths"
 HELP=$(python3 tools/inject_frames.py --help 2>&1)
 case "$HELP" in
     *--payload-lens*) ;;
@@ -129,15 +150,15 @@ ISO_MARKERS=$(strings "$ISO" | grep -c "rate-limited, %u oversize")
     || guard_fail "the ISO predates the fix (ifconfig has no oversize field)"
 
 echo "==> Copying pristine disk.img -> $RUN_DISK"
-rm -f "$RUN_DISK" "$SERIAL" "$TRACE" "$MON_SOCK"
+rm -f "$RUN_DISK" "$SERIAL" "$TRACE" "$PEER_LOG" "$MON_SOCK"
 [ -f disk.img ] || { echo "ERROR: disk.img not found"; exit 1; }
 cp disk.img "$RUN_DISK"
 
-echo "==> Launching headless QEMU (monitor $MON_SOCK, mcast socket $QEMU_MCAST)"
+echo "==> Launching headless QEMU (monitor $MON_SOCK, dgram $GUEST_EP <-> $PEER_EP)"
 qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom "$ISO" \
     -boot d -m 256M \
     -drive file="$RUN_DISK",format=raw,if=ide \
-    -netdev socket,id=net0,mcast="$QEMU_MCAST" \
+    -netdev dgram,id=net0,local.type=inet,local.host=127.0.0.1,local.port=${GUEST_EP##*:},remote.type=inet,remote.host=127.0.0.1,remote.port=${PEER_EP##*:} \
     -device e1000,netdev=net0,mac="$GUEST_MAC" \
     -serial "file:$SERIAL" \
     -monitor "unix:$MON_SOCK,server,nowait" \
@@ -159,14 +180,18 @@ export TINYOS_HOOK_ICMPBIG="
     if [ -z \"\$GUEST_IP\" ]; then
         echo 'ICMPBIG: could not read guest IP from serial log' >&2
     else
+        python3 tools/net_peer.py --listen $PEER_EP --send $GUEST_EP --guest $GUEST_MAC \
+            --duration 7 --out '$PEER_LOG' >/dev/null 2>&1 &
+        PEER=\$!
         sleep 1
         python3 tools/inject_frames.py \
-            --mcast '$QEMU_MCAST' --mode icmp --icmp-type 8 --count 1 \
+            --mcast '$GUEST_EP' --mode icmp --icmp-type 8 --count 1 \
             --payload-lens '$LENS' \
             --dst $GUEST_MAC --dst-ip \"\$GUEST_IP\" --src-ip $SRC_IP \
             >/dev/null 2>&1
+        wait \$PEER
     fi
-    sleep 5; true"
+    true"
 
 #   ifconfig   : BASELINE
 #   >ICMPBIG   : host hook -- the burst
@@ -258,8 +283,18 @@ if [ "$REQ_D" -ne 1 ] || [ "$LIM_D" -ne 0 ]; then
         "echo-request 0 with oversize over-counted means the bound is wrong."
 fi
 
+# --- The reply itself -------------------------------------------------------
+[ -s "$PEER_LOG" ] || fail_with "the host-side capture never ran (no $PEER_LOG)"
+REPLY_LENS=$(grep "icmp type=0 " "$PEER_LOG" | sed -n 's/^len=\([0-9]*\) .*/\1/p')
+echo "  echo replies captured, by length: [$(echo $REPLY_LENS)] (expected exactly 1514)"
+if [ "$(echo $REPLY_LENS)" != "1514" ]; then
+    fail_with "the wire carried echo replies [$(echo $REPLY_LENS)], expected exactly one of 1514 bytes" \
+        "The counters above passed, so the request was accepted; none means the" \
+        "reply never left the NIC, other sizes mean an oversize request was answered."
+fi
+
 echo ""
 echo "RESULT: PASS"
 echo "  $OVERSIZE_FRAMES oversize echo requests were counted exactly with no console"
-echo "  output, and the 1514-byte request behind them was still answered."
+echo "  output, and the 1514-byte request behind them was answered on the wire."
 exit 0
