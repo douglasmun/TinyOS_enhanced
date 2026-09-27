@@ -333,6 +333,12 @@ def main():
     ap.add_argument("--src", type=parse_mac, default=parse_mac("52:54:00:aa:bb:cc"),
                     help="source MAC")
     ap.add_argument("--payload-len", type=int, default=46)
+    ap.add_argument("--payload-lens", default=None,
+                    help="--mode icmp only: comma-separated payload lengths, "
+                         "sent back to back in this order (--count times "
+                         "each pass). One process, so the whole sequence "
+                         "lands well inside the guest's 100ms ICMP rate "
+                         "limit window -- two separate invocations do not.")
     ap.add_argument("--payload-hex", default=None,
                     help="Exact L4 payload as hex (--mode icmp only), "
                          "e.g. '9090909031c0' for the IDS NOP-sled "
@@ -369,6 +375,22 @@ def main():
                                 args.tcp_src_port, args.tcp_dst_port,
                                 args.tcp_data_offset, 0)
         desc = f"tcp data_offset {args.tcp_data_offset} words"
+    elif args.mode == "icmp" and args.payload_lens:
+        lens = [int(x) for x in args.payload_lens.split(",") if x.strip()]
+        frames = [build_icmp_frame(args.dst, args.src, args.src_ip, args.dst_ip,
+                                   args.icmp_type, args.icmp_id, 1, n, None)
+                  for n in lens]
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        try:
+            for _ in range(args.count):
+                for f in frames:
+                    sock.sendto(f, (group, port))
+        finally:
+            sock.close()
+        sizes = ",".join(str(len(f)) for f in frames)
+        print(f"sent {args.count} x [{sizes}] byte icmp type {args.icmp_type} frames")
+        return
     elif args.mode == "icmp":
         pb = None
         if args.payload_hex:

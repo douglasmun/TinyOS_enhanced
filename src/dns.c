@@ -102,6 +102,13 @@ static uint32_t dns_drop_malformed = 0;     /* short, truncated, bad RCODE   */
 static uint32_t dns_drop_name_pointer = 0;  /* hostile compression pointer   */
 static uint32_t dns_drop_name_label = 0;    /* label length > 63, or > 127   */
 static uint32_t dns_drop_no_answer = 0;     /* well-formed, no A record      */
+/* Query-binding signatures. Separate from dns_drop_tid because they cost an
+ * attacker nothing to hit and say something different: a port mismatch is a
+ * blind spoofer who has not found our ephemeral port, an unsolicited response
+ * arrives when no query is in flight (a late duplicate, or a spray aimed at the
+ * window after we already accepted an answer). */
+static uint32_t dns_drop_port = 0;          /* not addressed to our query port */
+static uint32_t dns_drop_unsolicited = 0;   /* no query in flight            */
 
 void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
                       uint32_t* drop_tid, uint32_t* drop_question,
@@ -117,12 +124,27 @@ void dns_get_rx_stats(uint32_t* responses, uint32_t* drop_source_ip,
     if (drop_name_label) *drop_name_label = dns_drop_name_label;
 }
 
+void dns_get_query_drop_stats(uint32_t* drop_port, uint32_t* drop_unsolicited) {
+    if (drop_port)        *drop_port        = dns_drop_port;
+    if (drop_unsolicited) *drop_unsolicited = dns_drop_unsolicited;
+}
+
 // Storage for last resolved IP address
 static uint8_t last_resolved_ip[4] = {0, 0, 0, 0};
 static bool dns_resolution_complete = false;
 
 // SECURITY: Track last DNS query Transaction ID to prevent DNS cache poisoning
 static uint16_t last_dns_tid = 0;
+
+/* The ephemeral source port of the query in flight, and whether one is in
+ * flight at all. Without the port, the random source port bought nothing: the
+ * UDP dispatcher routed anything FROM port 53 here regardless of which port it
+ * was sent TO, so a blind spoofer needed only the 16-bit TID. Without the
+ * in-flight flag, a response matching an already-answered query could still
+ * overwrite last_resolved_ip. Both are set in send_dns_query() before the query
+ * leaves, and the flag is cleared once an answer is accepted. */
+static uint16_t last_dns_src_port = 0;
+static bool dns_query_outstanding = false;
 
 // SECURITY: Track last queried domain name for question validation
 #define MAX_DOMAIN_NAME_LEN 253
@@ -509,7 +531,8 @@ static bool dns_label_to_domain(const uint8_t* packet_start, const uint8_t* pack
  * @param dns_len Length of the DNS payload.
  * @param source_ip Source IP address of the DNS response packet (for validation).
  */
-void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* source_ip) {
+void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* source_ip,
+                         uint16_t dest_port) {
     // 1. Check minimum length
     if (dns_len < sizeof(dns_header_t)) {
         dns_drop_malformed++;
@@ -545,6 +568,19 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
      *=======================================================================*/
     if (memcmp(source_ip, local_dns_server, 4) != 0) {
         dns_drop_source_ip++;
+        return;
+    }
+
+    /* Bind the response to the query: one must be in flight, and the response
+     * must be addressed to the ephemeral port that query was sent from. The
+     * port is what makes the source-port randomisation in send_dns_query() an
+     * actual ~14 bits on top of the TID rather than a decoration. */
+    if (!dns_query_outstanding) {
+        dns_drop_unsolicited++;
+        return;
+    }
+    if (dest_port != last_dns_src_port) {
+        dns_drop_port++;
         return;
     }
 
@@ -690,6 +726,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
             // Save the resolved IP
             memcpy(last_resolved_ip, ip, 4);
             dns_resolution_complete = true;
+            dns_query_outstanding = false;
 
             dns_responses_rx++;
 
@@ -716,6 +753,7 @@ void handle_dns_response(uint8_t* dns_data, size_t dns_len, const uint8_t* sourc
 void send_dns_query(const char* domain) {
     // Reset DNS resolution flag
     dns_resolution_complete = false;
+    dns_query_outstanding = false;
     memset(last_resolved_ip, 0, 4);
 
     // Validate input
@@ -865,6 +903,11 @@ void send_dns_query(const char* domain) {
         // Clamp to ephemeral port range: 49152 + (random % 16384)
         uint16_t src_port = 49152 + (random_port_bytes[0] % 16384);
 
+        /* Recorded before the query leaves: the reply can arrive on knetd
+         * before send_udp_packet() returns. */
+        last_dns_src_port = src_port;
+        dns_query_outstanding = true;
+
         // Send UDP packet: IP header has DNS server IP, but Ethernet frame
         // uses next-hop MAC (gateway MAC for external DNS)
         // SECURITY FIX: Use local copy to prevent TOCTOU
@@ -968,8 +1011,27 @@ void dns_forge_response(const char* which) {
     pkt[off++] = 203;  pkt[off++] = 0;
     pkt[off++] = 113;  pkt[off++] = 7;      /* RDATA = 203.0.113.7 (TEST-NET-3) */
 
+    /* Every case models a response to a query still in flight, so the forger
+     * re-arms it; the real `dig` response already consumed the flag. `stale`
+     * is the exception and does its own arming below. */
+    uint16_t dport = last_dns_src_port;
+
     if (strcmp(which, "srcip") == 0) {
         src[3] ^= 0xFF;                     /* same packet, wrong sender */
+    } else if (strcmp(which, "port") == 0) {
+        dport ^= 0x0001;                    /* same packet, wrong dest port */
+    } else if (strcmp(which, "stale") == 0) {
+        /*
+         * A VALID response delivered twice. The first copy is accepted and
+         * consumes the in-flight query; the second is byte-identical, so the
+         * only thing that can reject it is the in-flight check. Before that
+         * check existed the replay was accepted and overwrote the answer.
+         */
+        kprintf("[FAULT] dnsforge stale injected\n");
+        dns_query_outstanding = true;
+        handle_dns_response(pkt, off, src, dport);
+        handle_dns_response(pkt, off, src, dport);
+        return;
     } else if (strcmp(which, "tid") == 0) {
         h->id = htons((uint16_t)(last_dns_tid ^ 0xFFFF));
     } else if (strcmp(which, "question") == 0) {
@@ -987,11 +1049,12 @@ void dns_forge_response(const char* which) {
     } else if (strcmp(which, "noanswer") == 0) {
         pkt[ans_off + 3] = 0x1C;            /* TYPE = AAAA, so no A record */
     } else if (strcmp(which, "valid") != 0) {
-        kprintf("[FAULT] dnsforge: valid|srcip|tid|question|malformed|noanswer\n");
+        kprintf("[FAULT] dnsforge: valid|srcip|port|stale|tid|question|malformed|noanswer\n");
         return;
     }
 
     kprintf("[FAULT] dnsforge %s injected\n", which);
-    handle_dns_response(pkt, off, src);
+    dns_query_outstanding = true;
+    handle_dns_response(pkt, off, src, dport);
 }
 #endif

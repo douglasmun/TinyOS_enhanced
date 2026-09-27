@@ -43,12 +43,18 @@ static uint32_t icmp_replies_dropped = 0;
  *===========================================================================*/
 static uint32_t icmp_echo_replies_rx = 0;   /* echo replies matching our ID   */
 static uint32_t icmp_echo_requests_rx = 0;  /* echo requests we answered      */
+/* Echo requests whose mirrored reply would not fit one Ethernet frame. The
+ * NIC accepts up to 1518 bytes (VLAN-sized, CRC stripped) while the reply is
+ * capped at 1514, so a 1515-1518 byte request reaches this from any host on
+ * the segment. It used to print one console line each. */
+static uint32_t icmp_echo_oversize = 0;
 
 void icmp_get_rx_stats(uint32_t* echo_replies, uint32_t* echo_requests,
-                       uint32_t* rate_limited) {
+                       uint32_t* rate_limited, uint32_t* oversize) {
     if (echo_replies) *echo_replies = icmp_echo_replies_rx;
     if (echo_requests) *echo_requests = icmp_echo_requests_rx;
     if (rate_limited) *rate_limited = icmp_replies_dropped;
+    if (oversize) *oversize = icmp_echo_oversize;
 }
 
 /*=============================================================================
@@ -234,6 +240,22 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
 
     // Handle Echo Request (someone pinging us - auto-reply)
     if (icmp->type == ICMP_ECHO_REQUEST && icmp->code == 0) {
+        // ---- Reply frame size: ETH(14) + IP(20) + ICMP(8 + data) ----
+        const size_t ip_header_len = 20;
+        const size_t icmp_header_len = sizeof(icmp_header_t);
+        const size_t reply_icmp_len = icmp_len; // mirror header+data size
+        const size_t reply_ip_len   = ip_header_len + reply_icmp_len;
+        const size_t reply_total    = 14 + reply_ip_len;
+
+        /* Checked BEFORE the rate limiter: a request we can never answer must
+         * not take the reply slot from one we can. Counted, not printed -- a
+         * remote host picks the rate. The three echo-request buckets
+         * (answered, rate-limited, oversize) are disjoint. */
+        if (reply_total > 1514) {
+            icmp_echo_oversize++;
+            return;
+        }
+
         /*=====================================================================
          * SECURITY: ICMP Rate Limiting (DoS Protection)
          * Drop Echo Requests if we're processing them too frequently
@@ -253,19 +275,6 @@ void handle_icmp_with_context(const uint8_t* eth_frame,
         const uint8_t* req_ip_src = ip_hdr + 12;
 
         icmp_echo_requests_rx++;
-
-        // ---- Build reply frame: ETH(14) + IP(20) + ICMP(8 + data) ----
-        const size_t ip_header_len = 20;
-        const size_t icmp_header_len = sizeof(icmp_header_t);
-        const size_t reply_icmp_len = icmp_len; // mirror header+data size
-        const size_t reply_ip_len   = ip_header_len + reply_icmp_len;
-        const size_t reply_total    = 14 + reply_ip_len;
-
-        // Safety upper bound
-        if (reply_total > 1514) {
-            kprintf("ICMP: Reply too large (%u bytes), dropping.\n", (unsigned)reply_total);
-            return;
-        }
 
         uint8_t buf[1514];
         size_t off = 0;

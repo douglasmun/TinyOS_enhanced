@@ -32,6 +32,35 @@
 # handle_dns_response fails leg 1 while every counter leg still passes -- the
 # counters are correct and the print is still there, which is the whole bug.
 #
+# QUERY BINDING (legs 9-12)
+#
+# A response used to be accepted from the server's IP with the right TID,
+# whatever port it was addressed to and whether or not a query was still in
+# flight. So the random source port bought nothing (a forger needed ~65536 TID
+# guesses, not 2^32 TID+port), and a replay after the answer was accepted
+# overwrote it. Now the destination port must equal the in-flight query's
+# source port, and the first accepted answer closes the query.
+#
+#   leg 9   `dnsforge port`: the valid packet addressed to port^1 -> `port` drop
+#   leg 10  `dnsforge stale`: a valid packet delivered twice -> resolved +1 and
+#           unsolicited +1, EXACTLY (the first is the positive control for the
+#           second, inside the same command)
+#   leg 11  the REAL `dig` resolved with the port counter pinned. The forger
+#           reuses the stored port, so it cannot catch the port being stored in
+#           the wrong byte order; only a genuine reply off the wire can.
+#   leg 12  selectivity: `unsolicited` is pinned across the armed drop cases,
+#           so a port mismatch is not counted as unsolicited and the forger's
+#           re-arming actually happened.
+#
+#   Validation (run, not assumed), each against the otherwise-fixed tree:
+#     port check disabled          -> FAIL legs 8 + 9 (wrong-port forgery
+#                                     ACCEPTED, resolved 2 -> 3)
+#     in-flight flag never cleared -> FAIL legs 10a/10b (resolved +2, the
+#                                     replay overwrote the answer)
+#     query port stored byte-swapped -> FAIL leg 11 only (real dig: resolved
+#                                     0 -> 0, port 0 -> 1); every forger leg
+#                                     still PASSED, which is why leg 11 exists
+#
 #==============================================================================
 set -uo pipefail
 
@@ -55,6 +84,10 @@ grep -q "dnsforge" src/shell.c \
     || guard_fail "the \`dnsforge\` command is gone from shell.c, so the typed
 commands below would be rejected by the shell and this harness would grade the
 boot output instead of the injection."
+
+grep -q "dns_get_query_drop_stats" src/shell_network.c \
+    || guard_fail "ifconfig does not report the DNS query-binding counters
+(port/unsolicited); tree predates the fix."
 
 grep -q "dns_get_rx_stats" src/shell_network.c \
     || guard_fail "ifconfig no longer reports the DNS counters; there is nothing
@@ -156,7 +189,7 @@ TINYOS_PASSWORD="$PASSWORD" \
 TINYOS_FOLLOWUP_TIMEOUT=900 \
 TINYOS_EXEC_CMD="ifconfig" \
 TINYOS_EXPECT="DNS rx:" \
-TINYOS_FOLLOWUP_CMDS="!dig example.com;ifconfig=>DNS rx:;dnsforge valid=>dnsforge valid injected;ifconfig=>DNS rx:;dnsforge srcip=>dnsforge srcip injected;dnsforge tid=>dnsforge tid injected;dnsforge question=>dnsforge question injected;dnsforge malformed=>dnsforge malformed injected;dnsforge noanswer=>dnsforge noanswer injected;ifconfig=>DNS rx:" \
+TINYOS_FOLLOWUP_CMDS="!dig example.com;ifconfig=>DNS rx:;dnsforge valid=>dnsforge valid injected;ifconfig=>DNS rx:;dnsforge srcip=>dnsforge srcip injected;dnsforge port=>dnsforge port injected;dnsforge tid=>dnsforge tid injected;dnsforge question=>dnsforge question injected;dnsforge malformed=>dnsforge malformed injected;dnsforge noanswer=>dnsforge noanswer injected;ifconfig=>DNS rx:;dnsforge stale=>dnsforge stale injected;ifconfig=>DNS rx:" \
 python3 tools/qemu_typist.py >/dev/null 2>&1
 TYPIST_RC=$?
 
@@ -175,29 +208,41 @@ fi
 
 nth_rx()    { grep -o "DNS rx:.*"    "$SERIAL" | sed -n "${1}p"; }
 nth_drops() { grep -o "DNS drops:.*" "$SERIAL" | sed -n "${1}p"; }
+nth_bind()  { grep -o "DNS binding:.*" "$SERIAL" | sed -n "${1}p"; }
 
 field_rx()    { nth_rx "$1"    | sed -E "s/.*[^0-9]([0-9]+) $2.*/\1/"; }
 field_drops() { nth_drops "$1" | sed -E "s/.*[^0-9]([0-9]+) $2.*/\1/"; }
+field_bind()  { nth_bind "$1"  | sed -E "s/.*[^0-9]([0-9]+) $2.*/\1/"; }
 
 READINGS=$(grep -c "DNS rx:" "$SERIAL")
 note ""
 note "== Readings captured: $READINGS =="
 grep -o "DNS rx:.*"    "$SERIAL" | sed 's/^/    /'
 grep -o "DNS drops:.*" "$SERIAL" | sed 's/^/    /'
+grep -o "DNS binding:.*" "$SERIAL" | sed 's/^/    /'
 
+# FIVE readings. The first four are explained below; the fifth follows
+# `dnsforge stale`.
+#
 # FOUR readings, not three: TINYOS_EXEC_CMD="ifconfig" fires its own reading
 # BEFORE the followup list runs, so the followups' three are readings 2-4.
 # Getting this off by one does not fail loudly -- it silently compares the
 # pre-dig baseline against the post-valid reading, which made every drop leg
 # report "did not move" on a kernel whose counters were all correct.
-if [ "$READINGS" -lt 4 ]; then
-    note "RESULT: INCONCLUSIVE — expected 4 ifconfig readings, got $READINGS."
+if [ "$READINGS" -lt 5 ]; then
+    note "RESULT: INCONCLUSIVE — expected 5 ifconfig readings, got $READINGS."
     note "  The typist did not complete its command sequence."
     exit 3
 fi
 
-# 2 = after dig, 3 = after `dnsforge valid`, 4 = after all drop cases.
+# 1 = boot baseline, 2 = after dig, 3 = after `dnsforge valid`,
+# 4 = after all drop cases, 5 = after `dnsforge stale`.
+OK0=$(field_rx 1 resolved)
 OK1=$(field_rx 2 resolved);  OK2=$(field_rx 3 resolved);  OK3=$(field_rx 4 resolved)
+OK4=$(field_rx 5 resolved)
+PORT0=$(field_bind 1 port);  PORT1=$(field_bind 2 port);  PORT3=$(field_bind 4 port)
+UNS1=$(field_bind 2 unsolicited); UNS3=$(field_bind 4 unsolicited)
+UNS4=$(field_bind 5 unsolicited)
 NA1=$(field_rx 2 no-answer); NA3=$(field_rx 4 no-answer)
 SRC1=$(field_drops 2 src-ip);    SRC3=$(field_drops 4 src-ip)
 TID1=$(field_drops 2 tid);       TID3=$(field_drops 4 tid)
@@ -209,6 +254,8 @@ note "================ VERDICT ================"
 note "  resolved:  $OK1 -> $OK2 -> $OK3"
 note "  drops:     src-ip $SRC1->$SRC3, tid $TID1->$TID3, question $QUE1->$QUE3, malformed $MAL1->$MAL3"
 note "  no-answer: $NA1 -> $NA3"
+note "  binding:   port $PORT0->$PORT1->$PORT3, unsolicited $UNS1->$UNS3->$UNS4"
+note "  resolved across dig: $OK0 -> $OK1; across stale: $OK3 -> $OK4"
 
 rose() {  # name label before after
     if [ -z "${3:-}" ] || [ -z "${4:-}" ]; then
@@ -254,6 +301,48 @@ else
     bad "leg 8" "resolved rose $OK2 -> $OK3 across the DROP-ONLY window.
       A forged response was ACCEPTED. This is the spoofing/poisoning defence
       failing, not a counter bug."
+fi
+
+#==============================================================================
+# LEGS 9-12 — query binding (port + in-flight)
+#==============================================================================
+rose "leg 9" "port drops (reply to the wrong port)" "$PORT1" "$PORT3"
+
+exactly_one() {  # name label before after
+    if [ -z "${3:-}" ] || [ -z "${4:-}" ]; then
+        bad "$1" "$2: counter unreadable ('${3:-unset}' -> '${4:-unset}')"
+    elif [ "$4" -eq $(( $3 + 1 )) ]; then
+        ok "$1" "$2 rose by exactly 1 ($3 -> $4)"
+    else
+        bad "$1" "$2 went $3 -> $4, expected exactly +1"
+    fi
+}
+# Two copies of a valid response: exactly one accepted, exactly one refused.
+# resolved +2 is the replay overwriting the answer (the pre-fix behaviour);
+# resolved +0 means the forger's first copy was bad, so the refusal of the
+# second would prove nothing.
+exactly_one "leg 10a" "resolved across \`dnsforge stale\`"    "$OK3"  "$OK4"
+exactly_one "leg 10b" "unsolicited across \`dnsforge stale\`" "$UNS3" "$UNS4"
+
+if [ -z "${OK0:-}" ] || [ -z "${OK1:-}" ] || [ -z "${PORT0:-}" ] || [ -z "${PORT1:-}" ]; then
+    bad "leg 11" "resolved/port counters unreadable around the real dig"
+elif [ "$OK1" -gt "$OK0" ] && [ "$PORT1" -eq "$PORT0" ]; then
+    ok "leg 11" "real dig resolved ($OK0 -> $OK1) with port drops pinned at $PORT0"
+else
+    bad "leg 11" "real dig: resolved $OK0 -> $OK1, port drops $PORT0 -> $PORT1.
+      A genuine reply that lands on 'port' means the stored query port does
+      not match what the wire carries (byte order), which would break DNS
+      for everyone while the forger-driven legs still pass."
+fi
+
+if [ -z "${UNS1:-}" ] || [ -z "${UNS3:-}" ]; then
+    bad "leg 12" "unsolicited counter unreadable"
+elif [ "$UNS3" -eq "$UNS1" ]; then
+    ok "leg 12" "unsolicited pinned at $UNS1 across the armed drop cases"
+else
+    bad "leg 12" "unsolicited rose $UNS1 -> $UNS3 across drop cases that each
+      had a query in flight: either the forger is not re-arming or a port
+      mismatch is being counted as unsolicited."
 fi
 
 #==============================================================================

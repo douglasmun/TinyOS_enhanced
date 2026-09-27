@@ -1231,7 +1231,7 @@ static void handle_udp(ip_header_t* ip_hdr, uint16_t ip_len) {
 
         // kprintf("UDP: Detected DNS Response (Source Port %d). Forwarding to handler.\n", DNS_PORT);
         // SECURITY: Pass source IP for validation (prevents DNS spoofing)
-        handle_dns_response(dns_data, dns_len, ip_hdr->src_ip);
+        handle_dns_response(dns_data, dns_len, ip_hdr->src_ip, dest_port);
         return;
     }
 
