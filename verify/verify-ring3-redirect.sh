@@ -52,6 +52,13 @@
 #                                than silently written to D:. A harness with
 #                                only success paths would miss a shell that
 #                                wrote the file to the wrong drive.
+#   - `> /abs` and `chmod /abs` — an ABSOLUTE D: path. task_resolve_path
+#                                leaves a leading-'/' path unqualified, and
+#                                SYS_REDIRECT/SYS_CHMOD tested for a "D:"
+#                                prefix only, so both refused every absolute
+#                                path with -EXDEV. Witnessed by `stat` of the
+#                                same file by its RELATIVE name: it must exist,
+#                                hold the text, and carry the odd mode 604.
 #   - prompt still on console  — after all of the above, the shell is not stuck
 #                                redirected. `id` output on the console proves
 #                                the restore path ran.
@@ -138,6 +145,9 @@ cat d.txt=>r3-delta;\
 pwd=>D:/scratch;\
 cat h.txt=>Hello from ELF;\
 echo nope > C:/nope.txt=>cannot;\
+echo r3-abs > /scratch/a.txt;\
+chmod 604 /scratch/a.txt;\
+stat a.txt=>a.txt;\
 id=>uid=" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
@@ -215,6 +225,9 @@ l_hello=$(grep -n "Hello from ELF" "$REJOINED" 2>/dev/null | head -1 | cut -d: -
 l_catcmd=$(grep -n "cat h\.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The refusal for a non-RAMFS target.
 l_xdev=$(grep -n "^>: C:/nope.txt" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
+# The absolute-path legs: one stat line proves the file was written (size > 0)
+# AND chmod'd (604), each through a path starting with '/'.
+l_abs=$(grep -nE "^a\.txt  size=[1-9][0-9]*  mode=604  file" "$REJOINED" 2>/dev/null | head -1 | cut -d: -f1)
 # The console still works after all the redirecting — the restore path ran.
 l_id=$(grep -n "uid=" "$REJOINED" 2>/dev/null | tail -1 | cut -d: -f1)
 
@@ -226,6 +239,13 @@ if [ -z "$l_cd" ] || [ -z "$l_hello" ] || [ -z "$l_catcmd" ] \
          "counts: alpha=$n_alpha beta=$n_beta gamma=$n_gamma"
     echo "--- tail of $SERIAL ---"
     grep -v "Suspicious" "$REJOINED" | tail -40
+    exit 2
+fi
+
+if [ -z "$l_abs" ]; then
+    echo "RESULT: FAIL — '> /scratch/a.txt' or 'chmod 604 /scratch/a.txt' did not take effect"
+    echo "  (an absolute D: path was refused; expected 'a.txt  size=N  mode=604  file')"
+    grep -E "a\.txt|^>: /|^chmod: /" "$REJOINED" | tail -10
     exit 2
 fi
 
