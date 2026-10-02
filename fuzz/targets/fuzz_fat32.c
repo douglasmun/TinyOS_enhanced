@@ -9,7 +9,11 @@
  * is all file-static). Each input runs one fixed script: mount, walk the tree
  * two levels deep, read and seek every file found, then create / write /
  * truncate / mkdir / unlink / rmdir -- every entry point a shell user reaches
- * through the VFS. */
+ * through the VFS.
+ *
+ * Oracles beyond ASan/UBSan: a mounted driver writes only the FAT and the
+ * data region, and a path that names NEW.TXT only by losing characters
+ * never opens it. */
 #include "fat32.c"
 
 #include <stdlib.h>
@@ -159,6 +163,20 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t len) {
                 fat32_close(fd);
             }
             read_file("/NEW.TXT");
+            /* Names that only reach NEW.TXT by dropping or clipping part of
+             * the path. parse_path() skipped a long component and
+             * filename_to_83() clipped a long extension, so each of these
+             * opened -- and an unlink would have deleted -- /NEW.TXT. */
+            static const char* const alias[] = {
+                "/LONGDIRNAME1/NEW.TXT", "/NEW.TXTX", "/NEW.TXT.TXT", "NEW.T.TXT",
+            };
+            for (size_t i = 0; i < sizeof(alias) / sizeof(alias[0]); i++) {
+                int fd = fat32_open(alias[i]);
+                if (fd >= 0) {
+                    fuzz_note(alias[i]);
+                    abort();
+                }
+            }
         }
         if (fat32_mkdir("/D2") == 0) {
             fat32_create("/D2/X.TXT");

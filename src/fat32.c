@@ -321,6 +321,31 @@ static int flush_dirent(fat32_file_t* file) {
  * FUNCTION: parse_path
  * PURPOSE: Parse path into directory components
  *---------------------------------------------------------------------------*/
+/* True if `name` (len bytes) is "." / "..", or an 8.3 name filename_to_83()
+ * maps without losing a character: 1-8 base characters, then optionally one
+ * dot and 1-3 extension characters. */
+static bool component_is_83(const char* name, int len) {
+    if ((len == 1 && name[0] == '.') ||
+        (len == 2 && name[0] == '.' && name[1] == '.')) {
+        return true;
+    }
+    int dot = -1;
+    for (int i = 0; i < len; i++) {
+        if (name[i] == '.') {
+            if (dot >= 0) return false;
+            dot = i;
+        }
+    }
+    if (dot < 0) return len >= 1 && len <= 8;
+    return dot >= 1 && dot <= 8 && len - dot - 1 >= 1 && len - dot - 1 <= 3;
+}
+
+/* Returns the component count, or -1 if the path cannot be named exactly.
+ * This used to skip a component of 12 or more characters and stop silently
+ * after max_components, and filename_to_83() clipped long names, so
+ * "/LONGDIRNAME1/X.TXT" resolved to "/X.TXT" and "/REPORTFINAL.TXT" to
+ * "/REPORTFI.TXT" -- an unlink or a write landed on a file the caller never
+ * named. Found reviewing the fat32 fuzz target's path inputs. */
 static int parse_path(const char* path, char components[][12], int max_components) {
     int count = 0;
     const char* start = path;
@@ -328,16 +353,17 @@ static int parse_path(const char* path, char components[][12], int max_component
     // Skip leading slashes
     while (*start == '/' || *start == '\\') start++;
 
-    while (*start && count < max_components) {
+    while (*start) {
         const char* end = start;
         while (*end && *end != '/' && *end != '\\') end++;
 
         int len = end - start;
-        if (len > 0 && len < 12) {
-            memcpy(components[count], start, len);
-            components[count][len] = '\0';
-            count++;
+        if (count >= max_components || !component_is_83(start, len)) {
+            return -1;
         }
+        memcpy(components[count], start, len);
+        components[count][len] = '\0';
+        count++;
 
         start = end;
         while (*start == '/' || *start == '\\') start++;
@@ -508,6 +534,9 @@ static int resolve_parent_dir(const char* path, uint32_t* out_parent_cluster,
     char components[16][12];
     int depth = parse_path(path, components, 16);
 
+    if (depth < 0) {
+        return -1;
+    }
     if (depth == 0) {
         /* The root has no parent and no leaf name; callers that cannot act on
          * the root itself (all four mutating ops) reject this. */
@@ -858,6 +887,10 @@ int fat32_open(const char* path) {
     char components[16][12];
     int depth = parse_path(path, components, 16);
 
+    if (depth < 0) {
+        mutex_unlock(&fat32_mutex);
+        return -1;
+    }
     if (depth == 0) {
         // Open root directory
         open_files[fd].in_use = true;
@@ -1803,6 +1836,10 @@ int fat32_list_dir_cb(const char* path, fat32_dir_emit_t emit, void* ctx) {
     if (path && path[0] != '\0') {
         char components[16][12];
         int depth = parse_path(path, components, 16);
+        if (depth < 0) {
+            mutex_unlock(&fat32_mutex);
+            return -1;  // No such directory
+        }
 
         for (int i = 0; i < depth; i++) {
             fat32_dir_entry_t entry;
