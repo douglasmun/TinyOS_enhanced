@@ -27,8 +27,28 @@ int ide_read_sectors(uint32_t lba, uint8_t count, void* buffer) {
     return 0;
 }
 
+/* FUZZ_FAT32_NO_DISKSIZE=1 reports an unknown size (0), switching off the
+ * mount's volume-vs-disk check so a reproducer is judged on the cluster-range
+ * checks alone. */
+uint32_t ide_get_sector_count(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("FUZZ_FAT32_NO_DISKSIZE") != NULL;
+    return off ? 0 : (uint32_t)(disk_len / 512);
+}
+
+/* Oracle: a mounted driver writes only FAT sectors and the data region.
+ * A write to the boot sector or the rest of the reserved area means a
+ * cluster number escaped its range. */
 int ide_write_sectors(uint32_t lba, uint8_t count, const void* buffer) {
     uint64_t off = (uint64_t)lba * 512, n = (uint64_t)count * 512;
+    if (fat32_mounted) {
+        uint64_t fat_end = (uint64_t)fat_start_sector +
+                           (uint64_t)boot_sector.num_fats * boot_sector.fat_size_32;
+        bool in_fat = lba >= fat_start_sector && (uint64_t)lba + count <= fat_end;
+        bool in_data = lba >= data_start_sector &&
+                       (uint64_t)lba + count <= boot_sector.total_sectors_32;
+        if (!in_fat && !in_data) abort();
+    }
     if (off + n > disk_len) return -1;
     memcpy(disk + off, buffer, (size_t)n);
     return 0;
@@ -121,6 +141,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t len) {
     disk_len = len;
 
     if (fat32_mount() == 0) {
+        fuzz_note("fat32: mounted");
         struct names all = { .parent = "/" };
         all.count = 0;
         walk_dir("/", 0, &all);
