@@ -282,9 +282,6 @@ void sys_exit(int status) {
         current->streams.stdout_stream.fd = -1;
         current->streams.stdin_stream.fd = -1;
 
-        /* Step 2: Reset FD count */
-        current->open_fd_count = 0;
-
         /*=====================================================================
          * SECURITY FIX (Issue 5.2): ZOMBIE State for Safe Cleanup
          *

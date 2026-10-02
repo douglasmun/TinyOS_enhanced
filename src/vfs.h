@@ -182,6 +182,9 @@ typedef struct {
 #define VFS_ENOSPC          -28     /* No space left on device */
 #define VFS_ENOTEMPTY       -39     /* Directory not empty */
 #define VFS_EBUSY           -16     /* Resource busy (unlink of an open file) */
+#define VFS_EAGAIN          -11     /* Try again (a per-user descriptor limit) */
+#define VFS_ENFILE          -23     /* System descriptor table full */
+#define VFS_EMFILE          -24     /* Per-process descriptor limit */
 
 /*=============================================================================
  * PHASE 9: No /dev/mem or /dev/kmem (Security-by-Omission)

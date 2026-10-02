@@ -632,6 +632,44 @@ int ramfs_mkdir(const char* path) {
     return 0;
 }
 
+/* Choose a free slot for `self`, or say why it may not have one. Called with
+ * interrupts off; claims nothing. Limits are counted from the slots' owner
+ * fields, so they cannot drift. Before the scheduler runs (self == NULL)
+ * only the table size applies. */
+static int ramfs_pick_fd(task_t* self) {
+    int fd = -1, avail = 0, mine = 0, uid_held = 0;
+    for (int i = 0; i < RAMFS_MAX_FDS; i++) {
+        ramfs_fd_t* f = &file_descriptors[i];
+        if (!f->in_use) {
+            avail++;
+            if (fd < 0) {
+                fd = i;
+            }
+        } else if (self) {
+            if (f->owner_pid == self->pid && f->owner_generation == self->generation) {
+                mine++;
+            }
+            if (f->owner_uid == self->uid) {
+                uid_held++;
+            }
+        }
+    }
+    if (fd < 0) {
+        return -2;  // No available file descriptors
+    }
+    if (!self) {
+        return fd;
+    }
+    if (mine >= PROCESS_MAX_FDS) {
+        return -EMFILE;  // Too many open files (per-process limit)
+    }
+    if (self->euid != 0 &&
+        (uid_held >= RAMFS_USER_MAX_FDS || avail <= RAMFS_ROOT_RESERVED_FDS)) {
+        return RAMFS_OPEN_LIMIT;
+    }
+    return fd;
+}
+
 /**
  * Open a file
  */
@@ -644,34 +682,15 @@ int ramfs_open(const char* path, uint8_t flags) {
     uint16_t uid, gid;
     ramfs_get_current_credentials(&uid, &gid);
 
-    /*=========================================================================
-     * SECURITY FIX (v1.11): Per-Process FD Limit Enforcement
-     *
-     * ISSUE: Without per-process limits, a single malicious process can
-     * exhaust the global FD table (RAMFS_MAX_FDS=16), preventing other
-     * processes from opening files (DoS attack).
-     *
-     * FIX: Check per-process limit before allocating from global table.
-     * - Each process limited to PROCESS_MAX_FDS (8 FDs)
-     * - Return -EMFILE if process has reached its limit
-     * - Fair resource sharing across processes
-     *=======================================================================*/
+    /* Refuse early, so a caller with no slot to spend does not create the
+     * file first. Only advisory: the slot is claimed at the end, where the
+     * same test runs again with interrupts off. */
     task_t* current = scheduler_get_current_task();
-    if (current && current->open_fd_count >= PROCESS_MAX_FDS) {
-        return -EMFILE;  // Too many open files (per-process limit)
-    }
-
-    // Find an available file descriptor
-    int fd = -1;
-    for (int i = 0; i < RAMFS_MAX_FDS; i++) {
-        if (!file_descriptors[i].in_use) {
-            fd = i;
-            break;
-        }
-    }
-
+    CRITICAL_SECTION_ENTER();
+    int fd = ramfs_pick_fd(current);
+    CRITICAL_SECTION_EXIT();
     if (fd < 0) {
-        return -2;  // No available file descriptors
+        return fd;
     }
 
     /*=========================================================================
@@ -809,18 +828,26 @@ int ramfs_open(const char* path, uint8_t flags) {
      * table is global, so a sweep at exec closed other tasks' files (see
      * elf.c). Isolation comes from a task naming a slot only through its
      * own fdtable or streams. */
-    // Setup file descriptor
+    /* Pick and claim in one critical section. The slot found at the top was
+     * not marked in_use, and the lookup and create since then can sleep on
+     * ramfs_mutex, so another task could have taken it: both would then hold
+     * one slot with refs = 1, and either close freed it under the other. */
+    CRITICAL_SECTION_ENTER();
+    fd = ramfs_pick_fd(current);
+    if (fd < 0) {
+        CRITICAL_SECTION_EXIT();
+        return fd;
+    }
     file_descriptors[fd].node = node;
     file_descriptors[fd].pos = 0;
     file_descriptors[fd].flags = flags;
     file_descriptors[fd].in_use = true;
     file_descriptors[fd].refs = 1;
     file_descriptors[fd].close_on_exec = !(flags & RAMFS_FLAG_INHERIT);  // PHASE 13
-
-    /* Increment per-process FD count (v1.11) */
-    if (current) {
-        current->open_fd_count++;
-    }
+    file_descriptors[fd].owner_pid = current ? current->pid : 0;
+    file_descriptors[fd].owner_generation = current ? current->generation : 0;
+    file_descriptors[fd].owner_uid = current ? current->uid : 0;
+    CRITICAL_SECTION_EXIT();
 
     return fd;
 }
@@ -1101,13 +1128,6 @@ void ramfs_close(int fd) {
     }
     CRITICAL_SECTION_ENTER();
     if (file_descriptors[fd].in_use) {
-        /* Decrement per-process FD count (v1.11). Per reference, since each
-         * holder's close is balanced against that holder's open or inherit. */
-        task_t* current = scheduler_get_current_task();
-        if (current && current->open_fd_count > 0) {
-            current->open_fd_count--;
-        }
-
         /* Free the slot only when the last holder lets go. */
         if (file_descriptors[fd].refs > 1) {
             file_descriptors[fd].refs--;
@@ -1117,6 +1137,9 @@ void ramfs_close(int fd) {
             file_descriptors[fd].node = NULL;
             file_descriptors[fd].pos = 0;
             file_descriptors[fd].flags = 0;
+            file_descriptors[fd].owner_pid = 0;
+            file_descriptors[fd].owner_generation = 0;
+            file_descriptors[fd].owner_uid = 0;
         }
     }
     CRITICAL_SECTION_EXIT();

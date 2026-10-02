@@ -452,18 +452,12 @@ typedef struct task {
     struct env_state* env;               /* Per-task env/alias page (NULL until first write) */
 
     /*=========================================================================
-     * SECURITY (v1.11): Per-Process FD Limit Tracking
+     * SECURITY (v1.11): Per-Process FD Limit
      *
-     * ISSUE: Global FD table (RAMFS_MAX_FDS=16) can be exhausted by a single
-     * malicious process, preventing other processes from opening files (DoS).
-     *
-     * FIX: Track FDs per-process and enforce PROCESS_MAX_FDS limit.
-     * - open_fd_count: Number of FDs currently open by this process
-     * - Limit: PROCESS_MAX_FDS (defined below, e.g., 8 per process)
-     * - Prevents one process from monopolizing global FD table
-     * - Provides fair resource sharing across processes
+     * PROCESS_MAX_FDS (below) is enforced by ramfs_open() from the owner
+     * fields on each RAMFS slot. There was an open_fd_count here; it was
+     * decremented by whichever task closed, so kill drifted it.
      *=======================================================================*/
-    uint8_t open_fd_count;           // Number of open file descriptors
 
     /*=========================================================================
      * REVOLUTIONARY SECURITY: Per-Process Private /tmp Directory

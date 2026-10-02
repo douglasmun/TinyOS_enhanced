@@ -30,14 +30,25 @@
  * sys_exit released nothing -- only a killed task's teardown did -- so each
  * child that exited with a file open, or with an inherited redirected stdout
  * (which now carries its own reference), kept a slot in the 16-entry RAMFS
- * table for good. The parent and a sleeping child hold 6 + 7 slots,
- * leaving 3, then:
+ * table for good. A leaked slot still counts against its opener's uid, which
+ * may hold RAMFS_USER_MAX_FDS (8). The probe holds 5, leaving 3, then:
  *
- *   PROBE exit child-held=7
- *   PROBE exit stream held=6 spawned=4 open=FD    4 redirected children
+ *   PROBE exit stream held=5 spawned=4 open=FD    4 redirected children
  *   PROBE exit files spawned=2 opened=4 open=FD   2 children, 2 files each
  *
  * Fixed: FD >= 0 both times.
+ *
+ * Leg "cap": one uid may not take the whole table, and the last
+ * RAMFS_ROOT_RESERVED_FDS (4) free slots are root's. The per-process cap
+ * alone let one user's two processes hold all 16, after which no exec --
+ * root's included -- could open its ELF. Needs `/fdprobe.elf roothold &`
+ * started by root first, holding ROOT_FIRST slots:
+ *
+ *   PROBE cap child-held=2
+ *   PROBE cap user opened=N refused=RC      fixed: 6, -11 (8 for the uid, less
+ *                                           the child's 2; root holds 3)
+ *   PROBE cap reserve opened=N refused=RC   fixed: 3, -11 (root now holds 7
+ *                                           and the child 2: 7 free, 4 kept)
  *
  * Mode "guard" (run as `/fdprobe.elf guard`): spawn a child, wait for it,
  * create a file -- ROUNDS times. Creating the child marked its kernel guard
@@ -100,12 +111,12 @@ static void leg_stream(void) {
     printf("PROBE stream out=%d victim=%d\n", file_len(OUT), file_len(VICTIM));
 }
 
-/* Hold most of the 16-slot RAMFS table so a few leaked exits fill it: each
- * spawn costs a signature check, ~20 s under TCG. A process may hold 8
- * (PROCESS_MAX_FDS) and the parent's spawn and redirect need 2 of its own, so
- * the parent holds 6 and a sleeping child the other 7. */
-#define HELD_SELF  6
-#define HELD_CHILD 7
+/* Hold most of this uid's 8 RAMFS slots so a few leaked exits use up the
+ * rest: each spawn costs a signature check, ~20 s under TCG. A round needs 2
+ * at once (the redirect target and the ELF being loaded), so 5 held leaves
+ * room for exactly one round's worth plus one -- a slot leaked per round
+ * stops the third spawn. */
+#define HELD_SELF  5
 #define EXIT_ROUNDS 4
 
 static int hold_files(int* fds, int n, char tag) {
@@ -123,10 +134,7 @@ static int hold_files(int* fds, int n, char tag) {
 
 static void leg_exit(void) {
     int held[HELD_SELF], nheld, spawned = 0;
-    int holder = run_child("hold");
-    sleep_ms(3000);                  /* let it open its 7 */
     nheld = hold_files(held, HELD_SELF, 'p');
-    printf("PROBE exit holder=%d\n", holder);
     /* 3 slots left. Children that exit with an inherited stdout reference... */
     for (int i = 0; i < EXIT_ROUNDS; i++) {
         redirect(1, OUT, REDIR_TRUNC);
@@ -148,6 +156,76 @@ static void leg_exit(void) {
     if (fd >= 0) close(fd);
     printf("PROBE exit files spawned=%d opened=%d open=%d\n", spawned, opened, fd);
     for (int i = 0; i < nheld; i++) close(held[i]);
+}
+
+#define ROOT_FIRST 3
+#define ROOT_MORE  4
+#define CAP_CHILD  2
+#define CAP_TRIES  12
+#define MORE "/scratch/fdprobe.more"
+#define ACK  "/scratch/fdprobe.ack"
+
+static int exists(const char* path) {
+    dirent_t st;
+    return stat(path, &st, sizeof(st)) == 0;
+}
+
+static int wait_for_file(const char* path, int seconds) {
+    for (int i = 0; i < seconds * 2; i++) {
+        if (exists(path)) return 1;
+        sleep_ms(500);
+    }
+    return 0;
+}
+
+static void touch(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd >= 0) close(fd);
+}
+
+/* Open until refused; return how many and store the refusal. */
+static int open_until_refused(int* fds, int* refused) {
+    char path[] = "/scratch/fdprobe.uA";
+    int n = 0;
+    *refused = 0;
+    while (n < CAP_TRIES) {
+        path[sizeof(path) - 2] = (char)('A' + n);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd < 0) { *refused = fd; break; }
+        fds[n++] = fd;
+    }
+    return n;
+}
+
+/* Run by root, backgrounded, before the unprivileged legs. */
+static void mode_roothold(void) {
+    int fds[ROOT_FIRST + ROOT_MORE];
+    int n = hold_files(fds, ROOT_FIRST, 'r');
+    printf("PROBE roothold held=%d\n", n);
+    if (!wait_for_file(MORE, 1800)) return;
+    n += hold_files(fds + n, ROOT_MORE, 's');
+    touch(ACK);
+    chmod(ACK, 0644);   /* created 0600; the unprivileged probe stats it */
+    printf("PROBE roothold held=%d\n", n);
+    sleep_ms(600000);
+}
+
+static void leg_cap(void) {
+    int fds[CAP_TRIES], refused;
+    int child = run_child("cap-hold");
+    /* Its second file existing means it holds both. */
+    wait_for_file("/scratch/fdprobe.hcB", 120);
+
+    int n = open_until_refused(fds, &refused);
+    for (int i = 0; i < n; i++) close(fds[i]);
+    printf("PROBE cap user opened=%d refused=%d\n", n, refused);
+
+    touch(MORE);
+    int acked = wait_for_file(ACK, 300);
+    n = open_until_refused(fds, &refused);
+    for (int i = 0; i < n; i++) close(fds[i]);
+    printf("PROBE cap reserve acked=%d opened=%d refused=%d\n", acked, n, refused);
+    if (child >= 0) kill(child);
 }
 
 #define ROUNDS 8
@@ -172,10 +250,14 @@ int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "noop")) {
         return 0;
     }
-    if (argc > 1 && !strcmp(argv[1], "hold")) {
-        int fds[HELD_CHILD];
-        printf("PROBE exit child-held=%d\n", hold_files(fds, HELD_CHILD, 'c'));
-        sleep_ms(600000);            /* outlives the leg; the run ends first */
+    if (argc > 1 && !strcmp(argv[1], "cap-hold")) {
+        int fds[CAP_CHILD];
+        printf("PROBE cap child-held=%d\n", hold_files(fds, CAP_CHILD, 'c'));
+        sleep_ms(600000);            /* the parent kills it */
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "roothold")) {
+        mode_roothold();
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "open-exit")) {
@@ -194,6 +276,7 @@ int main(int argc, char** argv) {
     leg_sweep();
     leg_stream();
     leg_exit();
+    leg_cap();
     printf("PROBE done\n");
     return 0;
 }

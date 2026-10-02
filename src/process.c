@@ -896,9 +896,6 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     // parent's cwd, so a child inherits rather than resetting to "D:/".
     task_cwd_init(task);
 
-    // Initialize FD tracking (v1.11)
-    task->open_fd_count = 0;
-
     /*=========================================================================
      * SECURITY (EDR Phase 2): Initialize Behavioral Detection State
      *
@@ -1504,9 +1501,6 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     // Start at the default drive root; sys_spawn overwrites this with the
     // parent's cwd, so a child inherits rather than resetting to "D:/".
     task_cwd_init(task);
-
-    // Initialize FD tracking (v1.11)
-    task->open_fd_count = 0;
 
     /*=========================================================================
      * REVOLUTIONARY SECURITY: Create Per-Process Private /tmp Directory

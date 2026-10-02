@@ -19,6 +19,7 @@
 #include "ramfs.h"
 #include "kprintf.h"
 #include "util.h"
+#include "errno.h"   /* EMFILE: ramfs_open's per-process refusal */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -202,6 +203,17 @@ static int ramfs_vfs_open(const char* path, int flags, void** private_data) {
          * like dead code from the shell. */
         if (ramfs_fd == RAMFS_CREATE_EPERM) {
             return VFS_EACCES;
+        }
+        /* Descriptor limits likewise: "no such file" sends the caller after
+         * the wrong problem. */
+        if (ramfs_fd == RAMFS_OPEN_LIMIT) {
+            return VFS_EAGAIN;
+        }
+        if (ramfs_fd == -EMFILE) {
+            return VFS_EMFILE;
+        }
+        if (ramfs_fd == -2) {
+            return VFS_ENFILE;
         }
         return VFS_ENOENT;  /* File not found or other error */
     }

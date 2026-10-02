@@ -207,7 +207,29 @@ typedef struct {
      * at 0. Without it a creator's close freed the slot under a child still
      * writing through it, and the next open anywhere reused the number. */
     uint8_t refs;
+    /* The task that opened the slot, and its uid. Limits are counted from
+     * these rather than from a per-task counter: a counter is decremented by
+     * whoever closes, and kill and the inherited-stream release close on
+     * another task's behalf, so it drifted -- a killer's count fell below
+     * what it held and the per-process cap stopped binding. */
+    uint32_t owner_pid;
+    uint32_t owner_generation;
+    uint16_t owner_uid;
 } ramfs_fd_t;
+
+/* ramfs_open() refusal for a non-root caller at its uid's cap or into the
+ * root reserve: "try again later", the same number as -EAGAIN. Distinct from
+ * every other ramfs_open() code (-1..-10, -EMFILE). */
+#define RAMFS_OPEN_LIMIT (-11)
+
+/* The table is RAMFS_MAX_FDS slots for the whole system, and the per-process
+ * cap alone did not protect it: one user running two processes held all 16,
+ * and every exec needs a slot to read the ELF, so root could not even start
+ * a program. A non-root uid holds at most RAMFS_USER_MAX_FDS, and the last
+ * RAMFS_ROOT_RESERVED_FDS free slots are root's, so two users cannot do
+ * together what one no longer can. */
+#define RAMFS_USER_MAX_FDS      8
+#define RAMFS_ROOT_RESERVED_FDS 4
 
 /* Initialize the filesystem */
 void ramfs_init(void);
