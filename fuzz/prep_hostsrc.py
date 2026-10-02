@@ -26,7 +26,7 @@ import sys
 ASM_RE = re.compile(rb"\b(__asm__|asm)\s+(volatile|__volatile__)?\s*\(")
 
 PMM_REWRITES = [
-    (re.compile(rb"\(\s*(uint8_t|void|char)\s*\*\s*\)\s*pmm_alloc\s*\(\s*\)"),
+    (re.compile(rb"\(\s*(\w+)\s*\*\s*\)\s*pmm_alloc\s*\(\s*\)"),
      rb"(\1*)fuzz_page_alloc()"),
     (re.compile(rb"pmm_free\s*\(\s*\(\s*uint32_t\s*\)\s*"), rb"fuzz_page_free((void*)"),
 ]
