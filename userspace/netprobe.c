@@ -322,9 +322,41 @@ static int hold(void) {
     return 0;
 }
 
+/* `tcpquiet`: drive, unprivileged, the TCP paths that used to print on every
+ * call -- a send on a socket that never connected, and a connect to a host
+ * that never answers, which the timer reaps after TCP_SYN_SENT_TIMEOUT_MS.
+ * Nothing between the start and end lines may come from the kernel; the
+ * harness counts it (verify-tcp-quiet.sh). */
+#define QUIET_SENDS 20
+#define QUIET_WAIT_MS 14000
+
+static int tcpquiet(void) {
+    printf("PROBE tcpquiet start\n");
+    int fd = tcpsock(TCPSOCK_SOCKET, 0, 0, 0);
+    int refused = 0;
+    for (int i = 0; i < QUIET_SENDS; i++) {
+        if (tcpsock(TCPSOCK_SEND, fd, (void*)"x", 1) == -ENOTCONN) {
+            refused++;
+        }
+    }
+    /* TEST-NET-3: routed via the gateway, and nothing answers it. */
+    tcpsock_connect_t req = { { 203, 0, 113, 1 }, 80, 0 };
+    int conn = tcpsock(TCPSOCK_CONNECT, fd, &req, sizeof(req));
+    sleep_ms(QUIET_WAIT_MS);
+    /* A reaped socket is gone: closing it again is refused. */
+    int after = tcpsock(TCPSOCK_CLOSE, fd, 0, 0);
+    printf("PROBE tcpquiet fd=%d refused=%d connect=%d after=%d\n",
+           fd, refused, conn, after);
+    printf("PROBE tcpquiet end\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "hold")) {
         return hold();
+    }
+    if (argc > 1 && !strcmp(argv[1], "tcpquiet")) {
+        return tcpquiet();
     }
 
     unsigned char rxbuf[1600];

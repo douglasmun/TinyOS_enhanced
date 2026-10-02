@@ -215,7 +215,7 @@ static bool tcp_evict_oldest_time_wait(void) {
     }
 
     if (oldest_idx >= 0) {
-        kprintf("TCP: TIME_WAIT exhaustion - forcibly closing oldest connection %d\n", oldest_idx);
+        net_count_tcp_tw_evicted();
         tcp_connections[oldest_idx].state = TCP_CLOSED;
         tcp_connections[oldest_idx].in_use = false;
         return true;
@@ -453,13 +453,10 @@ static uint16_t tcp_allocate_port(void) {
 
         // Prevent infinite loop if all ports exhausted
         if (next_ephemeral_port == start_port) {
-            kprintf("TCP: WARNING - All ephemeral ports exhausted!\n");
             return 0;  // Indicate failure
         }
     }
 
-    kprintf("TCP: WARNING - Could not find free port after %d attempts\n",
-            MAX_PORT_SEARCH_ATTEMPTS);
     return 0;  // Indicate failure
 }
 
@@ -1186,9 +1183,6 @@ int tcp_socket(void) {
 
     int time_wait_count = tcp_count_time_wait_connections();
     if (time_wait_count >= TIME_WAIT_EVICTION_THRESHOLD) {
-        kprintf("TCP: TIME_WAIT threshold exceeded (%d/%d) - attempting eviction\n",
-                time_wait_count, TCP_MAX_CONNECTIONS);
-
         if (tcp_evict_oldest_time_wait()) {
             // Try allocation again after eviction
             for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
@@ -1216,7 +1210,7 @@ int tcp_socket(void) {
     }
 
     TCP_UNLOCK();
-    kprintf("TCP: No free sockets (even after TIME_WAIT eviction)\n");
+    net_count_tcp_table_full();
     return TCP_SOCKET_FULL;
 }
 
@@ -1261,10 +1255,12 @@ int tcp_connect(int sockfd, const uint8_t* remote_ip, uint16_t remote_port) {
      * spoofed source IPs that never complete the handshake. This check
      * prevents resource exhaustion by limiting concurrent half-open connections.
      *=======================================================================*/
+    /* Every refusal below is COUNTED, not printed: SYS_TCPSOCK lets an
+     * unprivileged loop call this as fast as it likes, and the console is the
+     * stream that user's own output shares. `ifconfig` shows the count. */
     int half_open = tcp_count_half_open_connections();
     if (half_open >= TCP_MAX_HALF_OPEN_CONNECTIONS) {
-        kprintf("TCP: SYN flood protection - too many half-open connections (%d/%d)\n",
-                half_open, TCP_MAX_HALF_OPEN_CONNECTIONS);
+        net_count_tcp_connect_refused();
         return -1;
     }
 
@@ -1276,11 +1272,17 @@ int tcp_connect(int sockfd, const uint8_t* remote_ip, uint16_t remote_port) {
     if (conn->local_port == 0) {
         conn->local_port = tcp_allocate_port();
     }
-    
+    /* tcp_allocate_port() returns 0 when exhausted. Port 0 is not a port:
+     * connecting from it would emit SYNs nothing can answer. */
+    if (conn->local_port == 0) {
+        net_count_tcp_connect_refused();
+        return -1;
+    }
+
     // Look up remote MAC address
     uint8_t* remote_mac = get_route_mac(remote_ip);
     if (!remote_mac) {
-        kprintf("TCP: Cannot resolve MAC for remote IP\n");
+        net_count_tcp_connect_refused();
         return -1;
     }
     memcpy(conn->remote_mac, remote_mac, 6);
@@ -1295,9 +1297,6 @@ int tcp_connect(int sockfd, const uint8_t* remote_ip, uint16_t remote_port) {
     // Change state and send SYN
     conn->state = TCP_SYN_SENT;
     conn->syn_sent_start = tcp_get_time_ms();  // Track SYN_SENT entry time for timeout
-    kprintf("TCP: Initiating connection to %d.%d.%d.%d:%d from port %d\n",
-            remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3],
-            remote_port, conn->local_port);
 
     /* tcp_send_segment uses a shared static TX buffer (packet[1514]); an e1000
      * RX IRQ can reenter it (to emit an ACK) and clobber a half-built segment.
@@ -1313,10 +1312,9 @@ int tcp_connect(int sockfd, const uint8_t* remote_ip, uint16_t remote_port) {
  * @brief Send data
  */
 int tcp_send(int sockfd, const void* data, size_t len) {
-    // DEBUG: Re-adding diagnostic output to identify why tcp_send returns -1
-
+    /* Refusals are counted, not printed -- same reason as tcp_connect. */
     if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) {
-        kprintf("[TCP] tcp_send: Invalid sockfd %d (must be 0-%d)\n", sockfd, TCP_MAX_CONNECTIONS-1);
+        net_count_tcp_send_refused();
         return -1;
     }
 
@@ -1324,16 +1322,9 @@ int tcp_send(int sockfd, const void* data, size_t len) {
 
     TCP_LOCK();
 
-    if (!conn->in_use) {
-        kprintf("[TCP] tcp_send: Connection sockfd=%d not in use\n", sockfd);
+    if (!conn->in_use || conn->state != TCP_ESTABLISHED) {
         TCP_UNLOCK();
-        return -1;
-    }
-
-    if (conn->state != TCP_ESTABLISHED) {
-        kprintf("[TCP] tcp_send: Connection sockfd=%d state=%d (not ESTABLISHED=%d)\n",
-                sockfd, conn->state, TCP_ESTABLISHED);
-        TCP_UNLOCK();
+        net_count_tcp_send_refused();
         return -1;
     }
 
@@ -1697,12 +1688,10 @@ void tcp_tick(uint32_t current_time) {
 
         if (conn->state == TCP_SYN_SENT) {
             uint32_t elapsed = current_time - conn->syn_sent_start;
+            /* Counted, not printed: one unprivileged connect() to a host
+             * that never answers would otherwise buy two console lines. */
             if (elapsed > TCP_SYN_SENT_TIMEOUT_MS) {
-                kprintf("TCP: SYN_SENT timeout for connection %d (remote %d.%d.%d.%d:%d) after %u ms\n",
-                        i, conn->remote_ip[0], conn->remote_ip[1],
-                        conn->remote_ip[2], conn->remote_ip[3],
-                        conn->remote_port, elapsed);
-                kprintf("TCP: Forcefully closing zombie connection to prevent state exhaustion.\n");
+                net_count_tcp_timed_out();
                 conn->state = TCP_CLOSED;
                 conn->in_use = false;
             }
@@ -1711,11 +1700,7 @@ void tcp_tick(uint32_t current_time) {
         if (conn->state == TCP_SYN_RECEIVED) {
             uint32_t elapsed = current_time - conn->syn_sent_start;
             if (elapsed > TCP_SYN_SENT_TIMEOUT_MS) {
-                kprintf("TCP: SYN_RECEIVED timeout for connection %d (remote %d.%d.%d.%d:%d) after %u ms\n",
-                        i, conn->remote_ip[0], conn->remote_ip[1],
-                        conn->remote_ip[2], conn->remote_ip[3],
-                        conn->remote_port, elapsed);
-                kprintf("TCP: Forcefully closing zombie connection to prevent state exhaustion.\n");
+                net_count_tcp_timed_out();
                 conn->state = TCP_CLOSED;
                 conn->in_use = false;
             }
@@ -1768,11 +1753,8 @@ void tcp_tick(uint32_t current_time) {
         if (conn->state == TCP_FIN_WAIT_2) {
             if (conn->fin_wait_2_start > 0 &&
                 (current_time - conn->fin_wait_2_start) > TCP_FIN_WAIT_2_TIMEOUT) {
-                kprintf("TCP: FIN_WAIT_2 timeout for connection %d (remote %d.%d.%d.%d:%d) after %u ms\n",
-                        i, conn->remote_ip[0], conn->remote_ip[1],
-                        conn->remote_ip[2], conn->remote_ip[3],
-                        conn->remote_port, (current_time - conn->fin_wait_2_start));
-                kprintf("TCP: Forcefully closing connection to prevent resource exhaustion.\n");
+                /* The peer chooses whether this fires. Counted, not printed. */
+                net_count_tcp_timed_out();
                 conn->state = TCP_CLOSED;
                 conn->in_use = false;
             }
@@ -1817,10 +1799,9 @@ void tcp_tick(uint32_t current_time) {
                     // Send 1 byte of data as zero window probe
                     uint8_t probe_byte = conn->tx_buffer[conn->tx_tail];
 
-                    kprintf("TCP: Zero window detected (conn %d). Sending probe to %d.%d.%d.%d:%d\n",
-                            i, conn->remote_ip[0], conn->remote_ip[1],
-                            conn->remote_ip[2], conn->remote_ip[3], conn->remote_port);
-
+                    /* No print: the peer holds its window shut for as long
+                     * as it likes, and this fired every 5 s for that long.
+                     * The window itself is already counted (zero-window). */
                     /* Do not let the probe advance snd_nxt: tx_tail is not
                      * advanced either, so the byte is resent at the same
                      * sequence once the window reopens. */

@@ -1979,6 +1979,32 @@ void net_get_tcp_rx_stats(uint32_t* malformed, uint32_t* flood,
     if (zero_window) *zero_window = tcp_zero_window;
 }
 
+/* Local-side TCP events. Split by WHO drives them: send/connect refusals and
+ * a full table are the local caller's doing (SYS_TCPSOCK); timeouts and
+ * TIME_WAIT evictions are the peer's. All were kprintfs on a path an
+ * unprivileged loop or a remote host could fire at will. */
+static uint32_t tcp_send_refused = 0;     /* send on a socket not ESTABLISHED */
+static uint32_t tcp_connect_refused = 0;  /* half-open cap, no port, no MAC   */
+static uint32_t tcp_table_full = 0;       /* no free socket after eviction    */
+static uint32_t tcp_timed_out = 0;        /* SYN_SENT/SYN_RCVD/FIN_WAIT_2 reap */
+static uint32_t tcp_tw_evicted = 0;       /* TIME_WAIT slot forcibly reused   */
+
+void net_count_tcp_send_refused(void)    { tcp_send_refused++; }
+void net_count_tcp_connect_refused(void) { tcp_connect_refused++; }
+void net_count_tcp_table_full(void)      { tcp_table_full++; }
+void net_count_tcp_timed_out(void)       { tcp_timed_out++; }
+void net_count_tcp_tw_evicted(void)      { tcp_tw_evicted++; }
+
+void net_get_tcp_local_stats(uint32_t* send_refused, uint32_t* connect_refused,
+                             uint32_t* table_full, uint32_t* timed_out,
+                             uint32_t* tw_evicted) {
+    if (send_refused)    *send_refused    = tcp_send_refused;
+    if (connect_refused) *connect_refused = tcp_connect_refused;
+    if (table_full)      *table_full      = tcp_table_full;
+    if (timed_out)       *timed_out       = tcp_timed_out;
+    if (tw_evicted)      *tw_evicted      = tcp_tw_evicted;
+}
+
 /**
  * @brief Main packet reception handler.
  * @param data Pointer to received Ethernet frame.

@@ -279,3 +279,5 @@ tcpcap.log
 tcpcap-trace.log
 exitquiet.log
 exitquiet-trace.log
+tcpquiet.log
+tcpquiet-trace.log
