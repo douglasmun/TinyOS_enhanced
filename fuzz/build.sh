@@ -53,11 +53,12 @@ target_sources() {
     case "$1" in
         dns)   echo "dns.c" ;;
         dhcp)  echo "dhcp.c" ;;
+        fat32) echo "" ;;  # harness #includes fat32.c
         net)   echo "firewall.c ids.c icmp.c tcp.c dns.c dhcp.c kprintf.c sha256.c" ;;  # harness #includes net.c
         *)     echo "unknown target: $1" >&2; return 1 ;;
     esac
 }
-ALL_TARGETS="dns dhcp net"
+ALL_TARGETS="dns dhcp net fat32"
 
 prep() {
     python3 "$FUZZ_DIR/prep_hostsrc.py" "$ROOT/src" "$FUZZ_DIR/shim" "$HOSTSRC"
