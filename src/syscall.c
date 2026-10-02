@@ -1052,6 +1052,10 @@ int sys_readdir(int fd, void* user_buf, uint32_t size) {
     uint32_t written = 0;
 
     while (written + sizeof(entry) <= size) {
+        /* Zeroed per entry: the FAT32 emitter writes the name with
+         * safe_strcpy(), which does not pad, so the rest of name[64] was
+         * whatever this stack slot last held -- copied out to ring 3. */
+        memset(&entry, 0, sizeof(entry));
         ssize_t got = vfs_readdir(vfs_fd, &entry, sizeof(entry));
         if (got < 0) {
             /* Report the error only if nothing was produced; otherwise return
