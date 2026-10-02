@@ -63,3 +63,11 @@ void fuzz_reset(void) {
     fuzz_tx_count = 0;
     fuzz_tx_last_len = 0;
 }
+
+/* src/stdio.h shadows the host's, so declare write(2) directly. */
+extern long write(int fd, const void* buf, unsigned long n);
+void fuzz_note(const char* msg) {
+    if (!getenv("FUZZ_VERBOSE")) return;
+    write(2, msg, strlen(msg));
+    write(2, "\n", 1);
+}

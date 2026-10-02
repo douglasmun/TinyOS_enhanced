@@ -16,3 +16,7 @@ extern size_t fuzz_tx_last_len;
 
 /* Heap copy of exactly `len` bytes, so ASan flags any read past the input. */
 uint8_t* fuzz_dup(const uint8_t* data, size_t len);
+
+/* Write `msg` to stderr when FUZZ_VERBOSE is set: lets a positive control
+ * show it reached the line it claims without a printf in every harness. */
+void fuzz_note(const char* msg);
