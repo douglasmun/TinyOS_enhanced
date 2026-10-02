@@ -58,11 +58,12 @@ target_sources() {
         ramfs) echo "" ;;  # harness #includes ramfs.c
         elfload) echo "" ;;  # harness #includes elf.c
         shell) echo "" ;;  # harness #includes shell_redir.c, env.c
+        editor) echo "" ;;  # harness #includes editor.c, ramfs.c
         net)   echo "firewall.c ids.c icmp.c tcp.c dns.c dhcp.c kprintf.c sha256.c" ;;  # harness #includes net.c
         *)     echo "unknown target: $1" >&2; return 1 ;;
     esac
 }
-ALL_TARGETS="dns dhcp net fat32 elfsig ramfs shell elfload"
+ALL_TARGETS="dns dhcp net fat32 elfsig ramfs shell elfload editor"
 
 prep() {
     python3 "$FUZZ_DIR/prep_hostsrc.py" "$ROOT/src" "$FUZZ_DIR/shim" "$HOSTSRC"
@@ -71,6 +72,12 @@ prep() {
     awk '/^int canonicalize_path\(const char\* path/{f=1} f{print} f&&/^}/{exit}' \
         "$HOSTSRC/shell_fileops.c" > "$HOSTSRC/canonicalize_path.inc"
     [[ -s "$HOSTSRC/canonicalize_path.inc" ]] || { echo "canonicalize_path not found" >&2; exit 1; }
+    # editor.c casts its row allocator's uint32_t to a pointer, which the
+    # host cannot round-trip: route both row allocations to the harness.
+    local n
+    n=$(grep -c '(char\*)editor_row_alloc()' "$HOSTSRC/editor.c" || true)
+    [[ "$n" == 2 ]] || { echo "editor_row_alloc sites: $n, expected 2" >&2; exit 1; }
+    sed -i.bak 's/(char\*)editor_row_alloc()/editor_fuzz_alloc()/' "$HOSTSRC/editor.c" && rm "$HOSTSRC/editor.c.bak"
 }
 
 build_target() {
