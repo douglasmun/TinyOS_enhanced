@@ -2,6 +2,7 @@
  * process.c - Process Management Implementation
  *=============================================================================*/
 #include "process.h"
+#include "tcp.h"
 #include "kprintf.h"
 #include "util.h"
 #include "pmm.h"
@@ -1894,6 +1895,11 @@ void task_terminate(uint32_t pid) {
         // pipeline may still be parked in pipe_read waiting for data that can
         // no longer come.
         task_pipes_cleanup(task);
+
+        // And sockets opened via SYS_TCPSOCK, which otherwise stayed in_use
+        // forever: nothing reclaims a CLOSED socket, so a user who opened a
+        // few and exited took them from everyone until reboot.
+        tcp_task_cleanup(task->pid, task->generation);
 
         // A task terminated while not running never reaches the scheduler
         // cleanup queue (it is reaped off the ready queue without freeing its

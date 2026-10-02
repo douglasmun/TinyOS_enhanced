@@ -41,6 +41,7 @@
 #include "busyprobe_elf_data.h"
 #include "pipeprobe_elf_data.h"
 #include "fdprobe_elf_data.h"
+#include "tcpcap_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -1047,6 +1048,17 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(fdprobe_fd, fdprobe_elf_data, fdprobe_elf_data_len);
             ramfs_close(fdprobe_fd);
             ramfs_chmod("/fdprobe.elf", 0755);
+        }
+    }
+
+    /* tcpcap.elf opens TCP sockets until refused, unprivileged, and has a
+     * child exit holding them. See verify-tcp-socket-cap.sh. */
+    {
+        int tcpcap_fd = ramfs_open("/tcpcap.elf", RAMFS_FLAG_WRITE);
+        if (tcpcap_fd >= 0) {
+            ramfs_write(tcpcap_fd, tcpcap_elf_data, tcpcap_elf_data_len);
+            ramfs_close(tcpcap_fd);
+            ramfs_chmod("/tcpcap.elf", 0755);
         }
     }
 

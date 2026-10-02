@@ -17,7 +17,7 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
             netprobe.elf msealprobe.elf callprobe.elf \
-            busyprobe.elf pipeprobe.elf fdprobe.elf
+            busyprobe.elf pipeprobe.elf fdprobe.elf tcpcap.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -164,6 +164,13 @@ fdprobe.elf: fdprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c fdprobe.c -o fdprobe.o
 	$(LD) $(LDFLAGS) -o fdprobe.elf crt0.o fdprobe.o libc.o -lgcc
 	@echo "Built fdprobe.elf"
+
+# tcpcap.elf opens TCP sockets until refused, and has a child exit holding
+# them. See verify-tcp-socket-cap.sh.
+tcpcap.elf: tcpcap.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c tcpcap.c -o tcpcap.o
+	$(LD) $(LDFLAGS) -o tcpcap.elf crt0.o tcpcap.o libc.o -lgcc
+	@echo "Built tcpcap.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld

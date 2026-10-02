@@ -1084,6 +1084,59 @@ static uint32_t tcp_current_owner_uid(void) {
     return self ? (uint32_t)self->uid : TCP_SOCKET_OWNER_KERNEL;
 }
 
+/* Stamp a freshly allocated connection with the calling task. Both
+ * allocation paths go through here: memset() zeroes owner_uid, and uid 0 is
+ * root, so a path that forgot would hand out root-owned sockets. */
+static void tcp_stamp_owner(tcp_connection_t* conn) {
+    task_t* self = scheduler_get_current_task();
+    conn->owner_uid = tcp_current_owner_uid();
+    conn->owner_pid = self ? self->pid : 0;
+    conn->owner_generation = self ? self->generation : 0;
+}
+
+/* Is this caller over its own cap, or into the root reserve? Called with
+ * TCP_LOCK held. Counts only sockets the owner still holds: one it has closed
+ * (fin_sent) or lost (orphaned) is on its way out under the protocol's own
+ * timers and is not the user's to spend. TIME_WAIT slots are reclaimable by
+ * tcp_socket()'s eviction, so they count as free for the reserve. */
+static bool tcp_socket_over_limit(void) {
+    task_t* self = scheduler_get_current_task();
+    if (!self || self->uid == 0) {
+        return false;
+    }
+    uint32_t held = 0, avail = 0;
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_connection_t* c = &tcp_connections[i];
+        if (!c->in_use || c->state == TCP_TIME_WAIT) {
+            avail++;
+        } else if (c->owner_uid == (uint32_t)self->uid && !c->fin_sent && !c->orphaned) {
+            held++;
+        }
+    }
+    return held >= TCP_USER_MAX_SOCKETS || avail <= TCP_ROOT_RESERVED_SOCKETS;
+}
+
+void tcp_task_cleanup(uint32_t pid, uint32_t generation) {
+    if (pid == 0) {
+        return;
+    }
+    TCP_LOCK();
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_connection_t* c = &tcp_connections[i];
+        if (!c->in_use || c->owner_pid != pid || c->owner_generation != generation) {
+            continue;
+        }
+        c->owner_pid = 0;
+        c->owner_generation = 0;
+        if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) {
+            c->in_use = false;
+        } else {
+            c->orphaned = true;
+        }
+    }
+    TCP_UNLOCK();
+}
+
 bool tcp_owner_visible(int sockfd) {
     if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return false;
 
@@ -1099,6 +1152,12 @@ bool tcp_owner_visible(int sockfd) {
  */
 int tcp_socket(void) {
     TCP_LOCK();
+    /* Before the scan, so a capped caller never reaches the exhaustion
+     * path's kprintfs either: SYS_TCPSOCK made those ring-3 reachable. */
+    if (tcp_socket_over_limit()) {
+        TCP_UNLOCK();
+        return TCP_SOCKET_LIMIT;
+    }
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         if (!tcp_connections[i].in_use) {
             tcp_connection_t* conn = &tcp_connections[i];
@@ -1107,7 +1166,7 @@ int tcp_socket(void) {
             conn->state = TCP_CLOSED;
             conn->rcv_wnd = TCP_RX_BUFFER_SIZE;
             conn->local_port = 0; // Will be assigned on connect/bind
-            conn->owner_uid = tcp_current_owner_uid();
+            tcp_stamp_owner(conn);
             // kprintf("TCP: Socket %d created\n", i);  // Commented for less verbosity
             TCP_UNLOCK();
             return i;
@@ -1148,7 +1207,7 @@ int tcp_socket(void) {
                      * while tcp_socket() was kernel-only; a live bug the moment
                      * SYS_TCPSOCK let ring 3 drive the allocator into
                      * TIME_WAIT pressure. */
-                    conn->owner_uid = tcp_current_owner_uid();
+                    tcp_stamp_owner(conn);
                     TCP_UNLOCK();
                     return i;
                 }
@@ -1158,7 +1217,7 @@ int tcp_socket(void) {
 
     TCP_UNLOCK();
     kprintf("TCP: No free sockets (even after TIME_WAIT eviction)\n");
-    return -1;
+    return TCP_SOCKET_FULL;
 }
 
 /*=============================================================================
@@ -1412,6 +1471,7 @@ int tcp_close(int sockfd) {
         case TCP_ESTABLISHED:
             // Initiate active close
             conn->fin_sent = true;
+            conn->close_start = tcp_get_time_ms();
             conn->state = TCP_FIN_WAIT_1;
             tcp_send_segment(conn, TCP_ACK | TCP_FIN, NULL, 0);
             break;
@@ -1419,6 +1479,7 @@ int tcp_close(int sockfd) {
         case TCP_CLOSE_WAIT:
             // Passive close - send our FIN
             conn->fin_sent = true;
+            conn->close_start = tcp_get_time_ms();
             conn->state = TCP_LAST_ACK;
             tcp_send_segment(conn, TCP_ACK | TCP_FIN, NULL, 0);
             break;
@@ -1610,6 +1671,14 @@ void tcp_handle_packet(const uint8_t* src_ip, const uint8_t* dest_ip,
 void tcp_tick(uint32_t current_time) {
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_connection_t* conn = &tcp_connections[i];
+
+        /* An open connection whose owner exited: close it here, in ktimerd's
+         * task context, rather than from teardown. tcp_close() sends the FIN
+         * and the closing states then time out as for any other close. */
+        if (conn->in_use && conn->orphaned) {
+            conn->orphaned = false;
+            tcp_close(i);
+        }
         if (!conn->in_use) continue;
 
         /*=====================================================================
@@ -1650,6 +1719,17 @@ void tcp_tick(uint32_t current_time) {
                 conn->state = TCP_CLOSED;
                 conn->in_use = false;
             }
+        }
+
+        /* Our FIN is out and the peer never finished: FIN_WAIT_1 (no ACK),
+         * CLOSING (no ACK of our FIN) or LAST_ACK. Same limit as FIN_WAIT_2.
+         * Silent: a ring-3 user can drive this, so it is counted by nothing
+         * and printed by nothing. */
+        if ((conn->state == TCP_FIN_WAIT_1 || conn->state == TCP_CLOSING ||
+             conn->state == TCP_LAST_ACK) && conn->fin_sent &&
+            (current_time - conn->close_start) > TCP_FIN_WAIT_2_TIMEOUT) {
+            conn->state = TCP_CLOSED;
+            conn->in_use = false;
         }
 
         // Handle TIME_WAIT timeout

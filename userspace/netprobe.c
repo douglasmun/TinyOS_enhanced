@@ -276,11 +276,20 @@ static int tcpsock_probe(int uid) {
      * uid 0 leaks; everyone else audits. The leaked descriptor is a CLOSED
      * socket that never connects, so it holds no port and no buffer -- it
      * exists purely as a foreign table entry for the next run to not see.
+     *
+     * A task's sockets are released when it exits (tcp_task_cleanup), so the
+     * leak cannot live in this process: it would be gone before the
+     * unprivileged pass ran, and the exclusion check would pass against an
+     * inert filter again. A detached child holds it instead, for HOLD_MS,
+     * and says when it lets go; the harness asserts that line comes after
+     * the unprivileged pass's tcpsock_foreign line.
      *===================================================================*/
     if (uid == 0) {
-        int leak = tcpsock(TCPSOCK_SOCKET, 0, 0, 0);
-        printf("PROBE tcpsock_leak fd=%d\n", leak);
-        /* Deliberately NOT closed. */
+        char* const args[] = { "/netprobe.elf", "hold", 0 };
+        int pid = spawn("/netprobe.elf", args);
+        printf("PROBE tcpsock_holder pid=%d\n", pid);
+        /* Let the holder open its socket and report before this pass ends. */
+        sleep_ms(1000);
     } else {
         /* A root-owned socket is live right now (leaked by the root pass).
          * It must be absent from our bitmap and must refuse our queries. */
@@ -302,9 +311,21 @@ static int tcpsock_probe(int uid) {
     return bad;
 }
 
+/* The root pass's foreign socket: open it, report it, hold it, release it. */
+#define HOLD_MS 120000
+
+static int hold(void) {
+    int leak = tcpsock(TCPSOCK_SOCKET, 0, 0, 0);
+    printf("PROBE tcpsock_leak fd=%d\n", leak);
+    sleep_ms(HOLD_MS);
+    printf("PROBE tcphold released fd=%d\n", leak);
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && !strcmp(argv[1], "hold")) {
+        return hold();
+    }
 
     unsigned char rxbuf[1600];
     int uid = getuid();

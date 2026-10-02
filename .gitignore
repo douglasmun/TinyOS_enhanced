@@ -275,3 +275,5 @@ fdreuse.log
 fdreuse-trace.log
 guardframe.log
 guardframe-trace.log
+tcpcap.log
+tcpcap-trace.log

@@ -253,19 +253,21 @@ void sys_exit(int status) {
          * using its kernel stack. The scheduler will free it after the
          * context switch completes.
          *
-         * NOTE: File descriptors and pipes are released in Step 0.
+         * NOTE: File descriptors, pipes and sockets are released in Step 0.
          *===================================================================*/
 
         /* Step 0: release what the task holds, as task_terminate() does for a
          * killed one. A normal exit skipped all of it: SYS_OPEN descriptors,
-         * pipes the task created, and the RAMFS reference an inherited file
-         * stream carries all stayed allocated until reboot.
+         * pipes the task created, TCP sockets, and the RAMFS reference an
+         * inherited file stream carries all stayed allocated until reboot.
          * (The global close-on-exec sweep used to hide the descriptor half.)
          * Before the ZOMBIE transition, so a waitpid() that returns sees them
-         * already released. verify-ramfs-fd-reuse.sh. */
+         * already released. verify-ramfs-fd-reuse.sh,
+         * verify-tcp-socket-cap.sh. */
         streams_cleanup(&current->streams);
         task_fdtable_cleanup(current);
         task_pipes_cleanup(current);
+        tcp_task_cleanup(current->pid, current->generation);
 
         /*=====================================================================
          * SECURITY FIX (HIGH): Disable interrupts during cleanup to prevent
@@ -1944,6 +1946,9 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
         /* No buffer, no sockfd. tcp_socket() stamps owner_uid from the calling
          * task, which is why this needs no explicit credential handling. */
         int fd = tcp_socket();
+        if (fd == TCP_SOCKET_LIMIT) {
+            return -EAGAIN;
+        }
         if (fd < 0) {
             return -EMFILE;
         }
