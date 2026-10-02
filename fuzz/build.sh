@@ -56,14 +56,20 @@ target_sources() {
         elfsig) echo "ecdsa.c sha256.c" ;;  # harness #includes elf.c
         fat32) echo "" ;;  # harness #includes fat32.c
         ramfs) echo "" ;;  # harness #includes ramfs.c
+        shell) echo "" ;;  # harness #includes shell_redir.c, env.c
         net)   echo "firewall.c ids.c icmp.c tcp.c dns.c dhcp.c kprintf.c sha256.c" ;;  # harness #includes net.c
         *)     echo "unknown target: $1" >&2; return 1 ;;
     esac
 }
-ALL_TARGETS="dns dhcp net fat32 elfsig ramfs"
+ALL_TARGETS="dns dhcp net fat32 elfsig ramfs shell"
 
 prep() {
     python3 "$FUZZ_DIR/prep_hostsrc.py" "$ROOT/src" "$FUZZ_DIR/shim" "$HOSTSRC"
+    # The shell target needs canonicalize_path() without the rest of
+    # shell_fileops.c: cut the one function out of the real source.
+    awk '/^int canonicalize_path\(const char\* path/{f=1} f{print} f&&/^}/{exit}' \
+        "$HOSTSRC/shell_fileops.c" > "$HOSTSRC/canonicalize_path.inc"
+    [[ -s "$HOSTSRC/canonicalize_path.inc" ]] || { echo "canonicalize_path not found" >&2; exit 1; }
 }
 
 build_target() {
@@ -91,7 +97,8 @@ build_target() {
     echo "built $out/fuzz_$t ($(grep -c weak "$out/autostubs.c" || true) weak stubs)"
 }
 
-prep
+# FUZZ_NO_PREP=1 keeps an edited build/src (trying a fix without touching src/).
+[[ "${FUZZ_NO_PREP:-0}" == 1 ]] || prep
 targets=("$@")
 [[ ${#targets[@]} -eq 0 ]] && read -r -a targets <<< "$ALL_TARGETS"
 for t in "${targets[@]}"; do
