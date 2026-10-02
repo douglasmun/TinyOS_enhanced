@@ -131,16 +131,12 @@ void streams_cleanup(stream_context_t* ctx);
  * Inheritance is OPT-IN: a task that never has this called on it keeps the
  * console default, so existing behaviour is unchanged.
  *
- * OWNERSHIP: this is a shallow copy, matching how stream_context_t is embedded
- * by value in task_t, so for STREAM_TYPE_FILE both contexts end up holding the
- * same RAMFS fd number. The child's copies are marked `borrowed`, which stops
- * its stream resets — including the streams_cleanup() that task_terminate()
- * runs on every dying task — from closing the fd; the creator stays the sole
- * owner and closes it exactly once. That keeps a child's exit from yanking the
- * descriptor out from under the shell, but it does NOT make the fd outlive the
- * creator: the child must not survive the creator's own close. Foreground exec
- * satisfies that by blocking; anything else (background jobs, pipes) needs
- * refcounted or dup'd fds first.
+ * OWNERSHIP: for STREAM_TYPE_FILE both contexts hold the same RAMFS fd number,
+ * and the child takes its own reference (ramfs_fd_ref), so each side closes
+ * independently and the slot is freed only when both have. The creator may
+ * restore its stdout while a background child still writes. Pipe streams are
+ * marked `borrowed` instead: the pipe table keeps the buffer until no stream
+ * names it.
  *
  * @param child   Child's stream context (destination)
  * @param creator Creator's stream context (source)

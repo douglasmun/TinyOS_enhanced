@@ -766,8 +766,9 @@ static void parse_and_execute(char* cmd_line) {
             out_streams->stdout_stream.data = NULL;
             out_streams->stdout_stream.is_open = true;
             /* The shell opened redir_fd, so it owns it: stdout_reset() below is
-             * what actually closes it. A child that inherits this stream gets a
-             * borrowed copy instead and leaves the fd alone when it exits. */
+             * what actually closes it. A child that inherits this stream takes
+             * its own reference (streams_inherit), so neither close frees the
+             * slot under the other. */
             out_streams->stdout_stream.borrowed = false;
         }
     }

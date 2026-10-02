@@ -879,9 +879,8 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
 
     /* Streams before scheduling too — a child made runnable with the default
      * console context would ignore the caller's redirection on its first
-     * write. See streams_inherit's ownership caveat in stdio.h: the copy is
-     * shallow, so the caller must outlive the child (or wait for it) before
-     * closing any redirected fd. */
+     * write. The child takes its own reference on a redirected RAMFS fd (see
+     * streams_inherit in stdio.h), so the caller may restore while it runs. */
     streams_inherit(&child->streams, &self->streams);
 
     /* cwd inherits the same way, and for the same reason: a child spawned from
@@ -2058,8 +2057,8 @@ int sys_chdir(const char* user_path) {
  * Because sys_spawn inherits the caller's streams into the child, a shell gets
  * redirection of spawned programs for free: rebind, spawn, restore. The child
  * captured the redirected stream at spawn time and the restore does not reach
- * back into it (streams_inherit marks the child's copies borrowed, so the
- * child never closes the fd the shell owns).
+ * back into it (streams_inherit gives the child its own reference on the
+ * RAMFS fd, so the slot outlives whichever of the two closes first).
  *
  * DRIVE LIMITATION, enforced rather than ignored: the stream layer's
  * STREAM_TYPE_FILE is hard-wired to RAMFS (stdout_write calls ramfs_write

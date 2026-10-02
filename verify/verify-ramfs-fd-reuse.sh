@@ -17,14 +17,15 @@
 #   stream  a child inherits a redirected stdout/stdin as the bare RAMFS fd;
 #           the shell's restore right after spawning a background job or a
 #           pipeline stage closed it, and the child's output went to the next
-#           file opened. (Driven by the probe; graded once it is fixed.)
+#           file opened.
 #
 # /fdprobe.elf drives both and reports where the bytes landed:
 #
 #   leg 1  sweep:  a=4 (POSITIVE CONTROL), b=0
+#   leg 2  stream: out=4 (POSITIVE CONTROL), victim=0
 #
-# The control matters: a kernel that refused the write outright would keep B
-# clean too.
+# The controls matter: a kernel that refused the write outright would keep B
+# and VICTIM clean too, and break `cmd > f &`.
 #
 # Runs as a NON-ROOT user: nothing here needs privilege.
 #
@@ -134,8 +135,11 @@ field() {
 }
 SW_A=$(field sweep a)
 SW_B=$(field sweep b)
+ST_OUT=$(field stream out)
+ST_VIC=$(field stream victim)
 
 echo "  sweep : a=${SW_A:-none} b=${SW_B:-none}        (expected a=4 b=0)"
+echo "  stream: out=${ST_OUT:-none} victim=${ST_VIC:-none} (expected out=4 victim=0)"
 
 fail_with() {
     echo "RESULT: FAIL — $1"
@@ -145,7 +149,7 @@ fail_with() {
     exit 1
 }
 
-for v in SW_A SW_B; do
+for v in SW_A SW_B ST_OUT ST_VIC; do
     [ -n "${!v}" ] || fail_with "the probe never reported $v"
 done
 
@@ -158,6 +162,13 @@ fi
     "Positive control: the descriptor must still work after a spawn."
 echo "PASS leg 1: a spawn leaves other descriptors alone, and the write arrived."
 
+if [ "$ST_VIC" -ne 0 ]; then
+    fail_with "a child's inherited stdout wrote into a file someone else opened later" \
+        "The parent's restore closed the RAMFS fd the child still used."
+fi
+[ "$ST_OUT" -eq 4 ] || fail_with "stream: the child's output did not reach the redirect target (out=$ST_OUT)" \
+    "Positive control: \`cmd > f &\` must still write f."
+echo "PASS leg 2: the child's output reached its file and nothing else."
 
 echo ""
 echo "RESULT: PASS"

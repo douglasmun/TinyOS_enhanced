@@ -202,6 +202,11 @@ typedef struct {
     uint8_t flags;                   // Read/Write flags
     bool in_use;
     bool close_on_exec;              // PHASE 13: Close this FD on exec (default: true)
+    /* Holders of this slot. ramfs_open() makes 1; ramfs_fd_ref() adds one for
+     * each stream a child inherits; ramfs_close() drops one and frees the slot
+     * at 0. Without it a creator's close freed the slot under a child still
+     * writing through it, and the next open anywhere reused the number. */
+    uint8_t refs;
 } ramfs_fd_t;
 
 /* Initialize the filesystem */
@@ -209,6 +214,11 @@ void ramfs_init(void);
 
 /* File operations */
 int ramfs_open(const char* path, uint8_t flags);
+
+/* Take another reference on an open descriptor, for a second holder that will
+ * ramfs_close() it independently. 0 on success, -1 if fd is not open (or its
+ * count would overflow). */
+int ramfs_fd_ref(int fd);
 int ramfs_read(int fd, void* buf, size_t count);
 
 /* Cursor control. `pos` was always there and advanced by read/write; these

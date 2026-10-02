@@ -814,6 +814,7 @@ int ramfs_open(const char* path, uint8_t flags) {
     file_descriptors[fd].pos = 0;
     file_descriptors[fd].flags = flags;
     file_descriptors[fd].in_use = true;
+    file_descriptors[fd].refs = 1;
     file_descriptors[fd].close_on_exec = !(flags & RAMFS_FLAG_INHERIT);  // PHASE 13
 
     /* Increment per-process FD count (v1.11) */
@@ -1080,19 +1081,45 @@ int ramfs_fd_size(int fd) {
 /**
  * Close file
  */
+int ramfs_fd_ref(int fd) {
+    if (fd < 0 || fd >= RAMFS_MAX_FDS) {
+        return -1;
+    }
+    int rc = -1;
+    CRITICAL_SECTION_ENTER();
+    if (file_descriptors[fd].in_use && file_descriptors[fd].refs < UINT8_MAX) {
+        file_descriptors[fd].refs++;
+        rc = 0;
+    }
+    CRITICAL_SECTION_EXIT();
+    return rc;
+}
+
 void ramfs_close(int fd) {
-    if (fd >= 0 && fd < RAMFS_MAX_FDS && file_descriptors[fd].in_use) {
-        /* Decrement per-process FD count (v1.11) */
+    if (fd < 0 || fd >= RAMFS_MAX_FDS) {
+        return;
+    }
+    CRITICAL_SECTION_ENTER();
+    if (file_descriptors[fd].in_use) {
+        /* Decrement per-process FD count (v1.11). Per reference, since each
+         * holder's close is balanced against that holder's open or inherit. */
         task_t* current = scheduler_get_current_task();
         if (current && current->open_fd_count > 0) {
             current->open_fd_count--;
         }
 
-        file_descriptors[fd].in_use = false;
-        file_descriptors[fd].node = NULL;
-        file_descriptors[fd].pos = 0;
-        file_descriptors[fd].flags = 0;
+        /* Free the slot only when the last holder lets go. */
+        if (file_descriptors[fd].refs > 1) {
+            file_descriptors[fd].refs--;
+        } else {
+            file_descriptors[fd].refs = 0;
+            file_descriptors[fd].in_use = false;
+            file_descriptors[fd].node = NULL;
+            file_descriptors[fd].pos = 0;
+            file_descriptors[fd].flags = 0;
+        }
     }
+    CRITICAL_SECTION_EXIT();
 }
 
 /**
