@@ -2160,6 +2160,7 @@ typedef struct {
     uint32_t       owner_pid;
     uint32_t       owner_generation;
     uint32_t       pages;       /* frames backing buf, for the free path     */
+    bool           orphaned;    /* released, waiting for its last reader/writer */
 } pipe_slot_t;
 
 static pipe_slot_t pipe_table[MAX_PIPES];
@@ -2178,7 +2179,7 @@ static pipe_slot_t* pipe_slot_for(int id, task_t* self, int* err) {
         return NULL;
     }
     pipe_slot_t* slot = &pipe_table[id - 1];
-    if (!slot->buf) {
+    if (!slot->buf || slot->orphaned) {
         *err = -EBADF;
         return NULL;
     }
@@ -2201,20 +2202,70 @@ static void pipe_bind_stream(stream_t* s, pipe_buffer_t* buf) {
     s->borrowed  = false;
 }
 
-static void pipe_slot_release(pipe_slot_t* slot) {
-    /* pipe_destroy closes both ends first, so anyone still parked in
-     * pipe_read/pipe_write is woken to observe EOF/EPIPE rather than being
-     * left blocked on a buffer that is about to be freed. It also releases the
-     * wait-queue page; the frames below are the pipe_buffer_t itself. */
+/* Does any task's stream still name this buffer? A spawned child inherits
+ * its creator's streams by shallow copy (streams_inherit), so the pipe table's
+ * owner is not the only holder. A dying task's streams are reset before
+ * task_pipes_cleanup() runs, so it never counts as a holder of its own. */
+static bool pipe_buf_referenced(const pipe_buffer_t* buf) {
+    bool found = false;
+    CRITICAL_SECTION_ENTER();
+    for (int i = 0; i < MAX_TASKS && !found; i++) {
+        task_t* t = task_get_slot(i);
+        if (!t) {
+            continue;
+        }
+        const stream_t* s[3] = { &t->streams.stdin_stream,
+                                 &t->streams.stdout_stream,
+                                 &t->streams.stderr_stream };
+        for (int k = 0; k < 3; k++) {
+            if (s[k]->type == STREAM_TYPE_PIPE && s[k]->data == buf) {
+                found = true;
+            }
+        }
+    }
+    CRITICAL_SECTION_EXIT();
+    return found;
+}
+
+/* Free an orphaned slot's buffer once nothing can reach it. */
+static void pipe_slot_reap(pipe_slot_t* slot) {
+    if (!slot->buf || !slot->orphaned || pipe_buf_referenced(slot->buf)) {
+        return;
+    }
+    /* No stream names the buffer, so no task can be parked in
+     * pipe_read/pipe_write on it; pipe_destroy releases the wait-queue page
+     * (or leaks it if a killed waiter is still queued) and the frames below
+     * are the pipe_buffer_t itself. */
     pipe_destroy(slot->buf);
     uint32_t base = (uint32_t)(uintptr_t)slot->buf;
     for (uint32_t i = 0; i < slot->pages; i++) {
         pmm_free(base + i * 4096);
     }
     slot->buf = NULL;
+    slot->pages = 0;
+    slot->orphaned = false;
+}
+
+/* Give up the owner's claim. Freeing the buffer here was a use-after-free: a
+ * child spawned with the pipe as stdout or stdin kept the raw pointer, and
+ * PIPE_OP_DESTROY (or the owner exiting) pmm_free'd the frames under it, so
+ * the child's next write landed in whatever page the PMM handed out next.
+ * Closing both ends wakes anyone parked on it to see EOF/EPIPE, and every
+ * later read/write returns at once; the frames go back only when the last
+ * stream naming them is gone. Found auditing the ring-3 syscalls. */
+static void pipe_slot_release(pipe_slot_t* slot) {
+    pipe_close_write(slot->buf);
+    pipe_close_read(slot->buf);
     slot->owner_pid = 0;
     slot->owner_generation = 0;
-    slot->pages = 0;
+    slot->orphaned = true;
+    pipe_slot_reap(slot);
+}
+
+static void pipe_reap_orphans(void) {
+    for (int i = 0; i < MAX_PIPES; i++) {
+        pipe_slot_reap(&pipe_table[i]);
+    }
 }
 
 void task_pipes_cleanup(task_t* task) {
@@ -2223,12 +2274,14 @@ void task_pipes_cleanup(task_t* task) {
     }
     for (int i = 0; i < MAX_PIPES; i++) {
         pipe_slot_t* slot = &pipe_table[i];
-        if (slot->buf &&
+        if (slot->buf && !slot->orphaned &&
             slot->owner_pid == task->pid &&
             slot->owner_generation == task->generation) {
             pipe_slot_release(slot);
         }
     }
+    /* This task may have been the last holder of someone else's pipe. */
+    pipe_reap_orphans();
 }
 
 int sys_pipe(int op, int id) {
@@ -2255,6 +2308,7 @@ int sys_pipe(int op, int id) {
     }
 
     if (op == PIPE_OP_CREATE) {
+        pipe_reap_orphans();
         int slot_idx = -1;
         for (int i = 0; i < MAX_PIPES; i++) {
             if (!pipe_table[i].buf) {

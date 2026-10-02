@@ -269,3 +269,5 @@ csprngorder*.log
 dhcpcfg*.log
 icmpcsum*.log
 icmpovr-peer.log
+pipeuaf.log
+pipeuaf-trace.log

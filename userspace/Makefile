@@ -17,7 +17,7 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
             netprobe.elf msealprobe.elf callprobe.elf \
-            busyprobe.elf
+            busyprobe.elf pipeprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -147,6 +147,14 @@ busyprobe.elf: busyprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c busyprobe.c -o busyprobe.o
 	$(LD) $(LDFLAGS) -o busyprobe.elf crt0.o busyprobe.o libc.o -lgcc
 	@echo "Built busyprobe.elf"
+
+# pipeprobe.elf spawns a child onto a pipe and destroys the pipe under it. No
+# builtin destroys a pipe a live child still holds, so without this the
+# deferred free has no driver. See verify-pipe-uaf.sh.
+pipeprobe.elf: pipeprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c pipeprobe.c -o pipeprobe.o
+	$(LD) $(LDFLAGS) -o pipeprobe.elf crt0.o pipeprobe.o libc.o -lgcc
+	@echo "Built pipeprobe.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld

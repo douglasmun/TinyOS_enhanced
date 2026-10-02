@@ -39,6 +39,7 @@
 #include "msealprobe_elf_data.h"
 #include "callprobe_elf_data.h"
 #include "busyprobe_elf_data.h"
+#include "pipeprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -1019,6 +1020,19 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(busyprobe_fd, busyprobe_elf_data, busyprobe_elf_data_len);
             ramfs_close(busyprobe_fd);
             ramfs_chmod("/busyprobe.elf", 0755);
+        }
+    }
+
+    /* pipeprobe.elf destroys a pipe while a child it spawned still writes to
+     * it. No builtin does that, so the deferred pipe free would have no driver.
+     * 0755 for the same reason as busyprobe: the use-after-free needed no
+     * privilege. See verify-pipe-uaf.sh. */
+    {
+        int pipeprobe_fd = ramfs_open("/pipeprobe.elf", RAMFS_FLAG_WRITE);
+        if (pipeprobe_fd >= 0) {
+            ramfs_write(pipeprobe_fd, pipeprobe_elf_data, pipeprobe_elf_data_len);
+            ramfs_close(pipeprobe_fd);
+            ramfs_chmod("/pipeprobe.elf", 0755);
         }
     }
 
