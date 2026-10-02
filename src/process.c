@@ -1856,8 +1856,6 @@ void task_terminate(uint32_t pid) {
             return;
         }
 
-        kprintf("[PROCESS] Terminating task PID=%d '%s'\n", task->pid, task->name);
-
         // A task killed while blocked on a wait queue must be detached from it,
         // or the stale entry consumes a later wakeup / spuriously wakes the
         // slot's next occupant. No-op unless blocked_on_wq is set.

@@ -277,3 +277,5 @@ guardframe.log
 guardframe-trace.log
 tcpcap.log
 tcpcap-trace.log
+exitquiet.log
+exitquiet-trace.log

@@ -57,6 +57,11 @@
  * kernel #PF and panicked. The sweep leg does the same once.
  *
  *   PROBE guard rounds=N created=N   fixed: both ROUNDS (and no panic)
+ *
+ * Mode "quiet" (`/fdprobe.elf quiet`): QUIET_EXITS children exit normally,
+ * then one is killed. verify-exit-quiet.sh counts what the kernel printed.
+ *
+ *   PROBE quiet exits=N kill=RC      fixed: QUIET_EXITS, 0
  *===========================================================================*/
 #include "libc.h"
 
@@ -246,6 +251,21 @@ static void mode_guard(void) {
     printf("PROBE guard rounds=%d created=%d\n", rounds, created);
 }
 
+#define QUIET_EXITS 4
+
+static void mode_quiet(void) {
+    int exits = 0;
+    printf("PROBE quiet start\n");
+    for (int i = 0; i < QUIET_EXITS; i++) {
+        int pid = run_child("noop");
+        if (pid >= 0) { waitpid(pid); exits++; }
+    }
+    int victim = run_child("cap-hold");
+    wait_for_file("/scratch/fdprobe.hcB", 120);
+    int rc = victim >= 0 ? kill(victim) : victim;
+    printf("PROBE quiet exits=%d kill=%d\n", exits, rc);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "noop")) {
         return 0;
@@ -267,6 +287,11 @@ int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "late-write")) {
         sleep_ms(500);
         return write(1, "BBBB", 4);
+    }
+    if (argc > 1 && !strcmp(argv[1], "quiet")) {
+        mode_quiet();
+        printf("PROBE done\n");
+        return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "guard")) {
         mode_guard();

@@ -224,14 +224,15 @@ static bool exit_record_find(uint32_t pid, uint32_t generation, int* status) {
 }
 
 void sys_exit(int status) {
-    kprintf("\n[SYSCALL] Process exited with status %d\n", status);
-
+    /* No kprintf on this path, nor in task_terminate(): every ring-3 exit and
+     * kill reaches them, and the kernel console is the stream ring-3 output
+     * shares, so each child a pipeline or a loop ran wrote three lines into
+     * the middle of the user's own. The shell reports a nonzero status
+     * itself; waitpid() returns it. */
     // Get current task
     task_t* current = scheduler_get_current_task();
 
     if (current) {
-        kprintf("[SYSCALL] Terminating process PID=%d '%s'\n", current->pid, current->name);
-
         /*=====================================================================
          * SECURITY (v1.13): Comprehensive Task Cleanup (UAF Prevention)
          *
@@ -314,13 +315,10 @@ void sys_exit(int status) {
 
         /* Step 4: Remove from ready queue NOW to avoid race condition */
         // where timer interrupt tries to schedule/remove the same task
-        kprintf("[SYSCALL] Removing terminated task from ready queue...\n");
         scheduler_remove_task(current);
 
         /* SECURITY: Re-enable interrupts after atomic cleanup */
         restore_interrupts(eflags);
-
-        kprintf("[SYSCALL] Process cleanup complete, switching to next task...\n");
 
         // Force a context switch to the next task
         // This should NEVER return since we're terminated
