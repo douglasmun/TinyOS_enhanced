@@ -1318,6 +1318,10 @@ void cmd_secstatus(int argc, char* argv[]) {
     syscall_get_reject_stats(&sc_ok, &sc_range, &sc_unimpl);
     stream_printf(ctx, "    Syscall dispatch .... %u accepted, %u out-of-range, %u unimplemented\n",
                   sc_ok, sc_range, sc_unimpl);
+    uint32_t io_bad = 0, io_spawn = 0;
+    syscall_get_io_reject_stats(&io_bad, &io_spawn);
+    stream_printf(ctx, "    Syscall arg rejects . %u bad-buffer, %u spawn-failed\n",
+                  io_bad, io_spawn);
 
     stream_printf(ctx, "\n  Boot integrity\n");
     stream_printf(ctx, "    ELF signatures ...... %s\n",

@@ -593,6 +593,10 @@ typedef struct {
 void syscall_get_reject_stats(uint32_t* accepted, uint32_t* reject_range,
                               uint32_t* reject_unimpl);
 
+/* sys_read/sys_write refusals of a bad buffer (size cap, wraparound, beyond
+ * user space, faulting copy) and failed SYS_SPAWNs. Counted, not printed. */
+void syscall_get_io_reject_stats(uint32_t* bad_buffer, uint32_t* spawn_failed);
+
 /*-----------------------------------------------------------------------------
  * SYS_PSINFO record. One per visible task; see the SYS_PSINFO comment above for
  * why this is an allow-list rather than a redacted task_t.

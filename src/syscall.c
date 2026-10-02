@@ -354,6 +354,17 @@ void sys_exit(int status) {
  * SECURITY FIX: Uses copy_from_user() to prevent TOCTOU race conditions
  * where user unmaps buffer between validation and access.
  *-----------------------------------------------------------------------------*/
+/* sys_read/sys_write argument refusals and failed spawns. These were kprintf
+ * sites any ring-3 caller could fire per call -- outside its own redirection,
+ * into the stream every user's output shares. secstatus shows them. */
+static uint32_t syscall_reject_badbuf = 0;
+static uint32_t syscall_spawn_failed = 0;
+
+void syscall_get_io_reject_stats(uint32_t* bad_buffer, uint32_t* spawn_failed) {
+    if (bad_buffer)   *bad_buffer   = syscall_reject_badbuf;
+    if (spawn_failed) *spawn_failed = syscall_spawn_failed;
+}
+
 int sys_write(int fd, const char* buf, size_t len) {
     /* Reject unknown descriptors up front. stdin (0) is not writable. Note the
      * check happens before the len == 0 early-out so that a bad fd is reported
@@ -388,8 +399,7 @@ int sys_write(int fd, const char* buf, size_t len) {
      * before any address arithmetic or copy operations.
      *=======================================================================*/
     if (len > MAX_IO_SIZE) {
-        kprintf("[SYSCALL] sys_write: size %u exceeds maximum %u\n",
-                (unsigned int)len, (unsigned int)MAX_IO_SIZE);
+        syscall_reject_badbuf++;
         return -EINVAL;
     }
 
@@ -407,13 +417,13 @@ int sys_write(int fd, const char* buf, size_t len) {
 
     /* Check for wraparound (buf + len < buf) */
     if (buf_end < buf_addr) {
-        kprintf("[SYSCALL] sys_write: address wraparound detected\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
     /* Check if end address exceeds user space boundary */
     if (buf_end > USER_SPACE_END) {
-        kprintf("[SYSCALL] sys_write: buffer extends beyond user space\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
@@ -484,7 +494,7 @@ int sys_write(int fd, const char* buf, size_t len) {
          * Check: buf + total_written < buf indicates wraparound
          *===================================================================*/
         if ((uintptr_t)buf + total_written < (uintptr_t)buf) {
-            kprintf("[SYSCALL] sys_write: pointer overflow detected\n");
+            syscall_reject_badbuf++;
             return (total_written > 0) ? (int)total_written : -EFAULT;
         }
 
@@ -494,7 +504,7 @@ int sys_write(int fd, const char* buf, size_t len) {
          *===================================================================*/
         int ret = copy_from_user(kernel_buf, buf + total_written, chunk_size);
         if (ret < 0) {
-            kprintf("[SYSCALL] sys_write: copy_from_user failed (TOCTOU race?)\n");
+            syscall_reject_badbuf++;
             /* Return bytes written so far, or error if nothing written */
             return (total_written > 0) ? (int)total_written : ret;
         }
@@ -570,8 +580,7 @@ int sys_read(int fd, char* buf, size_t len) {
      * before any address arithmetic or copy operations.
      *=======================================================================*/
     if (len > MAX_IO_SIZE) {
-        kprintf("[SYSCALL] sys_read: size %u exceeds maximum %u\n",
-                (unsigned int)len, (unsigned int)MAX_IO_SIZE);
+        syscall_reject_badbuf++;
         return -EINVAL;
     }
 
@@ -589,13 +598,13 @@ int sys_read(int fd, char* buf, size_t len) {
 
     /* Check for wraparound (buf + len < buf) */
     if (buf_end < buf_addr) {
-        kprintf("[SYSCALL] sys_read: address wraparound detected\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
     /* Check if end address exceeds user space boundary */
     if (buf_end > USER_SPACE_END) {
-        kprintf("[SYSCALL] sys_read: buffer extends beyond user space\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
@@ -666,7 +675,7 @@ int sys_read(int fd, char* buf, size_t len) {
     if (i > 0) {
         int ret = copy_to_user(buf, kernel_buf, i);
         if (ret < 0) {
-            kprintf("[SYSCALL] sys_read: copy_to_user failed (TOCTOU race?)\n");
+            syscall_reject_badbuf++;
             return ret;  /* Return -EFAULT */
         }
     }
@@ -851,7 +860,11 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
     const char* err = NULL;
     int pid = elf_exec_from_path(path, name, kargc, kargv, &err);
     if (pid < 0) {
-        kprintf("[SPAWN] '%s': %s (rc=%d)\n", path, err ? err : "failed", pid);
+        /* Counted, not printed: the caller gets the errno, and the ring-3
+         * shell already reports it. A kprintf here was a console line per
+         * failed spawn, outside any redirection, at the caller's rate. */
+        (void)err;
+        syscall_spawn_failed++;
         return pid;
     }
 
@@ -3412,6 +3425,7 @@ static void syscall_dispatch(struct cpu_state* state) {
              * integers. Max reasonable write: 1MB per syscall.
              *===============================================================*/
             if ((uint32_t)arg3 > (1024 * 1024)) {  /* > 1MB */
+                syscall_reject_badbuf++;  /* same refusal sys_write counts */
                 ret = -EINVAL;  /* Invalid argument */
                 break;
             }
@@ -3433,6 +3447,7 @@ static void syscall_dispatch(struct cpu_state* state) {
              * so buf/len moved up one register (ebx=fd, ecx=buf, edx=len).
              *===============================================================*/
             if ((uint32_t)arg3 > (1024 * 1024)) {  /* > 1MB */
+                syscall_reject_badbuf++;  /* same refusal sys_read counts */
                 ret = -EINVAL;  /* Invalid argument */
                 break;
             }

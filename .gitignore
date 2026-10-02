@@ -281,3 +281,5 @@ exitquiet.log
 exitquiet-trace.log
 tcpquiet.log
 tcpquiet-trace.log
+sysioquiet.log
+sysioquiet-trace.log
