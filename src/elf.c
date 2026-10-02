@@ -1304,27 +1304,6 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
     kdbg("[ELF] Switching back to kernel page directory\n");
     __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
 
-    /*=========================================================================
-     * PHASE 13: Close-on-Exec Cleanup (Secure FD Inheritance)
-     *
-     * SECURITY: Before the new program starts executing, close all file
-     * descriptors that have close_on_exec == true (which is the default).
-     *
-     * TRADITIONAL UNIX/LINUX WEAKNESS:
-     * - Child processes inherit ALL parent FDs by default
-     * - Developer must explicitly set O_CLOEXEC flag to prevent leaks
-     * - Easy to forget → sensitive FDs leak to untrusted children
-     * - Examples: database connections, password files, network sockets
-     *
-     * TINYOS INNOVATION:
-     * - All FDs closed on exec by default (reversed semantics)
-     * - Must explicitly set RAMFS_FLAG_INHERIT to keep FD open
-     * - Fail-secure: Forget to set flag? Still secure.
-     *
-     * TIMING: Called AFTER program is loaded but BEFORE it starts executing.
-     * This ensures the new program begins with a clean FD table (except for
-     * explicitly inherited FDs like stdin/stdout/stderr).
-     *=======================================================================*/
     if (num_allocated > ELF_MAX_IMAGE_PAGES) {
         /* Unreachable: the loop refuses before exceeding the cap. If it ever
          * fires, tracking a truncated list would be worse than not loading --
@@ -1338,7 +1317,14 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
         return -1;
     }
 
-    ramfs_close_on_exec();
+    /* No close-on-exec sweep here. The one that ran here closed every
+     * close-on-exec RAMFS descriptor in the SYSTEM -- RAMFS fds are one
+     * global table -- and SYS_OPEN fds all are, so any user's spawn closed
+     * every other process's open files behind them. Their fdtables still
+     * named the slots, and the next ramfs_open() anywhere reused one: a held
+     * descriptor then read or wrote someone else's file. It had nothing of
+     * its own to close: a new task's fdtable starts empty and a child gets
+     * only its creator's streams. verify-ramfs-fd-reuse.sh. */
 
     /* Hand the image frames to the task so task_free_resources() can free them
      * on exit. Before this, nothing did: the teardown frees page TABLES but

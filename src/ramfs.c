@@ -805,12 +805,10 @@ int ramfs_open(const char* path, uint8_t flags) {
         return -7;  // Permission denied
     }
 
-    /*=========================================================================
-     * PHASE 13: Set close-on-exec flag (secure by default)
-     * - Default: close_on_exec = true (FD will be closed on exec)
-     * - Explicit RAMFS_FLAG_INHERIT: close_on_exec = false (FD survives exec)
-     * - Reversed Unix semantics for security
-     *=======================================================================*/
+    /* close_on_exec is recorded but nothing sweeps on it any more: the
+     * table is global, so a sweep at exec closed other tasks' files (see
+     * elf.c). Isolation comes from a task naming a slot only through its
+     * own fdtable or streams. */
     // Setup file descriptor
     file_descriptors[fd].node = node;
     file_descriptors[fd].pos = 0;
@@ -1094,36 +1092,6 @@ void ramfs_close(int fd) {
         file_descriptors[fd].node = NULL;
         file_descriptors[fd].pos = 0;
         file_descriptors[fd].flags = 0;
-    }
-}
-
-/*=============================================================================
- * PHASE 13: Close-on-Exec Cleanup (Secure FD Inheritance)
- *
- * Called by ELF loader when exec() loads a new program. Closes all file
- * descriptors that have close_on_exec == true (which is the default).
- *
- * TRADITIONAL UNIX/LINUX:
- * - All FDs inherited by default (security nightmare)
- * - Must explicitly set O_CLOEXEC flag to prevent leakage
- * - Easy to forget, leading to FD leaks
- *
- * TINYOS INNOVATION:
- * - All FDs closed on exec by default (close_on_exec = true)
- * - Must explicitly set RAMFS_FLAG_INHERIT to keep FD open
- * - Reversed semantics for security (fail-secure design)
- *
- * SECURITY BENEFITS:
- * - No accidental FD leaks to child processes
- * - Sensitive FDs (database connections, password files) auto-close
- * - Explicit opt-in for FD inheritance (intentional, not accidental)
- *===========================================================================*/
-void ramfs_close_on_exec(void) {
-    for (int fd = 0; fd < RAMFS_MAX_FDS; fd++) {
-        /* Close all FDs marked for close-on-exec */
-        if (file_descriptors[fd].in_use && file_descriptors[fd].close_on_exec) {
-            ramfs_close(fd);
-        }
     }
 }
 

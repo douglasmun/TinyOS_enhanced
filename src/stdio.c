@@ -103,10 +103,9 @@ int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
      * Attack: cmd < /tmp/input where attacker can replace /tmp/input with
      * symlink to /etc/shadow before open.
      *=======================================================================*/
-    /* RAMFS_FLAG_INHERIT: RAMFS closes every fd on exec by default (see
-     * ramfs_close_on_exec), which would leave an exec'd child's inherited stdin
-     * pointing at an already-closed descriptor. The opener still owns and closes
-     * this fd; INHERIT only exempts it from the exec sweep. */
+    /* RAMFS_FLAG_INHERIT marks this fd as one an exec'd child keeps using
+     * through its stdin. (It exempted it from an exec-time sweep, since
+     * removed.) The opener owns and closes it. */
     int fd = ramfs_open(filename,
                         RAMFS_FLAG_READ | RAMFS_FLAG_NOFOLLOW | RAMFS_FLAG_INHERIT);
     if (fd < 0) {

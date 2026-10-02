@@ -22,7 +22,7 @@
  * lets the RAMFS root stay unlistable (0711) while remaining a usable cwd.
  * The 0100/0010/0001 mode bits already existed; no flag mapped to them. */
 #define RAMFS_FLAG_EXEC     0x10
-#define RAMFS_FLAG_INHERIT  0x08  /* PHASE 13: Keep FD open across exec (not close-on-exec) */
+#define RAMFS_FLAG_INHERIT  0x08  /* fd is shared with an exec'd child (recorded only) */
 /*=============================================================================
  * SECURITY (v1.12): O_NOFOLLOW Flag
  *
@@ -189,11 +189,10 @@ typedef struct ramfs_node {
  * - Parent opens network connection, child hijacks communication
  * - CGI scripts inherit web server FDs (security nightmare)
  *
- * TINYOS INNOVATION:
- * - ALL FDs are close-on-exec by default (reversed semantics)
- * - Must explicitly request FD inheritance with RAMFS_FLAG_INHERIT
- * - Secure by default: Forget to set flag? Still secure.
- * - Fail-secure design: No accidental FD leaks
+ * TINYOS: the descriptor table is global, so there is no per-process set to
+ * close on exec -- an exec-time sweep closed EVERY task's files and was
+ * removed. A child reaches only the streams it inherits; a new task's SYS_OPEN
+ * fdtable starts empty. RAMFS_FLAG_INHERIT is still recorded per fd.
  *===========================================================================*/
 
 /* File descriptor structure */
@@ -247,8 +246,6 @@ int ramfs_unlink(const char* path);
 typedef bool (*ramfs_node_busy_fn)(const ramfs_node_t* node);
 void ramfs_set_external_busy_hook(ramfs_node_busy_fn fn);
 
-/* PHASE 13: Close-on-exec cleanup */
-void ramfs_close_on_exec(void);
 
 /*=============================================================================
  * PHASE 6: Crypto-Random Temporary File API
