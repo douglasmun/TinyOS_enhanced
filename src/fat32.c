@@ -28,6 +28,26 @@ static uint32_t bytes_per_cluster;
 static fat32_file_t open_files[FAT32_MAX_OPEN_FILES];
 static bool fat32_mounted = false;
 
+/* Cluster numbers come off the disk -- from directory entries, the FAT and the
+ * boot sector -- so every one is attacker-controlled on a hostile volume.
+ * fat32_mount() derives the valid range from the volume's real geometry:
+ * clusters 2..max_cluster each have both a FAT entry and a data-region slot.
+ * Anything outside it is refused before it reaches the disk: cluster 0 and 1
+ * would otherwise map to LBA 0, so a write through one overwrote the boot
+ * sector, and a cluster past the FAT read and wrote data sectors as FAT.
+ *
+ * chain_limit bounds every chain walk. A chain that visits more clusters than
+ * the volume has must revisit one, so the volume's cluster count is the
+ * tightest bound that never rejects a valid chain; the old fixed
+ * FAT32_MAX_CLUSTER_CHAIN let a one-cluster self-loop on a small disk spin
+ * for two million sector reads with fat32_mutex held. */
+static uint32_t max_cluster;
+static uint32_t chain_limit;
+
+static bool cluster_in_range(uint32_t cluster) {
+    return cluster >= 2 && cluster <= max_cluster;
+}
+
 /*=============================================================================
  * SECURITY FIX: Mutex Protection for Global Buffers (Race Condition)
  *
@@ -106,6 +126,9 @@ static uint32_t cluster_to_sector(uint32_t cluster) {
  * PROTECTED BY: fat32_mutex (global buffer access)
  *---------------------------------------------------------------------------*/
 static uint32_t read_fat_entry(uint32_t cluster) {
+    if (!cluster_in_range(cluster)) {
+        return FAT32_BAD_CLUSTER;
+    }
     uint32_t fat_offset = cluster * 4;  // 4 bytes per FAT32 entry
     uint32_t fat_sector = fat_start_sector + (fat_offset / FAT32_SECTOR_SIZE);
     uint32_t entry_offset = fat_offset % FAT32_SECTOR_SIZE;
@@ -129,6 +152,9 @@ static uint32_t read_fat_entry(uint32_t cluster) {
  * PROTECTED BY: fat32_mutex (global buffer access)
  *---------------------------------------------------------------------------*/
 static int write_fat_entry(uint32_t cluster, uint32_t value) {
+    if (!cluster_in_range(cluster)) {
+        return -1;
+    }
     uint32_t fat_offset = cluster * 4;
     uint32_t fat_sector = fat_start_sector + (fat_offset / FAT32_SECTOR_SIZE);
     uint32_t entry_offset = fat_offset % FAT32_SECTOR_SIZE;
@@ -161,17 +187,10 @@ static int write_fat_entry(uint32_t cluster, uint32_t value) {
  * PURPOSE: Find a free cluster in FAT
  *---------------------------------------------------------------------------*/
 static uint32_t find_free_cluster(void) {
-    // Guard against underflow/division-by-zero from a corrupted boot sector
-    if (sectors_per_cluster == 0 || boot_sector.total_sectors_32 <= data_start_sector) {
-        return 0;
-    }
-
-    uint32_t total_clusters = (boot_sector.total_sectors_32 - data_start_sector) / sectors_per_cluster;
-    if (total_clusters > FAT32_MAX_CLUSTER_CHAIN) {
-        total_clusters = FAT32_MAX_CLUSTER_CHAIN;
-    }
-
-    for (uint32_t cluster = 2; cluster < total_clusters; cluster++) {
+    /* Data clusters are numbered 2..max_cluster; the scan used to stop two
+     * short of the end. chain_limit caps the scan's FAT reads on a huge
+     * volume, as FAT32_MAX_CLUSTER_CHAIN did. */
+    for (uint32_t cluster = 2; cluster <= max_cluster && cluster - 2 < chain_limit; cluster++) {
         uint32_t entry = read_fat_entry(cluster);
         if (entry == FAT32_FREE) {
             return cluster;
@@ -218,6 +237,9 @@ static uint32_t allocate_cluster(uint32_t previous_cluster) {
  * NOTE: All callers pass cluster_buffer as the buffer parameter
  *---------------------------------------------------------------------------*/
 static int read_cluster(uint32_t cluster, void* buffer) {
+    if (!cluster_in_range(cluster)) {
+        return -1;
+    }
     uint32_t sector = cluster_to_sector(cluster);
     // kprintf("[FAT32_DEBUG] read_cluster: cluster=%u, buffer=%p, sectors=%u, sector=%u\n",
     //         cluster, buffer, sectors_per_cluster, sector);
@@ -235,6 +257,9 @@ static int read_cluster(uint32_t cluster, void* buffer) {
  * PROTECTED BY: fat32_mutex (global buffer access)
  *---------------------------------------------------------------------------*/
 static int write_cluster(uint32_t cluster, const void* buffer) {
+    if (!cluster_in_range(cluster)) {
+        return -1;
+    }
     uint32_t sector = cluster_to_sector(cluster);
     int result = ide_write_sectors(sector, sectors_per_cluster, buffer);
 
@@ -406,7 +431,7 @@ static int find_dir_entry(uint32_t dir_cluster, const char* name, fat32_dir_entr
 
     while (cluster < FAT32_EOC) {
         // Check for infinite loop (cyclic cluster chain)
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected (iteration limit exceeded)\n");
             kprintf("[FAT32] This indicates filesystem corruption or a DoS attack\n");
             return -1;  // -EIO: Filesystem corruption
@@ -548,7 +573,7 @@ static int dir_find_free_slot(uint32_t dir_cluster, uint32_t* out_cluster,
     uint32_t iterations = 0;
 
     while (cluster > 0 && cluster < FAT32_EOC) {
-        if (++iterations > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iterations > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected scanning directory\n");
             return -1;
         }
@@ -612,7 +637,7 @@ static int dir_name_exists(uint32_t dir_cluster, const char* name83) {
     uint32_t iterations = 0;
 
     while (cluster > 0 && cluster < FAT32_EOC) {
-        if (++iterations > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iterations > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected checking for duplicates\n");
             return -1;
         }
@@ -717,10 +742,32 @@ int fat32_mount(void) {
         return -1;
     }
 
+    if (boot_sector.num_fats == 0 || boot_sector.fat_size_32 == 0) {
+        kprintf("[FAT32] ERROR: Volume has no FAT\n");
+        return -1;
+    }
+
+    /* num_fats * fat_size_32 wrapped in 32 bits, which let a crafted boot
+     * sector place the data region on top of the FAT. */
+    uint64_t data_start64 = (uint64_t)boot_sector.reserved_sectors +
+                            (uint64_t)boot_sector.num_fats * boot_sector.fat_size_32;
+    if (data_start64 >= boot_sector.total_sectors_32) {
+        kprintf("[FAT32] ERROR: Data region starts beyond end of volume\n");
+        return -1;
+    }
+
+    /* A boot sector claiming more sectors than the disk has would size the
+     * cluster range -- and so chain_limit -- by space that does not exist. */
+    uint32_t disk_sectors = ide_get_sector_count();
+    if (disk_sectors != 0 && boot_sector.total_sectors_32 > disk_sectors) {
+        kprintf("[FAT32] ERROR: Volume is larger than the disk (%u > %u sectors)\n",
+                boot_sector.total_sectors_32, disk_sectors);
+        return -1;
+    }
+
     // Calculate important values
     fat_start_sector = boot_sector.reserved_sectors;
-    data_start_sector = boot_sector.reserved_sectors +
-                       (boot_sector.num_fats * boot_sector.fat_size_32);
+    data_start_sector = (uint32_t)data_start64;
     root_dir_cluster = boot_sector.root_cluster;
     sectors_per_cluster = boot_sector.sectors_per_cluster;
     bytes_per_cluster = sectors_per_cluster * FAT32_SECTOR_SIZE;
@@ -732,8 +779,25 @@ int fat32_mount(void) {
         return -1;
     }
 
-    if (data_start_sector >= boot_sector.total_sectors_32) {
-        kprintf("[FAT32] ERROR: Data region starts beyond end of volume\n");
+    /* The highest cluster with both a data-region slot and a FAT entry;
+     * values from 0x0FFFFFF7 up are BAD/EOC markers, never clusters. */
+    uint32_t data_clusters = (boot_sector.total_sectors_32 - data_start_sector) /
+                             sectors_per_cluster;
+    uint64_t fat_entries = (uint64_t)boot_sector.fat_size_32 * (FAT32_SECTOR_SIZE / 4);
+    uint64_t last = (uint64_t)data_clusters + 1;
+    if (last > fat_entries - 1) last = fat_entries - 1;
+    if (last > FAT32_BAD_CLUSTER - 1) last = FAT32_BAD_CLUSTER - 1;
+    if (last < 2) {
+        kprintf("[FAT32] ERROR: Volume has no data clusters\n");
+        return -1;
+    }
+    max_cluster = (uint32_t)last;
+    chain_limit = max_cluster - 1;
+    if (chain_limit > FAT32_MAX_CLUSTER_CHAIN) {
+        chain_limit = FAT32_MAX_CLUSTER_CHAIN;
+    }
+    if (!cluster_in_range(root_dir_cluster)) {
+        kprintf("[FAT32] ERROR: Root directory cluster %u out of range\n", root_dir_cluster);
         return -1;
     }
 
@@ -919,7 +983,7 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
 
     while (bytes_read < size && file->current_cluster < FAT32_EOC) {
         // Check for infinite loop (cyclic cluster chain)
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected in read operation\n");
             mutex_unlock(&fat32_mutex);
             return bytes_read > 0 ? (int)bytes_read : -1;  // Return partial read or error
@@ -1016,7 +1080,7 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
     uint32_t iteration_count = 0;
 
     while (bytes_written < size) {
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected in write operation\n");
             break;
         }
@@ -1112,7 +1176,7 @@ int fat32_truncate(int fd) {
     uint32_t iteration_count = 0;
 
     while (cluster >= 2 && cluster < FAT32_EOC) {
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected in truncate\n");
             mutex_unlock(&fat32_mutex);
             return -1;
@@ -1192,7 +1256,7 @@ int fat32_seek(int fd, uint32_t offset) {
     uint32_t iteration_count = 0;
 
     for (uint32_t i = 0; i < clusters_to_skip; i++) {
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected in seek operation\n");
             mutex_unlock(&fat32_mutex);
             return -1;
@@ -1411,7 +1475,7 @@ int fat32_unlink(const char* path) {
     uint32_t cluster = ent_cluster;
     uint32_t iteration_count = 0;
     while (cluster > 0 && cluster < FAT32_EOC) {
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected while freeing clusters\n");
             mutex_unlock(&fat32_mutex);
             return -1;
@@ -1647,7 +1711,7 @@ int fat32_rmdir(const char* path) {
             uint32_t scan = dir_cluster;
             uint32_t scan_iters = 0;
             while (scan > 0 && scan < FAT32_EOC) {
-                if (++scan_iters > FAT32_MAX_CLUSTER_CHAIN) {
+                if (++scan_iters > chain_limit) {
                     kprintf("[FAT32] ERROR: Cluster chain cycle detected in rmdir scan\n");
                     mutex_unlock(&fat32_mutex);
                     return -1;
@@ -1702,7 +1766,7 @@ int fat32_rmdir(const char* path) {
     uint32_t cluster = dir_cluster;
     uint32_t iteration_count = 0;
     while (cluster > 0 && cluster < FAT32_EOC) {
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected in rmdir\n");
             mutex_unlock(&fat32_mutex);
             return -1;
@@ -1767,7 +1831,7 @@ int fat32_list_dir_cb(const char* path, fat32_dir_emit_t emit, void* ctx) {
 
     while (cluster < FAT32_EOC) {
         // Check for infinite loop (cyclic cluster chain)
-        if (++iteration_count > FAT32_MAX_CLUSTER_CHAIN) {
+        if (++iteration_count > chain_limit) {
             kprintf("[FAT32] ERROR: Cluster chain cycle detected in directory listing\n");
             kprintf("[FAT32] Aborting listing to prevent kernel lockup\n");
             mutex_unlock(&fat32_mutex);
