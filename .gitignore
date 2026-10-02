@@ -271,3 +271,7 @@ icmpcsum*.log
 icmpovr-peer.log
 pipeuaf.log
 pipeuaf-trace.log
+fdreuse.log
+fdreuse-trace.log
+guardframe.log
+guardframe-trace.log

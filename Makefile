@@ -121,6 +121,7 @@ SRC := \
   src/callprobe_elf_data.c \
   src/busyprobe_elf_data.c \
   src/pipeprobe_elf_data.c \
+  src/fdprobe_elf_data.c \
   src/slotbomb_elf_data.c \
   src/slothold_elf_data.c \
   src/shell_elf_data.c \

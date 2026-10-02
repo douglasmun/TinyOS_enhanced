@@ -40,6 +40,7 @@
 #include "callprobe_elf_data.h"
 #include "busyprobe_elf_data.h"
 #include "pipeprobe_elf_data.h"
+#include "fdprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -1033,6 +1034,19 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(pipeprobe_fd, pipeprobe_elf_data, pipeprobe_elf_data_len);
             ramfs_close(pipeprobe_fd);
             ramfs_chmod("/pipeprobe.elf", 0755);
+        }
+    }
+
+    /* fdprobe.elf holds RAMFS descriptors across a spawn and across a stdout
+     * restore, and reports where its bytes land; `fdprobe.elf guard` spawns,
+     * waits and creates a file in a loop. 0755: none of it needs privilege.
+     * See verify-spawn-guard-frame.sh and verify-ramfs-fd-reuse.sh. */
+    {
+        int fdprobe_fd = ramfs_open("/fdprobe.elf", RAMFS_FLAG_WRITE);
+        if (fdprobe_fd >= 0) {
+            ramfs_write(fdprobe_fd, fdprobe_elf_data, fdprobe_elf_data_len);
+            ramfs_close(fdprobe_fd);
+            ramfs_chmod("/fdprobe.elf", 0755);
         }
     }
 

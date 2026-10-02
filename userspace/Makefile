@@ -17,7 +17,7 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
             netprobe.elf msealprobe.elf callprobe.elf \
-            busyprobe.elf pipeprobe.elf
+            busyprobe.elf pipeprobe.elf fdprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -155,6 +155,15 @@ pipeprobe.elf: pipeprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c pipeprobe.c -o pipeprobe.o
 	$(LD) $(LDFLAGS) -o pipeprobe.elf crt0.o pipeprobe.o libc.o -lgcc
 	@echo "Built pipeprobe.elf"
+
+# fdprobe.elf holds RAMFS descriptors across a spawn and across a stdout
+# restore, the two ways one was closed behind its holder; its "guard" mode
+# drives the spawn guard-page panic. See verify-ramfs-fd-reuse.sh and
+# verify-spawn-guard-frame.sh.
+fdprobe.elf: fdprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c fdprobe.c -o fdprobe.o
+	$(LD) $(LDFLAGS) -o fdprobe.elf crt0.o fdprobe.o libc.o -lgcc
+	@echo "Built fdprobe.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld
