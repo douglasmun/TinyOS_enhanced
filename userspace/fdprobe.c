@@ -26,6 +26,19 @@
  * In both legs the first number is the positive control: the bytes must
  * still arrive where they were meant to, not merely stay out of B / VICTIM.
  *
+ * Leg "exit": a task that exits normally must give back what it holds.
+ * sys_exit released nothing -- only a killed task's teardown did -- so each
+ * child that exited with a file open, or with an inherited redirected stdout
+ * (which now carries its own reference), kept a slot in the 16-entry RAMFS
+ * table for good. The parent and a sleeping child hold 6 + 7 slots,
+ * leaving 3, then:
+ *
+ *   PROBE exit child-held=7
+ *   PROBE exit stream held=6 spawned=4 open=FD    4 redirected children
+ *   PROBE exit files spawned=2 opened=4 open=FD   2 children, 2 files each
+ *
+ * Fixed: FD >= 0 both times.
+ *
  * Mode "guard" (run as `/fdprobe.elf guard`): spawn a child, wait for it,
  * create a file -- ROUNDS times. Creating the child marked its kernel guard
  * page not-present in THIS task's page tables, and its exit restored it
@@ -53,7 +66,12 @@ static int file_len(const char* path) {
 
 static int run_child(const char* role) {
     char* const args[] = { SELF, (char*)role, 0 };
-    return spawn(SELF, args);
+    /* Task creation is rate limited (5/s, burst 10). */
+    int pid, tries = 0;
+    while ((pid = spawn(SELF, args)) == -11 && tries++ < 20) {
+        sleep_ms(250);
+    }
+    return pid;
 }
 
 static void leg_sweep(void) {
@@ -82,6 +100,56 @@ static void leg_stream(void) {
     printf("PROBE stream out=%d victim=%d\n", file_len(OUT), file_len(VICTIM));
 }
 
+/* Hold most of the 16-slot RAMFS table so a few leaked exits fill it: each
+ * spawn costs a signature check, ~20 s under TCG. A process may hold 8
+ * (PROCESS_MAX_FDS) and the parent's spawn and redirect need 2 of its own, so
+ * the parent holds 6 and a sleeping child the other 7. */
+#define HELD_SELF  6
+#define HELD_CHILD 7
+#define EXIT_ROUNDS 4
+
+static int hold_files(int* fds, int n, char tag) {
+    char path[] = "/scratch/fdprobe.hxA";
+    int got = 0;
+    path[sizeof(path) - 3] = tag;
+    for (int i = 0; i < n; i++) {
+        path[sizeof(path) - 2] = (char)('A' + i);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd < 0) break;
+        fds[got++] = fd;
+    }
+    return got;
+}
+
+static void leg_exit(void) {
+    int held[HELD_SELF], nheld, spawned = 0;
+    int holder = run_child("hold");
+    sleep_ms(3000);                  /* let it open its 7 */
+    nheld = hold_files(held, HELD_SELF, 'p');
+    printf("PROBE exit holder=%d\n", holder);
+    /* 3 slots left. Children that exit with an inherited stdout reference... */
+    for (int i = 0; i < EXIT_ROUNDS; i++) {
+        redirect(1, OUT, REDIR_TRUNC);
+        int pid = run_child("noop");
+        redirect(1, 0, REDIR_RESTORE);
+        if (pid >= 0) { waitpid(pid); spawned++; }
+    }
+    int fd = open(A, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd >= 0) close(fd);
+    printf("PROBE exit stream held=%d spawned=%d open=%d\n", nheld, spawned, fd);
+    /* ...and children that exit with two files open. */
+    int opened = 0;
+    spawned = 0;
+    for (int i = 0; i < 2; i++) {
+        int pid = run_child("open-exit");
+        if (pid >= 0) { opened += waitpid(pid); spawned++; }
+    }
+    fd = open(A, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd >= 0) close(fd);
+    printf("PROBE exit files spawned=%d opened=%d open=%d\n", spawned, opened, fd);
+    for (int i = 0; i < nheld; i++) close(held[i]);
+}
+
 #define ROUNDS 8
 
 static void mode_guard(void) {
@@ -104,6 +172,16 @@ int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "noop")) {
         return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "hold")) {
+        int fds[HELD_CHILD];
+        printf("PROBE exit child-held=%d\n", hold_files(fds, HELD_CHILD, 'c'));
+        sleep_ms(600000);            /* outlives the leg; the run ends first */
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "open-exit")) {
+        /* Exit holding both; the count is the status. */
+        return (open(A, O_RDONLY) >= 0) + (open(B, O_RDONLY) >= 0);
+    }
     if (argc > 1 && !strcmp(argv[1], "late-write")) {
         sleep_ms(500);
         return write(1, "BBBB", 4);
@@ -115,6 +193,7 @@ int main(int argc, char** argv) {
     }
     leg_sweep();
     leg_stream();
+    leg_exit();
     printf("PROBE done\n");
     return 0;
 }

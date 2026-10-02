@@ -23,6 +23,11 @@
 #
 #   leg 1  sweep:  a=4 (POSITIVE CONTROL), b=0
 #   leg 2  stream: out=4 (POSITIVE CONTROL), victim=0
+#   leg 3  exit:   with 13 of the 16 RAMFS slots held (6 by the probe, 7 by
+#                  a sleeping child), 4 children exit
+#                  holding an inherited redirected stdout, then 2 exit holding
+#                  2 open files each; the table must still have room after
+#                  each batch. sys_exit released nothing.
 #
 # The controls matter: a kernel that refused the write outright would keep B
 # and VICTIM clean too, and break `cmd > f &`.
@@ -137,9 +142,22 @@ SW_A=$(field sweep a)
 SW_B=$(field sweep b)
 ST_OUT=$(field stream out)
 ST_VIC=$(field stream victim)
+exfield() {
+    grep -a "PROBE exit $1 .*$2=" "$SERIAL" | tail -1 \
+        | sed -n "s/.* $2=\(-\{0,1\}[0-9][0-9]*\).*/\1/p"
+}
+EX_HELD=$(exfield stream held)
+EX_CHELD=$(grep -a "PROBE exit child-held=" "$SERIAL" | tail -1 | sed -n 's/.*child-held=\([0-9][0-9]*\).*/\1/p')
+EX_S_SP=$(exfield stream spawned)
+EX_S_OPEN=$(exfield stream open)
+EX_F_SP=$(exfield files spawned)
+EX_F_N=$(exfield files opened)
+EX_F_OPEN=$(exfield files open)
 
 echo "  sweep : a=${SW_A:-none} b=${SW_B:-none}        (expected a=4 b=0)"
 echo "  stream: out=${ST_OUT:-none} victim=${ST_VIC:-none} (expected out=4 victim=0)"
+echo "  exit  : held=${EX_HELD:-none}+${EX_CHELD:-none} stream spawned=${EX_S_SP:-none} open=${EX_S_OPEN:-none}; files spawned=${EX_F_SP:-none} opened=${EX_F_N:-none} open=${EX_F_OPEN:-none}"
+echo "          (expected held=6+7, 4 and open>=0, 2/4 and open>=0)"
 
 fail_with() {
     echo "RESULT: FAIL — $1"
@@ -149,7 +167,7 @@ fail_with() {
     exit 1
 }
 
-for v in SW_A SW_B ST_OUT ST_VIC; do
+for v in SW_A SW_B ST_OUT ST_VIC EX_HELD EX_CHELD EX_S_SP EX_S_OPEN EX_F_SP EX_F_N EX_F_OPEN; do
     [ -n "${!v}" ] || fail_with "the probe never reported $v"
 done
 
@@ -169,6 +187,20 @@ fi
 [ "$ST_OUT" -eq 4 ] || fail_with "stream: the child's output did not reach the redirect target (out=$ST_OUT)" \
     "Positive control: \`cmd > f &\` must still write f."
 echo "PASS leg 2: the child's output reached its file and nothing else."
+
+# On a leaking kernel the table fills mid-batch: the next spawn fails (it
+# opens the ELF and the redirect target), and the redirect it gives back is
+# what the final open then finds. So a short spawn count IS the stream leak.
+[ "$EX_HELD" -eq 6 ] && [ "$EX_CHELD" -eq 7 ] \
+    || fail_with "exit: the slots were not held (held=$EX_HELD+$EX_CHELD)" \
+    "Positive control: with fewer slots held, 4 leaks cannot fill the table."
+[ "$EX_S_SP" -eq 4 ] && [ "$EX_S_OPEN" -ge 0 ] \
+    || fail_with "children that exited with a redirected stdout filled the RAMFS table (spawned=$EX_S_SP of 4, open=$EX_S_OPEN)" \
+    "sys_exit did not drop the reference an inherited file stream carries."
+[ "$EX_F_SP" -eq 2 ] && [ "$EX_F_N" -eq 4 ] && [ "$EX_F_OPEN" -ge 0 ] \
+    || fail_with "children that exited with files open filled the RAMFS table (spawned=$EX_F_SP of 2, opened=$EX_F_N, open=$EX_F_OPEN)" \
+    "sys_exit did not close the task's SYS_OPEN descriptors."
+echo "PASS leg 3: normal exits give their RAMFS descriptors back."
 
 echo ""
 echo "RESULT: PASS"

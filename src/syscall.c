@@ -253,9 +253,19 @@ void sys_exit(int status) {
          * using its kernel stack. The scheduler will free it after the
          * context switch completes.
          *
-         * NOTE: File descriptors are managed by the global VFS layer and will
-         * be cleaned up when the FD table entries are closed or reused.
+         * NOTE: File descriptors and pipes are released in Step 0.
          *===================================================================*/
+
+        /* Step 0: release what the task holds, as task_terminate() does for a
+         * killed one. A normal exit skipped all of it: SYS_OPEN descriptors,
+         * pipes the task created, and the RAMFS reference an inherited file
+         * stream carries all stayed allocated until reboot.
+         * (The global close-on-exec sweep used to hide the descriptor half.)
+         * Before the ZOMBIE transition, so a waitpid() that returns sees them
+         * already released. verify-ramfs-fd-reuse.sh. */
+        streams_cleanup(&current->streams);
+        task_fdtable_cleanup(current);
+        task_pipes_cleanup(current);
 
         /*=====================================================================
          * SECURITY FIX (HIGH): Disable interrupts during cleanup to prevent
