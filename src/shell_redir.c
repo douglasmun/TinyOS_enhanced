@@ -90,10 +90,18 @@ int parse_redirections(const char* cmd_line, cmd_context_t* ctx) {
     size_t cmd_len = 0;
 
     while (*src && cmd_len < sizeof(ctx->command) - 1) {
-        /* Skip spaces */
-        while (*src == ' ') {
+        /* Copy spaces through. Bounded like the outer loop, and the line may
+         * END in them: falling through to the copy below with *src == '\0'
+         * copied the terminator and kept reading past it, so a trailing space
+         * ("ls ") appended whatever stale stack sat after the NUL in the
+         * caller's buffer -- a leftover "> /path" included -- to the command.
+         * Found by fuzz_shell. */
+        while (*src == ' ' && cmd_len < sizeof(ctx->command) - 1) {
             *dst++ = *src++;
             cmd_len++;
+        }
+        if (*src == '\0' || cmd_len >= sizeof(ctx->command) - 1) {
+            break;
         }
 
         /* Check for redirection operators */
