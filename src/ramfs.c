@@ -300,6 +300,56 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
 }
 
 /*=============================================================================
+ * Directory search permission (the x bit)
+ *
+ * Every directory a lookup passes THROUGH must grant the caller search
+ * permission; the final component needs none of its own. Nothing checked
+ * this: ramfs_find_locked and the two creation walks below matched names and
+ * nothing else, so a root-owned 0700 directory hid nothing -- uid 1000 could
+ * open a 0644 file inside it by name, and create inside any writable
+ * directory beneath it. The x bit was only consulted by chdir
+ * (ramfs_vfs_access_dir), which is why the root's 0711 ("traverse to a known
+ * name, but not list") looked enforced. Found by fuzz/targets/fuzz_ramfs.c.
+ *
+ * Root passes ramfs_check_permission unconditionally, so boot-time and
+ * kernel-context lookups are unaffected. Callers must hold ramfs_mutex.
+ *===========================================================================*/
+static bool may_search(ramfs_node_t* dir) {
+    uint16_t uid, gid;
+    ramfs_get_current_credentials(&uid, &gid);
+    return ramfs_check_permission(dir, uid, gid, RAMFS_FLAG_EXEC);
+}
+
+#define WALK_NOT_DIR    (-1)
+#define WALK_NOT_FOUND  (-2)
+#define WALK_DENIED     (-3)
+
+/* Resolve the directory that will hold components[n-1] -- the walk mkdir and
+ * open-with-create share. Each step must be a directory the caller may
+ * search. open's copy of this walk never checked the type, so creating
+ * "/file/x" hung a child under a FILE node: invisible to every lookup
+ * (ramfs_find_locked stops at a non-directory), so each retry created
+ * another, and unlinking the file freed it with the children still attached
+ * -- RAMFS_MAX_FILES slots gone for good. Callers must hold ramfs_mutex. */
+static int walk_to_parent(char components[][RAMFS_MAX_NAME], int n,
+                          ramfs_node_t** parent_out) {
+    ramfs_node_t* parent = root;
+    for (int i = 0; i < n - 1; i++) {
+        if (!may_search(parent)) return WALK_DENIED;
+        ramfs_node_t* child = parent->children;
+        while (child && strcmp(child->name, components[i]) != 0) {
+            child = child->next;
+        }
+        if (!child) return WALK_NOT_FOUND;
+        if (child->type != RAMFS_TYPE_DIR) return WALK_NOT_DIR;
+        parent = child;
+    }
+    if (!may_search(parent)) return WALK_DENIED;
+    *parent_out = parent;
+    return 0;
+}
+
+/*=============================================================================
  * PUBLIC FUNCTIONS
  *=============================================================================*/
 
@@ -375,6 +425,9 @@ static ramfs_node_t* ramfs_find_locked(const char* path) {
     for (int i = 0; i < num_components; i++) {
         if (current->type != RAMFS_TYPE_DIR) {
             return NULL;  // Not a directory
+        }
+        if (!may_search(current)) {
+            return NULL;  // No search permission: as if absent
         }
 
         /*=====================================================================
@@ -514,29 +567,19 @@ int ramfs_mkdir(const char* path) {
     }
 
     // Find parent directory
-    ramfs_node_t* parent = root;
-
-    for (int i = 0; i < num_components - 1; i++) {
-        ramfs_node_t* child = parent->children;
-        bool found = false;
-
-        while (child) {
-            if (strcmp(child->name, components[i]) == 0) {
-                if (child->type != RAMFS_TYPE_DIR) {
-                    mutex_unlock(&ramfs_mutex);
-                    return -3;  // Parent is not a directory
-                }
-                parent = child;
-                found = true;
-                break;
-            }
-            child = child->next;
-        }
-
-        if (!found) {
-            mutex_unlock(&ramfs_mutex);
-            return -4;  // Parent not found
-        }
+    ramfs_node_t* parent = NULL;
+    int walk = walk_to_parent(components, num_components, &parent);
+    if (walk == WALK_NOT_DIR) {
+        mutex_unlock(&ramfs_mutex);
+        return -3;  // Parent is not a directory
+    }
+    if (walk == WALK_NOT_FOUND) {
+        mutex_unlock(&ramfs_mutex);
+        return -4;  // Parent not found
+    }
+    if (walk == WALK_DENIED) {
+        mutex_unlock(&ramfs_mutex);
+        return -5;  // Permission denied
     }
 
     /* Check write permission on parent directory */
@@ -659,25 +702,15 @@ int ramfs_open(const char* path, uint8_t flags) {
             }
 
             // Find parent directory
-            ramfs_node_t* parent = root;
-
-            for (int i = 0; i < num_components - 1; i++) {
-                ramfs_node_t* child = parent->children;
-                bool found = false;
-
-                while (child) {
-                    if (strcmp(child->name, components[i]) == 0) {
-                        parent = child;
-                        found = true;
-                        break;
-                    }
-                    child = child->next;
-                }
-
-                if (!found) {
-                    mutex_unlock(&ramfs_mutex);
-                    return -4;  // Parent not found
-                }
+            ramfs_node_t* parent = NULL;
+            int walk = walk_to_parent(components, num_components, &parent);
+            if (walk == WALK_DENIED) {
+                mutex_unlock(&ramfs_mutex);
+                return RAMFS_CREATE_EPERM;
+            }
+            if (walk < 0) {
+                mutex_unlock(&ramfs_mutex);
+                return -4;  // Parent not found (or not a directory)
             }
 
             /*=================================================================
