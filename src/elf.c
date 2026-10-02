@@ -652,6 +652,15 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
         return -1;
     }
 
+    /* ...and inside THIS file. The bounds above are a fixed 1MB, not the
+     * buffer: a 60-byte file with e_phoff=52, e_phnum=4 passed them and the
+     * segment loop read program headers out of whatever followed the exec
+     * buffer. Found by fuzz_elfload. */
+    if (ehdr->e_phoff > elf_size || phdr_table_size > elf_size - ehdr->e_phoff) {
+        kprintf("[ELF] SECURITY: Program header table extends beyond the file\n");
+        return -1;
+    }
+
     const elf32_phdr_t* phdr = (const elf32_phdr_t*)((uint8_t*)elf_data + ehdr->e_phoff);
 
     kdbg("[ELF] Found %d program headers\n", ehdr->e_phnum);
