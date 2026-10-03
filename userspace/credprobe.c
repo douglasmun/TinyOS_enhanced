@@ -23,18 +23,23 @@
 #define ENOSYS 38
 
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    /* Optional: credprobe [su_user [su_password [old_password]]]. The defaults
+     * are the attacker's guesses above; verify-legacy-cred-quiet.sh passes an
+     * unknown user and the real password to drive the not-found and success
+     * paths of the legacy build. */
+    const char* su_user = argc > 1 ? argv[1] : "root";
+    const char* su_pass = argc > 2 ? argv[2] : "guessguess";
+    const char* old_pass = argc > 3 ? argv[3] : "guessguess";
 
     /* Attempt to switch to root with a guessed password. Under the old code
      * this reached user_verify_password() — the bare hash comparison, with no
      * failed_attempts counter — so it was an unlimited password oracle. */
-    int su_rc = syscall3(SYS_SWITCH_USER, (uint32_t)(uintptr_t)"root",
-                         (uint32_t)(uintptr_t)"guessguess", 0);
+    int su_rc = syscall3(SYS_SWITCH_USER, (uint32_t)(uintptr_t)su_user,
+                         (uint32_t)(uintptr_t)su_pass, 0);
     printf("PROBE switch_user rc=%d\n", su_rc);
 
     /* Attempt to change a password outright. */
-    int pw_rc = syscall3(SYS_CHANGE_PASSWORD, (uint32_t)(uintptr_t)"guessguess",
+    int pw_rc = syscall3(SYS_CHANGE_PASSWORD, (uint32_t)(uintptr_t)old_pass,
                          (uint32_t)(uintptr_t)"newpassword", 0);
     printf("PROBE change_password rc=%d\n", pw_rc);
 
