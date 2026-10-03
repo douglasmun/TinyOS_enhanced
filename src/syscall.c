@@ -1992,6 +1992,40 @@ static void edr_selfkill_point(uint32_t syscall_num) {
     }
 }
 
+/* verify-dispatch-block-quiet.sh only. Neither of the dispatcher's two block
+ * paths has a live trigger: edr_detect_shellcode() is a placeholder that
+ * always returns false, and nothing enables a per-task syscall filter. When
+ * armed by `edrblock`, the first SYS_WRITE from a task whose name contains
+ * "hello" installs a filter on that task allowing everything except
+ * SYS_YIELD, and that write plus the next four are blocked as an EDR verdict
+ * would block them. hello.elf yields three times and writes eight lines, so
+ * it still runs to completion -- the blocks cost it output, not its life. */
+static bool edr_block_armed;
+static int edr_block_remaining;
+
+void syscall_edr_block_arm(void) {
+    edr_block_armed = true;
+    edr_block_remaining = 5;
+}
+
+static bool edr_block_point(uint32_t syscall_num) {
+    task_t* self = scheduler_get_current_task();
+    if (syscall_num != SYS_WRITE || !self || strstr(self->name, "hello") == NULL) {
+        return false;
+    }
+    if (edr_block_armed) {
+        edr_block_armed = false;
+        memset(self->syscall_filter, 0xFF, sizeof(self->syscall_filter));
+        self->syscall_filter[SYS_YIELD / 32] &= ~(1u << (SYS_YIELD % 32));
+        self->syscall_filter_enabled = true;
+    }
+    if (edr_block_remaining > 0) {
+        edr_block_remaining--;
+        return true;
+    }
+    return false;
+}
+
 /*=============================================================================
  * waitgate -- verify-waitpid-gate.sh only. Not in the command table.
  *
@@ -3041,6 +3075,11 @@ int sys_setegid(uint16_t egid) {
  * - Users can change their own password (requires old password verification)
  * - Root can change any user's password (no old password required)
  * - All password changes are audited
+ * - Nothing is printed. Both this and sys_switch_user carried a kprintf on
+ *   every exit, fired at syscall rate by a ring-3 caller (opt-out build) on
+ *   the console the ring-3 shell shares; two echoed caller-chosen strings and
+ *   "not found" put username enumeration on screen. audit_log keeps the
+ *   record. verify-legacy-cred-quiet.sh.
  *
  * PARAMETERS:
  * - old_password: Current password (NULL if root changing another user's password)
@@ -3060,7 +3099,6 @@ int sys_change_password(const char* old_password, const char* new_password) {
 
     /* Validate new_password pointer (always required) */
     if (!new_password) {
-        kprintf("[SYSCALL] sys_change_password: NULL new_password\n");
         RETURN_ERROR(EFAULT);
     }
 
@@ -3082,11 +3120,15 @@ int sys_change_password(const char* old_password, const char* new_password) {
     memset(kernel_old_password, 0, SYSCALL_MAX_PASSWORD_LEN);
     memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
-    /* Copy new password from user space */
-    int ret = copy_from_user(kernel_new_password, new_password, SYSCALL_MAX_PASSWORD_LEN - 1);
+    /* Copy new password from user space. As a STRING: a fixed-length
+     * copy_from_user read SYSCALL_MAX_PASSWORD_LEN - 1 bytes whatever the
+     * string's length, so a short password near the end of a mapped page
+     * (an argv string at the top of the user stack) faulted as -EFAULT, and
+     * an over-long one was silently truncated. copy_string_from_user stops
+     * at the terminator and refuses rather than truncates. */
+    int ret = copy_string_from_user(kernel_new_password, new_password, SYSCALL_MAX_PASSWORD_LEN);
     if (ret < 0) {
-        kprintf("[SYSCALL] sys_change_password: copy_from_user(new_password) failed\n");
-        RETURN_ERROR(EFAULT);
+        return ret;
     }
 
     /* Ensure null termination */
@@ -3097,7 +3139,6 @@ int sys_change_password(const char* old_password, const char* new_password) {
      * For now, just check that it's not empty
      *=======================================================================*/
     if (kernel_new_password[0] == '\0') {
-        kprintf("[SYSCALL] sys_change_password: Empty password not allowed\n");
         RETURN_ERROR(EINVAL);
     }
 
@@ -3112,8 +3153,6 @@ int sys_change_password(const char* old_password, const char* new_password) {
          * ROOT: Can change own password without verification
          * (Root is already authenticated via login)
          *===================================================================*/
-        kprintf("[SYSCALL] Root changing password for uid=%d\n", current->uid);
-
         ret = user_set_password(current->uid, kernel_new_password);
 
         /* Zero password buffer before returning (defense in depth) */
@@ -3124,7 +3163,6 @@ int sys_change_password(const char* old_password, const char* new_password) {
                       "Password changed by root for uid=%d", current->uid);
             return 0;
         } else {
-            kprintf("[SYSCALL] sys_change_password: user_set_password failed (%d)\n", ret);
             RETURN_ERROR(EINVAL);
         }
 
@@ -3135,17 +3173,16 @@ int sys_change_password(const char* old_password, const char* new_password) {
 
         /* old_password is required for non-root users */
         if (!old_password) {
-            kprintf("[SYSCALL] sys_change_password: Non-root user must provide old_password\n");
             memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
             RETURN_ERROR(EPERM);
         }
 
         /* Copy old password from user space */
-        ret = copy_from_user(kernel_old_password, old_password, SYSCALL_MAX_PASSWORD_LEN - 1);
+        ret = copy_string_from_user(kernel_old_password, old_password, SYSCALL_MAX_PASSWORD_LEN);
         if (ret < 0) {
-            kprintf("[SYSCALL] sys_change_password: copy_from_user(old_password) failed\n");
             memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
-            RETURN_ERROR(EFAULT);
+            memset(kernel_old_password, 0, SYSCALL_MAX_PASSWORD_LEN);
+            return ret;
         }
 
         /* Ensure null termination */
@@ -3183,8 +3220,6 @@ int sys_change_password(const char* old_password, const char* new_password) {
         memset(kernel_old_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
         if (!verified) {
-            kprintf("[SYSCALL] sys_change_password: Old password verification failed (%d)\n",
-                    auth);
             memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
             audit_log(AUDIT_AUTH_PASSWORD_CHANGE_FAILURE, AUDIT_WARN, current->uid,
                       "Failed password change attempt (wrong old password)");
@@ -3198,12 +3233,10 @@ int sys_change_password(const char* old_password, const char* new_password) {
         memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
         if (ret == 0) {
-            kprintf("[SYSCALL] Password changed successfully for uid=%d\n", current->uid);
             audit_log(AUDIT_USER_PASSWORD_CHANGE, AUDIT_INFO, current->uid,
                       "User changed own password");
             return 0;
         } else {
-            kprintf("[SYSCALL] sys_change_password: user_set_password failed (%d)\n", ret);
             RETURN_ERROR(EINVAL);
         }
     }
@@ -3281,7 +3314,6 @@ int sys_switch_user(const char* username, const char* password) {
      * SECURITY: Validate user-space pointers
      *=======================================================================*/
     if (!username) {
-        kprintf("[SYSCALL] sys_switch_user: NULL username\n");
         RETURN_ERROR(EFAULT);
     }
 
@@ -3304,10 +3336,10 @@ int sys_switch_user(const char* username, const char* password) {
     memset(kernel_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
     /* Copy username from user space */
-    int ret = copy_from_user(kernel_username, username, SYSCALL_MAX_USERNAME_LEN - 1);
+    /* As a string, for the reason given in sys_change_password. */
+    int ret = copy_string_from_user(kernel_username, username, SYSCALL_MAX_USERNAME_LEN);
     if (ret < 0) {
-        kprintf("[SYSCALL] sys_switch_user: copy_from_user(username) failed\n");
-        RETURN_ERROR(EFAULT);
+        return ret;
     }
 
     /* Ensure null termination */
@@ -3315,7 +3347,6 @@ int sys_switch_user(const char* username, const char* password) {
 
     /* Validate username not empty */
     if (kernel_username[0] == '\0') {
-        kprintf("[SYSCALL] sys_switch_user: Empty username\n");
         RETURN_ERROR(EINVAL);
     }
 
@@ -3324,7 +3355,8 @@ int sys_switch_user(const char* username, const char* password) {
      *=======================================================================*/
     user_account_t* target_user = user_find_by_username(kernel_username);
     if (!target_user) {
-        kprintf("[SYSCALL] sys_switch_user: User '%s' not found\n", kernel_username);
+        audit_log(AUDIT_AUTH_SU_FAILURE, AUDIT_WARN, current->uid,
+                  "Failed su attempt to unknown user");
         RETURN_ERROR(EINVAL);
     }
 
@@ -3338,9 +3370,6 @@ int sys_switch_user(const char* username, const char* password) {
         /*=====================================================================
          * ROOT: Can switch to any user without authentication
          *===================================================================*/
-        kprintf("[SYSCALL] Root switching to user '%s' (uid=%d)\n",
-                kernel_username, target_user->uid);
-
         /* Root skips the PASSWORD, not the account state: switching into a
          * locked or inactive account would resurrect it as a usable identity
          * and silently defeat an administrative lock. */
@@ -3359,15 +3388,14 @@ int sys_switch_user(const char* username, const char* password) {
 
         /* Password is required for non-root users */
         if (!password) {
-            kprintf("[SYSCALL] sys_switch_user: Non-root user must provide password\n");
             RETURN_ERROR(EPERM);
         }
 
         /* Copy password from user space */
-        ret = copy_from_user(kernel_password, password, SYSCALL_MAX_PASSWORD_LEN - 1);
+        ret = copy_string_from_user(kernel_password, password, SYSCALL_MAX_PASSWORD_LEN);
         if (ret < 0) {
-            kprintf("[SYSCALL] sys_switch_user: copy_from_user(password) failed\n");
-            RETURN_ERROR(EFAULT);
+            memset(kernel_password, 0, SYSCALL_MAX_PASSWORD_LEN);
+            return ret;
         }
 
         /* Ensure null termination */
@@ -3399,17 +3427,12 @@ int sys_switch_user(const char* username, const char* password) {
         memset(kernel_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
         if (auth < 0) {
-            kprintf("[SYSCALL] sys_switch_user: Authentication failed for '%s' (%d)\n",
-                    kernel_username, auth);
             audit_log(AUDIT_AUTH_SU_FAILURE, AUDIT_WARN, current->uid,
                       "Failed su attempt to user '%s' (auth=%d)", kernel_username, auth);
             RETURN_ERROR(EPERM);
         }
 
         /* Authentication successful, switch user */
-        kprintf("[SYSCALL] User uid=%d switching to user '%s' (uid=%d)\n",
-                current->uid, kernel_username, target_user->uid);
-
         int rc = switch_user_commit(current, target_user, kernel_username);
         if (rc < 0) return rc;
 
@@ -3557,12 +3580,20 @@ int sys_mseal(uint32_t addr, uint32_t size) {
 static uint32_t syscall_accepted = 0;
 static uint32_t syscall_reject_range = 0;   /* num > MAX_SYSCALL_NUM      */
 static uint32_t syscall_reject_unimpl = 0;  /* in range, no implementation */
+/* Blocks, likewise counted: both used to print a line per blocked call. */
+static uint32_t syscall_block_filter = 0;   /* per-task syscall filter */
+static uint32_t syscall_block_edr = 0;      /* EDR behavioral verdict  */
 
 void syscall_get_reject_stats(uint32_t* accepted, uint32_t* reject_range,
                               uint32_t* reject_unimpl) {
     if (accepted)       *accepted       = syscall_accepted;
     if (reject_range)   *reject_range   = syscall_reject_range;
     if (reject_unimpl)  *reject_unimpl  = syscall_reject_unimpl;
+}
+
+void syscall_get_block_stats(uint32_t* filter_blocked, uint32_t* edr_blocked) {
+    if (filter_blocked) *filter_blocked = syscall_block_filter;
+    if (edr_blocked)    *edr_blocked    = syscall_block_edr;
 }
 
 static void syscall_dispatch(struct cpu_state* state) {
@@ -3641,8 +3672,9 @@ static void syscall_dispatch(struct cpu_state* state) {
 
         // Check if syscall is allowed
         if (!(current_task->syscall_filter[idx] & (1 << bit))) {
-            kprintf("[SYSCALL FILTER] PID %d: Blocked syscall %d\n",
-                    current_task->pid, syscall_num);
+            /* Counted, not printed: a filtered task that keeps calling would
+             * otherwise drive the console at syscall rate. */
+            syscall_block_filter++;
             state->eax = (uint32_t)(-ENOSYS);  // Function not implemented
             return;
         }
@@ -3700,6 +3732,9 @@ static void syscall_dispatch(struct cpu_state* state) {
 
 #ifdef TINYOS_FAULT_INJECT
     edr_selfkill_point(syscall_num);
+    if (edr_block_point(syscall_num)) {
+        allow = false;
+    }
 #endif
 
     /* EDR decided, inside the check above, to kill the task making this
@@ -3714,14 +3749,20 @@ static void syscall_dispatch(struct cpu_state* state) {
     }
 
     if (!allow) {
-        /* Syscall blocked by behavioral analysis */
-        kprintf("[EDR BEHAVIORAL] PID %d: Blocked suspicious syscall %d\n",
-                current_task->pid, syscall_num);
-
-        /* AUDIT: Log blocked syscall for forensic analysis */
-        audit_log(AUDIT_SEC_POLICY_VIOLATION, AUDIT_CRITICAL, current_task->uid,
-                  "EDR blocked syscall %d for PID %d (%s)",
-                  (int)syscall_num, (int)current_task->pid, current_task->name);
+        /* Syscall blocked by behavioral analysis. Counted every time; audited
+         * once per task. This used to print a line AND write an AUDIT_CRITICAL
+         * record (which audit_log echoes to the console too) on EVERY blocked
+         * call, so a blocked task that kept calling flooded the console and
+         * cycled the volatile audit ring until everything else in it was
+         * gone. The first record names the task and the syscall; the count is
+         * in `secstatus`. verify-dispatch-block-quiet.sh. */
+        syscall_block_edr++;
+        if (!(current_task->edr_state.flags & EDR_FLAG_BLOCK_AUDITED)) {
+            current_task->edr_state.flags |= EDR_FLAG_BLOCK_AUDITED;
+            audit_log(AUDIT_SEC_POLICY_VIOLATION, AUDIT_CRITICAL, current_task->uid,
+                      "EDR blocked syscall %d for PID %d (%s)",
+                      (int)syscall_num, (int)current_task->pid, current_task->name);
+        }
 
         state->eax = (uint32_t)(-EPERM);  // Operation not permitted
         return;

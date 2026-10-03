@@ -43,6 +43,7 @@ void edr_behavioral_init(task_t* task) {
     task->edr_state.flags = EDR_FLAG_DETECTION_ENABLED;  // Enable by default
     task->edr_state.last_signature = EDR_SIG_NONE;
     task->edr_state.last_alert_tick = 0;
+    task->edr_state.last_alert_severity = 0;
 }
 
 /*=============================================================================
@@ -300,19 +301,43 @@ bool edr_detect_syscall_flood(task_t* task) {
  * ALERT SYSTEM
  *=============================================================================*/
 
+/* Every alert raised, and how many of those the console rate limit kept
+ * quiet. Shown by `secstatus`. */
+static uint32_t edr_alerts_raised = 0;
+static uint32_t edr_alerts_unprinted = 0;
+
+void edr_behavioral_get_alert_stats(uint32_t* raised, uint32_t* unprinted) {
+    if (raised) *raised = edr_alerts_raised;
+    if (unprinted) *unprinted = edr_alerts_unprinted;
+}
+
+/* The rate limit governs the CONSOLE LINE, never the record. It used to
+ * return before alert_count and last_signature were updated, so an alert in
+ * the 100 ticks after another was lost outright: a trivially triggered
+ * WARNING (a syscall flood) erased the CRITICAL that followed it from the
+ * count edr_daemon scores threats by and from last_signature.
+ * verify-edr-alert-record.sh. */
 void edr_raise_alert(task_t* task, edr_severity_t severity, edr_signature_t signature, const char* message) {
     if (!task) return;
 
-    /* Rate limiting: Don't spam alerts (max 1 per 100 ticks) */
     uint32_t current_tick = pit_get_ticks();
-    if (current_tick - task->edr_state.last_alert_tick < 100) {
-        return;  /* Too soon since last alert */
-    }
-
-    /* Update state */
-    task->edr_state.last_alert_tick = current_tick;
     task->edr_state.last_signature = signature;
-    task->edr_state.alert_count++;
+    if (task->edr_state.alert_count < 0xFFFF) {
+        task->edr_state.alert_count++;
+    }
+    edr_alerts_raised++;
+
+    /* One line per task per 100 ticks, except that a MORE severe alert than
+     * the last one printed always prints: a quiet window opened by a WARNING
+     * must not hide a CRITICAL. The first alert always prints. */
+    if (task->edr_state.alert_count > 1 &&
+        current_tick - task->edr_state.last_alert_tick < 100 &&
+        (uint8_t)severity <= task->edr_state.last_alert_severity) {
+        edr_alerts_unprinted++;
+        return;
+    }
+    task->edr_state.last_alert_tick = current_tick;
+    task->edr_state.last_alert_severity = (uint8_t)severity;
 
     /* Log alert */
     kprintf("[EDR %s] PID %d: %s (signature=%s, score=%d, alerts=%d)\n",

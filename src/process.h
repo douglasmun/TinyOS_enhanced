@@ -418,11 +418,13 @@ typedef struct task {
         #define EDR_FLAG_NETWORK_ACTIVITY  0x01  /* Has network activity */
         #define EDR_FLAG_EXEC_INTENT       0x02  /* Has attempted exec */
         #define EDR_FLAG_PRIVILEGE_CHANGE  0x04  /* Has changed privileges */
+        #define EDR_FLAG_BLOCK_AUDITED     0x08  /* An EDR block of this task is in the audit log */
         #define EDR_FLAG_DETECTION_ENABLED 0x80  /* Detection enabled (default: on) */
 
         /* Last detection */
         uint8_t last_signature;     /* Last matched signature (edr_signature_t) */
-        uint32_t last_alert_tick;   /* Tick of last alert (rate limiting) */
+        uint32_t last_alert_tick;   /* Tick of last PRINTED alert (console rate limit) */
+        uint8_t last_alert_severity; /* Severity of that printed alert */
         uint32_t last_decay_tick;   /* Tick of last score decay (SECURITY: prevents timing evasion) */
     } edr_state;
 

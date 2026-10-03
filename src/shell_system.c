@@ -23,6 +23,8 @@
 #include "firewall.h"  /* secstatus: firewall stats */
 #include "ids.h"  /* secstatus: IDS stats */
 #include "edr_ml.h"  /* secstatus: EDR daemon stats */
+#include "edr_behavioral.h"  /* secstatus: EDR alert counts */
+#include "edr_advanced.h"  /* secstatus: EDR alert counts */
 #include "secure_boot.h"  /* secstatus: secure-boot key pinning state */
 #include "elf.h"          /* elf_signatures_enforced: the real ELF gate */
 #include "stdio.h"  /* stream_printf / get_current_streams */
@@ -1318,6 +1320,10 @@ void cmd_secstatus(int argc, char* argv[]) {
     syscall_get_reject_stats(&sc_ok, &sc_range, &sc_unimpl);
     stream_printf(ctx, "    Syscall dispatch .... %u accepted, %u out-of-range, %u unimplemented\n",
                   sc_ok, sc_range, sc_unimpl);
+    uint32_t blk_filter = 0, blk_edr = 0;
+    syscall_get_block_stats(&blk_filter, &blk_edr);
+    stream_printf(ctx, "    Syscall blocks ...... %u filter-blocked, %u edr-blocked\n",
+                  blk_filter, blk_edr);
     uint32_t io_bad = 0, io_spawn = 0;
     syscall_get_io_reject_stats(&io_bad, &io_spawn);
     stream_printf(ctx, "    Syscall arg rejects . %u bad-buffer, %u spawn-failed\n",
@@ -1350,6 +1356,13 @@ void cmd_secstatus(int argc, char* argv[]) {
     stream_printf(ctx, "\n  Endpoint detection (EDR)\n");
     stream_printf(ctx, "    Scans / threats ..... %u scans, %u threats, %u responses\n",
                   edr_scans, edr_threats, edr_responses);
+    /* Every alert is counted per task; only the console line is rate-limited.
+     * "unprinted" is the part of the record the console never showed. */
+    uint32_t al_raised = 0, al_quiet = 0, adv_raised = 0, adv_quiet = 0;
+    edr_behavioral_get_alert_stats(&al_raised, &al_quiet);
+    edr_advanced_get_alert_stats(&adv_raised, &adv_quiet);
+    stream_printf(ctx, "    Alerts .............. %u behavioral (%u unprinted), %u advanced (%u unprinted)\n",
+                  al_raised, al_quiet, adv_raised, adv_quiet);
 
     stream_printf(ctx, "\n");
     stream_printf(ctx, "  Details (root): aslr | pae | wxaudit | auditlog | sectest\n");

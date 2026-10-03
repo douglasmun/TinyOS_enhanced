@@ -975,6 +975,17 @@ void cmd_curl(int argc, char* argv[]) {
             int n = tcp_recv(sock, buffer, sizeof(buffer) - 1);
             if (n > 0) {
                 total += n;
+                /* The bytes are the peer's choice: an ESC sequence would
+                 * clear, retitle or overwrite the console (a forged prompt
+                 * or verdict line), and a NUL cut the chunk short under
+                 * "%s". Printable ASCII and \n \r \t pass; every other
+                 * byte becomes '.'. verify-curl-sanitize.sh. */
+                for (int i = 0; i < n; i++) {
+                    unsigned char c = (unsigned char)buffer[i];
+                    if ((c < 0x20 || c > 0x7E) && c != '\n' && c != '\r' && c != '\t') {
+                        buffer[i] = '.';
+                    }
+                }
                 buffer[n] = '\0';
                 kprintf("%s", buffer);
                 timeout = tcp_get_time_ms() + 2000;

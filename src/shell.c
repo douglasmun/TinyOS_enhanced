@@ -12,6 +12,7 @@
 #include "test_tasks.h"   /* knetd_die_now, under TINYOS_FAULT_INJECT */
 #include "net.h"          /* net_netd_set_claimed, under TINYOS_FAULT_INJECT */
 #include "dns.h"          /* dns_forge_response, under TINYOS_FAULT_INJECT */
+#include "edr_advanced.h" /* edr_alert_selftest, under TINYOS_FAULT_INJECT */
 #include "shell_fileops.h"
 #include "shell_search.h"
 #include "shell_monitor.h"
@@ -928,6 +929,15 @@ static void parse_and_execute(char* cmd_line) {
     /* verify-waitpid-gate.sh only. Not in the command table. */
     else if (strcmp(argv[0], "waitgate") == 0) {
         sys_waitgate_test();
+    }
+    /* verify-edr-alert-record.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "edralert") == 0) {
+        edr_alert_selftest();
+    }
+    /* verify-dispatch-block-quiet.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "edrblock") == 0) {
+        syscall_edr_block_arm();
+        kprintf("edrblock armed\n");
     }
     /* verify-double-fault.sh only. Not in the command table, so it never
      * appears in `help`.

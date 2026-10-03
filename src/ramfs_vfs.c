@@ -495,7 +495,13 @@ static int ramfs_vfs_stat(const char* path, vfs_dirent_t* out) {
     /* Reading metadata is a read of the containing directory, which the
      * caller already had to traverse; what ramfs_find does not check is
      * whether THIS node is readable. Require it, so stat cannot be used to
-     * probe sizes inside a directory the caller cannot open. */
+     * probe sizes inside a directory the caller cannot open.
+     *
+     * Deliberately stricter than POSIX, which needs only search on the path.
+     * In a search-but-not-list directory (the root is 0711) POSIX stat hands
+     * out the size and mode of any name the caller can guess, for files whose
+     * existence readdir would not even show. Decided 2026-10; do not
+     * "fix" toward POSIX. verify-stat-unreadable.sh pins it. */
     uint16_t uid, gid;
     ramfs_get_current_credentials(&uid, &gid);
     if (!ramfs_check_permission(node, uid, gid, RAMFS_FLAG_READ)) {

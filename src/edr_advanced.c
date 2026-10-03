@@ -11,6 +11,7 @@
 #include "scheduler.h"
 #include "vfs.h"
 #include "edr_ml.h"  /* Phase 4a: Automated Response */
+#include "edr_behavioral.h"  /* edr_alert_selftest */
 
 /* Task iteration uses task_get_all() from process.h */
 
@@ -527,33 +528,55 @@ void edr_advanced_init_process(task_t* task) {
     /* Enable advanced detection by default */
     state->advanced_detection_enabled = true;
     state->advanced_alert_count = 0;
+    state->last_print_tick = 0;
+    state->last_print_rank = 0;   /* 0 = nothing printed yet */
 }
 
 /*=============================================================================
  * ALERT GENERATION AND RESPONSE
  *=============================================================================*/
 
-/* Rate limiting state */
-static uint32_t last_alert_tick = 0;
+/* Every advanced alert raised, and how many the console rate limit kept
+ * quiet. Shown by `secstatus`. */
 static uint32_t total_advanced_alerts = 0;
+static uint32_t advanced_alerts_unprinted = 0;
+
+void edr_advanced_get_alert_stats(uint32_t* raised, uint32_t* unprinted) {
+    if (raised) *raised = total_advanced_alerts;
+    if (unprinted) *unprinted = advanced_alerts_unprinted;
+}
 
 /**
  * @brief Raise an advanced threat alert
+ *
+ * The rate limit governs the CONSOLE LINE, never the record, and it is per
+ * task. It used to be one GLOBAL 50-tick window that returned before
+ * advanced_alert_count was bumped, so any task's alert erased every other
+ * task's for the next 50 ticks -- one process could keep a second one off the
+ * record entirely. A terminating alert outranks a non-terminating one and
+ * always prints. verify-edr-alert-record.sh.
  */
 static void edr_advanced_raise_alert(task_t* task, edr_advanced_signature_t signature,
                                       const char* message, bool terminate) {
     if (!task || !task->edr_advanced) return;
 
-    /* Rate limiting: Max 1 alert per 50 ticks globally */
+    edr_advanced_state_t* state = task->edr_advanced;
     uint32_t current_tick = pit_get_ticks();
-    if (current_tick - last_alert_tick < 50) {
+    uint8_t rank = terminate ? 2 : 1;
+
+    if (state->advanced_alert_count < 0xFFFF) {
+        state->advanced_alert_count++;
+    }
+    total_advanced_alerts++;
+
+    if (state->last_print_rank != 0 &&
+        current_tick - state->last_print_tick < 50 &&
+        rank <= state->last_print_rank) {
+        advanced_alerts_unprinted++;
         return;
     }
-    last_alert_tick = current_tick;
-
-    /* Update stats */
-    task->edr_advanced->advanced_alert_count++;
-    total_advanced_alerts++;
+    state->last_print_tick = current_tick;
+    state->last_print_rank = rank;
 
     /* Log alert */
     kprintf("[EDR ADVANCED] PID %d: %s (sig=%s, terminate=%d)\n",
@@ -712,3 +735,59 @@ const char* edr_advanced_signature_to_string(edr_advanced_signature_t signature)
         default: return "UNKNOWN";
     }
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * verify-edr-alert-record.sh only. Not in the command table.
+ *
+ * Raises a fixed burst of alerts against three static task_t shells that are
+ * never in the task table (PIDs 9997-9999), so the record each burst leaves
+ * can be read back without staging a real attack and without disturbing the
+ * shell's own EDR state. The whole burst lands inside one rate-limit window.
+ * One EDRALERT line per task reports the RECORD; the harness counts the
+ * console lines the alerts print, which is the other half.
+ *===========================================================================*/
+static task_t edralert_beh;
+static task_t edralert_adv_a;
+static task_t edralert_adv_b;
+static edr_advanced_state_t edralert_state_a;
+static edr_advanced_state_t edralert_state_b;
+
+void edr_alert_selftest(void) {
+    task_t* b = &edralert_beh;
+    memset(b, 0, sizeof(*b));
+    b->pid = 9999;
+    edr_behavioral_init(b);
+    for (int i = 0; i < 4; i++) {
+        edr_raise_alert(b, EDR_SEVERITY_WARNING, EDR_SIG_SYSCALL_FLOOD, "selftest warning");
+    }
+    for (int i = 0; i < 2; i++) {
+        edr_raise_alert(b, EDR_SEVERITY_CRITICAL, EDR_SIG_SHELLCODE_EXEC, "selftest critical");
+    }
+    kprintf("EDRALERT beh pid=%u count=%u last_sig=%s\n", b->pid,
+            (unsigned)b->edr_state.alert_count,
+            edr_signature_to_string((edr_signature_t)b->edr_state.last_signature));
+
+    task_t* a = &edralert_adv_a;
+    task_t* c = &edralert_adv_b;
+    memset(a, 0, sizeof(*a));
+    memset(c, 0, sizeof(*c));
+    memset(&edralert_state_a, 0, sizeof(edralert_state_a));
+    memset(&edralert_state_b, 0, sizeof(edralert_state_b));
+    a->pid = 9998;
+    c->pid = 9997;
+    a->edr_advanced = &edralert_state_a;
+    c->edr_advanced = &edralert_state_b;
+    edr_advanced_init_process(a);
+    edr_advanced_init_process(c);
+    for (int i = 0; i < 4; i++) {
+        edr_advanced_raise_alert(a, EDR_SIG_ADV_C2_BEACON, "selftest beacon", false);
+    }
+    edr_advanced_raise_alert(a, EDR_SIG_ADV_RANSOMWARE, "selftest ransomware", true);
+    edr_advanced_raise_alert(c, EDR_SIG_ADV_C2_BEACON, "selftest beacon", false);
+    kprintf("EDRALERT adv pid=%u count=%u\n", a->pid,
+            (unsigned)a->edr_advanced->advanced_alert_count);
+    kprintf("EDRALERT adv pid=%u count=%u\n", c->pid,
+            (unsigned)c->edr_advanced->advanced_alert_count);
+}
+#endif
