@@ -334,8 +334,10 @@ static void scheduler_remove_task_locked(task_t* task) {
         current = current->next;
     } while (current != ready_queue_head);
 
-    kprintf("[SCHEDULER] WARNING: Task PID=%d '%s' not found in ready queue!\n",
-            task->pid, task->name);
+    /* Not a fault: every exiting user task is unlinked before it is reaped,
+     * so the reaper's removal lands here each time. kdbg, not a WARNING. */
+    kdbg("[SCHEDULER] Task PID=%d '%s' not in ready queue (already unlinked)\n",
+         task->pid, task->name);
 }
 
 void scheduler_remove_task(task_t* task) {

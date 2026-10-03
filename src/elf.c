@@ -230,15 +230,15 @@ bool elf_verify_signature(const void* elf_data, size_t elf_size) {
     /* Verify hash matches */
     if (memcmp(computed_hash, sig->hash, 32) != 0) {
         kprintf("[ELF] ERROR: Hash mismatch!\n");
-        kprintf("[ELF]   Stored:   ");
-        for (int i = 0; i < 32; i++) kprintf("%02x", sig->hash[i]);
-        kprintf("\n[ELF]   Computed: ");
-        for (int i = 0; i < 32; i++) kprintf("%02x", computed_hash[i]);
-        kprintf("\n");
+        kdbg("[ELF]   Stored:   ");
+        for (int i = 0; i < 32; i++) kdbg("%02x", sig->hash[i]);
+        kdbg("\n[ELF]   Computed: ");
+        for (int i = 0; i < 32; i++) kdbg("%02x", computed_hash[i]);
+        kdbg("\n");
         return false;
     }
 
-    kprintf("[ELF] Hash verification: PASS\n");
+    kdbg("[ELF] Hash verification: PASS\n");
 
     /* SECURITY: Pin the verification key. The trailer carries the signer's
      * public key, but an attacker controls the trailer; only accept the
@@ -277,12 +277,10 @@ bool elf_verify_signature(const void* elf_data, size_t elf_size) {
     bool valid = ecdsa_verify(&signature, computed_hash, &public_key);
     restore_interrupts(verify_flags);
 
-    if (valid) {
-        kprintf("[ELF] Signature verification: PASS\n");
-        kprintf("[ELF] Public key X: ");
-        for (int i = 0; i < 8; i++) kprintf("%02x", sig->pub_key_x[i]);
-        kprintf("...\n");
-    } else {
+    /* The PASS verdict is printed once, by the loader, with the binary's
+     * name. The key is not printed: it was just checked equal to the pinned
+     * trusted key, so it says nothing the boot banner does not. */
+    if (!valid) {
         kprintf("[ELF] ERROR: Signature verification FAILED!\n");
     }
 
@@ -438,7 +436,7 @@ int elf_exec_from_path(const char* path, const char* name,
         goto out;
     }
 
-    kprintf("[EXEC] File size: %u bytes\n", file_size);
+    kdbg("[EXEC] File size: %u bytes\n", file_size);
 
     int pid = elf_load_process_argv(exec_buffer, file_size, name, argc, argv);
     if (pid < 0) {
@@ -481,8 +479,39 @@ int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
  * FUNCTION: elf_load_process_argv
  * PURPOSE: Load ELF executable and create a process, passing it an argv vector
  *=============================================================================*/
+/* Load outcomes, shown by secstatus. SYS_SPAWN lets any ring-3 caller run
+ * this path in a loop; the load trace it used to print (file size, signer key,
+ * a 12-line header dump) is kdbg now, and these counts are what remains on
+ * the default console besides the one verdict line per load. */
+static uint32_t elf_loads_verified = 0;   /* signature checked and good      */
+static uint32_t elf_loads_unsigned = 0;   /* loaded unchecked (permissive)   */
+static uint32_t elf_loads_refused = 0;    /* every failed load, any reason   */
+static uint32_t elf_refused_sig = 0;      /* ...of which: bad/no signature   */
+
+void elf_get_load_stats(uint32_t* verified, uint32_t* unsigned_loaded,
+                        uint32_t* refused, uint32_t* refused_signature) {
+    if (verified)          *verified          = elf_loads_verified;
+    if (unsigned_loaded)   *unsigned_loaded   = elf_loads_unsigned;
+    if (refused)           *refused           = elf_loads_refused;
+    if (refused_signature) *refused_signature = elf_refused_sig;
+}
+
+static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
+                                      const char* name, int argc,
+                                      const char* const* argv);
+
 int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
                           int argc, const char* const* argv) {
+    int pid = elf_load_process_argv_impl(elf_data, elf_size, name, argc, argv);
+    if (pid < 0) {
+        elf_loads_refused++;
+    }
+    return pid;
+}
+
+static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
+                                      const char* name, int argc,
+                                      const char* const* argv) {
     kdbg("[ELF] Loading process '%s' (file size: %zu bytes)...\n", name, elf_size);
 
     /*=========================================================================
@@ -576,24 +605,30 @@ int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* nam
                                    ? elf_verify_signature(elf_data, elf_size)
                                    : false;
 
+    /* One verdict line per load, either way (kprintf.h: verdicts are never
+     * kdbg). It used to be three lines on each side plus the signer key. */
     if (has_valid_signature) {
-        kprintf("[ELF]  Binary '%s' has valid ECDSA signature\n", name);
+        elf_loads_verified++;
+        kprintf("[ELF] Signature verification: PASS ('%s')\n", name);
     } else {
         /* No signature or verification failed */
         if (elf_require_signatures) {
             /* ENFORCE mode: Block unsigned/invalid binaries */
-            kprintf("[ELF] SECURITY: Rejecting unsigned/invalid binary '%s'\n", name);
-            kprintf("[ELF] ERROR: Signature verification required (enforce mode)\n");
-            kprintf("[ELF] HINT: Sign with tools/sign_elf.py\n");
+            elf_refused_sig++;
+            kprintf("[ELF] SECURITY: Rejecting unsigned/invalid binary '%s' "
+                    "(enforce mode; sign with tools/sign_elf.py)\n", name);
             return -1;
         } else {
             /* PERMISSIVE mode: Warn but allow */
+            elf_loads_unsigned++;
             kprintf("[ELF] WARNING: Loading unsigned binary '%s' (permissive mode)\n", name);
         }
     }
 
-    // Dump header for debugging
-    elf_dump_header(elf_data);
+    // Dump header for debugging -- 12 lines per load, so only under kdbg
+    if (kdbg_enabled) {
+        elf_dump_header(elf_data);
+    }
 
     const elf32_ehdr_t* ehdr = (const elf32_ehdr_t*)elf_data;
 

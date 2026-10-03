@@ -158,6 +158,11 @@ bool elf_validate(const void* elf_data);
  */
 bool elf_verify_signature(const void* elf_data, size_t elf_size);
 
+/* Load outcomes since boot (secstatus). `refused` counts every failed load;
+ * `refused_signature` is the subset refused for a missing or bad signature. */
+void elf_get_load_stats(uint32_t* verified, uint32_t* unsigned_loaded,
+                        uint32_t* refused, uint32_t* refused_signature);
+
 /*-----------------------------------------------------------------------------
  * Report whether unsigned binaries are actually rejected. This is the real
  * gate (-DELF_PERMISSIVE_SIGNATURES), and it is the ONLY one: secure_boot.c

@@ -1562,11 +1562,13 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     // Set state to ready
     task->state = TASK_STATE_READY;
 
-    kprintf("[PROCESS] Created user task PID=%d '%s' entry=0x%x\n",
-            task->pid, task->name, entry);
-    kprintf("[PROCESS]   User stack: 0x%08x (ASLR randomized)\n",
-            task->user_stack);
-    kprintf("[PROCESS]   Private /tmp: %s\n", task->private_tmp_dir);
+    /* kdbg, not kprintf: this ran on every SYS_SPAWN, and it put the child's
+     * randomized stack address on the console every user's output shares. */
+    kdbg("[PROCESS] Created user task PID=%d '%s' entry=0x%x\n",
+         task->pid, task->name, entry);
+    kdbg("[PROCESS]   User stack: 0x%08x (ASLR randomized)\n",
+         task->user_stack);
+    kdbg("[PROCESS]   Private /tmp: %s\n", task->private_tmp_dir);
 
     return task->pid;
 }

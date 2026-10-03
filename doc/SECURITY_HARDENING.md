@@ -217,6 +217,10 @@ uint32_t aslr_get_random_stack_base(uint32_t stack_size_pages) {
 [ASLR] Demo tasks created - observe different stack addresses above
 ```
 
+The boot demo has since been removed, and the `[PROCESS]` lines are now `kdbg`
+traces (`loglevel debug` shows them): on the default console they put every
+spawned child's randomized stack address in front of whoever was reading it.
+
 ### Shell Command Usage
 
 ```bash

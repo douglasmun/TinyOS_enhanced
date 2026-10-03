@@ -1147,7 +1147,7 @@ void pae_free_user_pdpt(uint32_t pdpt_phys) {
         return;
     }
 
-    kprintf("[PAE] Freeing user PDPT at phys=0x%08x\n", pdpt_phys);
+    kdbg("[PAE] Freeing user PDPT at phys=0x%08x\n", pdpt_phys);
 
     /* All RAM is identity-mapped in PAE mode */
     pae_pdpte_t* user_pdpt = (pae_pdpte_t*)(uintptr_t)pdpt_phys;
@@ -1186,7 +1186,7 @@ void pae_free_user_pdpt(uint32_t pdpt_phys) {
         pmm_free(pd_phys);
     }
 
-    kprintf("[PAE] Freed %d user page tables\n", freed_count);
+    kdbg("[PAE] Freed %d user page tables\n", freed_count);
 
     pmm_free(pdpt_phys);
 }

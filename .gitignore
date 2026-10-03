@@ -283,5 +283,7 @@ tcpquiet.log
 tcpquiet-trace.log
 sysioquiet.log
 sysioquiet-trace.log
+spawnquiet.log
+spawnquiet-trace.log
 kecho.log
 kecho-trace.log
