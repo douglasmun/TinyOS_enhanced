@@ -84,7 +84,7 @@ echo
 # page is freed by a bare pmm_free() that bypasses the helper.
 #
 # On (b), three bare pmm_free() sites are CORRECT and must not be flagged:
-#   process.c:660, 1095  — failure paths ABOVE the map_page() that creates the
+#   process.c:660, 1095  — failure paths ABOVE the kernel_identity_map() that creates the
 #                          not-present PTE, so there is no mapping to restore.
 #   process.c:1212, 1751 — the USER guard page, which lives in the per-task
 #                          PAE address space, not the shared identity map;
@@ -103,15 +103,19 @@ BODY=$(awk '/^static void guard_page_release\(uint32_t guard_phys\)/,/^}/' "$SRC
 if [ -z "$BODY" ]; then
     fail "guard_page_release() not found — the fix is gone entirely"
 else
-    L_MAP=$(printf '%s\n' "$BODY" | grep -n "map_page(guard_phys, guard_phys" | head -1 | cut -d: -f1)
+    # kernel_identity_map(), not map_page(): since 98491d0 the guard is marked
+    # not-present in the KERNEL tables, and map_page() would restore it in the
+    # current CR3, which at exit is the dying task's -- leaving the kernel's
+    # entry not-present and the frame poisoned exactly as before the fix.
+    L_MAP=$(printf '%s\n' "$BODY" | grep -n "kernel_identity_map(guard_phys," | head -1 | cut -d: -f1)
     L_FLUSH=$(printf '%s\n' "$BODY" | grep -n "flush_tlb_single(guard_phys)" | head -1 | cut -d: -f1)
     L_FREE=$(printf '%s\n' "$BODY" | grep -n "pmm_free(guard_phys)" | head -1 | cut -d: -f1)
 
     if [ -z "$L_MAP" ] || [ -z "$L_FLUSH" ] || [ -z "$L_FREE" ]; then
-        fail "guard_page_release() is missing map_page / flush_tlb_single / pmm_free"
+        fail "guard_page_release() is missing kernel_identity_map / flush_tlb_single / pmm_free"
         info "map=${L_MAP:-absent} flush=${L_FLUSH:-absent} free=${L_FREE:-absent}"
     elif [ "$L_MAP" -lt "$L_FLUSH" ] && [ "$L_FLUSH" -lt "$L_FREE" ]; then
-        pass "guard_page_release(): map_page -> flush_tlb_single -> pmm_free, in order"
+        pass "guard_page_release(): kernel_identity_map -> flush_tlb_single -> pmm_free, in order"
     else
         fail "guard_page_release() has the calls in the WRONG ORDER"
         info "map=$L_MAP flush=$L_FLUSH free=$L_FREE (need map < flush < free)"
@@ -135,7 +139,7 @@ fi
 
 # (b) no kernel guard freed outside the helper
 # Exemption is CONTENT-based, not line-based: the two legitimate bare frees
-# sit on failure paths ABOVE the map_page() that creates the not-present PTE,
+# sit on failure paths ABOVE the kernel_identity_map() that creates the not-present PTE,
 # and each is marked with the comment below. Keying on line numbers would let
 # any edit that shifts the file silently re-exempt a real site (and did, until
 # a negative control shifted process.c by 8 lines).
@@ -204,8 +208,12 @@ trap cleanup EXIT
 # verify-exec-frame-leak.sh — the subject is kernel teardown, not a ring-3
 # boundary.
 #
-# Each exec is verified on "Process exited" so the next is not typed until the
-# previous task is reaped and its guard frames are actually back in the PMM.
+# Each exec is verified on "[EXEC] Process completed" so the next is not typed
+# until the previous task is reaped and its guard frames are actually back in
+# the PMM.
+# "[EXEC] Process completed", not "Process exited": the latter was the exit
+# syscall's console line, removed when exit went quiet (999f83d), and it fired
+# BEFORE the reap. cmd_exec prints this one after reaping, as its last line.
 # The trailing ls/cat/mem are ALLOCATION PRESSURE: they exist to get a recycled
 # frame handed out and touched while we are still watching.
 TINYOS_SERIAL="$SERIAL" \
@@ -215,14 +223,14 @@ TINYOS_FOLLOWUP_TIMEOUT=900 \
 TINYOS_EXEC_CMD="mem" \
 TINYOS_EXPECT="Free:" \
 TINYOS_FOLLOWUP_CMDS="\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
 ls /=>hello.elf;\
 ps=>PID;\
 mem=>Free:" \
@@ -241,7 +249,7 @@ fi
 CLEAN=$(mktemp "${TMPDIR:-/tmp}/guardpg.XXXXXX")
 tr -d '\r' < "$SERIAL" | grep -v Suspicious > "$CLEAN"
 
-CYCLES=$(grep -c "Process exited" "$CLEAN")
+CYCLES=$(grep -cF "[EXEC] Process completed" "$CLEAN")
 echo "  exec cycles completed: $CYCLES (requested 8)"
 
 if [ "$CYCLES" -lt 4 ]; then
