@@ -1144,6 +1144,27 @@ bool tcp_owner_visible(int sockfd) {
     return tcp_connections[sockfd].owner_uid == (uint32_t)self->uid;
 }
 
+#ifdef TINYOS_FAULT_INJECT
+/* verify-tcpsock-race.sh only: stand in for "the slot was freed and another
+ * user's socket now occupies it" without needing the allocator to cooperate. */
+void tcp_fault_reassign_owner(int sockfd, uint32_t uid) {
+    if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return;
+    TCP_LOCK();
+    tcp_connections[sockfd].owner_uid = uid;
+    TCP_UNLOCK();
+}
+
+/* Owner uid of an in-use slot, or -1 if the slot is free. */
+int tcp_fault_slot_owner(int sockfd) {
+    if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return -1;
+    TCP_LOCK();
+    int owner = tcp_connections[sockfd].in_use
+                    ? (int)tcp_connections[sockfd].owner_uid : -1;
+    TCP_UNLOCK();
+    return owner;
+}
+#endif
+
 /**
  * @brief Create a TCP socket
  */

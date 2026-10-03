@@ -913,6 +913,10 @@ static void parse_and_execute(char* cmd_line) {
     else if (strcmp(argv[0], "rowtest") == 0) {
         editor_rowtest();
     }
+    /* verify-tcpsock-race.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "tcpsockrace") == 0) {
+        sys_tcpsock_race_test();
+    }
     /* verify-guard-sync.sh only. Not in the command table. */
     else if (strcmp(argv[0], "guardsync") == 0) {
         task_guardsync_test();

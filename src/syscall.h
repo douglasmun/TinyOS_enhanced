@@ -862,6 +862,11 @@ int sys_nettx(const void* user_buf, size_t len);
 int sys_netstat(uint32_t subcmd, int sockfd, void* user_buf, size_t len);
 int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len);
 
+#ifdef TINYOS_FAULT_INJECT
+/* verify-tcpsock-race.sh only (kernel-shell `tcpsockrace`). */
+void sys_tcpsock_race_test(void);
+#endif
+
 /**
  * @brief Change the caller's cwd.
  *
