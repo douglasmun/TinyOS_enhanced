@@ -251,6 +251,12 @@ uint32_t pae_create_user_pdpt(void);
 void pae_free_user_pdpt(uint32_t pdpt_phys);
 
 /**
+ * @brief Copy the kernel identity-map PTE for phys into every user PDPT's
+ *        private page-table copy (guard pages; see pae.c). Caller flushes.
+ */
+void pae_sync_identity_pte(uint32_t phys);
+
+/**
  * @brief Enable NX (No eXecute) bit in EFER MSR
  * Required for W^X enforcement
  * @return true if NX was enabled, false if not supported

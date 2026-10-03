@@ -1943,6 +1943,40 @@ static int tcpsock_check_owner(int sockfd) {
     return 0;
 }
 
+/* The check above runs before copy_from_user and outside TCP_LOCK, so on its
+ * own it answers for the slot as it WAS: freed and reallocated to another
+ * user in between, the primitive would act on that user's connection. This
+ * re-asks under the lock and, on success, RETURNS WITH IT HELD across the
+ * primitive (critical sections nest, so tcp_*'s own TCP_LOCK is fine). The
+ * caller releases it before any copy to user memory: a fault taken with
+ * interrupts masked is a double fault. verify-tcpsock-race.sh. */
+static int tcpsock_lock_owned(int sockfd) {
+    CRITICAL_SECTION_ENTER();
+    if (!tcp_owner_visible(sockfd)) {
+        CRITICAL_SECTION_EXIT();
+        return -EBADF;
+    }
+    return 0;
+}
+
+#ifdef TINYOS_FAULT_INJECT
+/* The window between tcpsock_check_owner() and the primitive's use of the
+ * slot, made deterministic: when armed, the next SYS_TCPSOCK call hands its
+ * slot to uid 0 at exactly that point, as a free-and-reallocate by another
+ * user would. */
+static bool tcpsock_race_armed;
+static bool tcpsock_race_fired;
+static void tcpsock_race_point(int sockfd) {
+    if (tcpsock_race_armed) {
+        tcpsock_race_armed = false;
+        tcpsock_race_fired = true;
+        tcp_fault_reassign_owner(sockfd, 0);
+    }
+}
+#else
+#define tcpsock_race_point(sockfd) ((void)0)
+#endif
+
 int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -1981,7 +2015,11 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
          * mapped per-cause: the causes are kernel-side resource state, and
          * distinguishing them here would tell an unprivileged caller how full
          * the half-open table is. */
-        if (tcp_connect(sockfd, req.remote_ip, req.remote_port) < 0) {
+        tcpsock_race_point(sockfd);
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
+        int crc = tcp_connect(sockfd, req.remote_ip, req.remote_port);
+        CRITICAL_SECTION_EXIT();
+        if (crc < 0) {
             return -EHOSTUNREACH;
         }
         return 0;
@@ -2001,7 +2039,10 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
         if (copy_from_user(tcpsock_staging, user_buf, len) < 0) {
             return -EFAULT;
         }
+        tcpsock_race_point(sockfd);
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
         int sent = tcp_send(sockfd, tcpsock_staging, len);
+        CRITICAL_SECTION_EXIT();
         if (sent < 0) {
             return -ENOTCONN;
         }
@@ -2021,7 +2062,10 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
          * TCP_LOCK (interrupts masked); copy_to_user can fault, and a page
          * fault taken with interrupts masked is how this becomes a double
          * fault. The two steps stay separate -- same rule as sys_netrx. */
+        tcpsock_race_point(sockfd);
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
         int got = tcp_recv(sockfd, tcpsock_staging, len);
+        CRITICAL_SECTION_EXIT();
         if (got < 0) {
             return -ENOTCONN;
         }
@@ -2037,7 +2081,11 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
     case TCPSOCK_CLOSE: {
         int rc = tcpsock_check_owner(sockfd);
         if (rc < 0) return rc;
-        if (tcp_close(sockfd) < 0) {
+        tcpsock_race_point(sockfd);
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
+        int clrc = tcp_close(sockfd);
+        CRITICAL_SECTION_EXIT();
+        if (clrc < 0) {
             return -EBADF;
         }
         return 0;
@@ -2047,6 +2095,81 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
         return -EINVAL;
     }
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/* Drives sys_tcpsock as uid 1000 (NOT root: tcp_owner_visible() lets euid 0
+ * see every socket, which would pass any version of this). RECV and CLOSE need
+ * no copy-in, so a kernel caller reaches them with no user buffer.
+ *
+ *   arm1  RECV on a slot handed to uid 0 mid-call: must be -EBADF. Acting on
+ *         it reads as -ENOTCONN (the foreign socket is not connected).
+ *   arm2  CLOSE likewise: must be -EBADF AND the foreign socket must survive.
+ *   arm3  CLOSE on our own socket, unarmed: must succeed (positive control). */
+void sys_tcpsock_race_test(void) {
+    stream_context_t* out = get_current_streams();
+    task_t* self = scheduler_get_current_task();
+    if (!self) return;
+    uint16_t saved_uid = self->uid, saved_euid = self->euid;
+    uint8_t dummy[4];
+    bool ok = true;
+
+    stream_printf(out, "[TCPSOCKRACE] owner re-check at the point of use\n");
+    self->uid = 1000;
+    self->euid = 1000;
+
+    /* One socket at a time: TCP_USER_MAX_SOCKETS is 2, and a slot handed to
+     * uid 0 stops counting against uid 1000. */
+    int fd1 = sys_tcpsock(TCPSOCK_SOCKET, 0, NULL, 0);
+    int fd2 = -1, fd3 = -1;
+    if (fd1 >= 0) {
+        tcpsock_race_fired = false;
+        tcpsock_race_armed = true;
+        int r1 = sys_tcpsock(TCPSOCK_RECV, fd1, dummy, sizeof(dummy));
+        bool c1 = tcpsock_race_fired && tcp_fault_slot_owner(fd1) == 0;
+        stream_printf(out, "[TCPSOCKRACE] arm1 control: %s\n", c1 ? "ok" : "CONTROL-DEAD");
+        stream_printf(out, "[TCPSOCKRACE] arm1 recv on reassigned slot rc=%d: %s\n",
+                      r1, r1 == -EBADF ? "PASS" : "FAIL");
+        ok = ok && c1 && r1 == -EBADF;
+        fd2 = sys_tcpsock(TCPSOCK_SOCKET, 0, NULL, 0);
+    }
+    if (fd2 >= 0) {
+        tcpsock_race_fired = false;
+        tcpsock_race_armed = true;
+        int r2 = sys_tcpsock(TCPSOCK_CLOSE, fd2, NULL, 0);
+        bool c2 = tcpsock_race_fired;
+        bool alive = tcp_fault_slot_owner(fd2) == 0;
+        stream_printf(out, "[TCPSOCKRACE] arm2 control: %s\n", c2 ? "ok" : "CONTROL-DEAD");
+        stream_printf(out, "[TCPSOCKRACE] arm2 close on reassigned slot rc=%d: %s\n",
+                      r2, r2 == -EBADF ? "PASS" : "FAIL");
+        stream_printf(out, "[TCPSOCKRACE] arm2 foreign socket survived: %s\n",
+                      alive ? "PASS" : "FAIL");
+        ok = ok && c2 && r2 == -EBADF && alive;
+        tcpsock_race_armed = false;
+        fd3 = sys_tcpsock(TCPSOCK_SOCKET, 0, NULL, 0);
+    }
+    if (fd3 >= 0) {
+        int r3 = sys_tcpsock(TCPSOCK_CLOSE, fd3, NULL, 0);
+        stream_printf(out, "[TCPSOCKRACE] arm3 own close rc=%d: %s\n",
+                      r3, r3 == 0 ? "PASS" : "FAIL");
+        ok = ok && r3 == 0;
+    }
+    bool c0 = fd1 >= 0 && fd2 >= 0 && fd3 >= 0;
+    stream_printf(out, "[TCPSOCKRACE] sockets: %s (fds %d %d %d)\n",
+                  c0 ? "ok" : "CONTROL-DEAD", fd1, fd2, fd3);
+    ok = ok && c0;
+
+    tcpsock_race_armed = false;
+    self->uid = saved_uid;
+    self->euid = saved_euid;
+    /* Whatever survived (the slots now "owned" by uid 0, or a leftover from
+     * a failed arm) is closed as the kernel. */
+    if (fd1 >= 0 && tcp_fault_slot_owner(fd1) >= 0) tcp_close(fd1);
+    if (fd2 >= 0 && tcp_fault_slot_owner(fd2) >= 0) tcp_close(fd2);
+    if (fd3 >= 0 && tcp_fault_slot_owner(fd3) >= 0) tcp_close(fd3);
+
+    stream_printf(out, "[TCPSOCKRACE] VERDICT: %s\n", ok ? "PASS" : "FAIL");
+}
+#endif
 
 int sys_chdir(const char* user_path) {
     task_t* self = scheduler_get_current_task();

@@ -266,6 +266,11 @@ int tcp_available(int sockfd);
  */
 bool tcp_owner_visible(int sockfd);
 
+#ifdef TINYOS_FAULT_INJECT
+void tcp_fault_reassign_owner(int sockfd, uint32_t uid);
+int tcp_fault_slot_owner(int sockfd);
+#endif
+
 /*=============================================================================
  * Observable socket state, filled under TCP_LOCK() by tcp_snapshot().
  *

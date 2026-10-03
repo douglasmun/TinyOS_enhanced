@@ -718,6 +718,11 @@ void task_terminate(uint32_t pid);
  */
 void task_free_resources(task_t* task);
 
+#ifdef TINYOS_FAULT_INJECT
+/* verify-guard-sync.sh only: private PT copies vs kernel guard pages. */
+void task_guardsync_test(void);
+#endif
+
 /**
  * @brief Exit current task
  */
