@@ -884,6 +884,33 @@ int user_authenticate(const char* username, const char* password) {
     return user_authenticate_for(username, password, USER_AUTH_OP_LOGIN);
 }
 
+/* Spend what a password verification spends, and throw the result away.
+ *
+ * Every refusal in user_authenticate_for() that comes BEFORE the password is
+ * checked (no such user, no password set, locked, inactive) used to return in
+ * microseconds, while a wrong password costs a full PBKDF2. That gap is a
+ * username oracle at syscall rate: ring 3 can read rdtsc, and the legacy
+ * SYS_SWITCH_USER answers per call. Each early return calls this first, so all
+ * refusals cost the same KDF a wrong password does. Same function, same
+ * iteration count, same lock and interrupt masking as
+ * user_verify_password_locked() -- this is not a cheaper stand-in.
+ * verify-legacy-su-oracle.sh. */
+static void auth_equalize_cost(const char* password) {
+    static const uint8_t dummy_salt[PBKDF2_SALT_LEN] = {
+        't', 'i', 'n', 'y', 'o', 's', '-', 'n', 'o', '-', 'u', 's', 'e', 'r', 0, 0
+    };
+    uint8_t dk[PBKDF2_HASH_LEN];
+
+    mutex_lock(&user_db_mutex);
+    CRITICAL_SECTION_ENTER();
+    pbkdf2_hmac_sha256((const uint8_t*)password, strlen(password),
+                       dummy_salt, sizeof(dummy_salt),
+                       PBKDF2_ITERATIONS, sizeof(dk), dk);
+    CRITICAL_SECTION_EXIT();
+    mutex_unlock(&user_db_mutex);
+    crypto_secure_zero(dk, sizeof(dk));
+}
+
 int user_authenticate_for(const char* username, const char* password,
                           user_auth_op_t op) {
     const audit_event_type_t fail_event = auth_failure_event(op);
@@ -905,6 +932,7 @@ int user_authenticate_for(const char* username, const char* password,
          * would otherwise be the least-observed path in the auth system. */
         ids_register_login_failure(username);
 
+        auth_equalize_cost(password);
         return -2;  /* User not found */
     }
 
@@ -924,6 +952,7 @@ int user_authenticate_for(const char* username, const char* password,
         /* Account has no password set yet */
         audit_log(fail_event, AUDIT_INFO, user->uid,
                   "%s failed: account '%s' has no password set", verb, username);
+        auth_equalize_cost(password);
         return -6;  /* No password set */
     }
 
@@ -939,6 +968,7 @@ int user_authenticate_for(const char* username, const char* password,
             audit_log(fail_event, AUDIT_WARN, user->uid,
                       "%s failed: account '%s' is locked due to failed attempts",
                       verb, username);
+            auth_equalize_cost(password);
             return -3;  /* Account locked */
         } else {
             /* Unlock account */
@@ -958,6 +988,7 @@ int user_authenticate_for(const char* username, const char* password,
         /* Audit: Login attempt on inactive account */
         audit_log(fail_event, AUDIT_WARN, user->uid,
                   "%s failed: account '%s' is inactive", verb, username);
+        auth_equalize_cost(password);
         return -4;  /* Account inactive */
     }
 

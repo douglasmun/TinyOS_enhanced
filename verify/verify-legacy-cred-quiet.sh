@@ -109,9 +109,11 @@ echo "  probe rc pairs (switch/change): $PAIRS"
 
 # root->creduser 0, then creduser's wrong old password -EPERM(-1)
 # creduser: root wrong password -1, wrong old password -1
-# creduser: unknown user -EINVAL(-22), correct change 0
+# creduser: unknown user -EPERM(-1) -- the same answer as a wrong password, so
+#           the name's existence is not revealed (verify-legacy-su-oracle.sh);
+#           then a correct change 0
 # creduser: authenticated switch 0, correct change 0
-EXPECT="0/-1 -1/-1 -22/0 0/0 "
+EXPECT="0/-1 -1/-1 -1/0 0/0 "
 if [ "$PAIRS" != "$EXPECT" ]; then
     echo "RESULT: FAIL — probe legs did not take the intended paths (want '$EXPECT')"
     echo "  Nothing below is graded; check the typist reached every leg."

@@ -3259,8 +3259,8 @@ int sys_change_password(const char* old_password, const char* new_password) {
  * RETURN:
  * - 0 on success (process now running as target user)
  * - -EFAULT if pointers invalid
- * - -EINVAL if user not found
- * - -EPERM if authentication fails
+ * - -EINVAL if user not found (root only; see below)
+ * - -EPERM if authentication fails, or a non-root caller names no such user
  *-----------------------------------------------------------------------------*/
 /*-----------------------------------------------------------------------------
  * Shared tail of both switch_user entry points: re-check the account state and
@@ -3353,8 +3353,14 @@ int sys_switch_user(const char* username, const char* password) {
     /*=========================================================================
      * Lookup target user
      *=======================================================================*/
+    /* Only root learns "no such user" here. A non-root caller used to get
+     * -EINVAL for an unknown name and -EPERM for a wrong password, which made
+     * this syscall a username oracle; for it, an unknown name goes through
+     * user_authenticate_for() like any other and fails the same way, in the
+     * same time (auth_equalize_cost() in user.c). Root needs no oracle: it can
+     * read the account table. verify-legacy-su-oracle.sh. */
     user_account_t* target_user = user_find_by_username(kernel_username);
-    if (!target_user) {
+    if (!target_user && current->euid == 0) {
         audit_log(AUDIT_AUTH_SU_FAILURE, AUDIT_WARN, current->uid,
                   "Failed su attempt to unknown user");
         RETURN_ERROR(EINVAL);
@@ -3432,7 +3438,11 @@ int sys_switch_user(const char* username, const char* password) {
             RETURN_ERROR(EPERM);
         }
 
-        /* Authentication successful, switch user */
+        /* Authentication successful, switch user. Look the account up again:
+         * the one above may be NULL (an unknown name reaches the password
+         * check on purpose) or stale. */
+        target_user = user_find_by_username(kernel_username);
+        if (!target_user) RETURN_ERROR(EPERM);
         int rc = switch_user_commit(current, target_user, kernel_username);
         if (rc < 0) return rc;
 
