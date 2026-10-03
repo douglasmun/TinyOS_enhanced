@@ -934,6 +934,11 @@ static void parse_and_execute(char* cmd_line) {
     else if (strcmp(argv[0], "edralert") == 0) {
         edr_alert_selftest();
     }
+    /* verify-dispatch-block-quiet.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "edrblock") == 0) {
+        syscall_edr_block_arm();
+        kprintf("edrblock armed\n");
+    }
     /* verify-double-fault.sh only. Not in the command table, so it never
      * appears in `help`.
      *

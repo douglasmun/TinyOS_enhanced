@@ -594,6 +594,10 @@ typedef struct {
 void syscall_get_reject_stats(uint32_t* accepted, uint32_t* reject_range,
                               uint32_t* reject_unimpl);
 
+/* Calls blocked by a per-task syscall filter, and by an EDR behavioral
+ * verdict. Counted, not printed (an EDR block is audited once per task). */
+void syscall_get_block_stats(uint32_t* filter_blocked, uint32_t* edr_blocked);
+
 /* sys_read/sys_write refusals of a bad buffer (size cap, wraparound, beyond
  * user space, faulting copy) and failed SYS_SPAWNs. Counted, not printed. */
 void syscall_get_io_reject_stats(uint32_t* bad_buffer, uint32_t* spawn_failed);
@@ -872,6 +876,8 @@ void syscall_edr_selfkill_arm(void);
 bool syscall_exit_status_lookup(uint32_t pid, uint32_t generation, int* status);
 /* verify-waitpid-gate.sh only (kernel-shell `waitgate`). */
 void sys_waitgate_test(void);
+/* verify-dispatch-block-quiet.sh only: force both dispatcher block paths. */
+void syscall_edr_block_arm(void);
 #endif
 
 /**

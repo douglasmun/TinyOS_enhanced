@@ -1320,6 +1320,10 @@ void cmd_secstatus(int argc, char* argv[]) {
     syscall_get_reject_stats(&sc_ok, &sc_range, &sc_unimpl);
     stream_printf(ctx, "    Syscall dispatch .... %u accepted, %u out-of-range, %u unimplemented\n",
                   sc_ok, sc_range, sc_unimpl);
+    uint32_t blk_filter = 0, blk_edr = 0;
+    syscall_get_block_stats(&blk_filter, &blk_edr);
+    stream_printf(ctx, "    Syscall blocks ...... %u filter-blocked, %u edr-blocked\n",
+                  blk_filter, blk_edr);
     uint32_t io_bad = 0, io_spawn = 0;
     syscall_get_io_reject_stats(&io_bad, &io_spawn);
     stream_printf(ctx, "    Syscall arg rejects . %u bad-buffer, %u spawn-failed\n",

@@ -1992,6 +1992,40 @@ static void edr_selfkill_point(uint32_t syscall_num) {
     }
 }
 
+/* verify-dispatch-block-quiet.sh only. Neither of the dispatcher's two block
+ * paths has a live trigger: edr_detect_shellcode() is a placeholder that
+ * always returns false, and nothing enables a per-task syscall filter. When
+ * armed by `edrblock`, the first SYS_WRITE from a task whose name contains
+ * "hello" installs a filter on that task allowing everything except
+ * SYS_YIELD, and that write plus the next four are blocked as an EDR verdict
+ * would block them. hello.elf yields three times and writes eight lines, so
+ * it still runs to completion -- the blocks cost it output, not its life. */
+static bool edr_block_armed;
+static int edr_block_remaining;
+
+void syscall_edr_block_arm(void) {
+    edr_block_armed = true;
+    edr_block_remaining = 5;
+}
+
+static bool edr_block_point(uint32_t syscall_num) {
+    task_t* self = scheduler_get_current_task();
+    if (syscall_num != SYS_WRITE || !self || strstr(self->name, "hello") == NULL) {
+        return false;
+    }
+    if (edr_block_armed) {
+        edr_block_armed = false;
+        memset(self->syscall_filter, 0xFF, sizeof(self->syscall_filter));
+        self->syscall_filter[SYS_YIELD / 32] &= ~(1u << (SYS_YIELD % 32));
+        self->syscall_filter_enabled = true;
+    }
+    if (edr_block_remaining > 0) {
+        edr_block_remaining--;
+        return true;
+    }
+    return false;
+}
+
 /*=============================================================================
  * waitgate -- verify-waitpid-gate.sh only. Not in the command table.
  *
@@ -3557,12 +3591,20 @@ int sys_mseal(uint32_t addr, uint32_t size) {
 static uint32_t syscall_accepted = 0;
 static uint32_t syscall_reject_range = 0;   /* num > MAX_SYSCALL_NUM      */
 static uint32_t syscall_reject_unimpl = 0;  /* in range, no implementation */
+/* Blocks, likewise counted: both used to print a line per blocked call. */
+static uint32_t syscall_block_filter = 0;   /* per-task syscall filter */
+static uint32_t syscall_block_edr = 0;      /* EDR behavioral verdict  */
 
 void syscall_get_reject_stats(uint32_t* accepted, uint32_t* reject_range,
                               uint32_t* reject_unimpl) {
     if (accepted)       *accepted       = syscall_accepted;
     if (reject_range)   *reject_range   = syscall_reject_range;
     if (reject_unimpl)  *reject_unimpl  = syscall_reject_unimpl;
+}
+
+void syscall_get_block_stats(uint32_t* filter_blocked, uint32_t* edr_blocked) {
+    if (filter_blocked) *filter_blocked = syscall_block_filter;
+    if (edr_blocked)    *edr_blocked    = syscall_block_edr;
 }
 
 static void syscall_dispatch(struct cpu_state* state) {
@@ -3641,8 +3683,9 @@ static void syscall_dispatch(struct cpu_state* state) {
 
         // Check if syscall is allowed
         if (!(current_task->syscall_filter[idx] & (1 << bit))) {
-            kprintf("[SYSCALL FILTER] PID %d: Blocked syscall %d\n",
-                    current_task->pid, syscall_num);
+            /* Counted, not printed: a filtered task that keeps calling would
+             * otherwise drive the console at syscall rate. */
+            syscall_block_filter++;
             state->eax = (uint32_t)(-ENOSYS);  // Function not implemented
             return;
         }
@@ -3700,6 +3743,9 @@ static void syscall_dispatch(struct cpu_state* state) {
 
 #ifdef TINYOS_FAULT_INJECT
     edr_selfkill_point(syscall_num);
+    if (edr_block_point(syscall_num)) {
+        allow = false;
+    }
 #endif
 
     /* EDR decided, inside the check above, to kill the task making this
@@ -3714,14 +3760,20 @@ static void syscall_dispatch(struct cpu_state* state) {
     }
 
     if (!allow) {
-        /* Syscall blocked by behavioral analysis */
-        kprintf("[EDR BEHAVIORAL] PID %d: Blocked suspicious syscall %d\n",
-                current_task->pid, syscall_num);
-
-        /* AUDIT: Log blocked syscall for forensic analysis */
-        audit_log(AUDIT_SEC_POLICY_VIOLATION, AUDIT_CRITICAL, current_task->uid,
-                  "EDR blocked syscall %d for PID %d (%s)",
-                  (int)syscall_num, (int)current_task->pid, current_task->name);
+        /* Syscall blocked by behavioral analysis. Counted every time; audited
+         * once per task. This used to print a line AND write an AUDIT_CRITICAL
+         * record (which audit_log echoes to the console too) on EVERY blocked
+         * call, so a blocked task that kept calling flooded the console and
+         * cycled the volatile audit ring until everything else in it was
+         * gone. The first record names the task and the syscall; the count is
+         * in `secstatus`. verify-dispatch-block-quiet.sh. */
+        syscall_block_edr++;
+        if (!(current_task->edr_state.flags & EDR_FLAG_BLOCK_AUDITED)) {
+            current_task->edr_state.flags |= EDR_FLAG_BLOCK_AUDITED;
+            audit_log(AUDIT_SEC_POLICY_VIOLATION, AUDIT_CRITICAL, current_task->uid,
+                      "EDR blocked syscall %d for PID %d (%s)",
+                      (int)syscall_num, (int)current_task->pid, current_task->name);
+        }
 
         state->eax = (uint32_t)(-EPERM);  // Operation not permitted
         return;
