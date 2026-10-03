@@ -287,3 +287,4 @@ spawnquiet.log
 spawnquiet-trace.log
 kecho.log
 kecho-trace.log
+kprintfzu-trace.log
