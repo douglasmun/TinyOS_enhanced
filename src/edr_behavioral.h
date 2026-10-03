@@ -158,6 +158,12 @@ void edr_record_syscall(task_t* task, uint32_t syscall_num, uint32_t timestamp, 
  */
 void edr_raise_alert(task_t* task, edr_severity_t severity, edr_signature_t signature, const char* message);
 
+/**
+ * @brief Alerts raised since boot, and how many the console rate limit kept
+ *        off the console (every one of them is still counted per task)
+ */
+void edr_behavioral_get_alert_stats(uint32_t* raised, uint32_t* unprinted);
+
 /*=============================================================================
  * SIGNATURE DETECTION FUNCTIONS
  *=============================================================================*/

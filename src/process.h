@@ -422,7 +422,8 @@ typedef struct task {
 
         /* Last detection */
         uint8_t last_signature;     /* Last matched signature (edr_signature_t) */
-        uint32_t last_alert_tick;   /* Tick of last alert (rate limiting) */
+        uint32_t last_alert_tick;   /* Tick of last PRINTED alert (console rate limit) */
+        uint8_t last_alert_severity; /* Severity of that printed alert */
         uint32_t last_decay_tick;   /* Tick of last score decay (SECURITY: prevents timing evasion) */
     } edr_state;
 

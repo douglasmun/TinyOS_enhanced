@@ -323,6 +323,8 @@ typedef struct edr_advanced_state {
     /* Global flags */
     bool advanced_detection_enabled; /* Master switch (default: true) */
     uint16_t advanced_alert_count;   /* Number of advanced alerts */
+    uint32_t last_print_tick;        /* Tick of last PRINTED alert (console rate limit) */
+    uint8_t last_print_rank;         /* 1 = alert, 2 = terminating; 0 = none printed */
 } edr_advanced_state_t;
 
 /*=============================================================================
@@ -367,5 +369,16 @@ void edr_advanced_set_enabled(task_t* task, bool enabled);
  * @return String representation
  */
 const char* edr_advanced_signature_to_string(edr_advanced_signature_t signature);
+
+/**
+ * @brief Advanced alerts raised since boot, and how many the console rate
+ *        limit kept off the console (all are still counted per task)
+ */
+void edr_advanced_get_alert_stats(uint32_t* raised, uint32_t* unprinted);
+
+#ifdef TINYOS_FAULT_INJECT
+/* verify-edr-alert-record.sh only: alert record vs console rate limit. */
+void edr_alert_selftest(void);
+#endif
 
 #endif /* EDR_ADVANCED_H */
