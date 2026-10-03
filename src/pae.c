@@ -135,6 +135,13 @@ static bool nx_enabled = false;
 /* Kernel PDPT physical address (saved at initialization) */
 static uint32_t kernel_pdpt_phys = 0;
 
+/* Every live user PDPT, so a kernel identity-map edit can reach the private
+ * page-table copies pae_map_page_into() makes (pae_sync_identity_pte()).
+ * Sized for MAX_TASKS address spaces plus in-flight exec/test ones; a full
+ * registry refuses the new PDPT rather than leaving one untracked. */
+#define PAE_MAX_USER_PDPTS 64
+static uint32_t user_pdpts[PAE_MAX_USER_PDPTS];
+
 /*=============================================================================
  * Helper Functions
  *===========================================================================*/
@@ -1103,6 +1110,23 @@ uint32_t pae_create_user_pdpt(void) {
         }
     }
 
+    bool registered = false;
+    CRITICAL_SECTION_ENTER();
+    for (int i = 0; i < PAE_MAX_USER_PDPTS; i++) {
+        if (user_pdpts[i] == 0) {
+            user_pdpts[i] = pdpt_phys;
+            registered = true;
+            break;
+        }
+    }
+    CRITICAL_SECTION_EXIT();
+    if (!registered) {
+        /* Every PT is still kernel-shared, so this frees only the PDs and
+         * the PDPT. */
+        pae_free_user_pdpt(pdpt_phys);
+        return 0;
+    }
+
     kdbg("[PAE] Created user PDPT at phys=0x%08x\n", pdpt_phys);
     return pdpt_phys;
 }
@@ -1149,6 +1173,14 @@ void pae_free_user_pdpt(uint32_t pdpt_phys) {
 
     kdbg("[PAE] Freeing user PDPT at phys=0x%08x\n", pdpt_phys);
 
+    CRITICAL_SECTION_ENTER();
+    for (int i = 0; i < PAE_MAX_USER_PDPTS; i++) {
+        if (user_pdpts[i] == pdpt_phys) {
+            user_pdpts[i] = 0;
+        }
+    }
+    CRITICAL_SECTION_EXIT();
+
     /* All RAM is identity-mapped in PAE mode */
     pae_pdpte_t* user_pdpt = (pae_pdpte_t*)(uintptr_t)pdpt_phys;
 
@@ -1189,6 +1221,68 @@ void pae_free_user_pdpt(uint32_t pdpt_phys) {
     kdbg("[PAE] Freed %d user page tables\n", freed_count);
 
     pmm_free(pdpt_phys);
+}
+
+/*=============================================================================
+ * FUNCTION: pae_sync_identity_pte
+ * PURPOSE: Push a kernel identity-map PTE into every private PT copy
+ *
+ * pae_map_page_into() copies a kernel-shared page table into a private one
+ * the first time a user page lands in its 2 MB range, and the copy is a
+ * snapshot. Kernel guard pages are marked and released in the KERNEL tables
+ * only, so without this a copy taken while a guard was not-present kept it
+ * not-present after the frame was freed and reused -- the next kernel access
+ * to it under that CR3 was a ring-0 #PF -- and a copy taken before a guard
+ * was marked never saw the guard. verify-guard-sync.sh.
+ *
+ * Only identity entries are touched: frame == phys and not a user mapping.
+ * A user page mapped over the identity address keeps its mapping. The
+ * caller flushes the TLB for phys afterwards (the current CR3 may be one of
+ * these PDPTs).
+ *
+ * @param phys Identity-mapped physical address whose kernel PTE changed
+ *===========================================================================*/
+void pae_sync_identity_pte(uint32_t phys) {
+    if (!pae_active) {
+        return;
+    }
+
+    uint32_t pdpt_idx = PAE_PDPT_INDEX(phys);
+    uint32_t pd_idx = PAE_PD_INDEX(phys);
+    uint32_t pt_idx = PAE_PT_INDEX(phys);
+
+    CRITICAL_SECTION_ENTER();
+
+    uint64_t kernel_pde = page_directories[pdpt_idx][pd_idx];
+    if (!(kernel_pde & PAE_PRESENT)) {
+        CRITICAL_SECTION_EXIT();
+        return;
+    }
+    pae_pte_t kernel_pte =
+        ((pae_pte_t*)(uintptr_t)(kernel_pde & PAE_FRAME_MASK))[pt_idx];
+
+    for (int i = 0; i < PAE_MAX_USER_PDPTS; i++) {
+        if (user_pdpts[i] == 0) {
+            continue;
+        }
+        pae_pdpte_t* upd = pae_pdpt_from_phys(user_pdpts[i]);
+        if (!(upd[pdpt_idx] & PAE_PRESENT)) {
+            continue;
+        }
+        pae_pde_t* pd = (pae_pde_t*)(uintptr_t)(upd[pdpt_idx] & PAE_FRAME_MASK);
+        uint64_t pde = pd[pd_idx];
+        if (!(pde & PAE_PRESENT) ||
+            (pde & PAE_FRAME_MASK) == (kernel_pde & PAE_FRAME_MASK)) {
+            continue;   /* no table, or still the shared one */
+        }
+        pae_pte_t* pte = &((pae_pte_t*)(uintptr_t)(pde & PAE_FRAME_MASK))[pt_idx];
+        if ((*pte & PAE_USER) || (uint32_t)(*pte & PAE_FRAME_MASK) != phys) {
+            continue;   /* a user mapping, not the identity entry */
+        }
+        pae_atomic_write_pte(pte, kernel_pte);
+    }
+
+    CRITICAL_SECTION_EXIT();
 }
 
 /*=============================================================================

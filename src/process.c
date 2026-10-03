@@ -587,15 +587,16 @@ void task_free_slot_for_task(task_t* task) {
  * wait, create a file. verify-spawn-guard-frame.sh.
  *
  * In the kernel tables every address space that shares them sees the change,
- * and nothing is cloned. A task whose page table for this range is already a
- * private copy keeps its snapshot, in which the stack frames are already
- * identity-mapped present (the boot identity map covers RAM); that task simply
- * does not see the child's guard, which only matters while the child runs, on
- * its own CR3.
+ * and nothing is cloned. An address space whose page table for this range is
+ * already a private copy does NOT share them: its snapshot would keep a
+ * released guard not-present over a reused frame (the same ring-0 #PF) and
+ * would never see a new guard. pae_sync_identity_pte() pushes each edit into
+ * those copies. verify-guard-sync.sh.
  *===========================================================================*/
 static void kernel_identity_map(uint32_t phys, uint64_t flags) {
     if (pae_is_active()) {
         pae_map_page(phys, (uint64_t)phys, flags & PAE_FLAGS_MASK);
+        pae_sync_identity_pte(phys);
     } else {
         map_page(phys, phys, flags);
     }
@@ -614,6 +615,7 @@ static bool guard_page_mark(uint32_t guard_phys) {
     }
     /* Clear PAE_PRESENT, keep PAE_READWRITE for debugging */
     *guard_pte = (guard_phys & PAE_FRAME_MASK) | PAE_READWRITE;  // Present=0
+    pae_sync_identity_pte(guard_phys);
     flush_tlb_single(guard_phys);
     return true;
 }
