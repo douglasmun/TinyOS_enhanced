@@ -50,7 +50,11 @@ FILTER="${FILTER:-}"
 #                          counted it as a 64th PASS that graded nothing. Its
 #                          actual coverage is edr-rejoin-test.sh, which IS a
 #                          harness and is included.
-EXCLUDE="verify-exec.sh firstexec-trial.sh run-all.sh edr-rejoin.sh"
+#   preserve-serial.sh  -- the same case: a library the DNS harnesses source to
+#                          keep a failing run's serial log. It printed no
+#                          RESULT: line and was classed INCONCLUSIVE on every
+#                          batch. Its coverage is preserve-serial-test.sh.
+EXCLUDE="verify-exec.sh firstexec-trial.sh run-all.sh edr-rejoin.sh preserve-serial.sh"
 
 # Harnesses that build with -DTINYOS_FAULT_INJECT, which is NOT in the make
 # dependency graph. Objects compiled with it linger and break every LATER
