@@ -261,8 +261,7 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
              *================================================================*/
             if (components[count][0] == '.' && components[count][1] == '.' &&
                 components[count][2] == '\0') {
-                kprintf("[RAMFS] SECURITY: Path traversal attempt blocked (..)\n");
-                return -1;  // Reject path with ".."
+                return -1;  // Reject path with ".." (silently: see below)
             }
             if (components[count][0] == '.' && components[count][1] == '\0') {
                 return -1;  // "." is never an entry: nothing could remove it
@@ -285,7 +284,6 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
         // Check the last component for ".." as well
         if (components[count][0] == '.' && components[count][1] == '.' &&
             components[count][2] == '\0') {
-            kprintf("[RAMFS] SECURITY: Path traversal attempt blocked (..)\n");
             return -1;  // Reject path with ".."
         }
         if (components[count][0] == '.' && components[count][1] == '\0') {
@@ -300,9 +298,15 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
      * If *path is not '\0' after the loop, we hit max_components limit and
      * silently truncated. This could cause writes to wrong locations.
      * Fail explicitly instead of truncating.
+     *
+     * All three refusals in this function are silent. Each used to print a
+     * "[RAMFS] SECURITY:" line, and ring 3 reaches them once per syscall:
+     * the VFS allows 32 components where this allows 16, and SYS_CHMOD and
+     * the redirect syscall hand ramfs a path that was never canonicalized,
+     * ".." included. The caller gets its errno; that is the record.
+     * verify-ramfs-path-quiet.sh.
      *========================================================================*/
     if (*path != '\0') {
-        kprintf("[RAMFS] SECURITY: Path too deep (>%d components)\n", max_components);
         return -1;  // Path exceeds depth limit
     }
 
