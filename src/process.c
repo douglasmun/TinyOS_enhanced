@@ -605,6 +605,19 @@ static pae_pte_t* kernel_guard_pte(uint32_t guard_phys) {
     return pae_get_pte_in(pae_get_kernel_pdpt(), guard_phys);
 }
 
+/* Mark a task's kernel guard page not-present, in the kernel tables (PAE).
+ * Returns false if the kernel tables have no PTE for it. */
+static bool guard_page_mark(uint32_t guard_phys) {
+    pae_pte_t* guard_pte = kernel_guard_pte(guard_phys);
+    if (!guard_pte) {
+        return false;
+    }
+    /* Clear PAE_PRESENT, keep PAE_READWRITE for debugging */
+    *guard_pte = (guard_phys & PAE_FRAME_MASK) | PAE_READWRITE;  // Present=0
+    flush_tlb_single(guard_phys);
+    return true;
+}
+
 /*=============================================================================
  * FUNCTION: task_create_kernel
  * PURPOSE: Create a new kernel-mode task
@@ -791,12 +804,7 @@ int task_create_kernel(void (*entry)(void), const char* name) {
      *=======================================================================*/
     if (pae_is_active()) {
         /* PAE Mode: Use 64-bit PTE functions */
-        pae_pte_t* guard_pte = kernel_guard_pte(guard_page_phys);
-        if (guard_pte) {
-            /* Clear PAE_PRESENT bit while keeping PAE_READWRITE for debugging */
-            *guard_pte = (guard_page_phys & PAE_FRAME_MASK) | PAE_READWRITE;  // Present=0
-            flush_tlb_single(guard_page_phys);
-        } else {
+        if (!guard_page_mark(guard_page_phys)) {
             kprintf("[PROCESS] WARNING: Could not get PAE PTE for guard page 0x%08x\n", guard_page_phys);
         }
     } else {
@@ -981,6 +989,121 @@ static void guard_page_release(uint32_t guard_phys) {
     flush_tlb_single(guard_phys);
     pmm_free(guard_phys);
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * guardsync -- verify-guard-sync.sh only. Not in the command table.
+ *
+ * A user PDPT's page table for a 2 MB identity range is a private COPY once
+ * pae_map_page_into() has put a user page there, and guard_page_mark() /
+ * guard_page_release() edit only the KERNEL tables. Drives the real helpers
+ * against a scratch PDPT that is never loaded into CR3:
+ *
+ *   arm1  copy taken while a guard is not-present; the guard is released
+ *         (frame back in the PMM). The copy must now map it present, or the
+ *         next kernel use of that frame under this CR3 is a ring-0 #PF.
+ *   arm2  copy taken BEFORE a guard is marked. The copy must see the guard.
+ *   arm3  a guard frame whose address is a USER virtual address in the copy:
+ *         the user mapping must survive mark and release untouched.
+ *
+ * Each arm has a control that the copy really is private and really held
+ * the state the arm starts from; a dead control is not a pass.
+ *===========================================================================*/
+static bool guardsync_pte_present(uint32_t pdpt, uint32_t virt, uint32_t frame) {
+    pae_pte_t* e = pae_get_pte_in(pdpt, virt);
+    return e && (*e & PAE_PRESENT) && (uint32_t)(*e & PAE_FRAME_MASK) == frame;
+}
+
+static bool guardsync_pte_absent(uint32_t pdpt, uint32_t virt) {
+    pae_pte_t* e = pae_get_pte_in(pdpt, virt);
+    return e && !(*e & PAE_PRESENT);
+}
+
+static bool guardsync_pt_private(uint32_t pdpt, uint32_t virt) {
+    pae_pte_t* mine = pae_get_pte_in(pdpt, virt);
+    pae_pte_t* kern = pae_get_pte_in(pae_get_kernel_pdpt(), virt);
+    return mine && kern && mine != kern;
+}
+
+/* A page in frame's 2 MB range that is none of the frames in avoid[]. */
+static uint32_t guardsync_neighbour(uint32_t frame, const uint32_t* avoid, int n) {
+    uint32_t base = frame & ~0x1FFFFFu;
+    for (uint32_t v = base + PAGE_SIZE; v < base + 0x200000u; v += PAGE_SIZE) {
+        bool clash = false;
+        for (int i = 0; i < n; i++) {
+            if (avoid[i] == v) clash = true;
+        }
+        if (!clash) return v;
+    }
+    return 0;
+}
+
+void task_guardsync_test(void) {
+    stream_context_t* out = get_current_streams();
+    const uint64_t uflags = PAE_PRESENT | PAE_READWRITE | PAE_USER | PAE_NX;
+    bool ok = true;
+
+    stream_printf(out, "[GUARDSYNC] private page-table copies vs kernel guard pages\n");
+    if (!pae_is_active()) {
+        stream_printf(out, "[GUARDSYNC] VERDICT: SKIP (PAE inactive)\n");
+        return;
+    }
+
+    uint32_t ga = pmm_alloc(), gb = pmm_alloc(), gc = pmm_alloc(), ufr = pmm_alloc();
+    uint32_t pdpt = pae_create_user_pdpt();
+    if (!ga || !gb || !gc || !ufr || !pdpt) {
+        stream_printf(out, "[GUARDSYNC] VERDICT: SKIP (allocation failed)\n");
+        if (ga) pmm_free(ga);
+        if (gb) pmm_free(gb);
+        if (gc) pmm_free(gc);
+        if (ufr) pmm_free(ufr);
+        if (pdpt) pae_free_user_pdpt(pdpt);
+        return;
+    }
+    const uint32_t avoid[4] = { ga, gb, gc, ufr };
+
+    /* arm1: copy taken while ga is not-present */
+    guard_page_mark(ga);
+    pae_map_page_into(pdpt, guardsync_neighbour(ga, avoid, 4), ufr, uflags);
+    bool c1 = guardsync_pt_private(pdpt, ga) && guardsync_pte_absent(pdpt, ga);
+    guard_page_release(ga);                       /* frees ga */
+    bool a1 = guardsync_pte_present(pdpt, ga, ga);
+    stream_printf(out, "[GUARDSYNC] arm1 control: %s\n", c1 ? "ok" : "CONTROL-DEAD");
+    stream_printf(out, "[GUARDSYNC] arm1 released guard present in copy: %s\n",
+                  a1 ? "PASS" : "FAIL");
+    ok = ok && c1 && a1;
+
+    /* arm2: copy taken before gb is marked */
+    pae_map_page_into(pdpt, guardsync_neighbour(gb, avoid, 4), ufr, uflags);
+    bool c2 = guardsync_pt_private(pdpt, gb) && guardsync_pte_present(pdpt, gb, gb);
+    guard_page_mark(gb);
+    bool a2 = guardsync_pte_absent(pdpt, gb);
+    guard_page_release(gb);                       /* frees gb */
+    bool a2b = guardsync_pte_present(pdpt, gb, gb);
+    stream_printf(out, "[GUARDSYNC] arm2 control: %s\n", c2 ? "ok" : "CONTROL-DEAD");
+    stream_printf(out, "[GUARDSYNC] arm2 marked guard absent in copy: %s\n",
+                  a2 ? "PASS" : "FAIL");
+    stream_printf(out, "[GUARDSYNC] arm2 released guard present in copy: %s\n",
+                  a2b ? "PASS" : "FAIL");
+    ok = ok && c2 && a2 && a2b;
+
+    /* arm3: gc is a user virtual address in the copy, mapped to ufr */
+    pae_map_page_into(pdpt, gc, ufr, uflags);
+    bool c3 = guardsync_pt_private(pdpt, gc) && guardsync_pte_present(pdpt, gc, ufr);
+    guard_page_mark(gc);
+    bool a3 = guardsync_pte_present(pdpt, gc, ufr);
+    guard_page_release(gc);                       /* frees gc */
+    bool a3b = guardsync_pte_present(pdpt, gc, ufr);
+    stream_printf(out, "[GUARDSYNC] arm3 control: %s\n", c3 ? "ok" : "CONTROL-DEAD");
+    stream_printf(out, "[GUARDSYNC] arm3 user mapping untouched: %s\n",
+                  (a3 && a3b) ? "PASS" : "FAIL");
+    ok = ok && c3 && a3 && a3b;
+
+    pae_free_user_pdpt(pdpt);
+    pmm_free(ufr);
+    stream_printf(out, "[GUARDSYNC] VERDICT: %s\n", ok ? "PASS" : "FAIL");
+}
+#endif
 
 int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages,
                           int argc, const char* const* argv) {
@@ -1184,11 +1307,7 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
 
     // Mark guard page as NOT PRESENT (PAE-aware)
     if (pae_is_active()) {
-        pae_pte_t* guard_pte = kernel_guard_pte(guard_page_phys);
-        if (guard_pte) {
-            *guard_pte = (guard_page_phys & PAE_FRAME_MASK) | PAE_READWRITE;  // Present=0
-            flush_tlb_single(guard_page_phys);
-        }
+        (void)guard_page_mark(guard_page_phys);
     } else {
         uint32_t* guard_pte = get_page_table_entry(guard_page_phys);
         if (guard_pte) {
