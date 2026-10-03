@@ -591,10 +591,15 @@ void pipe_destroy(pipe_buffer_t* pipe) {
         int still_waiting = wait_queue_count((wait_queue_t*)pipe->readers) +
                             wait_queue_count((wait_queue_t*)pipe->writers);
         if (still_waiting > 0) {
-            /* A woken task has not been scheduled yet, so it is still recorded
-             * on the queue. Freeing now would be a use-after-free the moment it
-             * runs. Leak the page instead: a bounded one-page leak beats
-             * corrupting whatever gets that frame next. */
+            /* Unreachable today, and a tripwire, not a leak path. Wakeup
+             * dequeues at wake time, not when the woken task next runs, so
+             * the two close calls above leave both queues empty. Nothing can
+             * re-enqueue once both flags are set: pipe_read sleeps only while
+             * !write_closed, pipe_write only while !read_closed, and an
+             * external kill detaches its waiter (task_terminate ->
+             * wait_queue_remove_task). If this ever fires, something sleeps
+             * on a pipe without re-checking its closed flag. Freeing the page
+             * would turn that bug into a use-after-free, so leak it and report it. */
             kprintf("[PIPE] WARNING: %d task(s) still queued, leaking wait-queue page\n",
                     still_waiting);
             page = NULL;
