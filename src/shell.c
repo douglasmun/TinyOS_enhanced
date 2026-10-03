@@ -925,6 +925,10 @@ static void parse_and_execute(char* cmd_line) {
     else if (strcmp(argv[0], "edrkill") == 0) {
         task_edrkill_test();
     }
+    /* verify-waitpid-gate.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "waitgate") == 0) {
+        sys_waitgate_test();
+    }
     /* verify-double-fault.sh only. Not in the command table, so it never
      * appears in `help`.
      *
