@@ -31,9 +31,20 @@
 # secstatus before and after brackets the run:
 #
 #   ELF loads verified +6        the 5 children plus /fdprobe.elf itself
-#   refused +1, bad-signature +0 a 6-byte text file exec'd as a program is
-#                                refused (too small for an ELF header) and is
-#                                counted, not a signature refusal
+#   refused +2, bad-signature +0 a 6-byte text file exec'd as a program is
+#                                refused (too small for an ELF header), and a
+#                                62-byte one is refused by elf_validate (bad
+#                                magic); both counted, neither a signature
+#                                refusal
+#
+# The payload is one word: the kernel shell keeps MAX_ARGS (10) tokens and
+# drops the rest, so a 13-word echo wrote 9 words, 41 bytes -- short of the
+# header, so it took the size check instead and the leg came back INCONCLUSIVE.
+#
+# The 62-byte leg reaches elf_validate, which runs BEFORE the signature check,
+# so any unprivileged spawn of a non-ELF file drives it. It must print exactly
+# one line, the reason ("Invalid ELF magic number"); it used to print a second,
+# "[ELF] Validation failed", per attempt.
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
 # Logs: spawnquiet.log
@@ -109,6 +120,10 @@ echo hello > /scratch/sq.elf;\
 !id=>uid=;\
 exec /scratch/sq.elf;\
 !id=>uid=;\
+echo notanelfbinaryjustplaintextpaddedpasttheelfheadersizexxxxxxxx > /scratch/nx.elf;\
+!id=>uid=;\
+exec /scratch/nx.elf;\
+!id=>uid=;\
 secstatus=>ELF signatures" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
@@ -152,7 +167,10 @@ B1=$(printf '%s\n' "$STATS" | sed -n 2p | sed -n 's/.*(\([0-9][0-9]*\) bad-signa
 
 echo "  window: verdicts=$VERDICTS other=$OTHER leaks=$LEAKS (expected 5, 0, 0)"
 echo "  secstatus: verified ${V0:-?} -> ${V1:-?}, refused ${R0:-?} -> ${R1:-?}, bad-signature ${B0:-?} -> ${B1:-?}"
-echo "             (expected +6, +1, +0)"
+echo "             (expected +6, +2, +0)"
+MAGIC=$(grep -ac "Invalid ELF magic number" "$SERIAL")
+VFAIL=$(grep -ac "Validation failed" "$SERIAL")
+echo "  non-ELF refusal: reason lines=$MAGIC, 'Validation failed' lines=$VFAIL (expected 1, 0)"
 
 if [ "$OTHER" -ne 0 ] || [ "$LEAKS" -ne 0 ]; then
     echo "RESULT: FAIL — $OTHER other kernel line(s), $LEAKS address leak(s) in the user's output"
@@ -164,10 +182,17 @@ fi
 [ "$NSTATS" -eq 2 ] && [ -n "$V0" ] && [ -n "$V1" ] && [ -n "$R0" ] && [ -n "$R1" ] \
     && [ -n "$B0" ] && [ -n "$B1" ] \
     || { echo "RESULT: INCONCLUSIVE — did not read two secstatus 'ELF loads' lines"; exit 3; }
-if [ $((V1 - V0)) -ne 6 ] || [ $((R1 - R0)) -ne 1 ] || [ $((B1 - B0)) -ne 0 ]; then
+if [ $((V1 - V0)) -ne 6 ] || [ $((R1 - R0)) -ne 2 ] || [ $((B1 - B0)) -ne 0 ]; then
     echo "RESULT: FAIL — the load counters did not move as expected"
     exit 1
 fi
+# Positive control: the non-ELF file reached elf_validate and was refused there.
+[ "$MAGIC" -eq 1 ] \
+    || { echo "RESULT: INCONCLUSIVE — the non-ELF exec never reached elf_validate (reason lines=$MAGIC)"; exit 3; }
+if [ "$VFAIL" -ne 0 ]; then
+    echo "RESULT: FAIL — a non-ELF refusal printed $((MAGIC + VFAIL)) lines, want 1"
+    exit 1
+fi
 
-echo "RESULT: PASS — 5 spawns printed 5 verdict lines and nothing else; loads and a refusal were counted"
+echo "RESULT: PASS — 5 spawns printed 5 verdict lines and nothing else; both refusals were counted, one line each"
 exit 0
