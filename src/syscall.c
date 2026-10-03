@@ -1943,6 +1943,22 @@ static int tcpsock_check_owner(int sockfd) {
     return 0;
 }
 
+/* The check above runs before copy_from_user and outside TCP_LOCK, so on its
+ * own it answers for the slot as it WAS: freed and reallocated to another
+ * user in between, the primitive would act on that user's connection. This
+ * re-asks under the lock and, on success, RETURNS WITH IT HELD across the
+ * primitive (critical sections nest, so tcp_*'s own TCP_LOCK is fine). The
+ * caller releases it before any copy to user memory: a fault taken with
+ * interrupts masked is a double fault. verify-tcpsock-race.sh. */
+static int tcpsock_lock_owned(int sockfd) {
+    CRITICAL_SECTION_ENTER();
+    if (!tcp_owner_visible(sockfd)) {
+        CRITICAL_SECTION_EXIT();
+        return -EBADF;
+    }
+    return 0;
+}
+
 #ifdef TINYOS_FAULT_INJECT
 /* The window between tcpsock_check_owner() and the primitive's use of the
  * slot, made deterministic: when armed, the next SYS_TCPSOCK call hands its
@@ -2000,7 +2016,10 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
          * distinguishing them here would tell an unprivileged caller how full
          * the half-open table is. */
         tcpsock_race_point(sockfd);
-        if (tcp_connect(sockfd, req.remote_ip, req.remote_port) < 0) {
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
+        int crc = tcp_connect(sockfd, req.remote_ip, req.remote_port);
+        CRITICAL_SECTION_EXIT();
+        if (crc < 0) {
             return -EHOSTUNREACH;
         }
         return 0;
@@ -2021,7 +2040,9 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
             return -EFAULT;
         }
         tcpsock_race_point(sockfd);
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
         int sent = tcp_send(sockfd, tcpsock_staging, len);
+        CRITICAL_SECTION_EXIT();
         if (sent < 0) {
             return -ENOTCONN;
         }
@@ -2042,7 +2063,9 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
          * fault taken with interrupts masked is how this becomes a double
          * fault. The two steps stay separate -- same rule as sys_netrx. */
         tcpsock_race_point(sockfd);
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
         int got = tcp_recv(sockfd, tcpsock_staging, len);
+        CRITICAL_SECTION_EXIT();
         if (got < 0) {
             return -ENOTCONN;
         }
@@ -2059,7 +2082,10 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
         int rc = tcpsock_check_owner(sockfd);
         if (rc < 0) return rc;
         tcpsock_race_point(sockfd);
-        if (tcp_close(sockfd) < 0) {
+        if (tcpsock_lock_owned(sockfd) < 0) return -EBADF;
+        int clrc = tcp_close(sockfd);
+        CRITICAL_SECTION_EXIT();
+        if (clrc < 0) {
             return -EBADF;
         }
         return 0;
