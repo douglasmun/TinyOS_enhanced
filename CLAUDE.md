@@ -136,7 +136,7 @@ reasons are tracked in the private publish notes (memory `tinyos-publish-setup`)
 here. `publish.sh` (gitignored) and the push workflow are in memory
 `publish-push-gotchas`. PRs land as **merge commits** — do not amend or force-push main.
 
-Demo ISO: the signed `v2.4` GitHub Release asset, mirrored to `web/tinyos.iso` and the
+Demo ISO: the signed `v2.8` GitHub Release asset, mirrored to `web/tinyos.iso` and the
 `gh-pages` branch — see `web/README.md`, and note those are four separate artifacts that
 must be updated together.
 

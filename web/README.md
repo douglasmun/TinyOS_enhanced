@@ -25,11 +25,11 @@ python3 -m http.server 8000
 ```
 
 Press **Start**, then click the console and type. First boot sets a root
-password; after login try `help`, `ls D:`, and `exec /hello.elf` (verifies an
+password; after login try `help`, `ls D:`, and `/hello.elf` (verifies an
 ECDSA signature, then prints *Hello from ELF!* from ring 3).
 
 Crypto (PBKDF2 100k, bit-serial ECDSA) is slow under the emulator's JIT, so
-password setup and the first `exec` take a little while — this is a speed cost,
+password setup and the first program launch take a little while — this is a speed cost,
 not a fault.
 
 ## Contents
@@ -56,62 +56,50 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is built from `main` at **PR #109** (`eaef86d`), and
-matches the signed `v2.7` release asset. It is a pinned image, not a rolling
+The committed ISO is built from `main` at **PR #141** (`0297df4`), and
+matches the signed `v2.8` release asset. It is a pinned image, not a rolling
 build of `main`: it only moves when someone runs the steps above, so expect it
 to fall behind again as work lands.
 
-The previous image had gone badly stale — **v2.6 was 103 commits behind `main`**
-by the time this one was cut, so the demo was missing every fix listed below.
-
 **Login drops straight into the ring-3 shell** (PR #51), which is what the demo
-shows. That shell now has **40 builtins** against the kernel shell's ~70 (v2.6
-had ~25) — type `kshell` to hand over to the kernel shell for the privileged and
-introspection commands (`pae`, `mem`, `wxaudit`, `auditlog`, networking), and
-`exit` to log out. Note that the nine privileged commands are gated on **euid
-0**, so a non-root user reaching the kernel shell still cannot run them.
+shows. Run a signed program by its path (`/hello.elf`); type `kshell` to hand
+over to the kernel shell for the privileged and introspection commands (`pae`,
+`mem`, `wxaudit`, `auditlog`, networking), and `exit` to log out. The nine
+privileged commands are gated on **euid 0**, so a non-root user reaching the
+kernel shell still cannot run them.
 
-### What is new since v2.6
+### What is new since v2.7
 
-The headline is that **the security audit behind this image found 16 issues and
-all 16 are fixed here** (PRs #103–#105) — one Critical, two High. Two of them are
-reachable from this demo:
+The headline is **PR #141: every input surface fuzzed, 35 defects fixed** — see
+[`../doc/FUZZ_REPORT_2026-10.md`](../doc/FUZZ_REPORT_2026-10.md). The ones you
+can reach from this demo, as an unprivileged user:
 
-- **Critical — `ramfs_open` created files with no permission check on the parent
-  directory.** Creating a file is a write to its parent, but the create path
-  never asked; every *other* ramfs mutation did. An unprivileged user could
-  plant a file in a root-owned `0755` directory. Fixed in the primitive, so the
-  next caller inherits the check.
-- **High — the firewall had no reachable default-deny.** It now denies by
-  default, with an IDS that matches payload signatures and blocks the source.
+- **A pipe use-after-free**: a spawned child kept writing through frames its
+  pipe's owner had already freed.
+- **A kernel panic from spawn**: a child's guard page was marked not-present in
+  the *caller's* page table, so once the frame was reused a ring-0 page fault
+  took the kernel down.
+- **Writes landing in another user's file**, two ways: every `exec` closed
+  *every* process's close-on-exec fds, and an inherited redirected stdout was a
+  bare fd number its creator could close.
+- **RAMFS never checked the directory search bit**, so a root-only `0700`
+  directory hid nothing.
+- **One user could exhaust the RAMFS fd table**, blocking every `exec` including
+  root's. Now a per-user cap with a root reserve, released on normal exit.
+- **The editor's negative cursor read and wrote kernel memory**, alongside five
+  data-loss bugs in `edit`.
+- **Every spawn printed ~24 lines**, including the child's ASLR stack address and
+  page-table physical addresses. Now one verdict line; load counts are in
+  `secstatus`.
 
-Also landed since v2.6:
+Also since v2.7: the DNS/DHCP/ICMP/ARP network audit (7 findings, PRs
+#135–#139), FAT32 hardening against hostile volumes, per-user TCP socket caps,
+and a double-fault task gate so a kernel stack overflow reports instead of
+triple-faulting. The demo has **no NIC and no disk attached**, so the network
+and FAT32 fixes matter for the QEMU configuration in the top-level README.
 
-- **A memory leak on every process exit.** Teardown freed only what a `task_t`
-  field named, and nothing walked the PTEs — so each `exec` leaked its whole ELF
-  image (measured: 8 frames for `/hello.elf`). Since `SYS_SPAWN` is ungated and
-  the frames leak on *exit*, a spawn-and-wait loop drained memory without ever
-  holding two tasks at once, so the per-uid cap never fired.
-- **The EDR daemon never actually ran.** It was created but never enqueued —
-  `task_create_kernel()` allocates without scheduling, so it appeared in `ps`
-  and in every status surface while executing zero instructions.
-- **An editor data-loss bug**: `editor_insert_row` shifted rows before
-  allocating, so one OOM insert destroyed a line *and* lost two frames.
-- **Remote-driven console floods closed across the RX path** (`tcp.c`, `dns.c`,
-  `icmp.c`): any host on the segment could print to the kernel console, twice
-  from *before* the connection lookup. These are counters now, surfaced in
-  `ifconfig`.
-- **A supervised network daemon** (`knetd`) with restart rate-limiting, and RX
-  parsing moved into task context rather than the ISR.
-- **New ring-3 builtins**: `date`, `chmod`, `whoami`, `clear`, `history`,
-  `jobs`, `grep`, `find`, `man`, and the `env`/`alias` group via `SYS_ENV`.
-
-Note the demo has **no NIC attached**, so the networking fixes are not
-exercisable here — they matter for the QEMU configuration in the top-level
-README.
-
-SHA-256 `372f921c129a0afccbc3db206f924ba0bc27351938e18dde0ee0031f28bd8446` as of
-2026-08-22. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
+SHA-256 `fd91ef42536947ed4170a250c7a7453e2eeb71f5cf0bfa9c5bb57180982a226b` as of
+2026-10-03. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs — this hash identifies
 the committed artifact, it is not reproducible from source.
 
