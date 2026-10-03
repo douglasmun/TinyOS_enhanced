@@ -85,11 +85,17 @@ trap cleanup EXIT
 echo "==> Driving the boot flow (ECDSA verify under TCG is slow; be patient)..."
 # Wait for the child's exit message: by then the shell has been through the
 # whole block/resume cycle, which is the window under test.
+#
+# `loglevel debug` first: the child's [PAGING]/[PAE] teardown lines -- the
+# witness check (1) needs inside the window -- are kdbg traces, off by default
+# since SYS_SPAWN stopped printing its load and teardown trace to the console.
 TINYOS_PASSWORD="$PASSWORD" \
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
-TINYOS_EXEC_CMD="exec /hello.elf | cat -n" \
-TINYOS_EXPECT="ELF program exiting" \
+TINYOS_EXEC_CMD="loglevel debug" \
+TINYOS_EXPECT="trace ON" \
+TINYOS_FOLLOWUP_TIMEOUT=600 \
+TINYOS_FOLLOWUP_CMDS="exec /hello.elf | cat -n=>ELF program exiting" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
@@ -150,13 +156,23 @@ if [ "${leaked:-0}" -gt 0 ]; then
     exit 2
 fi
 
-# Corollary: this kernel logging must EXIST somewhere unnumbered, otherwise the
-# build emits none at all and (1) is vacuous.  The buggy build produced 29 such
+# Corollary: this kernel logging must EXIST unnumbered, and it must come from
+# THIS pipeline, otherwise (1) is vacuous.  The buggy build produced 29 such
 # lines numbered; the fixed build produces them on the console instead.
-if ! grep -qE "^\[(SYSCALL|PAGING|PAE)\]" "$SERIAL" 2>/dev/null; then
-    echo "RESULT: INCONCLUSIVE — no unnumbered [SYSCALL]/[PAGING]/[PAE] logging,"
-    echo "  so there was no kernel output to distinguish captured from not."
-    echo "  (Was kernel logging compiled out?)"
+# (Anywhere-in-the-log was the old test, and the boot's own [PAE] lines
+# satisfied it whatever the pipeline did.)
+#
+# The range starts at the pipeline's command echo, not at "[EXEC] Waiting":
+# the shell's captured lines reach the serial log only when `cat -n` prints
+# them, after the child has exited, so the child's unnumbered teardown lines
+# land BEFORE the numbered block, not inside it.
+cmd_line=$(grep -nF "exec /hello.elf | cat -n" "$SERIAL" 2>/dev/null | head -1 | cut -d: -f1)
+witness=$(sed -n "${cmd_line:-$win_start},${win_end}p" "$SERIAL" \
+          | grep -cE "^\[(SYSCALL|PAGING|PAE)\]")
+if [ "${witness:-0}" -eq 0 ]; then
+    echo "RESULT: INCONCLUSIVE — no unnumbered [SYSCALL]/[PAGING]/[PAE] logging"
+    echo "  from the pipeline, so there was no kernel output to"
+    echo "  distinguish captured from not.  (Did 'loglevel debug' take effect?)"
     exit 3
 fi
 

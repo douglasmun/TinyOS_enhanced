@@ -224,14 +224,15 @@ static bool exit_record_find(uint32_t pid, uint32_t generation, int* status) {
 }
 
 void sys_exit(int status) {
-    kprintf("\n[SYSCALL] Process exited with status %d\n", status);
-
+    /* No kprintf on this path, nor in task_terminate(): every ring-3 exit and
+     * kill reaches them, and the kernel console is the stream ring-3 output
+     * shares, so each child a pipeline or a loop ran wrote three lines into
+     * the middle of the user's own. The shell reports a nonzero status
+     * itself; waitpid() returns it. */
     // Get current task
     task_t* current = scheduler_get_current_task();
 
     if (current) {
-        kprintf("[SYSCALL] Terminating process PID=%d '%s'\n", current->pid, current->name);
-
         /*=====================================================================
          * SECURITY (v1.13): Comprehensive Task Cleanup (UAF Prevention)
          *
@@ -253,9 +254,21 @@ void sys_exit(int status) {
          * using its kernel stack. The scheduler will free it after the
          * context switch completes.
          *
-         * NOTE: File descriptors are managed by the global VFS layer and will
-         * be cleaned up when the FD table entries are closed or reused.
+         * NOTE: File descriptors, pipes and sockets are released in Step 0.
          *===================================================================*/
+
+        /* Step 0: release what the task holds, as task_terminate() does for a
+         * killed one. A normal exit skipped all of it: SYS_OPEN descriptors,
+         * pipes the task created, TCP sockets, and the RAMFS reference an
+         * inherited file stream carries all stayed allocated until reboot.
+         * (The global close-on-exec sweep used to hide the descriptor half.)
+         * Before the ZOMBIE transition, so a waitpid() that returns sees them
+         * already released. verify-ramfs-fd-reuse.sh,
+         * verify-tcp-socket-cap.sh. */
+        streams_cleanup(&current->streams);
+        task_fdtable_cleanup(current);
+        task_pipes_cleanup(current);
+        tcp_task_cleanup(current->pid, current->generation);
 
         /*=====================================================================
          * SECURITY FIX (HIGH): Disable interrupts during cleanup to prevent
@@ -269,9 +282,6 @@ void sys_exit(int status) {
         current->streams.stdin_stream.is_open = false;
         current->streams.stdout_stream.fd = -1;
         current->streams.stdin_stream.fd = -1;
-
-        /* Step 2: Reset FD count */
-        current->open_fd_count = 0;
 
         /*=====================================================================
          * SECURITY FIX (Issue 5.2): ZOMBIE State for Safe Cleanup
@@ -305,13 +315,10 @@ void sys_exit(int status) {
 
         /* Step 4: Remove from ready queue NOW to avoid race condition */
         // where timer interrupt tries to schedule/remove the same task
-        kprintf("[SYSCALL] Removing terminated task from ready queue...\n");
         scheduler_remove_task(current);
 
         /* SECURITY: Re-enable interrupts after atomic cleanup */
         restore_interrupts(eflags);
-
-        kprintf("[SYSCALL] Process cleanup complete, switching to next task...\n");
 
         // Force a context switch to the next task
         // This should NEVER return since we're terminated
@@ -347,6 +354,17 @@ void sys_exit(int status) {
  * SECURITY FIX: Uses copy_from_user() to prevent TOCTOU race conditions
  * where user unmaps buffer between validation and access.
  *-----------------------------------------------------------------------------*/
+/* sys_read/sys_write argument refusals and failed spawns. These were kprintf
+ * sites any ring-3 caller could fire per call -- outside its own redirection,
+ * into the stream every user's output shares. secstatus shows them. */
+static uint32_t syscall_reject_badbuf = 0;
+static uint32_t syscall_spawn_failed = 0;
+
+void syscall_get_io_reject_stats(uint32_t* bad_buffer, uint32_t* spawn_failed) {
+    if (bad_buffer)   *bad_buffer   = syscall_reject_badbuf;
+    if (spawn_failed) *spawn_failed = syscall_spawn_failed;
+}
+
 int sys_write(int fd, const char* buf, size_t len) {
     /* Reject unknown descriptors up front. stdin (0) is not writable. Note the
      * check happens before the len == 0 early-out so that a bad fd is reported
@@ -381,8 +399,7 @@ int sys_write(int fd, const char* buf, size_t len) {
      * before any address arithmetic or copy operations.
      *=======================================================================*/
     if (len > MAX_IO_SIZE) {
-        kprintf("[SYSCALL] sys_write: size %u exceeds maximum %u\n",
-                (unsigned int)len, (unsigned int)MAX_IO_SIZE);
+        syscall_reject_badbuf++;
         return -EINVAL;
     }
 
@@ -400,13 +417,13 @@ int sys_write(int fd, const char* buf, size_t len) {
 
     /* Check for wraparound (buf + len < buf) */
     if (buf_end < buf_addr) {
-        kprintf("[SYSCALL] sys_write: address wraparound detected\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
     /* Check if end address exceeds user space boundary */
     if (buf_end > USER_SPACE_END) {
-        kprintf("[SYSCALL] sys_write: buffer extends beyond user space\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
@@ -477,7 +494,7 @@ int sys_write(int fd, const char* buf, size_t len) {
          * Check: buf + total_written < buf indicates wraparound
          *===================================================================*/
         if ((uintptr_t)buf + total_written < (uintptr_t)buf) {
-            kprintf("[SYSCALL] sys_write: pointer overflow detected\n");
+            syscall_reject_badbuf++;
             return (total_written > 0) ? (int)total_written : -EFAULT;
         }
 
@@ -487,7 +504,7 @@ int sys_write(int fd, const char* buf, size_t len) {
          *===================================================================*/
         int ret = copy_from_user(kernel_buf, buf + total_written, chunk_size);
         if (ret < 0) {
-            kprintf("[SYSCALL] sys_write: copy_from_user failed (TOCTOU race?)\n");
+            syscall_reject_badbuf++;
             /* Return bytes written so far, or error if nothing written */
             return (total_written > 0) ? (int)total_written : ret;
         }
@@ -563,8 +580,7 @@ int sys_read(int fd, char* buf, size_t len) {
      * before any address arithmetic or copy operations.
      *=======================================================================*/
     if (len > MAX_IO_SIZE) {
-        kprintf("[SYSCALL] sys_read: size %u exceeds maximum %u\n",
-                (unsigned int)len, (unsigned int)MAX_IO_SIZE);
+        syscall_reject_badbuf++;
         return -EINVAL;
     }
 
@@ -582,13 +598,13 @@ int sys_read(int fd, char* buf, size_t len) {
 
     /* Check for wraparound (buf + len < buf) */
     if (buf_end < buf_addr) {
-        kprintf("[SYSCALL] sys_read: address wraparound detected\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
     /* Check if end address exceeds user space boundary */
     if (buf_end > USER_SPACE_END) {
-        kprintf("[SYSCALL] sys_read: buffer extends beyond user space\n");
+        syscall_reject_badbuf++;
         return -EFAULT;
     }
 
@@ -659,7 +675,7 @@ int sys_read(int fd, char* buf, size_t len) {
     if (i > 0) {
         int ret = copy_to_user(buf, kernel_buf, i);
         if (ret < 0) {
-            kprintf("[SYSCALL] sys_read: copy_to_user failed (TOCTOU race?)\n");
+            syscall_reject_badbuf++;
             return ret;  /* Return -EFAULT */
         }
     }
@@ -844,7 +860,11 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
     const char* err = NULL;
     int pid = elf_exec_from_path(path, name, kargc, kargv, &err);
     if (pid < 0) {
-        kprintf("[SPAWN] '%s': %s (rc=%d)\n", path, err ? err : "failed", pid);
+        /* Counted, not printed: the caller gets the errno, and the ring-3
+         * shell already reports it. A kprintf here was a console line per
+         * failed spawn, outside any redirection, at the caller's rate. */
+        (void)err;
+        syscall_spawn_failed++;
         return pid;
     }
 
@@ -879,9 +899,8 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
 
     /* Streams before scheduling too — a child made runnable with the default
      * console context would ignore the caller's redirection on its first
-     * write. See streams_inherit's ownership caveat in stdio.h: the copy is
-     * shallow, so the caller must outlive the child (or wait for it) before
-     * closing any redirected fd. */
+     * write. The child takes its own reference on a redirected RAMFS fd (see
+     * streams_inherit in stdio.h), so the caller may restore while it runs. */
     streams_inherit(&child->streams, &self->streams);
 
     /* cwd inherits the same way, and for the same reason: a child spawned from
@@ -936,6 +955,24 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
  * @param user_path Path pointer from ring 3
  * @return 0 on success, negative errno otherwise
  *===========================================================================*/
+/* The RAMFS-relative part of a path syscall_copy_path() resolved, or NULL if
+ * it names another drive. task_resolve_path() qualifies only RELATIVE paths:
+ * a drive-qualified one comes back as given ("D:/x", "d:/x"), and so does a
+ * leading-'/' one, which the VFS resolves against the default drive. Testing
+ * for a "D:" prefix alone refused every absolute path, so from ring 3
+ * `echo x > /scratch/f` and `chmod 600 /scratch/f` failed with -EXDEV while
+ * the same names relative to cwd worked. */
+static const char* syscall_ramfs_path(const char* path) {
+    if (path[0] == '/') {
+        return path;
+    }
+    if ((path[0] == VFS_DEFAULT_DRIVE || path[0] == VFS_DEFAULT_DRIVE - 'A' + 'a')
+        && path[1] == ':') {
+        return path + 2;
+    }
+    return NULL;
+}
+
 static int syscall_copy_path(char* out, size_t out_size, const char* user_path) {
     task_t* self = scheduler_get_current_task();
     if (!self) {
@@ -1052,6 +1089,10 @@ int sys_readdir(int fd, void* user_buf, uint32_t size) {
     uint32_t written = 0;
 
     while (written + sizeof(entry) <= size) {
+        /* Zeroed per entry: the FAT32 emitter writes the name with
+         * safe_strcpy(), which does not pad, so the rest of name[64] was
+         * whatever this stack slot last held -- copied out to ring 3. */
+        memset(&entry, 0, sizeof(entry));
         ssize_t got = vfs_readdir(vfs_fd, &entry, sizeof(entry));
         if (got < 0) {
             /* Report the error only if nothing was produced; otherwise return
@@ -1408,18 +1449,17 @@ int sys_chmod(const char* user_path, uint32_t mode) {
         return -EINVAL;
     }
 
-    /* task_resolve_path always yields a drive-qualified path, so this test is
-     * total. FAT32 has no permission bits and there is no VFS .chmod op, so
+    /* FAT32 has no permission bits and there is no VFS .chmod op, so
      * anything off the RAMFS drive is refused rather than silently ignored --
      * a no-op success here would be a lie a script could not detect. */
-    if (path[0] != VFS_DEFAULT_DRIVE || path[1] != ':') {
+    const char* ramfs_path = syscall_ramfs_path(path);
+    if (!ramfs_path) {
         return -EXDEV;
     }
 
-    /* Skipping "D:" is safe because the check above proved the prefix.
-     * ramfs_find() walks a plain '/'-rooted path and does not know about
+    /* ramfs_find() walks a plain '/'-rooted path and does not know about
      * drive letters. */
-    int result = ramfs_chmod(path + 2, (uint16_t)mode);
+    int result = ramfs_chmod(ramfs_path, (uint16_t)mode);
 
     switch (result) {
     case 0:                 return 0;
@@ -1914,6 +1954,9 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len) {
         /* No buffer, no sockfd. tcp_socket() stamps owner_uid from the calling
          * task, which is why this needs no explicit credential handling. */
         int fd = tcp_socket();
+        if (fd == TCP_SOCKET_LIMIT) {
+            return -EAGAIN;
+        }
         if (fd < 0) {
             return -EMFILE;
         }
@@ -2037,8 +2080,8 @@ int sys_chdir(const char* user_path) {
  * Because sys_spawn inherits the caller's streams into the child, a shell gets
  * redirection of spawned programs for free: rebind, spawn, restore. The child
  * captured the redirected stream at spawn time and the restore does not reach
- * back into it (streams_inherit marks the child's copies borrowed, so the
- * child never closes the fd the shell owns).
+ * back into it (streams_inherit gives the child its own reference on the
+ * RAMFS fd, so the slot outlives whichever of the two closes first).
  *
  * DRIVE LIMITATION, enforced rather than ignored: the stream layer's
  * STREAM_TYPE_FILE is hard-wired to RAMFS (stdout_write calls ramfs_write
@@ -2101,16 +2144,13 @@ int sys_redirect(int fd, const char* user_path, int mode) {
         return rc;
     }
 
-    /* task_resolve_path always yields a drive-qualified path, so this test is
-     * total: anything not on the RAMFS drive cannot be represented by a
-     * STREAM_TYPE_FILE stream. */
-    if (path[0] != VFS_DEFAULT_DRIVE || path[1] != ':') {
+    /* Anything not on the RAMFS drive cannot be represented by a
+     * STREAM_TYPE_FILE stream. The stream helpers take the drive-relative
+     * part. */
+    const char* ramfs_path = syscall_ramfs_path(path);
+    if (!ramfs_path) {
         return -EXDEV;
     }
-
-    /* The stream helpers take a RAMFS path, which is the drive-relative part.
-     * Skipping "D:" is safe because the check above proved the prefix. */
-    const char* ramfs_path = path + 2;
 
     int err;
     if (fd == STDIN_FILENO) {
@@ -2156,6 +2196,7 @@ typedef struct {
     uint32_t       owner_pid;
     uint32_t       owner_generation;
     uint32_t       pages;       /* frames backing buf, for the free path     */
+    bool           orphaned;    /* released, waiting for its last reader/writer */
 } pipe_slot_t;
 
 static pipe_slot_t pipe_table[MAX_PIPES];
@@ -2174,7 +2215,7 @@ static pipe_slot_t* pipe_slot_for(int id, task_t* self, int* err) {
         return NULL;
     }
     pipe_slot_t* slot = &pipe_table[id - 1];
-    if (!slot->buf) {
+    if (!slot->buf || slot->orphaned) {
         *err = -EBADF;
         return NULL;
     }
@@ -2197,20 +2238,70 @@ static void pipe_bind_stream(stream_t* s, pipe_buffer_t* buf) {
     s->borrowed  = false;
 }
 
-static void pipe_slot_release(pipe_slot_t* slot) {
-    /* pipe_destroy closes both ends first, so anyone still parked in
-     * pipe_read/pipe_write is woken to observe EOF/EPIPE rather than being
-     * left blocked on a buffer that is about to be freed. It also releases the
-     * wait-queue page; the frames below are the pipe_buffer_t itself. */
+/* Does any task's stream still name this buffer? A spawned child inherits
+ * its creator's streams by shallow copy (streams_inherit), so the pipe table's
+ * owner is not the only holder. A dying task's streams are reset before
+ * task_pipes_cleanup() runs, so it never counts as a holder of its own. */
+static bool pipe_buf_referenced(const pipe_buffer_t* buf) {
+    bool found = false;
+    CRITICAL_SECTION_ENTER();
+    for (int i = 0; i < MAX_TASKS && !found; i++) {
+        task_t* t = task_get_slot(i);
+        if (!t) {
+            continue;
+        }
+        const stream_t* s[3] = { &t->streams.stdin_stream,
+                                 &t->streams.stdout_stream,
+                                 &t->streams.stderr_stream };
+        for (int k = 0; k < 3; k++) {
+            if (s[k]->type == STREAM_TYPE_PIPE && s[k]->data == buf) {
+                found = true;
+            }
+        }
+    }
+    CRITICAL_SECTION_EXIT();
+    return found;
+}
+
+/* Free an orphaned slot's buffer once nothing can reach it. */
+static void pipe_slot_reap(pipe_slot_t* slot) {
+    if (!slot->buf || !slot->orphaned || pipe_buf_referenced(slot->buf)) {
+        return;
+    }
+    /* No stream names the buffer, so no task can be parked in
+     * pipe_read/pipe_write on it; pipe_destroy releases the wait-queue page
+     * (or leaks it if a killed waiter is still queued) and the frames below
+     * are the pipe_buffer_t itself. */
     pipe_destroy(slot->buf);
     uint32_t base = (uint32_t)(uintptr_t)slot->buf;
     for (uint32_t i = 0; i < slot->pages; i++) {
         pmm_free(base + i * 4096);
     }
     slot->buf = NULL;
+    slot->pages = 0;
+    slot->orphaned = false;
+}
+
+/* Give up the owner's claim. Freeing the buffer here was a use-after-free: a
+ * child spawned with the pipe as stdout or stdin kept the raw pointer, and
+ * PIPE_OP_DESTROY (or the owner exiting) pmm_free'd the frames under it, so
+ * the child's next write landed in whatever page the PMM handed out next.
+ * Closing both ends wakes anyone parked on it to see EOF/EPIPE, and every
+ * later read/write returns at once; the frames go back only when the last
+ * stream naming them is gone. Found auditing the ring-3 syscalls. */
+static void pipe_slot_release(pipe_slot_t* slot) {
+    pipe_close_write(slot->buf);
+    pipe_close_read(slot->buf);
     slot->owner_pid = 0;
     slot->owner_generation = 0;
-    slot->pages = 0;
+    slot->orphaned = true;
+    pipe_slot_reap(slot);
+}
+
+static void pipe_reap_orphans(void) {
+    for (int i = 0; i < MAX_PIPES; i++) {
+        pipe_slot_reap(&pipe_table[i]);
+    }
 }
 
 void task_pipes_cleanup(task_t* task) {
@@ -2219,12 +2310,14 @@ void task_pipes_cleanup(task_t* task) {
     }
     for (int i = 0; i < MAX_PIPES; i++) {
         pipe_slot_t* slot = &pipe_table[i];
-        if (slot->buf &&
+        if (slot->buf && !slot->orphaned &&
             slot->owner_pid == task->pid &&
             slot->owner_generation == task->generation) {
             pipe_slot_release(slot);
         }
     }
+    /* This task may have been the last holder of someone else's pipe. */
+    pipe_reap_orphans();
 }
 
 int sys_pipe(int op, int id) {
@@ -2251,6 +2344,7 @@ int sys_pipe(int op, int id) {
     }
 
     if (op == PIPE_OP_CREATE) {
+        pipe_reap_orphans();
         int slot_idx = -1;
         for (int i = 0; i < MAX_PIPES; i++) {
             if (!pipe_table[i].buf) {
@@ -3331,6 +3425,7 @@ static void syscall_dispatch(struct cpu_state* state) {
              * integers. Max reasonable write: 1MB per syscall.
              *===============================================================*/
             if ((uint32_t)arg3 > (1024 * 1024)) {  /* > 1MB */
+                syscall_reject_badbuf++;  /* same refusal sys_write counts */
                 ret = -EINVAL;  /* Invalid argument */
                 break;
             }
@@ -3352,6 +3447,7 @@ static void syscall_dispatch(struct cpu_state* state) {
              * so buf/len moved up one register (ebx=fd, ecx=buf, edx=len).
              *===============================================================*/
             if ((uint32_t)arg3 > (1024 * 1024)) {  /* > 1MB */
+                syscall_reject_badbuf++;  /* same refusal sys_read counts */
                 ret = -EINVAL;  /* Invalid argument */
                 break;
             }

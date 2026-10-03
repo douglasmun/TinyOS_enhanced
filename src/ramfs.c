@@ -247,6 +247,10 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
 
     while (*path && count < max_components) {
         if (*path == '/') {
+            if (comp_idx == 0) {
+                path++;  // "a//b" is "a/b": an empty component names nothing
+                continue;
+            }
             components[count][comp_idx] = '\0';
 
             /*=================================================================
@@ -259,6 +263,9 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
                 components[count][2] == '\0') {
                 kprintf("[RAMFS] SECURITY: Path traversal attempt blocked (..)\n");
                 return -1;  // Reject path with ".."
+            }
+            if (components[count][0] == '.' && components[count][1] == '\0') {
+                return -1;  // "." is never an entry: nothing could remove it
             }
 
             count++;
@@ -281,6 +288,9 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
             kprintf("[RAMFS] SECURITY: Path traversal attempt blocked (..)\n");
             return -1;  // Reject path with ".."
         }
+        if (components[count][0] == '.' && components[count][1] == '\0') {
+            return -1;  // "." is never an entry: nothing could remove it
+        }
 
         count++;
     }
@@ -297,6 +307,56 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
     }
 
     return count;
+}
+
+/*=============================================================================
+ * Directory search permission (the x bit)
+ *
+ * Every directory a lookup passes THROUGH must grant the caller search
+ * permission; the final component needs none of its own. Nothing checked
+ * this: ramfs_find_locked and the two creation walks below matched names and
+ * nothing else, so a root-owned 0700 directory hid nothing -- uid 1000 could
+ * open a 0644 file inside it by name, and create inside any writable
+ * directory beneath it. The x bit was only consulted by chdir
+ * (ramfs_vfs_access_dir), which is why the root's 0711 ("traverse to a known
+ * name, but not list") looked enforced. Found by fuzz/targets/fuzz_ramfs.c.
+ *
+ * Root passes ramfs_check_permission unconditionally, so boot-time and
+ * kernel-context lookups are unaffected. Callers must hold ramfs_mutex.
+ *===========================================================================*/
+static bool may_search(ramfs_node_t* dir) {
+    uint16_t uid, gid;
+    ramfs_get_current_credentials(&uid, &gid);
+    return ramfs_check_permission(dir, uid, gid, RAMFS_FLAG_EXEC);
+}
+
+#define WALK_NOT_DIR    (-1)
+#define WALK_NOT_FOUND  (-2)
+#define WALK_DENIED     (-3)
+
+/* Resolve the directory that will hold components[n-1] -- the walk mkdir and
+ * open-with-create share. Each step must be a directory the caller may
+ * search. open's copy of this walk never checked the type, so creating
+ * "/file/x" hung a child under a FILE node: invisible to every lookup
+ * (ramfs_find_locked stops at a non-directory), so each retry created
+ * another, and unlinking the file freed it with the children still attached
+ * -- RAMFS_MAX_FILES slots gone for good. Callers must hold ramfs_mutex. */
+static int walk_to_parent(char components[][RAMFS_MAX_NAME], int n,
+                          ramfs_node_t** parent_out) {
+    ramfs_node_t* parent = root;
+    for (int i = 0; i < n - 1; i++) {
+        if (!may_search(parent)) return WALK_DENIED;
+        ramfs_node_t* child = parent->children;
+        while (child && strcmp(child->name, components[i]) != 0) {
+            child = child->next;
+        }
+        if (!child) return WALK_NOT_FOUND;
+        if (child->type != RAMFS_TYPE_DIR) return WALK_NOT_DIR;
+        parent = child;
+    }
+    if (!may_search(parent)) return WALK_DENIED;
+    *parent_out = parent;
+    return 0;
 }
 
 /*=============================================================================
@@ -375,6 +435,9 @@ static ramfs_node_t* ramfs_find_locked(const char* path) {
     for (int i = 0; i < num_components; i++) {
         if (current->type != RAMFS_TYPE_DIR) {
             return NULL;  // Not a directory
+        }
+        if (!may_search(current)) {
+            return NULL;  // No search permission: as if absent
         }
 
         /*=====================================================================
@@ -514,29 +577,19 @@ int ramfs_mkdir(const char* path) {
     }
 
     // Find parent directory
-    ramfs_node_t* parent = root;
-
-    for (int i = 0; i < num_components - 1; i++) {
-        ramfs_node_t* child = parent->children;
-        bool found = false;
-
-        while (child) {
-            if (strcmp(child->name, components[i]) == 0) {
-                if (child->type != RAMFS_TYPE_DIR) {
-                    mutex_unlock(&ramfs_mutex);
-                    return -3;  // Parent is not a directory
-                }
-                parent = child;
-                found = true;
-                break;
-            }
-            child = child->next;
-        }
-
-        if (!found) {
-            mutex_unlock(&ramfs_mutex);
-            return -4;  // Parent not found
-        }
+    ramfs_node_t* parent = NULL;
+    int walk = walk_to_parent(components, num_components, &parent);
+    if (walk == WALK_NOT_DIR) {
+        mutex_unlock(&ramfs_mutex);
+        return -3;  // Parent is not a directory
+    }
+    if (walk == WALK_NOT_FOUND) {
+        mutex_unlock(&ramfs_mutex);
+        return -4;  // Parent not found
+    }
+    if (walk == WALK_DENIED) {
+        mutex_unlock(&ramfs_mutex);
+        return -5;  // Permission denied
     }
 
     /* Check write permission on parent directory */
@@ -579,6 +632,44 @@ int ramfs_mkdir(const char* path) {
     return 0;
 }
 
+/* Choose a free slot for `self`, or say why it may not have one. Called with
+ * interrupts off; claims nothing. Limits are counted from the slots' owner
+ * fields, so they cannot drift. Before the scheduler runs (self == NULL)
+ * only the table size applies. */
+static int ramfs_pick_fd(task_t* self) {
+    int fd = -1, avail = 0, mine = 0, uid_held = 0;
+    for (int i = 0; i < RAMFS_MAX_FDS; i++) {
+        ramfs_fd_t* f = &file_descriptors[i];
+        if (!f->in_use) {
+            avail++;
+            if (fd < 0) {
+                fd = i;
+            }
+        } else if (self) {
+            if (f->owner_pid == self->pid && f->owner_generation == self->generation) {
+                mine++;
+            }
+            if (f->owner_uid == self->uid) {
+                uid_held++;
+            }
+        }
+    }
+    if (fd < 0) {
+        return -2;  // No available file descriptors
+    }
+    if (!self) {
+        return fd;
+    }
+    if (mine >= PROCESS_MAX_FDS) {
+        return -EMFILE;  // Too many open files (per-process limit)
+    }
+    if (self->euid != 0 &&
+        (uid_held >= RAMFS_USER_MAX_FDS || avail <= RAMFS_ROOT_RESERVED_FDS)) {
+        return RAMFS_OPEN_LIMIT;
+    }
+    return fd;
+}
+
 /**
  * Open a file
  */
@@ -591,34 +682,15 @@ int ramfs_open(const char* path, uint8_t flags) {
     uint16_t uid, gid;
     ramfs_get_current_credentials(&uid, &gid);
 
-    /*=========================================================================
-     * SECURITY FIX (v1.11): Per-Process FD Limit Enforcement
-     *
-     * ISSUE: Without per-process limits, a single malicious process can
-     * exhaust the global FD table (RAMFS_MAX_FDS=16), preventing other
-     * processes from opening files (DoS attack).
-     *
-     * FIX: Check per-process limit before allocating from global table.
-     * - Each process limited to PROCESS_MAX_FDS (8 FDs)
-     * - Return -EMFILE if process has reached its limit
-     * - Fair resource sharing across processes
-     *=======================================================================*/
+    /* Refuse early, so a caller with no slot to spend does not create the
+     * file first. Only advisory: the slot is claimed at the end, where the
+     * same test runs again with interrupts off. */
     task_t* current = scheduler_get_current_task();
-    if (current && current->open_fd_count >= PROCESS_MAX_FDS) {
-        return -EMFILE;  // Too many open files (per-process limit)
-    }
-
-    // Find an available file descriptor
-    int fd = -1;
-    for (int i = 0; i < RAMFS_MAX_FDS; i++) {
-        if (!file_descriptors[i].in_use) {
-            fd = i;
-            break;
-        }
-    }
-
+    CRITICAL_SECTION_ENTER();
+    int fd = ramfs_pick_fd(current);
+    CRITICAL_SECTION_EXIT();
     if (fd < 0) {
-        return -2;  // No available file descriptors
+        return fd;
     }
 
     /*=========================================================================
@@ -659,25 +731,15 @@ int ramfs_open(const char* path, uint8_t flags) {
             }
 
             // Find parent directory
-            ramfs_node_t* parent = root;
-
-            for (int i = 0; i < num_components - 1; i++) {
-                ramfs_node_t* child = parent->children;
-                bool found = false;
-
-                while (child) {
-                    if (strcmp(child->name, components[i]) == 0) {
-                        parent = child;
-                        found = true;
-                        break;
-                    }
-                    child = child->next;
-                }
-
-                if (!found) {
-                    mutex_unlock(&ramfs_mutex);
-                    return -4;  // Parent not found
-                }
+            ramfs_node_t* parent = NULL;
+            int walk = walk_to_parent(components, num_components, &parent);
+            if (walk == WALK_DENIED) {
+                mutex_unlock(&ramfs_mutex);
+                return RAMFS_CREATE_EPERM;
+            }
+            if (walk < 0) {
+                mutex_unlock(&ramfs_mutex);
+                return -4;  // Parent not found (or not a directory)
             }
 
             /*=================================================================
@@ -762,23 +824,30 @@ int ramfs_open(const char* path, uint8_t flags) {
         return -7;  // Permission denied
     }
 
-    /*=========================================================================
-     * PHASE 13: Set close-on-exec flag (secure by default)
-     * - Default: close_on_exec = true (FD will be closed on exec)
-     * - Explicit RAMFS_FLAG_INHERIT: close_on_exec = false (FD survives exec)
-     * - Reversed Unix semantics for security
-     *=======================================================================*/
-    // Setup file descriptor
+    /* close_on_exec is recorded but nothing sweeps on it any more: the
+     * table is global, so a sweep at exec closed other tasks' files (see
+     * elf.c). Isolation comes from a task naming a slot only through its
+     * own fdtable or streams. */
+    /* Pick and claim in one critical section. The slot found at the top was
+     * not marked in_use, and the lookup and create since then can sleep on
+     * ramfs_mutex, so another task could have taken it: both would then hold
+     * one slot with refs = 1, and either close freed it under the other. */
+    CRITICAL_SECTION_ENTER();
+    fd = ramfs_pick_fd(current);
+    if (fd < 0) {
+        CRITICAL_SECTION_EXIT();
+        return fd;
+    }
     file_descriptors[fd].node = node;
     file_descriptors[fd].pos = 0;
     file_descriptors[fd].flags = flags;
     file_descriptors[fd].in_use = true;
+    file_descriptors[fd].refs = 1;
     file_descriptors[fd].close_on_exec = !(flags & RAMFS_FLAG_INHERIT);  // PHASE 13
-
-    /* Increment per-process FD count (v1.11) */
-    if (current) {
-        current->open_fd_count++;
-    }
+    file_descriptors[fd].owner_pid = current ? current->pid : 0;
+    file_descriptors[fd].owner_generation = current ? current->generation : 0;
+    file_descriptors[fd].owner_uid = current ? current->uid : 0;
+    CRITICAL_SECTION_EXIT();
 
     return fd;
 }
@@ -1039,49 +1108,41 @@ int ramfs_fd_size(int fd) {
 /**
  * Close file
  */
-void ramfs_close(int fd) {
-    if (fd >= 0 && fd < RAMFS_MAX_FDS && file_descriptors[fd].in_use) {
-        /* Decrement per-process FD count (v1.11) */
-        task_t* current = scheduler_get_current_task();
-        if (current && current->open_fd_count > 0) {
-            current->open_fd_count--;
-        }
-
-        file_descriptors[fd].in_use = false;
-        file_descriptors[fd].node = NULL;
-        file_descriptors[fd].pos = 0;
-        file_descriptors[fd].flags = 0;
+int ramfs_fd_ref(int fd) {
+    if (fd < 0 || fd >= RAMFS_MAX_FDS) {
+        return -1;
     }
+    int rc = -1;
+    CRITICAL_SECTION_ENTER();
+    if (file_descriptors[fd].in_use && file_descriptors[fd].refs < UINT8_MAX) {
+        file_descriptors[fd].refs++;
+        rc = 0;
+    }
+    CRITICAL_SECTION_EXIT();
+    return rc;
 }
 
-/*=============================================================================
- * PHASE 13: Close-on-Exec Cleanup (Secure FD Inheritance)
- *
- * Called by ELF loader when exec() loads a new program. Closes all file
- * descriptors that have close_on_exec == true (which is the default).
- *
- * TRADITIONAL UNIX/LINUX:
- * - All FDs inherited by default (security nightmare)
- * - Must explicitly set O_CLOEXEC flag to prevent leakage
- * - Easy to forget, leading to FD leaks
- *
- * TINYOS INNOVATION:
- * - All FDs closed on exec by default (close_on_exec = true)
- * - Must explicitly set RAMFS_FLAG_INHERIT to keep FD open
- * - Reversed semantics for security (fail-secure design)
- *
- * SECURITY BENEFITS:
- * - No accidental FD leaks to child processes
- * - Sensitive FDs (database connections, password files) auto-close
- * - Explicit opt-in for FD inheritance (intentional, not accidental)
- *===========================================================================*/
-void ramfs_close_on_exec(void) {
-    for (int fd = 0; fd < RAMFS_MAX_FDS; fd++) {
-        /* Close all FDs marked for close-on-exec */
-        if (file_descriptors[fd].in_use && file_descriptors[fd].close_on_exec) {
-            ramfs_close(fd);
+void ramfs_close(int fd) {
+    if (fd < 0 || fd >= RAMFS_MAX_FDS) {
+        return;
+    }
+    CRITICAL_SECTION_ENTER();
+    if (file_descriptors[fd].in_use) {
+        /* Free the slot only when the last holder lets go. */
+        if (file_descriptors[fd].refs > 1) {
+            file_descriptors[fd].refs--;
+        } else {
+            file_descriptors[fd].refs = 0;
+            file_descriptors[fd].in_use = false;
+            file_descriptors[fd].node = NULL;
+            file_descriptors[fd].pos = 0;
+            file_descriptors[fd].flags = 0;
+            file_descriptors[fd].owner_pid = 0;
+            file_descriptors[fd].owner_generation = 0;
+            file_descriptors[fd].owner_uid = 0;
         }
     }
+    CRITICAL_SECTION_EXIT();
 }
 
 /**
@@ -1200,39 +1261,43 @@ int ramfs_rename(const char* old_path, const char* new_path) {
         return -4;  // Permission denied
     }
 
-    /* Extract new name from new_path (just the filename, not the full path)
-     * For now, only support rename in same directory (no move across directories)
-     * Full path rename would require updating parent pointers
-     */
-    const char* new_name = new_path;
-    const char* last_slash = NULL;
-
-    /* Find last slash to extract filename */
-    for (const char* p = new_path; *p != '\0'; p++) {
-        if (*p == '/') {
-            last_slash = p;
-        }
+    /* The destination must name an entry in the source's OWN directory: a
+     * cross-directory move would need parent pointers and both directories'
+     * child lists updated, and this function only renames in place.
+     *
+     * It used to take everything after the last '/' of new_path and write it
+     * into the node without resolving new_path's directory at all. The
+     * "destination exists" check above looks up the FULL new_path, so
+     * renaming /d/a to /elsewhere/b passed it even when /d/b existed and left
+     * /d with two entries named "b" -- lookups find only the first, so the
+     * other can no longer be opened or removed by name. A trailing slash gave
+     * an empty name, and ".." gave a name split_path refuses to look up:
+     * nodes that occupy one of RAMFS_MAX_FILES slots until reboot. Found by
+     * fuzz/targets/fuzz_ramfs.c.
+     *
+     * Resolving the destination with the same split_path/walk_to_parent as
+     * creation fixes all three: the name is a validated component, and the
+     * directory is checked to be the source's. */
+    char components[16][RAMFS_MAX_NAME];
+    int num_components = split_path(new_path, components, 16);
+    if (num_components <= 0) {
+        mutex_unlock(&ramfs_mutex);
+        return -3;  // Invalid destination path
+    }
+    ramfs_node_t* new_parent = NULL;
+    int walk = walk_to_parent(components, num_components, &new_parent);
+    if (walk == WALK_DENIED) {
+        mutex_unlock(&ramfs_mutex);
+        return -4;  // Permission denied
+    }
+    if (walk < 0 || new_parent != parent) {
+        mutex_unlock(&ramfs_mutex);
+        return -3;  // Destination not in the source's directory
     }
 
-    if (last_slash) {
-        new_name = last_slash + 1;
-    }
-
-    /* Verify new name fits in buffer */
-    size_t new_name_len = 0;
-    for (const char* p = new_name; *p != '\0'; p++) {
-        new_name_len++;
-        if (new_name_len >= RAMFS_MAX_NAME) {
-            mutex_unlock(&ramfs_mutex);
-            return -3;  // Name too long
-        }
-    }
-
-    /* ATOMIC OPERATION: Just update the name field */
-    for (size_t i = 0; i < RAMFS_MAX_NAME && i <= new_name_len; i++) {
-        old_node->name[i] = new_name[i];
-    }
-    old_node->name[RAMFS_MAX_NAME - 1] = '\0';  // Ensure null termination
+    /* ATOMIC OPERATION: Just update the name field. split_path bounded the
+     * component to RAMFS_MAX_NAME - 1 and terminated it. */
+    memcpy(old_node->name, components[num_components - 1], RAMFS_MAX_NAME);
 
     mutex_unlock(&ramfs_mutex);
     return 0;  // Success

@@ -1005,7 +1005,7 @@ void free_page_directory(uint32_t page_dir_phys) {
         return;
     }
 
-    kprintf("[PAGING] Freeing page directory at phys=0x%08x\n", page_dir_phys);
+    kdbg("[PAGING] Freeing page directory at phys=0x%08x\n", page_dir_phys);
 
     // Get kernel page directory for comparison
     uint32_t kernel_pd_phys = get_kernel_page_directory();
@@ -1080,7 +1080,7 @@ void free_page_directory(uint32_t page_dir_phys) {
         freed_count++;
     }
 
-    kprintf("[PAGING] Freed %d user page tables\n", freed_count);
+    kdbg("[PAGING] Freed %d user page tables\n", freed_count);
 
     // Free the page directory itself
     pmm_free(page_dir_phys);

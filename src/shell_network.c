@@ -319,6 +319,12 @@ void cmd_ifconfig(void) {
     kprintf("  TCP rx state: %u buf-full, %u peer-reset, %u zero-window\n",
             t_rxfull, t_reset, t_zwin);
 
+    uint32_t l_send = 0, l_conn = 0, l_full = 0, l_tmo = 0, l_tw = 0;
+    net_get_tcp_local_stats(&l_send, &l_conn, &l_full, &l_tmo, &l_tw);
+    kprintf("  TCP local:    %u send-refused, %u connect-refused, %u table-full\n",
+            l_send, l_conn, l_full);
+    kprintf("  TCP reaped:   %u timed-out, %u tw-evicted\n", l_tmo, l_tw);
+
     /* DMA region placement (doc/NETWORK_ISOLATION.md item 3). Printed with the
      * live present/absent state of each guard rather than just the addresses:
      * the addresses only show where the guards were MEANT to go, whereas the

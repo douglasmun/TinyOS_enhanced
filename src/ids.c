@@ -239,8 +239,9 @@ static bool ids_inspect_payload(const uint8_t* payload, size_t len, uint32_t src
  *===========================================================================*/
 bool ids_analyze_packet(const ip_header_t* ip_header, size_t packet_len) {
     stats.packets_analyzed++;
-    uint32_t src_ip = (ip_header->src_ip[0] << 24) | (ip_header->src_ip[1] << 16) |
-                      (ip_header->src_ip[2] << 8) | ip_header->src_ip[3];
+    uint32_t src_ip = ((uint32_t)ip_header->src_ip[0] << 24) |
+                      ((uint32_t)ip_header->src_ip[1] << 16) |
+                      ((uint32_t)ip_header->src_ip[2] << 8) | ip_header->src_ip[3];
     if (packet_len < sizeof(ip_header_t)) {
         ids_generate_alert(IDS_ALERT_MALFORMED_PACKET, IDS_SEVERITY_MEDIUM,
                           src_ip, "Packet too small for IP header");

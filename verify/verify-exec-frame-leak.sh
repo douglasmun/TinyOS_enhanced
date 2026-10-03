@@ -108,10 +108,13 @@ trap cleanup EXIT
 # a violation of it: the thing under test is the kernel's page teardown, not a
 # ring-3 boundary.
 #
-# Each `exec` is verified on "Process exited" so the next one is not typed
+# Each `exec` is verified on "[EXEC] Process completed" so the next one is not typed
 # until the previous process has actually been reaped — otherwise the final
 # `mem` could be read while frames are still held by a live task and the
 # measurement would understate or overstate at random.
+# "[EXEC] Process completed", not "Process exited": the latter was the exit
+# syscall's console line, removed when exit went quiet (999f83d), and it fired
+# BEFORE the reap. cmd_exec prints this one after reaping, as its last line.
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_PASSWORD="$PASSWORD" \
@@ -119,11 +122,11 @@ TINYOS_FOLLOWUP_TIMEOUT=600 \
 TINYOS_EXEC_CMD="mem" \
 TINYOS_EXPECT="Free:" \
 TINYOS_FOLLOWUP_CMDS="\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
-exec /hello.elf=>Process exited;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
+exec /hello.elf=>[EXEC] Process completed;\
 mem=>Free:" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
@@ -173,13 +176,12 @@ DELTA=$(( BEFORE - AFTER ))
 # How many execs actually completed? If the typist missed one, the per-run
 # figure must be divided by what really ran, not by the number requested.
 #
-# Count "Process exited" ONLY AFTER the baseline `mem`, not over the whole log.
-# The ring-3 login shell exits with status 70 when `kshell` hands over, and
-# that exit is printed by the same kprintf -- counting it would inflate the
-# divisor and shrink the apparent per-run leak toward zero. Everything before
-# the first `mem` reading is pre-baseline by definition.
+# Count completions ONLY AFTER the baseline `mem`, not over the whole log, so
+# nothing pre-baseline can inflate the divisor and shrink the apparent per-run
+# leak toward zero. (The ring-3 login shell's own exit on the `kshell` handover
+# used to be counted that way; cmd_exec's line is not printed for it at all.)
 BASELINE_OFF=$(tr -d '\r' < "$SERIAL" | grep -n "Memory Usage" | head -1 | cut -d: -f1)
-COMPLETED=$(tr -d '\r' < "$SERIAL" | tail -n +"${BASELINE_OFF:-1}" | grep -c "Process exited")
+COMPLETED=$(tr -d '\r' < "$SERIAL" | tail -n +"${BASELINE_OFF:-1}" | grep -cF "[EXEC] Process completed")
 [ "$COMPLETED" -eq 0 ] && COMPLETED=1
 
 PER_RUN=$(( DELTA / COMPLETED ))

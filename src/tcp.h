@@ -143,6 +143,21 @@ typedef struct {
      * sockets opened before any task exists (boot DHCP/DNS). */
     uint32_t owner_uid;
 
+    /* The task that opened it, so its exit can release it (tcp_task_cleanup).
+     * owner_uid alone cannot: a uid outlives any one task. orphaned marks a
+     * connection whose owner died while it was open; tcp_tick closes it from
+     * task context, since teardown may run where no FIN can be sent. */
+    uint32_t owner_pid;
+    uint32_t owner_generation;
+    bool orphaned;
+
+    /* When tcp_close() sent our FIN. FIN_WAIT_1, CLOSING and LAST_ACK each
+     * wait on the peer and had no timeout, so a peer that went silent after
+     * the handshake held the slot until reboot -- and the per-uid cap does not
+     * count a socket its owner has closed, so a user could leak slots past it
+     * two at a time. */
+    uint32_t close_start;
+
 } tcp_connection_t;
 
 /* Sentinel owner for sockets created with no current task -- boot-time paths.
@@ -164,6 +179,21 @@ void tcp_init(void);
  * @return Socket descriptor (0-7) or -1 on error
  */
 int tcp_socket(void);
+
+/* tcp_socket() refusals. TCP_SOCKET_FULL is the table being full;
+ * TCP_SOCKET_LIMIT is a non-root caller at its own cap or at the root
+ * reserve -- "try again later", which SYS_TCPSOCK reports as -EAGAIN. */
+#define TCP_SOCKET_FULL   (-1)
+#define TCP_SOCKET_LIMIT  (-2)
+
+/* Per-uid cap on sockets a non-root user holds open, and slots only root may
+ * take. Without them, eight SYS_TCPSOCK calls by any user took the whole
+ * table, and nothing ever gave a CLOSED socket back. */
+#define TCP_USER_MAX_SOCKETS      2
+#define TCP_ROOT_RESERVED_SOCKETS 2
+
+/* Release the sockets a dying task opened. Called from task teardown. */
+void tcp_task_cleanup(uint32_t pid, uint32_t generation);
 
 /**
  * @brief Connect to a remote TCP server

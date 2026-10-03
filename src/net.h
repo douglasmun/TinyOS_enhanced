@@ -295,6 +295,17 @@ void net_count_tcp_zero_window(void);
 void net_get_tcp_rx_stats(uint32_t* malformed, uint32_t* flood,
                           uint32_t* sequence, uint32_t* rx_full,
                           uint32_t* peer_reset, uint32_t* zero_window);
+
+/* TCP local-side refusals and reaps. These replace kprintf sites a ring-3
+ * caller (SYS_TCPSOCK) or a peer's timing could fire at will. */
+void net_count_tcp_send_refused(void);
+void net_count_tcp_connect_refused(void);
+void net_count_tcp_table_full(void);
+void net_count_tcp_timed_out(void);
+void net_count_tcp_tw_evicted(void);
+void net_get_tcp_local_stats(uint32_t* send_refused, uint32_t* connect_refused,
+                             uint32_t* table_full, uint32_t* timed_out,
+                             uint32_t* tw_evicted);
 void net_count_syscall_rx(void);
 void net_count_syscall_tx(void);
 void e1000_poll_rx(void);

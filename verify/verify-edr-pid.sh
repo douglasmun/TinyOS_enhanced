@@ -50,7 +50,15 @@ i686-elf-grub-mkrescue -o dist/tinyos.iso iso >/dev/null 2>&1
 qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom dist/tinyos.iso -boot d \
     -m 256M -netdev user,id=net0 -device e1000,netdev=net0 \
     -serial file:"$LOG" -display none >/dev/null 2>&1 &
-QP=$!; sleep 25; kill $QP 2>/dev/null; wait $QP 2>/dev/null
+QP=$!
+# Up to 150 s, not a flat 25: leg 2b's witness is the daemon's first 60-second
+# status report (see there), and the boot lines legs 2-4 read come long before.
+for _ in $(seq 150); do
+    grep -qa "\[EDR DAEMON\] Scans performed:" "$LOG" 2>/dev/null && break
+    kill -0 $QP 2>/dev/null || break
+    sleep 1
+done
+kill $QP 2>/dev/null; wait $QP 2>/dev/null
 BOOT=$(tr -d '\r' < "$LOG")
 
 if echo "$BOOT" | grep -q "EDR daemon already protected"; then
@@ -74,16 +82,23 @@ echo "== leg 2b: the daemon task actually RUNS =="
 # identically either way, which is what made this harness a false pass.
 #
 # This string is the FIRST statement inside edr_daemon_main(), so it can only
-# appear if the task was scheduled. "Scan complete" is asserted too: reaching
-# the loop body proves the daemon is not merely entered but running, and it is
-# what makes the scans_performed counter on the secstatus line non-zero.
+# appear if the task was scheduled. A completed scan is asserted too: reaching
+# the loop body proves the daemon is not merely entered but running.
+#
+# The scan witness is the 60-second status report's "Scans performed: N" with
+# N > 0. It used to be the per-scan "Scan complete" line, which b0946e0
+# removed (three lines every 5 s on an idle system); after that this leg
+# failed on every run, against a daemon that was scanning fine.
 if echo "$BOOT" | grep -q "Starting EDR background daemon"; then
     ok "edr_daemon_main() entered (the task was actually scheduled)"
 else
     bad "edr_daemon_main() never ran -- task created but never enqueued"
 fi
-if echo "$BOOT" | grep -q "\[EDR DAEMON\] Scan complete"; then
-    ok "the daemon's scan loop is executing (scans_performed advances)"
+SCANS=$(echo "$BOOT" | sed -n 's/.*\[EDR DAEMON\] Scans performed: \([0-9][0-9]*\).*/\1/p' | head -1)
+if [ -z "$SCANS" ]; then
+    bad "no EDR status report within 150 s -- the daemon never reached report_statistics()"
+elif [ "$SCANS" -gt 0 ]; then
+    ok "the daemon's scan loop is executing ($SCANS scans in the first report)"
 else
     bad "daemon entered but never completed a scan -- its counters stay 0"
 fi

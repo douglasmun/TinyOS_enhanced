@@ -16,7 +16,7 @@
   </defs>
   <rect width="1000" height="700" fill="#0d1117"/>
   <text x="24" y="30" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="19" font-weight="700" fill="#e6edf3">TinyOS Enhanced — architecture</text>
-  <text x="24" y="50" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#8b949e">32-bit i386 · Multiboot2 · 92 kernel modules · preemptive, single core</text>
+  <text x="24" y="50" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#8b949e">32-bit i386 · Multiboot2 · 95 kernel modules · preemptive, single core</text>
   <rect x="24" y="68" width="952" height="104" rx="8" fill="none" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
   <text x="38" y="88" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#4c8eda">RING 3 · USER MODE</text>
   <text x="190" y="88" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="10.5" fill="#8b949e">linked at 0x08000000 · private PAE address space per process</text>

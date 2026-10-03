@@ -235,8 +235,10 @@ fi
 # TIME_WAIT eviction. The retry one memset()s the connection and originally did
 # not re-stamp owner_uid -- so a socket allocated under TIME_WAIT pressure came
 # back owned by uid 0. Nothing in the probe can force that path (it needs half
-# the table in TIME_WAIT), so only this guard holds the fix in place.
-if [ "$(grep -c 'owner_uid = tcp_current_owner_uid()' src/tcp.c)" -lt 2 ]; then
+# the table in TIME_WAIT), so only this guard holds the fix in place. Both now
+# call tcp_stamp_owner(), which also records the owning task for exit cleanup.
+if [ "$(grep -c 'tcp_stamp_owner(conn);' src/tcp.c)" -lt 2 ] \
+        || ! grep -q 'conn->owner_uid = tcp_current_owner_uid();' src/tcp.c; then
     guard_fail "tcp_socket() stamps owner_uid on fewer than two paths. The
   TIME_WAIT eviction retry memset()s the connection and must re-stamp it;
   without that, a socket allocated under TIME_WAIT pressure comes back
@@ -632,6 +634,18 @@ if [ -z "$TS_LEAK" ] || [ "$TS_LEAK" -lt 0 ]; then
         "Without a live foreign socket during the unprivileged pass, the" \
         "exclusion assertion below cannot fail even against a completely" \
         "inert ownership filter. The probe MUST leave that socket open."
+fi
+# The holder releases it after HOLD_MS. Its "released" line must not come
+# before the unprivileged pass's check, or that check ran against an empty
+# table and passes an inert filter.
+FOREIGN_LN=$(grep -an "PROBE tcpsock_foreign" "$SERIAL" | head -1 | cut -d: -f1)
+RELEASE_LN=$(grep -an "PROBE tcphold released" "$SERIAL" | head -1 | cut -d: -f1)
+LEAK_LN=$(grep -an "PROBE tcpsock_leak" "$SERIAL" | head -1 | cut -d: -f1)
+if [ -n "$FOREIGN_LN" ] && { [ "${LEAK_LN:-0}" -gt "$FOREIGN_LN" ] \
+        || { [ -n "$RELEASE_LN" ] && [ "$RELEASE_LN" -lt "$FOREIGN_LN" ]; }; }; then
+    fail_with "root's foreign socket was not live during the unprivileged pass" \
+        "leak line $LEAK_LN, released line ${RELEASE_LN:-none}, check line $FOREIGN_LN." \
+        "The exclusion assertion below would grade an empty table."
 fi
 
 TS_FOREIGN=$(grep -a "PROBE tcpsock_foreign" "$SERIAL" | tr -d '\r' \

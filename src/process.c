@@ -2,6 +2,7 @@
  * process.c - Process Management Implementation
  *=============================================================================*/
 #include "process.h"
+#include "tcp.h"
 #include "kprintf.h"
 #include "util.h"
 #include "pmm.h"
@@ -570,6 +571,41 @@ void task_free_slot_for_task(task_t* task) {
 }
 
 /*=============================================================================
+ * Kernel identity-map edits for a task's kernel stack and guard page.
+ *
+ * These go into the KERNEL page tables, explicitly, never "whatever CR3 holds".
+ * map_page() and pae_get_pte() follow the current CR3, and task creation runs
+ * in the creator's context: a SYS_SPAWN from ring 3 has the caller's user PDPT
+ * loaded. So the child's stack mapping was written into the CALLER's tables --
+ * copy-on-writing the kernel-shared page table into a private one on the way
+ * -- and the child's guard page was marked not-present in that private copy.
+ * The teardown restored the guard in whatever tables were current at exit
+ * (the dying child's), never the caller's. The caller's private table kept
+ * the frame not-present for good, and the caller's next kernel allocation
+ * that drew that frame (a ramfs node for its next new file) took a
+ * kernel-mode #PF and panicked the system. Any user could do it: spawn,
+ * wait, create a file. verify-spawn-guard-frame.sh.
+ *
+ * In the kernel tables every address space that shares them sees the change,
+ * and nothing is cloned. A task whose page table for this range is already a
+ * private copy keeps its snapshot, in which the stack frames are already
+ * identity-mapped present (the boot identity map covers RAM); that task simply
+ * does not see the child's guard, which only matters while the child runs, on
+ * its own CR3.
+ *===========================================================================*/
+static void kernel_identity_map(uint32_t phys, uint64_t flags) {
+    if (pae_is_active()) {
+        pae_map_page(phys, (uint64_t)phys, flags & PAE_FLAGS_MASK);
+    } else {
+        map_page(phys, phys, flags);
+    }
+}
+
+static pae_pte_t* kernel_guard_pte(uint32_t guard_phys) {
+    return pae_get_pte_in(pae_get_kernel_pdpt(), guard_phys);
+}
+
+/*=============================================================================
  * FUNCTION: task_create_kernel
  * PURPOSE: Create a new kernel-mode task
  *=============================================================================*/
@@ -673,10 +709,10 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     // CRITICAL FIX: Map guard page and stack pages into page tables
     // The guard page is mapped but marked NOT PRESENT (handled below)
     // Stack pages need to be identity-mapped (virtual == physical) so they can be accessed
-    map_page(guard_page_phys, guard_page_phys, PAGE_READWRITE | PAE_NX);  // Will be marked NOT PRESENT below
+    kernel_identity_map(guard_page_phys, PAGE_READWRITE | PAE_NX);  // Will be marked NOT PRESENT below
     for (int i = 0; i < KERNEL_TASK_STACK_PAGES; i++) {
         // Identity-map each stack page (virtual address = physical address)
-        map_page(stack_pages[i], stack_pages[i], PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
+        kernel_identity_map(stack_pages[i], PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
         // CRITICAL: Flush TLB after mapping so page is immediately accessible
         flush_tlb_single(stack_pages[i]);
     }
@@ -755,7 +791,7 @@ int task_create_kernel(void (*entry)(void), const char* name) {
      *=======================================================================*/
     if (pae_is_active()) {
         /* PAE Mode: Use 64-bit PTE functions */
-        pae_pte_t* guard_pte = pae_get_pte(guard_page_phys);
+        pae_pte_t* guard_pte = kernel_guard_pte(guard_page_phys);
         if (guard_pte) {
             /* Clear PAE_PRESENT bit while keeping PAE_READWRITE for debugging */
             *guard_pte = (guard_page_phys & PAE_FRAME_MASK) | PAE_READWRITE;  // Present=0
@@ -860,9 +896,6 @@ int task_create_kernel(void (*entry)(void), const char* name) {
     // parent's cwd, so a child inherits rather than resetting to "D:/".
     task_cwd_init(task);
 
-    // Initialize FD tracking (v1.11)
-    task->open_fd_count = 0;
-
     /*=========================================================================
      * SECURITY (EDR Phase 2): Initialize Behavioral Detection State
      *
@@ -941,7 +974,10 @@ static void guard_page_release(uint32_t guard_phys) {
     if (guard_phys == 0) {
         return;
     }
-    map_page(guard_phys, guard_phys, PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
+    /* In the kernel tables, where task creation marked it (see
+     * kernel_identity_map); map_page() would restore it in the current CR3,
+     * which at exit is the dying task's. */
+    kernel_identity_map(guard_phys, PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
     flush_tlb_single(guard_phys);
     pmm_free(guard_phys);
 }
@@ -1110,7 +1146,7 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
 
     // Map kernel stack pages (identity mapping) and flush TLB
     for (int i = 0; i < 8; i++) {
-        map_page(kernel_stack_pages[i], kernel_stack_pages[i], PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
+        kernel_identity_map(kernel_stack_pages[i], PAGE_PRESENT | PAGE_READWRITE | PAE_NX);
         flush_tlb_single(kernel_stack_pages[i]);
     }
 
@@ -1148,7 +1184,7 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
 
     // Mark guard page as NOT PRESENT (PAE-aware)
     if (pae_is_active()) {
-        pae_pte_t* guard_pte = pae_get_pte(guard_page_phys);
+        pae_pte_t* guard_pte = kernel_guard_pte(guard_page_phys);
         if (guard_pte) {
             *guard_pte = (guard_page_phys & PAE_FRAME_MASK) | PAE_READWRITE;  // Present=0
             flush_tlb_single(guard_page_phys);
@@ -1466,9 +1502,6 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     // parent's cwd, so a child inherits rather than resetting to "D:/".
     task_cwd_init(task);
 
-    // Initialize FD tracking (v1.11)
-    task->open_fd_count = 0;
-
     /*=========================================================================
      * REVOLUTIONARY SECURITY: Create Per-Process Private /tmp Directory
      *
@@ -1529,11 +1562,13 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     // Set state to ready
     task->state = TASK_STATE_READY;
 
-    kprintf("[PROCESS] Created user task PID=%d '%s' entry=0x%x\n",
-            task->pid, task->name, entry);
-    kprintf("[PROCESS]   User stack: 0x%08x (ASLR randomized)\n",
-            task->user_stack);
-    kprintf("[PROCESS]   Private /tmp: %s\n", task->private_tmp_dir);
+    /* kdbg, not kprintf: this ran on every SYS_SPAWN, and it put the child's
+     * randomized stack address on the console every user's output shares. */
+    kdbg("[PROCESS] Created user task PID=%d '%s' entry=0x%x\n",
+         task->pid, task->name, entry);
+    kdbg("[PROCESS]   User stack: 0x%08x (ASLR randomized)\n",
+         task->user_stack);
+    kdbg("[PROCESS]   Private /tmp: %s\n", task->private_tmp_dir);
 
     return task->pid;
 }
@@ -1823,8 +1858,6 @@ void task_terminate(uint32_t pid) {
             return;
         }
 
-        kprintf("[PROCESS] Terminating task PID=%d '%s'\n", task->pid, task->name);
-
         // A task killed while blocked on a wait queue must be detached from it,
         // or the stale entry consumes a later wakeup / spuriously wakes the
         // slot's next occupant. No-op unless blocked_on_wq is set.
@@ -1856,6 +1889,11 @@ void task_terminate(uint32_t pid) {
         // pipeline may still be parked in pipe_read waiting for data that can
         // no longer come.
         task_pipes_cleanup(task);
+
+        // And sockets opened via SYS_TCPSOCK, which otherwise stayed in_use
+        // forever: nothing reclaims a CLOSED socket, so a user who opened a
+        // few and exited took them from everyone until reboot.
+        tcp_task_cleanup(task->pid, task->generation);
 
         // A task terminated while not running never reaches the scheduler
         // cleanup queue (it is reaped off the ready queue without freeing its

@@ -1554,16 +1554,11 @@ void cmd_exec(int argc, char* argv[]) {
          * scheduler_add_task: after that the child is runnable and could
          * write on the next tick.
          *
-         * FOREGROUND ONLY. streams_inherit is a shallow copy, so parent and
-         * child would share the same RAMFS fd NUMBER with no refcount. The
-         * shell closes that fd and resets stdin as soon as the command line
-         * finishes (shell.c), which for a background child happens while it is
-         * still running — every subsequent write would hit a closed, possibly
-         * recycled fd. Blocking on the child, as the foreground path does,
-         * keeps the fd alive for exactly as long as the child can use it.
-         * A background job therefore keeps the console default and ignores
-         * redirection; lifting that needs refcounted or dup'd fds, which
-         * belongs with the pipe work rather than here. */
+         * FOREGROUND ONLY. A background job keeps the console default and
+         * ignores redirection. That was forced while parent and child shared
+         * the RAMFS fd number with no refcount; streams_inherit now gives the
+         * child its own reference, so the restriction could be lifted, but
+         * that is a behaviour change for its own commit. */
         if (!background) {
             streams_inherit(&task->streams, get_current_streams());
         }

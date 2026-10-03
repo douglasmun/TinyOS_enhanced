@@ -31,13 +31,15 @@
 #
 # WHAT IS MEASURED, AND WHY IT NEEDS NO FAULT INJECTION
 #
-# elf.c:486 runs on EVERY process load:
+# elf.c runs this on EVERY process load:
 #
-#   kprintf("[ELF] Loading process '%s' (file size: %zu bytes)...\n", ...)
+#   kdbg("[ELF] Loading process '%s' (file size: %zu bytes)...\n", ...)
 #
-# so a plain boot exercises it several times before the shell even appears
-# (shell.elf itself is loaded this way). No injection, no special netdev, no
-# typed command is required -- which makes this one of the cheapest harnesses
+# It was kprintf until the quiet sweep (b0946e0) made it a debug trace, so
+# the harness turns on `loglevel debug` and then execs: kdbg formats through
+# the same vkprintf as kprintf, so the witness is unchanged. The boot-time
+# shell.elf load now prints nothing (debug is off at boot). No injection, no
+# special netdev, and one typed command beyond the exec are required -- which makes this one of the cheapest harnesses
 # in the suite and means it cannot fail for an unrelated environmental reason.
 #
 # THE TWO LEGS, AND WHY BOTH ARE NEEDED
@@ -113,13 +115,13 @@ QEMU_PID=$!
 cleanup() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; rm -f "$MON_SOCK"; }
 trap cleanup EXIT
 
-# One exec so a USER-driven load is covered too, not only the boot-time
-# shell.elf load. Both go through elf_load_process_argv().
+# `loglevel debug` first: the load line is a kdbg trace, off by default.
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_PASSWORD="$PASSWORD" \
-TINYOS_EXEC_CMD="exec /hello.elf" \
-TINYOS_EXPECT="Hello from ELF" \
+TINYOS_EXEC_CMD="loglevel debug" \
+TINYOS_EXPECT="trace ON" \
+TINYOS_FOLLOWUP_CMDS="exec /hello.elf=>Hello from ELF" \
 python3 tools/qemu_typist.py
 RC=$?
 sleep 2

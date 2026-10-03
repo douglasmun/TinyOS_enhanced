@@ -287,14 +287,17 @@ static void cmd_clear(void) {
     console_clear();
 }
 
+/* stream_printf, not kprintf: kprintf ignores the command's streams, so
+ * `echo x > file` created the file empty and printed x on the console. */
 static void cmd_echo(int argc, char* argv[]) {
+    stream_context_t* ctx = get_current_streams();
     for (int i = 1; i < argc; i++) {
-        kprintf("%s", argv[i]);
+        stream_printf(ctx, "%s", argv[i]);
         if (i < argc - 1) {
-            kprintf(" ");
+            stream_printf(ctx, " ");
         }
     }
-    kprintf("\n");
+    stream_printf(ctx, "\n");
 }
 
 /*-----------------------------------------------------------------------------
@@ -636,13 +639,10 @@ static void parse_and_execute(char* cmd_line) {
                     ramfs_close(redir_fd);
                     redir_fd = -1;
                 }
-                /* RAMFS_FLAG_INHERIT is required, not optional: RAMFS defaults
-                 * every fd to close-on-exec, and elf.c calls
-                 * ramfs_close_on_exec() while loading the child. Without the
-                 * flag, `exec prog > file` hands the child a stdout bound to an
-                 * fd that exec itself just closed, and every write returns -1.
-                 * The shell still owns and closes this fd; INHERIT only exempts
-                 * it from the exec sweep. */
+                /* RAMFS_FLAG_INHERIT marks this fd as one an exec'd child
+                 * keeps using through its stdout. (It exempted it from an
+                 * exec-time sweep, since removed.) The shell owns and closes
+                 * it. */
                 redir_fd = ramfs_open(cmd_ctx.redirects[i].filename,
                                      RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW |
                                      RAMFS_FLAG_INHERIT);
@@ -669,13 +669,10 @@ static void parse_and_execute(char* cmd_line) {
                     ramfs_close(redir_fd);
                     redir_fd = -1;
                 }
-                /* RAMFS_FLAG_INHERIT is required, not optional: RAMFS defaults
-                 * every fd to close-on-exec, and elf.c calls
-                 * ramfs_close_on_exec() while loading the child. Without the
-                 * flag, `exec prog > file` hands the child a stdout bound to an
-                 * fd that exec itself just closed, and every write returns -1.
-                 * The shell still owns and closes this fd; INHERIT only exempts
-                 * it from the exec sweep. */
+                /* RAMFS_FLAG_INHERIT marks this fd as one an exec'd child
+                 * keeps using through its stdout. (It exempted it from an
+                 * exec-time sweep, since removed.) The shell owns and closes
+                 * it. */
                 redir_fd = ramfs_open(cmd_ctx.redirects[i].filename,
                                      RAMFS_FLAG_WRITE | RAMFS_FLAG_NOFOLLOW |
                                      RAMFS_FLAG_INHERIT);
@@ -772,8 +769,9 @@ static void parse_and_execute(char* cmd_line) {
             out_streams->stdout_stream.data = NULL;
             out_streams->stdout_stream.is_open = true;
             /* The shell opened redir_fd, so it owns it: stdout_reset() below is
-             * what actually closes it. A child that inherits this stream gets a
-             * borrowed copy instead and leaves the fd alone when it exits. */
+             * what actually closes it. A child that inherits this stream takes
+             * its own reference (streams_inherit), so neither close frees the
+             * slot under the other. */
             out_streams->stdout_stream.borrowed = false;
         }
     }

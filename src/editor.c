@@ -304,8 +304,14 @@ static void editor_insert_char(char c) {
 }
 
 static void editor_insert_newline(void) {
+    /* Enter changes nothing unless a row was actually inserted. Truncating
+     * the split row after a failed insert (row page full, or OOM) dropped the
+     * text after the cursor; moving the cursor anyway left it below the last
+     * row, where KEY_LEFT read a slot past E.numrows. Found by fuzz_editor. */
+    int before = E.numrows;
     if (E.cy + E.rowoff >= E.numrows) {
         editor_insert_row(E.numrows, "", 0);
+        if (E.numrows == before) return;
     } else {
         erow *row = &E.rows[E.cy + E.rowoff];
         int split = E.cx + E.coloff;
@@ -314,6 +320,7 @@ static void editor_insert_newline(void) {
         editor_insert_row(E.cy + E.rowoff + 1,
                          row->chars + split,
                          row->size - split);
+        if (E.numrows == before) return;
 
         row = &E.rows[E.cy + E.rowoff];
         row->size = split;
@@ -335,7 +342,10 @@ static void editor_del_char(void) {
     int filecol = E.cx + E.coloff;
 
     if (filerow >= E.numrows) return;
-    if (filecol == 0 && filerow == 0) return;
+    /* <= 0, not == 0: a negative column must never reach the join below
+     * with filerow == 0, which reads and appends to E.rows[-1] -- the end of
+     * whatever frame precedes the row page. */
+    if (filecol <= 0 && filerow == 0) return;
 
     erow *row = &E.rows[filerow];
 
@@ -343,17 +353,38 @@ static void editor_del_char(void) {
         editor_row_del_char(row, filecol - 1);
         E.cx--;
     } else {
-        /* Join with previous line */
+        /* Join with previous line -- only if the result fits. The append
+         * refuses a join of 4096 or more, and the row was deleted anyway,
+         * losing its text. Found by fuzz_editor. */
+        if (E.rows[filerow - 1].size + row->size >= 4096) return;
         E.cx = E.rows[filerow - 1].size;
         editor_row_append_string(&E.rows[filerow - 1], row->chars, row->size);
         editor_del_row(filerow);
-        E.cy--;
+        /* The joined row may be above the screen: scroll, as KEY_UP does. */
+        if (E.cy > 0) E.cy--;
+        else E.rowoff--;
     }
 }
 
 /*=============================================================================
  * FILE I/O
  *=============================================================================*/
+
+/* An existing file the editor cannot hold whole: drop what was loaded and
+ * forget the name. Keeping the name made :w write the partial buffer (or an
+ * empty one) over the file the user could not see in full. */
+static void editor_open_refuse(const char *msg) {
+    for (int i = 0; i < E.numrows; i++) {
+        editor_free_row(&E.rows[i]);
+    }
+    E.numrows = 0;
+    E.dirty = false;
+    if (E.filename) {
+        pmm_free((uint32_t)E.filename);
+        E.filename = NULL;
+    }
+    editor_set_status_message(msg);
+}
 
 void editor_open(const char *filename) {
     /* Store filename */
@@ -434,7 +465,7 @@ void editor_open(const char *filename) {
     /* STEP 2: Validate file size BEFORE attempting to read */
     if (file_node->size >= FILE_BUFFER_SIZE) {
         /* File too large for editor buffer - reject */
-        editor_set_status_message("Error: File too large (max 64KB)");
+        editor_open_refuse("Error: File too large (max 64KB)");
         return;
     }
 
@@ -442,7 +473,7 @@ void editor_open(const char *filename) {
     int fd = ramfs_open(filename, RAMFS_FLAG_READ);
     if (fd < 0) {
         /* Open failed (permissions, etc.) */
-        editor_set_status_message("Error: Cannot open file");
+        editor_open_refuse("Error: Cannot open file");
         return;
     }
 
@@ -451,7 +482,7 @@ void editor_open(const char *filename) {
     ramfs_close(fd);
 
     if (bytes_read < 0) {
-        editor_set_status_message("Error reading file");
+        editor_open_refuse("Error reading file");
         return;
     }
 
@@ -464,7 +495,21 @@ void editor_open(const char *filename) {
             int line_len = i - line_start;
             if (line_len > 0 && file_buffer[i - 1] == '\r') line_len--;
 
+            /* Refuse what a row cannot hold rather than load it short:
+             * editor_insert_row() clips a line at 4095 and returns without
+             * a row past the row page or on OOM, and the file still read as
+             * "Loaded file" -- so a :w after a one-character edit wrote the
+             * truncated text over the original. Found by fuzz_editor. */
+            if (line_len > 4095) {
+                editor_open_refuse("Error: Line too long (max 4095)");
+                return;
+            }
+            int before = E.numrows;
             editor_insert_row(E.numrows, file_buffer + line_start, line_len);
+            if (E.numrows == before) {
+                editor_open_refuse("Error: Too many lines or out of memory");
+                return;
+            }
             line_start = i + 1;
         }
     }
@@ -502,6 +547,15 @@ int editor_save(void) {
     int fd = ramfs_open(E.filename, RAMFS_FLAG_WRITE);
     if (fd < 0) {
         editor_set_status_message("Error opening file for write");
+        return -1;
+    }
+
+    /* ramfs_open() with WRITE keeps the old contents and starts at offset
+     * 0, so a save shorter than the file left the old tail after the new
+     * text. Found by fuzz_editor. */
+    if (ramfs_truncate(fd) != 0) {
+        ramfs_close(fd);
+        editor_set_status_message("Error writing file");
         return -1;
     }
 
@@ -710,8 +764,11 @@ static void editor_move_cursor(unsigned char key) {
                 if (E.cy > 0) E.cy--;
                 else E.rowoff--;
 
-                row = &E.rows[E.cy + E.rowoff];
-                E.cx = row->size;
+                /* The cursor can sit below the last row (Enter on an empty
+                 * buffer's end): E.rows past E.numrows holds stale or never
+                 * written slots, whose size made E.cx negative. */
+                row = (E.cy + E.rowoff < E.numrows) ? &E.rows[E.cy + E.rowoff] : NULL;
+                E.cx = row ? row->size : 0;
             }
             break;
 

@@ -64,13 +64,34 @@ void streams_inherit(stream_context_t* child, const stream_context_t* creator) {
     child->stdout_stream = creator->stdout_stream;
     child->stderr_stream = creator->stderr_stream;
 
-    /* The creator keeps ownership of any fd behind these streams. Marking the
-     * child's copies borrowed stops stdin_reset/stdout_reset/stderr_reset —
-     * and therefore streams_cleanup(), which task_terminate() runs on every
-     * dying task — from closing a descriptor the creator is still using. */
+    /* Pipes stay borrowed: the pipe table owns them, and its free waits for
+     * every stream naming the buffer (syscall.c pipe_slot_reap). */
     child->stdin_stream.borrowed  = true;
     child->stdout_stream.borrowed = true;
     child->stderr_stream.borrowed = true;
+
+    /* A RAMFS file the child gets its own reference to, and closes on its own
+     * reset. Borrowing it was not enough: the creator's close freed the slot
+     * while a background job or pipeline stage still wrote through it, and
+     * the next ramfs_open() anywhere -- any user's -- reused the number, so
+     * the child's output went into that file. The ring-3 shell restores
+     * right after spawning `cmd > f &`. verify-ramfs-fd-reuse.sh. */
+    stream_t* s[3] = { &child->stdin_stream, &child->stdout_stream,
+                       &child->stderr_stream };
+    for (int i = 0; i < 3; i++) {
+        if (s[i]->type != STREAM_TYPE_FILE || !s[i]->is_open) {
+            continue;
+        }
+        if (s[i]->fd >= 0 && ramfs_fd_ref(s[i]->fd) == 0) {
+            s[i]->borrowed = false;
+        } else {
+            /* Not open after all: give the child the console, not a number
+             * that could name someone else's file later. */
+            s[i]->type = STREAM_TYPE_CONSOLE;
+            s[i]->fd = -1;
+            s[i]->data = NULL;
+        }
+    }
 }
 
 int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
@@ -103,10 +124,9 @@ int stdin_redirect_from_file(stream_context_t* ctx, const char* filename) {
      * Attack: cmd < /tmp/input where attacker can replace /tmp/input with
      * symlink to /etc/shadow before open.
      *=======================================================================*/
-    /* RAMFS_FLAG_INHERIT: RAMFS closes every fd on exec by default (see
-     * ramfs_close_on_exec), which would leave an exec'd child's inherited stdin
-     * pointing at an already-closed descriptor. The opener still owns and closes
-     * this fd; INHERIT only exempts it from the exec sweep. */
+    /* RAMFS_FLAG_INHERIT marks this fd as one an exec'd child keeps using
+     * through its stdin. (It exempted it from an exec-time sweep, since
+     * removed.) The opener owns and closes it. */
     int fd = ramfs_open(filename,
                         RAMFS_FLAG_READ | RAMFS_FLAG_NOFOLLOW | RAMFS_FLAG_INHERIT);
     if (fd < 0) {

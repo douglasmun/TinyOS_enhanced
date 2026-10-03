@@ -37,9 +37,52 @@
 #define N_UNIMPL       7   /* SYS_CRYPTO: in range, no handler      */
 #define N_ACCEPTED    11   /* SYS_GETPID: in range, real handler    */
 
+/*-----------------------------------------------------------------------------
+ * `io` mode: the sys_read/sys_write argument refusals and the failed-spawn
+ * path. Each was a kprintf any caller could fire per call -- outside its own
+ * redirection, into the stream every user shares. Now each is counted
+ * (secstatus "Syscall arg rejects"), and verify-syscall-io-quiet.sh counts
+ * kernel lines between "PROBE io start" and "PROBE io end".
+ *
+ * Three bad buffers per direction -- over the size cap, wrapping, and ending
+ * past user space -- because each is its own refusal site. N_SPAWN_FAIL is
+ * odd so the two counters cannot be mistaken for each other.
+ *---------------------------------------------------------------------------*/
+#define SYS_WRITE 1
+#define SYS_READ  2
+#define IO_TOO_BIG   (1024u * 1024u + 1u)   /* MAX_IO_SIZE + 1   */
+#define IO_WRAP_PTR  0xFFFFFFF0u            /* + 0x20 wraps      */
+#define IO_KERN_PTR  0xBFFFFFF0u            /* + 0x20 > USER_SPACE_END */
+#define N_SPAWN_FAIL 3
+
+static int io_mode(void) {
+    static char buf[16];
+    int r[6];
+    printf("PROBE io start\n");
+    r[0] = syscall3(SYS_WRITE, 1, (uint32_t)buf, IO_TOO_BIG);
+    r[1] = syscall3(SYS_WRITE, 1, IO_WRAP_PTR, 0x20);
+    r[2] = syscall3(SYS_WRITE, 1, IO_KERN_PTR, 0x20);
+    r[3] = syscall3(SYS_READ, 0, (uint32_t)buf, IO_TOO_BIG);
+    r[4] = syscall3(SYS_READ, 0, IO_WRAP_PTR, 0x20);
+    r[5] = syscall3(SYS_READ, 0, IO_KERN_PTR, 0x20);
+    int refused = 0;
+    for (int i = 0; i < 6; i++) {
+        if (r[i] < 0) refused++;
+    }
+    int spawn_failed = 0;
+    for (int i = 0; i < N_SPAWN_FAIL; i++) {
+        char* const args[] = { "/no-such-probe.elf", 0 };
+        if (spawn("/no-such-probe.elf", args) < 0) spawn_failed++;
+    }
+    printf("PROBE io refused=%d spawn_failed=%d\n", refused, spawn_failed);
+    printf("PROBE io end\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && !strcmp(argv[1], "io")) {
+        return io_mode();
+    }
     int i;
     int rc = 0;
 
