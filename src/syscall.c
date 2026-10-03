@@ -3116,11 +3116,16 @@ int sys_change_password(const char* old_password, const char* new_password) {
     memset(kernel_old_password, 0, SYSCALL_MAX_PASSWORD_LEN);
     memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
-    /* Copy new password from user space */
-    int ret = copy_from_user(kernel_new_password, new_password, SYSCALL_MAX_PASSWORD_LEN - 1);
+    /* Copy new password from user space. As a STRING: a fixed-length
+     * copy_from_user read SYSCALL_MAX_PASSWORD_LEN - 1 bytes whatever the
+     * string's length, so a short password near the end of a mapped page
+     * (an argv string at the top of the user stack) faulted as -EFAULT, and
+     * an over-long one was silently truncated. copy_string_from_user stops
+     * at the terminator and refuses rather than truncates. */
+    int ret = copy_string_from_user(kernel_new_password, new_password, SYSCALL_MAX_PASSWORD_LEN);
     if (ret < 0) {
         kprintf("[SYSCALL] sys_change_password: copy_from_user(new_password) failed\n");
-        RETURN_ERROR(EFAULT);
+        return ret;
     }
 
     /* Ensure null termination */
@@ -3175,11 +3180,12 @@ int sys_change_password(const char* old_password, const char* new_password) {
         }
 
         /* Copy old password from user space */
-        ret = copy_from_user(kernel_old_password, old_password, SYSCALL_MAX_PASSWORD_LEN - 1);
+        ret = copy_string_from_user(kernel_old_password, old_password, SYSCALL_MAX_PASSWORD_LEN);
         if (ret < 0) {
             kprintf("[SYSCALL] sys_change_password: copy_from_user(old_password) failed\n");
             memset(kernel_new_password, 0, SYSCALL_MAX_PASSWORD_LEN);
-            RETURN_ERROR(EFAULT);
+            memset(kernel_old_password, 0, SYSCALL_MAX_PASSWORD_LEN);
+            return ret;
         }
 
         /* Ensure null termination */
@@ -3338,10 +3344,11 @@ int sys_switch_user(const char* username, const char* password) {
     memset(kernel_password, 0, SYSCALL_MAX_PASSWORD_LEN);
 
     /* Copy username from user space */
-    int ret = copy_from_user(kernel_username, username, SYSCALL_MAX_USERNAME_LEN - 1);
+    /* As a string, for the reason given in sys_change_password. */
+    int ret = copy_string_from_user(kernel_username, username, SYSCALL_MAX_USERNAME_LEN);
     if (ret < 0) {
         kprintf("[SYSCALL] sys_switch_user: copy_from_user(username) failed\n");
-        RETURN_ERROR(EFAULT);
+        return ret;
     }
 
     /* Ensure null termination */
@@ -3398,10 +3405,11 @@ int sys_switch_user(const char* username, const char* password) {
         }
 
         /* Copy password from user space */
-        ret = copy_from_user(kernel_password, password, SYSCALL_MAX_PASSWORD_LEN - 1);
+        ret = copy_string_from_user(kernel_password, password, SYSCALL_MAX_PASSWORD_LEN);
         if (ret < 0) {
             kprintf("[SYSCALL] sys_switch_user: copy_from_user(password) failed\n");
-            RETURN_ERROR(EFAULT);
+            memset(kernel_password, 0, SYSCALL_MAX_PASSWORD_LEN);
+            return ret;
         }
 
         /* Ensure null termination */
