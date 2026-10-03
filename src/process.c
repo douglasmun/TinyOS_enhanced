@@ -19,6 +19,9 @@
 #include "edr_behavioral.h"  /* EDR Phase 2: Behavioral detection */
 #include "edr_advanced.h"    /* EDR Phase 3: Advanced detection */
 #include "env.h"             /* Per-task environment storage */
+#ifdef TINYOS_FAULT_INJECT
+#include "edr_ml.h"          /* edr_response_terminate(), edrkill test only */
+#endif
 #include "ramfs.h"   /* For ramfs_mkdir() - per-process private /tmp */
 #include "crypto.h"  /* For csprng_random_bytes() - crypto-random tmp names */
 
@@ -1105,6 +1108,174 @@ void task_guardsync_test(void) {
     pmm_free(ufr);
     stream_printf(out, "[GUARDSYNC] VERDICT: %s\n", ok ? "PASS" : "FAIL");
 }
+
+/*=============================================================================
+ * edrkill -- verify-edr-kill-reap.sh only. Not in the command table.
+ *
+ * edr_response_terminate() marks its target TERMINATED and relies on the
+ * scheduler to clean up, but the scheduler only reaps a TERMINATED task that
+ * it switches away FROM, i.e. one that was running. Drives the real response
+ * function against kernel-task targets that are NOT running:
+ *
+ *   control  a blocked target killed by task_terminate(): slot back in the
+ *            allocator, wait-queue entry gone. Proves both witnesses can PASS.
+ *   blocked  a target parked on a wait queue, killed by EDR.
+ *   ready    a target in the ready queue (yield loop), killed by EDR.
+ *
+ * The slot witness reads free_slot_bitmap, which is what task_alloc_slot()
+ * consults. task_count_free_slots() and task_get() both treat a TERMINATED
+ * slot as gone, so they cannot see this leak.
+ *===========================================================================*/
+static wait_queue_t edrkill_wq;
+
+static void edrkill_blocked_entry(void) {
+    for (;;) {
+        CRITICAL_SECTION_ENTER();
+        wait_queue_sleep(&edrkill_wq);   /* releases the critical section */
+    }
+}
+
+static void edrkill_ready_entry(void) {
+    for (;;) {
+        scheduler_yield();
+    }
+}
+
+static uint32_t edrkill_bitmap_free(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (free_slot_bitmap & (1u << i)) n++;
+    }
+    return n;
+}
+
+/* Wait up to `ticks` for the target to reach the state the leg starts from. */
+static bool edrkill_settle(const task_t* t, bool want_blocked, uint32_t ticks) {
+    for (uint32_t i = 0; i < ticks; i++) {
+        bool there = want_blocked
+            ? (t->state == TASK_STATE_BLOCKED && edrkill_wq.count == 1)
+            : (t->has_run_before && t->state != TASK_STATE_BLOCKED);
+        if (there) return true;
+        task_sleep(1);
+    }
+    return false;
+}
+
+typedef enum {
+    EDRKILL_BY_TERMINATE,   /* task_terminate(): the control */
+    EDRKILL_BY_EDR,         /* edr_response_terminate() */
+    EDRKILL_PROTECTED,      /* EDR against a CAP_UNKILLABLE target */
+    EDRKILL_STALE,          /* EDR against a {pid, generation} that is not it */
+} edrkill_mode_t;
+
+/* One leg. Returns true on PASS. */
+static bool edrkill_leg(stream_context_t* out, const char* leg, bool blocked,
+                        edrkill_mode_t mode) {
+    uint32_t free_before = edrkill_bitmap_free();
+    int pid = task_create_kernel(blocked ? edrkill_blocked_entry : edrkill_ready_entry,
+                                 blocked ? "edrk-blk" : "edrk-rdy");
+    task_t* t = pid > 0 ? task_get((uint32_t)pid) : NULL;
+    if (!t) {
+        stream_printf(out, "[EDRKILL] %s control: CONTROL-DEAD (create failed)\n", leg);
+        return false;
+    }
+    /* Kernel tasks get CAP_ALL, which includes CAP_UNKILLABLE; task_terminate
+     * would refuse the control target and grade nothing. The protected leg
+     * keeps it on purpose. */
+    if (mode != EDRKILL_PROTECTED) {
+        t->capabilities &= ~CAP_UNKILLABLE;
+    }
+    scheduler_add_task(t);
+    uint32_t gen = t->generation;
+
+    bool settled = edrkill_settle(t, blocked, 200);
+    bool used = edrkill_bitmap_free() == free_before - 1;
+    stream_printf(out, "[EDRKILL] %s control: %s (state=%d free=%u->%u)\n", leg,
+                  (settled && used) ? "ok" : "CONTROL-DEAD", t->state,
+                  (unsigned)free_before, (unsigned)edrkill_bitmap_free());
+    if (!settled || !used) return false;
+
+    uint32_t unkillable_before, gone_before, unkillable_after, gone_after;
+    edr_response_get_refusals(&unkillable_before, &gone_before);
+    bool ret;
+    switch (mode) {
+    case EDRKILL_BY_TERMINATE:
+        task_terminate((uint32_t)pid);
+        ret = true;
+        break;
+    case EDRKILL_BY_EDR:
+    case EDRKILL_PROTECTED:
+        ret = edr_response_terminate(t);
+        break;
+    default:   /* EDRKILL_STALE: the slot's previous occupant, as a scan sees it */
+        ret = edr_response_execute_target(t, (uint32_t)pid, gen - 1,
+                                          RESPONSE_TERMINATE_PROCESS, "edrkill stale leg");
+        break;
+    }
+    task_sleep(50);   /* every scheduler cleanup path gets its chance */
+    edr_response_get_refusals(&unkillable_after, &gone_after);
+
+    if (mode == EDRKILL_PROTECTED || mode == EDRKILL_STALE) {
+        /* Must be refused: same task, same slot, still parked, and counted
+         * under the right refusal. */
+        bool alive = !ret && task_get_validated((uint32_t)pid, gen) == t &&
+                     t->state == TASK_STATE_BLOCKED &&
+                     edrkill_bitmap_free() == free_before - 1;
+        bool counted = (mode == EDRKILL_PROTECTED)
+            ? (unkillable_after == unkillable_before + 1 && gone_after == gone_before)
+            : (gone_after == gone_before + 1 && unkillable_after == unkillable_before);
+        stream_printf(out, "[EDRKILL] %s target survived: %s (ret=%d state=%d free=%u)\n",
+                      leg, alive ? "PASS" : "FAIL", ret, t->state,
+                      (unsigned)edrkill_bitmap_free());
+        stream_printf(out, "[EDRKILL] %s refusal counted: %s (unkillable %u->%u, gone %u->%u)\n",
+                      leg, counted ? "PASS" : "FAIL",
+                      (unsigned)unkillable_before, (unsigned)unkillable_after,
+                      (unsigned)gone_before, (unsigned)gone_after);
+        /* Not graded: put the target down so later legs start clean. */
+        t->capabilities &= ~CAP_UNKILLABLE;
+        task_terminate((uint32_t)pid);
+        task_sleep(50);
+        return alive && counted;
+    }
+
+    bool slot_back = edrkill_bitmap_free() == free_before;
+    bool wq_clean = edrkill_wq.count == 0;
+    int want = (mode == EDRKILL_BY_EDR) ? EDR_KILL_STATUS : 0x7F;
+    int status = -1;
+    bool recorded = syscall_exit_status_lookup((uint32_t)pid, gen, &status);
+    stream_printf(out, "[EDRKILL] %s slot returned to allocator: %s (free=%u, want %u)\n",
+                  leg, slot_back ? "PASS" : "FAIL",
+                  (unsigned)edrkill_bitmap_free(), (unsigned)free_before);
+    if (blocked) {
+        stream_printf(out, "[EDRKILL] %s wait-queue entry removed: %s (count=%d)\n",
+                      leg, wq_clean ? "PASS" : "FAIL", edrkill_wq.count);
+    }
+    stream_printf(out, "[EDRKILL] %s waitpid status: %s (recorded=%d status=%d, want %d)\n",
+                  leg, (recorded && status == want) ? "PASS" : "FAIL",
+                  recorded, status, want);
+    return ret && slot_back && (!blocked || wq_clean) && recorded && status == want;
+}
+
+void task_edrkill_test(void) {
+    stream_context_t* out = get_current_streams();
+    stream_printf(out, "[EDRKILL] EDR termination of a task that is not running\n");
+    wait_queue_init(&edrkill_wq);
+
+    /* Control first: if it fails it leaves its target on edrkill_wq, and the
+     * blocked leg's settle check (count == 1) then reports CONTROL-DEAD rather
+     * than grading a queue it did not start clean. */
+    bool c = edrkill_leg(out, "control", true, EDRKILL_BY_TERMINATE);
+    bool b = edrkill_leg(out, "blocked", true, EDRKILL_BY_EDR);
+    bool r = edrkill_leg(out, "ready", false, EDRKILL_BY_EDR);
+    bool p = edrkill_leg(out, "protected", true, EDRKILL_PROTECTED);
+    bool s = edrkill_leg(out, "stale", true, EDRKILL_STALE);
+    stream_printf(out, "[EDRKILL] VERDICT: %s\n", (c && b && r && p && s) ? "PASS" : "FAIL");
+
+    /* The self-kill leg runs in ring 3 after this returns; the harness logs
+     * back in and runs hello.elf. */
+    syscall_edr_selfkill_arm();
+    stream_printf(out, "[EDRKILL] self-kill leg armed\n");
+}
 #endif
 
 int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages,
@@ -1969,80 +2140,107 @@ void task_free_resources(task_t* task) {
  * FUNCTION: task_terminate
  * PURPOSE: Terminate a task
  *=============================================================================*/
+static void task_terminate_task(task_t* task, int status);
+
 void task_terminate(uint32_t pid) {
     task_t* task = task_get(pid);
     if (task) {
-        /* SECURITY: Check if process is protected from termination */
-        if (task->capabilities & CAP_UNKILLABLE) {
-            kprintf("[PROCESS] DENIED: Cannot terminate protected process PID=%d '%s' (CAP_UNKILLABLE)\n",
-                    task->pid, task->name);
-            return;
-        }
+        task_terminate_task(task, 0x7F);
+    }
+}
 
-        // A task killed while blocked on a wait queue must be detached from it,
-        // or the stale entry consumes a later wakeup / spuriously wakes the
-        // slot's next occupant. No-op unless blocked_on_wq is set.
-        wait_queue_remove_task(task);
+/*=============================================================================
+ * FUNCTION: task_terminate_status
+ * PURPOSE: Terminate the task {pid, generation} with an explicit wait status.
+ *
+ * For killers that choose their target earlier than they act on it: EDR scans
+ * a snapshot of task pointers, analyses, and only then responds. The
+ * generation check refuses a slot the target has exited from and another task
+ * now occupies, which a bare pid lookup would kill instead. Protected tasks
+ * are refused silently; the caller counts the refusal. Returns false when the
+ * target is gone or protected.
+ *=============================================================================*/
+bool task_terminate_status(uint32_t pid, uint32_t generation, int status) {
+    task_t* task = task_get_validated(pid, generation);
+    if (!task || (task->capabilities & CAP_UNKILLABLE)) {
+        return false;
+    }
+    task_terminate_task(task, status);
+    return true;
+}
 
-        // An externally killed task never runs sys_exit, so nothing else would
-        // record its status or wake anyone blocked in waitpid() on it. Waiters
-        // block on a wait queue rather than polling, so skipping this hangs
-        // them permanently instead of just delaying them a tick. 0x7F follows
-        // the shell convention for "died abnormally"; it is indistinguishable
-        // from a deliberate exit(127) until waitpid grows real WIFSIGNALED
-        // encoding, which is fine for now — the point is that the waiter is
-        // released at all.
-        waitpid_notify_death(task->pid, task->generation, 0x7F);
+static void task_terminate_task(task_t* task, int status) {
+    /* SECURITY: Check if process is protected from termination */
+    if (task->capabilities & CAP_UNKILLABLE) {
+        kprintf("[PROCESS] DENIED: Cannot terminate protected process PID=%d '%s' (CAP_UNKILLABLE)\n",
+                task->pid, task->name);
+        return;
+    }
 
-        // Clean up streams (close any open file descriptors)
-        streams_cleanup(&task->streams);
+    // A task killed while blocked on a wait queue must be detached from it,
+    // or the stale entry consumes a later wakeup / spuriously wakes the
+    // slot's next occupant. No-op unless blocked_on_wq is set.
+    wait_queue_remove_task(task);
 
-        // Release any files the task opened via SYS_OPEN. Safe on the self-exit
-        // path too: this only returns entries to the global VFS fd pool and
-        // never touches the kernel stack the dying task is still running on.
-        task_fdtable_cleanup(task);
+    // An externally killed task never runs sys_exit, so nothing else would
+    // record its status or wake anyone blocked in waitpid() on it. Waiters
+    // block on a wait queue rather than polling, so skipping this hangs
+    // them permanently instead of just delaying them a tick. 0x7F follows
+    // the shell convention for "died abnormally"; it is indistinguishable
+    // from a deliberate exit(127) until waitpid grows real WIFSIGNALED
+    // encoding, which is fine for now — the point is that the waiter is
+    // released at all. A caller that knows better passes its own status
+    // (EDR passes 137).
+    waitpid_notify_death(task->pid, task->generation, status);
 
-        // Same for pipes created via SYS_PIPE. Without this, a shell killed
-        // mid-pipeline would strand its slots forever: nothing else knows the
-        // owner is gone, and the table is a fixed 8 entries, so repeating it
-        // exhausts pipes system-wide. Frees the buffer AND wakes anything still
-        // blocked on either end, which matters because the other stage of the
-        // pipeline may still be parked in pipe_read waiting for data that can
-        // no longer come.
-        task_pipes_cleanup(task);
+    // Clean up streams (close any open file descriptors)
+    streams_cleanup(&task->streams);
 
-        // And sockets opened via SYS_TCPSOCK, which otherwise stayed in_use
-        // forever: nothing reclaims a CLOSED socket, so a user who opened a
-        // few and exited took them from everyone until reboot.
-        tcp_task_cleanup(task->pid, task->generation);
+    // Release any files the task opened via SYS_OPEN. Safe on the self-exit
+    // path too: this only returns entries to the global VFS fd pool and
+    // never touches the kernel stack the dying task is still running on.
+    task_fdtable_cleanup(task);
 
-        // A task terminated while not running never reaches the scheduler
-        // cleanup queue (it is reaped off the ready queue without freeing its
-        // slot), so free its resources and release its slot here. A
-        // self-terminating task, by contrast, is STILL EXECUTING ON ITS KERNEL
-        // STACK: freeing its resources now would pmm_free the 8 kernel-stack
-        // frames it is running on, returning them to the allocator so the next
-        // exec's pmm_alloc_contiguous(8) can reclaim them while the dying task
-        // still pushes/writes to them — a live use-after-free and free-then-
-        // realloc that corrupts the next task's kernel stack (intermittent
-        // first-exec-after-login corruption). So for self-exit, defer BOTH the
-        // resource-free and the slot-free to the scheduler cleanup path
-        // (scheduler.c), which runs task_free_resources + task_free_slot_for_task
-        // AFTER the final context switch has moved esp onto the reaper's stack.
-        // task_free_resources is idempotent, so the deferred call is the sole
-        // freer for self-exiting tasks with no double-free.
-        if (task != scheduler_get_current_task()) {
-            task_free_resources(task);
-            task->state = TASK_STATE_TERMINATED;
-            task->pid = 0;  // Mark slot as free
-            scheduler_remove_task(task);
-            task_free_slot_for_task(task);
-        } else {
-            // Self-exit: mark terminated so the scheduler queues us for cleanup,
-            // but leave resources/slot for the deferred post-switch reaper.
-            task->state = TASK_STATE_TERMINATED;
-            task->pid = 0;
-        }
+    // Same for pipes created via SYS_PIPE. Without this, a shell killed
+    // mid-pipeline would strand its slots forever: nothing else knows the
+    // owner is gone, and the table is a fixed 8 entries, so repeating it
+    // exhausts pipes system-wide. Frees the buffer AND wakes anything still
+    // blocked on either end, which matters because the other stage of the
+    // pipeline may still be parked in pipe_read waiting for data that can
+    // no longer come.
+    task_pipes_cleanup(task);
+
+    // And sockets opened via SYS_TCPSOCK, which otherwise stayed in_use
+    // forever: nothing reclaims a CLOSED socket, so a user who opened a
+    // few and exited took them from everyone until reboot.
+    tcp_task_cleanup(task->pid, task->generation);
+
+    // A task terminated while not running never reaches the scheduler
+    // cleanup queue (it is reaped off the ready queue without freeing its
+    // slot), so free its resources and release its slot here. A
+    // self-terminating task, by contrast, is STILL EXECUTING ON ITS KERNEL
+    // STACK: freeing its resources now would pmm_free the 8 kernel-stack
+    // frames it is running on, returning them to the allocator so the next
+    // exec's pmm_alloc_contiguous(8) can reclaim them while the dying task
+    // still pushes/writes to them — a live use-after-free and free-then-
+    // realloc that corrupts the next task's kernel stack (intermittent
+    // first-exec-after-login corruption). So for self-exit, defer BOTH the
+    // resource-free and the slot-free to the scheduler cleanup path
+    // (scheduler.c), which runs task_free_resources + task_free_slot_for_task
+    // AFTER the final context switch has moved esp onto the reaper's stack.
+    // task_free_resources is idempotent, so the deferred call is the sole
+    // freer for self-exiting tasks with no double-free.
+    if (task != scheduler_get_current_task()) {
+        task_free_resources(task);
+        task->state = TASK_STATE_TERMINATED;
+        task->pid = 0;  // Mark slot as free
+        scheduler_remove_task(task);
+        task_free_slot_for_task(task);
+    } else {
+        // Self-exit: mark terminated so the scheduler queues us for cleanup,
+        // but leave resources/slot for the deferred post-switch reaper.
+        task->state = TASK_STATE_TERMINATED;
+        task->pid = 0;
     }
 }
 

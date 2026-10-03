@@ -921,6 +921,10 @@ static void parse_and_execute(char* cmd_line) {
     else if (strcmp(argv[0], "guardsync") == 0) {
         task_guardsync_test();
     }
+    /* verify-edr-kill-reap.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "edrkill") == 0) {
+        task_edrkill_test();
+    }
     /* verify-double-fault.sh only. Not in the command table, so it never
      * appears in `help`.
      *

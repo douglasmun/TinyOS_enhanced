@@ -22,6 +22,7 @@
 
 #include "edr_ml.h"
 #include "process.h"
+#include "scheduler.h"  /* scheduler_get_current_task(): self-kill is deferred */
 #include "kprintf.h"
 #include "vfs.h"
 #include "audit.h"
@@ -249,88 +250,95 @@ void edr_response_init(void) {
             g_response_policy.response_threshold);
 }
 
+/* Kill requests refused because the target was CAP_UNKILLABLE (a kernel
+ * daemon: shell, idle, edr_daemon, supervisor, ktimerd). Counted, not printed:
+ * a periodic scan that keeps flagging a daemon would otherwise repeat the
+ * refusal on every pass. */
+static uint32_t g_terminate_refused_unkillable;
+/* Responses whose target exited (or whose slot was reused) between the scan
+ * that chose it and the response. */
+static uint32_t g_response_target_gone;
+
+void edr_response_get_refusals(uint32_t* unkillable, uint32_t* gone) {
+    if (unkillable) *unkillable = g_terminate_refused_unkillable;
+    if (gone) *gone = g_response_target_gone;
+}
+
 /**
- * @brief Terminate malicious process
- * @param task Process to terminate
- * @return true if successful
+ * @brief Terminate the task {pid, generation} that a scan chose
+ * @param task       Pointer the scan analysed
+ * @param pid        task->pid as read BEFORE the analysis
+ * @param generation task->generation as read BEFORE the analysis
+ * @return true if the task was terminated or its termination is pending
+ *
+ * This used to set task->state = TERMINATED and "let the scheduler clean up".
+ * The scheduler only reaps the task it switches AWAY from, so a target that was
+ * blocked or ready was never reaped: its slot stayed claimed for good (32 in
+ * all), a blocked target stayed on its wait queue, its fds, pipes and sockets
+ * were never released, and no waitpid() waiter was ever woken.
+ * verify-edr-kill-reap.sh. Now:
+ *
+ *  - Identity first. The pointer came from a snapshot; if the slot no longer
+ *    holds {pid, generation} the target is gone and whoever replaced it is
+ *    not what was analysed.
+ *  - CAP_UNKILLABLE is honoured. Only kernel daemons hold it (ring-3 tasks
+ *    start with capabilities zeroed), and a heuristic false positive must not
+ *    be able to take down idle, the supervisor or EDR itself.
+ *  - The running task is not killed in place. The only way EDR runs on behalf
+ *    of the current, killable task is edr_behavioral_check() inside that
+ *    task's own syscall, and terminating there would let the syscall carry on
+ *    on a dead task. Mark it; syscall_dispatch() exits it before the body.
+ *  - Anything else goes through task_terminate_status(), the same teardown
+ *    `kill` uses, with status 137 so waitpid can tell an EDR kill apart.
  */
-bool edr_response_terminate(task_t* task) {
-    if (!task) {
+static bool edr_response_terminate_target(task_t* task, uint32_t pid, uint32_t generation) {
+    if (!task || pid == 0 || task_get_validated(pid, generation) != task) {
+        g_response_target_gone++;
+        return false;
+    }
+
+    if (task->capabilities & CAP_UNKILLABLE) {
+        g_terminate_refused_unkillable++;
         return false;
     }
 
     kprintf("[EDR RESPONSE] Terminating PID %d (%s)\n", task->pid, task->name);
 
-    /*=========================================================================
-     * SECURITY FIX (AUDIT 1A): Scheduler/EDR Race Condition Protection
-     *=========================================================================
-     *
-     * VULNERABILITY: Task Termination Race Condition
-     *
-     * ATTACK SCENARIO:
-     * 1. EDR marks task as TASK_STATE_TERMINATED (this line)
-     * 2. [RACE WINDOW] Timer interrupt fires
-     * 3. Scheduler runs, sees task in inconsistent state (marked TERMINATED
-     *    but still on ready queue)
-     * 4. Scheduler attempts to context-switch to half-deleted task
-     * 5. RESULT: Kernel panic from dereferencing corrupt task structure
-     *
-     * ROOT CAUSE: Non-atomic task state transition
-     * - State change happens outside scheduler's lock
-     * - Scheduler interrupt can preempt EDR between state change and queue removal
-     * - Task is visible to scheduler in invalid transitional state
-     *
-     * FIX: Atomic Task Cleanup with Critical Section
-     *
-     * REQUIREMENTS:
-     * 1. **Atomic State Transition** - State change + queue removal must be atomic
-     * 2. **Interrupt Protection** - No scheduler interrupts during cleanup
-     * 3. **Consistent View** - Scheduler never sees task in transitional state
-     * 4. **Fail-Safe** - If critical section fails, log and continue safely
-     *
-     * IMPLEMENTATION:
-     * - Use CRITICAL_SECTION_ENTER/EXIT to disable interrupts
-     * - This prevents scheduler timer interrupt during state transition
-     * - Ensures task state change is atomic with respect to scheduler
-     * - Scheduler will only see task in RUNNING or TERMINATED state, never between
-     *
-     * PERFORMANCE IMPACT: Minimal (~5 cycles for CLI/STI)
-     * SECURITY IMPACT: Eliminates kernel panic vector
-     *=======================================================================*/
-
-    /* CRITICAL: Enter uninterruptible section for atomic task state transition */
-    CRITICAL_SECTION_ENTER();
-
-    /* Set process state to terminated (now atomic with respect to scheduler) */
-    task->state = TASK_STATE_TERMINATED;
-    task->exit_status = 128 + 9;  /* Exit code 137 (SIGKILL equivalent) */
-
-    /*
-     * NOTE: The scheduler's timer interrupt handler will see this task as
-     * TERMINATED on its next tick and will skip it during task selection.
-     * The actual cleanup (resource deallocation, queue removal) happens
-     * asynchronously in the scheduler's cleanup routine.
-     *
-     * CRITICAL: The task MUST remain in a valid, inspectable state until
-     * the scheduler has a chance to fully remove it from all queues and
-     * deallocate its resources. The CRITICAL_SECTION ensures this state
-     * change is visible atomically.
-     */
-
-    /* Exit critical section - scheduler can now safely observe TERMINATED state */
-    CRITICAL_SECTION_EXIT();
-
-    /* Audit log (outside critical section to minimize interrupt latency) */
+    /* Audit and remediation logs first: on the non-self path the slot is
+     * freed and pid zeroed by the time task_terminate_status() returns. */
     audit_log(AUDIT_RESPONSE, AUDIT_CRITICAL, task->uid,
               "Process terminated: PID=%d, name=%s, reason=malware",
-              (int)task->pid, task->name);
+              (int)pid, task->name);
 
-    /* Log remediation */
     char desc[64];
-    resp_snprintf(desc, sizeof(desc), "Terminated PID %d (%s)", task->pid, task->name);
-    log_remediation(RESPONSE_TERMINATE_PROCESS, task->pid, true, desc);
+    resp_snprintf(desc, sizeof(desc), "Terminated PID %d (%s)", pid, task->name);
 
-    return true;
+    bool ok;
+    if (task == scheduler_get_current_task()) {
+        task->edr_kill_pending = true;
+        ok = true;
+    } else {
+        ok = task_terminate_status(pid, generation, EDR_KILL_STATUS);
+    }
+
+    log_remediation(RESPONSE_TERMINATE_PROCESS, pid, ok, desc);
+    return ok;
+}
+
+/**
+ * @brief Terminate malicious process
+ * @param task Process to terminate; its current identity is the target
+ * @return true if successful
+ *
+ * For a caller holding a pointer it has not analysed across a preemption
+ * (edr_behavioral_check on current_task). A scanner must use
+ * edr_response_execute_target() with the identity it read before analysing.
+ */
+bool edr_response_terminate(task_t* task) {
+    if (!task) {
+        return false;
+    }
+    return edr_response_terminate_target(task, task->pid, task->generation);
 }
 
 /**
@@ -530,12 +538,26 @@ bool edr_response_block_network(task_t* task) {
  * @param reason Reason for response
  * @return true if successful
  */
-bool edr_response_execute(task_t* task, response_action_t action, const char* reason) {
+bool edr_response_execute_target(task_t* task, uint32_t pid, uint32_t generation,
+                                 response_action_t action, const char* reason) {
     if (!g_response_initialized) {
         edr_response_init();
     }
 
     if (!task) {
+        return false;
+    }
+
+    /* Refuse before printing anything: a periodic scan that keeps choosing a
+     * protected daemon, or a pointer that outlived its target, would
+     * otherwise log an "Executing" line every pass for a response that never
+     * happens. */
+    if (pid == 0 || task_get_validated(pid, generation) != task) {
+        g_response_target_gone++;
+        return false;
+    }
+    if (action == RESPONSE_TERMINATE_PROCESS && (task->capabilities & CAP_UNKILLABLE)) {
+        g_terminate_refused_unkillable++;
         return false;
     }
 
@@ -546,7 +568,7 @@ bool edr_response_execute(task_t* task, response_action_t action, const char* re
 
     switch (action) {
         case RESPONSE_TERMINATE_PROCESS:
-            success = edr_response_terminate(task);
+            success = edr_response_terminate_target(task, pid, generation);
             break;
 
         case RESPONSE_BLOCK_NETWORK:
@@ -598,6 +620,20 @@ bool edr_response_execute(task_t* task, response_action_t action, const char* re
     }
 
     return success;
+}
+
+/**
+ * @brief Respond to task's CURRENT identity
+ *
+ * Only for a pointer that cannot have changed occupant since the decision
+ * (edr_behavioral_check on current_task). Scanners that analyse first and
+ * respond afterwards use edr_response_execute_target().
+ */
+bool edr_response_execute(task_t* task, response_action_t action, const char* reason) {
+    if (!task) {
+        return false;
+    }
+    return edr_response_execute_target(task, task->pid, task->generation, action, reason);
 }
 
 /**
