@@ -163,6 +163,7 @@ int  getgid(void);
 void yield(void);
 int  sleep_ms(uint32_t ms);      /* blocks; timer wakes the task */
 int  waitpid(int pid);           /* blocks until pid exits; returns status */
+                                 /* -ECHILD if pid is not this process's child */
 
 /* Load `path` and start it as a child process. Returns the child PID (> 0) or
  * a negative errno. Does NOT block — waitpid() on the result to wait for it.

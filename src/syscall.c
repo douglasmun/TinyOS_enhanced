@@ -739,8 +739,8 @@ int sys_sleep(uint32_t ms) {
  * (from both sys_exit and task_terminate) — it no longer wakes every 10 ms
  * tick to poll a condition that is almost always still false.
  *
- * SECURITY: only root or the owner of the target process may wait on it —
- * prevents an unprivileged process from siphoning another user's exit codes.
+ * SECURITY: only the target's parent may wait on it (root included), and a
+ * status lost from the exit ring is -ECHILD, never a fabricated 0.
  *-----------------------------------------------------------------------------*/
 /* Defined with the file-I/O syscalls below, where its rationale lives; spawn
  * needs it too so that path resolution is identical across every syscall that
@@ -2793,13 +2793,21 @@ int sys_waitpid(int pid) {
             CRITICAL_SECTION_EXIT();
             return -ECHILD;
         }
-        if (self->euid != 0 && target->uid != self->uid) {
-            /* -ECHILD, the same answer a nonexistent PID gets above: -EPERM
+        if (target->parent_pid != self->pid ||
+            target->parent_generation != self->generation) {
+            /* Only the parent may wait, root included. A uid match is not
+             * parentage: it let any process block on, and collect the exit
+             * status of, every same-uid process it never started, and let
+             * root block forever on a kernel task that never exits. The
+             * generation check refuses a child of an EARLIER task that held
+             * this pid. Every caller waits on a task it just created
+             * (sys_spawn, cmd_exec, the login shell), which records it as
+             * parent.
+             *
+             * -ECHILD, the same answer a nonexistent PID gets above: -EPERM
              * would confirm the PID is live and owned by someone else, which
              * is the existence `ps` deliberately withholds from unprivileged
-             * users (process.c task_visible_to_current). -ECHILD is also
-             * the honest answer to the question actually asked -- that process
-             * is not this caller's child. */
+             * users (process.c task_visible_to_current). */
             CRITICAL_SECTION_EXIT();
             return -ECHILD;
         }
@@ -2829,11 +2837,15 @@ int sys_waitpid(int pid) {
             /* Slot already reaped/recycled — recover the status from the
              * exit-record ring. This is the COMMON path, not an edge case:
              * the post-switch reaper recycles the slot within the same tick
-             * the child exits, so a woken waiter almost never sees the slot. */
+             * the child exits, so a woken waiter almost never sees the slot.
+             *
+             * A miss means the record was already overwritten: the status is
+             * lost. Say so (-ECHILD) rather than report "exited 0" for a
+             * child whose status this kernel no longer has. */
             int status = 0;
-            exit_record_find(pid, generation, &status);
+            bool found = exit_record_find(pid, generation, &status);
             CRITICAL_SECTION_EXIT();
-            return status & 0xFF;
+            return found ? (status & 0xFF) : -ECHILD;
         }
         if (child->state == TASK_STATE_ZOMBIE) {
             int status = child->exit_status;
