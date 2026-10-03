@@ -25,6 +25,12 @@
 #   5. POSITIVE CONTROLS: root stats the files first, so a refusal cannot be
 #      an absence; the user stats a file of their own.
 #
+# Leg 1's file is now also a HIDDEN name (no rights on it, in a directory the
+# user cannot list), so its refusal is ENOENT from the lookup and no longer
+# reaches the read check. Any refusal still passes here; the read rule on its
+# own, for a name the user CAN see, is graded by verify-ramfs-hidden-names.sh
+# (root's 0600 file in a 0755 directory must answer "permission denied").
+#
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
 # Logs: statunread.log (serial), statunread-trace.log (int/cpu_reset trace).
 set -uo pipefail

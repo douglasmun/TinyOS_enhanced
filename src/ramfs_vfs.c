@@ -501,7 +501,12 @@ static int ramfs_vfs_stat(const char* path, vfs_dirent_t* out) {
      * In a search-but-not-list directory (the root is 0711) POSIX stat hands
      * out the size and mode of any name the caller can guess, for files whose
      * existence readdir would not even show. Decided 2026-10; do not
-     * "fix" toward POSIX. verify-stat-unreadable.sh pins it. */
+     * "fix" toward POSIX. verify-stat-unreadable.sh pins it.
+     *
+     * In that directory the name itself is now hidden: ramfs_find answers a
+     * node the caller has no rights on as absent, so a guess there gets
+     * ENOENT above, never this EACCES (verify-ramfs-hidden-names.sh). This
+     * check still decides every name the caller can already see listed. */
     uint16_t uid, gid;
     ramfs_get_current_credentials(&uid, &gid);
     if (!ramfs_check_permission(node, uid, gid, RAMFS_FLAG_READ)) {

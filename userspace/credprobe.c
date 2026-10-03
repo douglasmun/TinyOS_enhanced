@@ -22,7 +22,34 @@
 
 #define ENOSYS 38
 
+static inline uint64_t rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* credprobe -t LABEL USER PASSWORD N: call SYS_SWITCH_USER N times and print
+ * each call's rc and cost in units of 1024 TSC cycles. The TSC is readable
+ * from ring 3 here, which is what makes a cost difference between refusals
+ * an oracle; verify-legacy-su-oracle.sh compares an unknown user, a wrong
+ * password and a locked account. */
+static int timing_mode(const char* label, const char* user, const char* pass, int n) {
+    for (int i = 0; i < n; i++) {
+        uint64_t t0 = rdtsc();
+        int rc = syscall3(SYS_SWITCH_USER, (uint32_t)(uintptr_t)user,
+                          (uint32_t)(uintptr_t)pass, 0);
+        uint64_t t1 = rdtsc();
+        printf("PROBE t %s rc=%d kc=%u\n", label, rc, (uint32_t)((t1 - t0) >> 10));
+    }
+    printf("PROBE TIMING DONE %s\n", label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 6 && strcmp(argv[1], "-t") == 0) {
+        return timing_mode(argv[2], argv[3], argv[4], atoi(argv[5]));
+    }
+
     /* Optional: credprobe [su_user [su_password [old_password]]]. The defaults
      * are the attacker's guesses above; verify-legacy-cred-quiet.sh passes an
      * unknown user and the real password to drive the not-found and success

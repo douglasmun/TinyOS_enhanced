@@ -261,8 +261,7 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
              *================================================================*/
             if (components[count][0] == '.' && components[count][1] == '.' &&
                 components[count][2] == '\0') {
-                kprintf("[RAMFS] SECURITY: Path traversal attempt blocked (..)\n");
-                return -1;  // Reject path with ".."
+                return -1;  // Reject path with ".." (silently: see below)
             }
             if (components[count][0] == '.' && components[count][1] == '\0') {
                 return -1;  // "." is never an entry: nothing could remove it
@@ -285,7 +284,6 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
         // Check the last component for ".." as well
         if (components[count][0] == '.' && components[count][1] == '.' &&
             components[count][2] == '\0') {
-            kprintf("[RAMFS] SECURITY: Path traversal attempt blocked (..)\n");
             return -1;  // Reject path with ".."
         }
         if (components[count][0] == '.' && components[count][1] == '\0') {
@@ -300,9 +298,15 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
      * If *path is not '\0' after the loop, we hit max_components limit and
      * silently truncated. This could cause writes to wrong locations.
      * Fail explicitly instead of truncating.
+     *
+     * All three refusals in this function are silent. Each used to print a
+     * "[RAMFS] SECURITY:" line, and ring 3 reaches them once per syscall:
+     * the VFS allows 32 components where this allows 16, and SYS_CHMOD and
+     * the redirect syscall hand ramfs a path that was never canonicalized,
+     * ".." included. The caller gets its errno; that is the record.
+     * verify-ramfs-path-quiet.sh.
      *========================================================================*/
     if (*path != '\0') {
-        kprintf("[RAMFS] SECURITY: Path too deep (>%d components)\n", max_components);
         return -1;  // Path exceeds depth limit
     }
 
@@ -330,6 +334,46 @@ static bool may_search(ramfs_node_t* dir) {
     return ramfs_check_permission(dir, uid, gid, RAMFS_FLAG_EXEC);
 }
 
+/*=============================================================================
+ * A name the caller may not know about is a name that does not exist.
+ *
+ * A directory the caller can search but not read (the root is 0711) hides its
+ * LISTING, but every operation used to answer a guessed name differently when
+ * it existed: stat EACCES, write ENOENT, chmod EPERM, unlink EACCES -- and
+ * ENOENT, or create's EACCES, when it did not. Any one of them was an
+ * existence oracle for root's files.
+ *
+ * So a node is hidden from a caller who cannot read its directory and holds
+ * no permission on the node itself, unless the caller owns it. Lookups treat a
+ * hidden node as absent, and each operation then gives exactly the answer it
+ * gives for a name that is not there. Nothing is hidden that the caller could
+ * otherwise witness: any granted bit, or ownership, already lets some
+ * operation succeed on the node, and a readable directory lists it.
+ *
+ * Not POSIX, which hides only the listing. Decided 2026-10 together with
+ * stat's read requirement. One gap is structural: in a directory the caller
+ * may WRITE but not read, creating a hidden name cannot succeed as it would
+ * for an absent one (it would duplicate the name), so existence still shows
+ * there. No such directory exists by default. verify-ramfs-hidden-names.sh.
+ *
+ * Root passes every permission check, so nothing is hidden from it. Callers
+ * must hold ramfs_mutex.
+ *===========================================================================*/
+static bool hidden_from_caller(const ramfs_node_t* node) {
+    uint16_t uid, gid;
+    ramfs_get_current_credentials(&uid, &gid);
+    if (uid == 0 || !node->parent || node->uid == uid) {
+        return false;
+    }
+    ramfs_node_t* n = (ramfs_node_t*)node;
+    if (ramfs_check_permission(n->parent, uid, gid, RAMFS_FLAG_READ)) {
+        return false;
+    }
+    return !ramfs_check_permission(n, uid, gid, RAMFS_FLAG_READ) &&
+           !ramfs_check_permission(n, uid, gid, RAMFS_FLAG_WRITE) &&
+           !ramfs_check_permission(n, uid, gid, RAMFS_FLAG_EXEC);
+}
+
 #define WALK_NOT_DIR    (-1)
 #define WALK_NOT_FOUND  (-2)
 #define WALK_DENIED     (-3)
@@ -350,7 +394,7 @@ static int walk_to_parent(char components[][RAMFS_MAX_NAME], int n,
         while (child && strcmp(child->name, components[i]) != 0) {
             child = child->next;
         }
-        if (!child) return WALK_NOT_FOUND;
+        if (!child || hidden_from_caller(child)) return WALK_NOT_FOUND;
         if (child->type != RAMFS_TYPE_DIR) return WALK_NOT_DIR;
         parent = child;
     }
@@ -407,7 +451,7 @@ void ramfs_init(void) {
  * holds CRITICAL_SECTION. Directory tree operations that already hold the
  * lock should call this directly to avoid non-nestable lock issues.
  */
-static ramfs_node_t* ramfs_find_locked(const char* path) {
+static ramfs_node_t* ramfs_lookup_locked(const char* path, bool hide) {
     if (!root || !path) {
         return NULL;
     }
@@ -470,6 +514,9 @@ static ramfs_node_t* ramfs_find_locked(const char* path) {
                  * exist yet. This comment serves as documentation for future
                  * implementation.
                  *===========================================================*/
+                if (hide && hidden_from_caller(child)) {
+                    return NULL;  // See hidden_from_caller(): as if absent
+                }
                 current = child;
                 found = true;
                 break;
@@ -483,6 +530,18 @@ static ramfs_node_t* ramfs_find_locked(const char* path) {
     }
 
     return current;
+}
+
+/* The lookup every operation answers from: hidden names are absent. */
+static ramfs_node_t* ramfs_find_locked(const char* path) {
+    return ramfs_lookup_locked(path, true);
+}
+
+/* Whether the name is taken, hidden or not. Only for the checks that stop a
+ * create or rename from linking a second node under an existing name; it must
+ * never decide what a caller is told about a lookup. */
+static ramfs_node_t* ramfs_find_any_locked(const char* path) {
+    return ramfs_lookup_locked(path, false);
 }
 
 /**
@@ -596,6 +655,12 @@ int ramfs_mkdir(const char* path) {
     if (!ramfs_check_permission(parent, uid, gid, RAMFS_FLAG_WRITE)) {
         mutex_unlock(&ramfs_mutex);
         return -5;  // Permission denied
+    }
+
+    /* The check at the top skips hidden names; the name must still be free. */
+    if (ramfs_find_any_locked(path)) {
+        mutex_unlock(&ramfs_mutex);
+        return -2;  // Already exists
     }
 
     /*=========================================================================
@@ -774,6 +839,13 @@ int ramfs_open(const char* path, uint8_t flags) {
             if (!ramfs_check_permission(parent, uid, gid, RAMFS_FLAG_WRITE)) {
                 mutex_unlock(&ramfs_mutex);
                 return RAMFS_CREATE_EPERM;
+            }
+
+            /* A hidden name looked absent above, but is not free: refuse as
+             * an existing file the caller may not open would be. */
+            if (ramfs_find_any_locked(path)) {
+                mutex_unlock(&ramfs_mutex);
+                return -7;  // Permission denied
             }
 
             // Create new file
@@ -1293,6 +1365,13 @@ int ramfs_rename(const char* old_path, const char* new_path) {
     if (walk < 0 || new_parent != parent) {
         mutex_unlock(&ramfs_mutex);
         return -3;  // Destination not in the source's directory
+    }
+
+    /* The check above skips hidden names; the destination must still be
+     * free, or the directory would hold two entries with one name. */
+    if (ramfs_find_any_locked(new_path)) {
+        mutex_unlock(&ramfs_mutex);
+        return -2;  // Destination already exists
     }
 
     /* ATOMIC OPERATION: Just update the name field. split_path bounded the

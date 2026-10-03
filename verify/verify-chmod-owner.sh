@@ -35,7 +35,13 @@ TESTPASS=chmodpass1
 # the ownership check does, which looks like a refusal and is not one.
 # (That resolve_path/VFS mismatch is a pre-existing chmod limitation, separate
 # from the ownership bug this probe is about.)
-SECRET="/secret.txt"
+#
+# And put it in a directory the user can LIST. ramfs answers a name the caller
+# has no rights on, in a directory the caller cannot read, as absent (see
+# verify-ramfs-hidden-names.sh); D:/ is 0711, so a 0600 file there makes the
+# non-owner chmod ENOENT and the ownership check is never reached.
+PUBDIR="/cmpub"
+SECRET="$PUBDIR/secret.txt"
 ISO=dist/tinyos.iso
 SERIAL=chmod-owner.log
 RUN_DISK=/tmp/tinyos-chmodowner-disk.img
@@ -79,6 +85,8 @@ TINYOS_FOLLOWUP_CMDS="\
 useradd $TESTUSER=>Enter password for new user;\
 !$TESTPASS=>created;\
 kshell=>Switching to the kernel shell;\
+mkdir $PUBDIR;\
+chmod 755 $PUBDIR=>chmod:;\
 write $SECRET ROOTONLYDATA;\
 chmod 600 $SECRET=>chmod:;\
 cat $SECRET=>ROOTONLYDATA;\
