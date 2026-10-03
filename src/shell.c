@@ -287,14 +287,17 @@ static void cmd_clear(void) {
     console_clear();
 }
 
+/* stream_printf, not kprintf: kprintf ignores the command's streams, so
+ * `echo x > file` created the file empty and printed x on the console. */
 static void cmd_echo(int argc, char* argv[]) {
+    stream_context_t* ctx = get_current_streams();
     for (int i = 1; i < argc; i++) {
-        kprintf("%s", argv[i]);
+        stream_printf(ctx, "%s", argv[i]);
         if (i < argc - 1) {
-            kprintf(" ");
+            stream_printf(ctx, " ");
         }
     }
-    kprintf("\n");
+    stream_printf(ctx, "\n");
 }
 
 /*-----------------------------------------------------------------------------
