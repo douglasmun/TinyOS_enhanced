@@ -2393,8 +2393,7 @@ static void pipe_slot_reap(pipe_slot_t* slot) {
     }
     /* No stream names the buffer, so no task can be parked in
      * pipe_read/pipe_write on it; pipe_destroy releases the wait-queue page
-     * (or leaks it if a killed waiter is still queued) and the frames below
-     * are the pipe_buffer_t itself. */
+     * and the frames below are the pipe_buffer_t itself. */
     pipe_destroy(slot->buf);
     uint32_t base = (uint32_t)(uintptr_t)slot->buf;
     for (uint32_t i = 0; i < slot->pages; i++) {

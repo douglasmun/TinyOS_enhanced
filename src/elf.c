@@ -546,9 +546,11 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
         return -1;
     }
 
-    // Validate ELF
+    /* elf_validate() prints the one verdict line, naming the reason. This
+     * path runs before the signature check, so an unprivileged SYS_SPAWN of
+     * any non-ELF file reaches it in a loop: a second "Validation failed"
+     * line here doubled that flood. elf_loads_refused counts it. */
     if (!elf_validate(elf_data)) {
-        kprintf("[ELF] Validation failed\n");
         return -1;
     }
 
