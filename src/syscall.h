@@ -870,6 +870,8 @@ void sys_tcpsock_race_test(void);
 void syscall_edr_selfkill_arm(void);
 /* verify-edr-kill-reap.sh only: waitpid status from the exit ring. */
 bool syscall_exit_status_lookup(uint32_t pid, uint32_t generation, int* status);
+/* verify-waitpid-gate.sh only (kernel-shell `waitgate`). */
+void sys_waitgate_test(void);
 #endif
 
 /**

@@ -739,8 +739,8 @@ int sys_sleep(uint32_t ms) {
  * (from both sys_exit and task_terminate) — it no longer wakes every 10 ms
  * tick to poll a condition that is almost always still false.
  *
- * SECURITY: only root or the owner of the target process may wait on it —
- * prevents an unprivileged process from siphoning another user's exit codes.
+ * SECURITY: only the target's parent may wait on it (root included), and a
+ * status lost from the exit ring is -ECHILD, never a fabricated 0.
  *-----------------------------------------------------------------------------*/
 /* Defined with the file-I/O syscalls below, where its rationale lives; spawn
  * needs it too so that path resolution is identical across every syscall that
@@ -1991,6 +1991,142 @@ static void edr_selfkill_point(uint32_t syscall_num) {
                              "fault-inject: edrkill self-kill leg");
     }
 }
+
+/*=============================================================================
+ * waitgate -- verify-waitpid-gate.sh only. Not in the command table.
+ *
+ * Grades sys_waitpid's two decisions on kernel-task targets parked on a wait
+ * queue (they never exit on their own):
+ *
+ *   child     target's parent is the caller: the control, must return 127
+ *   nonchild  same uid, no parent: must be refused (-ECHILD)
+ *   stale     parent pid is the caller's but the generation is not: refused
+ *   evicted   the child dies and 16 later exits push its record out of the
+ *             exit ring before the waiter looks: must not read as status 0
+ *
+ * The one-shot hook below runs in sys_waitpid AFTER its admission check. It
+ * kills the target (task_terminate, status 0x7F), so a waitpid that wrongly
+ * admits a non-child returns 127 instead of blocking forever, and `fired`
+ * records whether admission happened at all. In "evict" mode it then logs
+ * EXIT_RECORDS fake deaths whose pids (> 0xFFFF) no real task can have.
+ *===========================================================================*/
+typedef enum { WAITGATE_OFF, WAITGATE_KILL, WAITGATE_KILL_EVICT } waitgate_mode_t;
+static waitgate_mode_t waitgate_mode;
+static bool waitgate_fired;
+static wait_queue_t waitgate_wq;
+
+static void waitgate_point(int pid) {
+    waitgate_mode_t mode = waitgate_mode;
+    if (mode == WAITGATE_OFF) return;
+    waitgate_mode = WAITGATE_OFF;
+    waitgate_fired = true;
+    task_terminate((uint32_t)pid);
+    if (mode == WAITGATE_KILL_EVICT) {
+        for (uint32_t i = 0; i < EXIT_RECORDS; i++) {
+            waitpid_notify_death(0x10000u + i, 1, 0);
+        }
+    }
+}
+
+static void waitgate_entry(void) {
+    for (;;) {
+        CRITICAL_SECTION_ENTER();
+        wait_queue_sleep(&waitgate_wq);   /* releases the critical section */
+    }
+}
+
+typedef enum { WG_CHILD, WG_NONCHILD, WG_STALE, WG_EVICTED } waitgate_leg_t;
+
+/* One leg. Returns true on PASS. */
+static bool waitgate_leg(stream_context_t* out, const char* leg, waitgate_leg_t kind) {
+    task_t* self = scheduler_get_current_task();
+    int pid = task_create_kernel(waitgate_entry, "waitgate");
+    task_t* t = pid > 0 ? task_get((uint32_t)pid) : NULL;
+    if (!self || !t) {
+        stream_printf(out, "[WAITGATE] %s control: CONTROL-DEAD (create failed)\n", leg);
+        return false;
+    }
+    /* CAP_ALL includes CAP_UNKILLABLE; task_terminate would refuse it. */
+    t->capabilities &= ~CAP_UNKILLABLE;
+    t->uid = self->uid;
+    t->euid = self->euid;
+    switch (kind) {
+    case WG_NONCHILD:
+        t->parent_pid = 0;
+        t->parent_generation = 0;
+        break;
+    case WG_STALE:   /* an earlier incarnation of the caller's pid */
+        t->parent_pid = self->pid;
+        t->parent_generation = self->generation + 1;
+        break;
+    default:
+        t->parent_pid = self->pid;
+        t->parent_generation = self->generation;
+        break;
+    }
+    uint32_t gen = t->generation;
+    scheduler_add_task(t);
+    for (int i = 0; i < 200 && t->state != TASK_STATE_BLOCKED; i++) {
+        task_sleep(1);
+    }
+    bool parked = t->state == TASK_STATE_BLOCKED;
+    stream_printf(out, "[WAITGATE] %s control: %s (state=%d)\n", leg,
+                  parked ? "ok" : "CONTROL-DEAD", t->state);
+    if (!parked) {
+        task_terminate((uint32_t)pid);
+        return false;
+    }
+
+    waitgate_fired = false;
+    waitgate_mode = (kind == WG_EVICTED) ? WAITGATE_KILL_EVICT : WAITGATE_KILL;
+    int ret = sys_waitpid(pid);
+    bool fired = waitgate_fired;
+    waitgate_mode = WAITGATE_OFF;
+    int status = -1;
+    bool recorded = syscall_exit_status_lookup((uint32_t)pid, gen, &status);
+    if (!fired) {
+        task_terminate((uint32_t)pid);   /* refused: put the target down */
+    }
+    task_sleep(20);
+
+    bool ok;
+    switch (kind) {
+    case WG_CHILD:
+        /* Control: admitted, killed by the hook, status read from the ring. */
+        ok = fired && recorded && ret == 0x7F;
+        stream_printf(out, "[WAITGATE] %s admitted, status read: %s (ret=%d fired=%d recorded=%d)\n",
+                      leg, ok ? "PASS" : "FAIL", ret, fired, recorded);
+        break;
+    case WG_EVICTED:
+        /* The eviction must actually have happened, or this grades nothing. */
+        if (!fired || recorded) {
+            stream_printf(out, "[WAITGATE] %s control: CONTROL-DEAD (fired=%d recorded=%d)\n",
+                          leg, fired, recorded);
+            return false;
+        }
+        ok = ret == -ECHILD;
+        stream_printf(out, "[WAITGATE] %s lost status not reported as exit 0: %s (ret=%d, want %d)\n",
+                      leg, ok ? "PASS" : "FAIL", ret, -ECHILD);
+        break;
+    default:
+        ok = !fired && ret == -ECHILD;
+        stream_printf(out, "[WAITGATE] %s refused: %s (ret=%d fired=%d, want %d fired=0)\n",
+                      leg, ok ? "PASS" : "FAIL", ret, fired, -ECHILD);
+        break;
+    }
+    return ok;
+}
+
+void sys_waitgate_test(void) {
+    stream_context_t* out = get_current_streams();
+    stream_printf(out, "[WAITGATE] waitpid admission and lost-status handling\n");
+    wait_queue_init(&waitgate_wq);
+    bool c = waitgate_leg(out, "child", WG_CHILD);
+    bool n = waitgate_leg(out, "nonchild", WG_NONCHILD);
+    bool s = waitgate_leg(out, "stale", WG_STALE);
+    bool e = waitgate_leg(out, "evicted", WG_EVICTED);
+    stream_printf(out, "[WAITGATE] VERDICT: %s\n", (c && n && s && e) ? "PASS" : "FAIL");
+}
 #endif
 
 #ifdef TINYOS_FAULT_INJECT
@@ -2657,19 +2793,30 @@ int sys_waitpid(int pid) {
             CRITICAL_SECTION_EXIT();
             return -ECHILD;
         }
-        if (self->euid != 0 && target->uid != self->uid) {
-            /* -ECHILD, the same answer a nonexistent PID gets above: -EPERM
+        if (target->parent_pid != self->pid ||
+            target->parent_generation != self->generation) {
+            /* Only the parent may wait, root included. A uid match is not
+             * parentage: it let any process block on, and collect the exit
+             * status of, every same-uid process it never started, and let
+             * root block forever on a kernel task that never exits. The
+             * generation check refuses a child of an EARLIER task that held
+             * this pid. Every caller waits on a task it just created
+             * (sys_spawn, cmd_exec, the login shell), which records it as
+             * parent.
+             *
+             * -ECHILD, the same answer a nonexistent PID gets above: -EPERM
              * would confirm the PID is live and owned by someone else, which
              * is the existence `ps` deliberately withholds from unprivileged
-             * users (process.c task_visible_to_current). -ECHILD is also
-             * the honest answer to the question actually asked -- that process
-             * is not this caller's child. */
+             * users (process.c task_visible_to_current). */
             CRITICAL_SECTION_EXIT();
             return -ECHILD;
         }
         generation = target->generation;
     }
     CRITICAL_SECTION_EXIT();
+#ifdef TINYOS_FAULT_INJECT
+    waitgate_point(pid);
+#endif
 
     /* Block on the waitpid wait queue until the child dies, re-checking the
      * condition on every wakeup: the queue is shared by all waiters and woken
@@ -2690,11 +2837,15 @@ int sys_waitpid(int pid) {
             /* Slot already reaped/recycled — recover the status from the
              * exit-record ring. This is the COMMON path, not an edge case:
              * the post-switch reaper recycles the slot within the same tick
-             * the child exits, so a woken waiter almost never sees the slot. */
+             * the child exits, so a woken waiter almost never sees the slot.
+             *
+             * A miss means the record was already overwritten: the status is
+             * lost. Say so (-ECHILD) rather than report "exited 0" for a
+             * child whose status this kernel no longer has. */
             int status = 0;
-            exit_record_find(pid, generation, &status);
+            bool found = exit_record_find(pid, generation, &status);
             CRITICAL_SECTION_EXIT();
-            return status & 0xFF;
+            return found ? (status & 0xFF) : -ECHILD;
         }
         if (child->state == TASK_STATE_ZOMBIE) {
             int status = child->exit_status;
