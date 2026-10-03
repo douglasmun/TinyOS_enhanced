@@ -22,6 +22,7 @@
 /* #include "ssh_crypto.h" */ // For dh_bigint_t and DH_GROUP14_SIZE
 /* #include "rsa.h" */       // For bigint_t and bigint operations
 #include "edr_behavioral.h" // EDR Phase 2: Behavioral detection
+#include "edr_ml.h"         // EDR_KILL_STATUS, edr_kill_pending response
 #include "audit.h"     // For audit_log() in mandatory EDR hook
 #include <stddef.h>    // For offsetof() macro used in static assertions
 #include "elf.h"       // SYS_SPAWN: elf_exec_from_path
@@ -1960,6 +1961,39 @@ static int tcpsock_lock_owned(int sockfd) {
 }
 
 #ifdef TINYOS_FAULT_INJECT
+/* EDR's real self-kill triggers (ROP / shellcode / privilege-escalation
+ * heuristics) are not a deterministic vehicle. When armed, the next SYS_WRITE
+ * from a task whose name contains "hello" (only hello.elf, a ring-3 program)
+ * gets the same response
+ * edr_behavioral_check() would issue, at the same point in the dispatcher.
+ * Armed by `edrkill` (verify-edr-kill-reap.sh), fires once. */
+static bool edr_selfkill_armed;
+
+void syscall_edr_selfkill_arm(void) {
+    edr_selfkill_armed = true;
+}
+
+/* The status waitpid() would return for {pid, generation}, from the exit
+ * ring. edrkill grades the status an EDR kill reports. */
+bool syscall_exit_status_lookup(uint32_t pid, uint32_t generation, int* status) {
+    uint32_t eflags = disable_interrupts();
+    bool found = exit_record_find(pid, generation, status);
+    restore_interrupts(eflags);
+    return found;
+}
+
+static void edr_selfkill_point(uint32_t syscall_num) {
+    task_t* self = scheduler_get_current_task();
+    if (edr_selfkill_armed && syscall_num == SYS_WRITE && self &&
+        strstr(self->name, "hello") != NULL) {
+        edr_selfkill_armed = false;
+        edr_response_execute(self, RESPONSE_TERMINATE_PROCESS,
+                             "fault-inject: edrkill self-kill leg");
+    }
+}
+#endif
+
+#ifdef TINYOS_FAULT_INJECT
 /* The window between tcpsock_check_owner() and the primitive's use of the
  * slot, made deterministic: when armed, the next SYS_TCPSOCK call hands its
  * slot to uid 0 at exactly that point, as a free-and-reallocate by another
@@ -3512,6 +3546,22 @@ static void syscall_dispatch(struct cpu_state* state) {
 
     /* MANDATORY: Run EDR behavioral analysis (cannot be bypassed) */
     bool allow = edr_behavioral_check(current_task, syscall_num, arg1);
+
+#ifdef TINYOS_FAULT_INJECT
+    edr_selfkill_point(syscall_num);
+#endif
+
+    /* EDR decided, inside the check above, to kill the task making this
+     * call (edr_response_terminate() on the current task only marks it).
+     * The syscall must not run: the verdict was that this task is executing
+     * an exploit, and before this check the flagged call was carried out and
+     * returned to ring 3 with the task already marked TERMINATED. Exit here,
+     * through the same teardown as SYS_EXIT; sys_exit() does not return.
+     * verify-edr-kill-reap.sh. */
+    if (current_task->edr_kill_pending) {
+        sys_exit(EDR_KILL_STATUS);
+    }
+
     if (!allow) {
         /* Syscall blocked by behavioral analysis */
         kprintf("[EDR BEHAVIORAL] PID %d: Blocked suspicious syscall %d\n",

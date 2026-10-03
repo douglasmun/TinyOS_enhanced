@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /*-----------------------------------------------------------------------------
  * System Call Numbers
@@ -865,6 +866,10 @@ int sys_tcpsock(uint32_t subcmd, int sockfd, void* user_buf, size_t len);
 #ifdef TINYOS_FAULT_INJECT
 /* verify-tcpsock-race.sh only (kernel-shell `tcpsockrace`). */
 void sys_tcpsock_race_test(void);
+/* verify-edr-kill-reap.sh only: arm the one-shot ring-3 EDR self-kill. */
+void syscall_edr_selfkill_arm(void);
+/* verify-edr-kill-reap.sh only: waitpid status from the exit ring. */
+bool syscall_exit_status_lookup(uint32_t pid, uint32_t generation, int* status);
 #endif
 
 /**

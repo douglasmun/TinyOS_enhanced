@@ -121,6 +121,10 @@ static void scan_process(task_t* task) {
 
     g_edr_daemon_state.processes_scanned++;
 
+    /* Identity BEFORE the analysis: the response must hit the task that was
+     * scored, not whatever occupies the slot by the time we respond. */
+    uint32_t pid = task->pid, generation = task->generation;
+
     /* Check if process is suspicious */
     if (is_process_suspicious(task)) {
         g_edr_daemon_state.threats_detected++;
@@ -161,20 +165,20 @@ static void scan_process(task_t* task) {
             /* Choose response based on threat level */
             if (threat_score >= 90) {
                 /* Critical threat - terminate immediately */
-                edr_response_execute(task, RESPONSE_TERMINATE_PROCESS,
-                                    "Critical threat detected by EDR daemon");
+                edr_response_execute_target(task, pid, generation, RESPONSE_TERMINATE_PROCESS,
+                                            "Critical threat detected by EDR daemon");
                 g_edr_daemon_state.responses_executed++;
             } else if (threat_score >= 70) {
                 /* High threat - block network and alert */
-                edr_response_execute(task, RESPONSE_BLOCK_NETWORK,
-                                    "High threat detected by EDR daemon");
-                edr_response_execute(task, RESPONSE_ALERT_ADMIN,
-                                    "Suspicious process activity");
+                edr_response_execute_target(task, pid, generation, RESPONSE_BLOCK_NETWORK,
+                                            "High threat detected by EDR daemon");
+                edr_response_execute_target(task, pid, generation, RESPONSE_ALERT_ADMIN,
+                                            "Suspicious process activity");
                 g_edr_daemon_state.responses_executed += 2;
             } else {
                 /* Medium threat - alert only */
-                edr_response_execute(task, RESPONSE_ALERT_ADMIN,
-                                    "Potentially suspicious process");
+                edr_response_execute_target(task, pid, generation, RESPONSE_ALERT_ADMIN,
+                                            "Potentially suspicious process");
                 g_edr_daemon_state.responses_executed++;
             }
         }

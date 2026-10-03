@@ -402,6 +402,15 @@ typedef struct {
  */
 bool edr_response_execute(task_t* task, response_action_t action, const char* reason);
 
+/* Same, against the identity {pid, generation} a scanner read BEFORE it
+ * analysed task. Refused (false) if the slot no longer holds it. */
+bool edr_response_execute_target(task_t* task, uint32_t pid, uint32_t generation,
+                                 response_action_t action, const char* reason);
+
+/* Wait status an EDR kill reports to waitpid(): 128 + 9, the shell's SIGKILL
+ * convention, so it is distinguishable from task_terminate()'s 0x7F. */
+#define EDR_KILL_STATUS (128 + 9)
+
 /**
  * @brief Quarantine malicious file
  * @param filepath File to quarantine
@@ -708,6 +717,8 @@ void edr_ti_get_stats(uint32_t* total_checks, uint32_t* total_matches,
 /* Automated Response - NEW functions */
 void edr_response_init(void);
 bool edr_response_terminate(task_t* task);
+/* Kill requests refused: target CAP_UNKILLABLE / target gone or replaced. */
+void edr_response_get_refusals(uint32_t* unkillable, uint32_t* gone);
 void edr_response_set_policy(const response_policy_t* policy);
 void edr_response_get_policy(response_policy_t* policy);
 bool edr_response_should_execute(uint8_t threat_score);

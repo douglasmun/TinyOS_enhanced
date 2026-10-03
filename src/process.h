@@ -322,6 +322,12 @@ typedef struct task {
     // Exit status (for ZOMBIE state)
     int exit_status;                 // Exit status code for zombies
 
+    // EDR decided to kill this task while it was the one running, i.e. from
+    // inside its own syscall. Terminating in place would leave the syscall
+    // running on a dead task, so EDR only sets this; syscall_dispatch() sees
+    // it before the syscall body and exits the task with status 137 instead.
+    bool edr_kill_pending;
+
     // Wait-queue back-pointer (void* to avoid a header cycle with wait_queue.h)
     void* blocked_on_wq;             // wait_queue_t* while blocked on one, else NULL
 
@@ -712,6 +718,15 @@ bool task_visible_to_current(const task_t* task);
 void task_terminate(uint32_t pid);
 
 /**
+ * @brief Terminate {pid, generation} with an explicit wait status
+ *
+ * Refuses (returns false, prints nothing) when the slot no longer holds that
+ * generation or the task is CAP_UNKILLABLE. Not for self-termination from a
+ * syscall -- see task_t.edr_kill_pending.
+ */
+bool task_terminate_status(uint32_t pid, uint32_t generation, int status);
+
+/**
  * @brief Free all memory owned by a task (stacks, guard pages, page directory,
  *        EDR state). Idempotent: fields are zeroed after freeing.
  * @param task Pointer to the task whose resources should be freed
@@ -721,6 +736,8 @@ void task_free_resources(task_t* task);
 #ifdef TINYOS_FAULT_INJECT
 /* verify-guard-sync.sh only: private PT copies vs kernel guard pages. */
 void task_guardsync_test(void);
+/* verify-edr-kill-reap.sh only: EDR kill of a non-running task. */
+void task_edrkill_test(void);
 #endif
 
 /**

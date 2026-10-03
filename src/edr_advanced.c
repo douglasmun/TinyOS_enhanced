@@ -561,13 +561,12 @@ static void edr_advanced_raise_alert(task_t* task, edr_advanced_signature_t sign
             edr_advanced_signature_to_string(signature),
             terminate);
 
-    /* Terminate process on critical threats */
-    if (terminate) {
-        kprintf("[EDR ADVANCED] TERMINATING PID %d due to critical threat!\n", task->pid);
-        /* Mark for termination - scheduler will clean up */
-        task->state = TASK_STATE_TERMINATED;
-        task->exit_status = 128 + 9;  /* Exit code 137 (SIGKILL) */
-    }
+    /* No termination here. This used to set task->state = TERMINATED and
+     * leave the rest to the scheduler, which never reaps a task it is not
+     * switching away from (verify-edr-kill-reap.sh) -- and it sat behind the
+     * rate limit above, so one alert elsewhere in the last 50 ticks let a
+     * critical threat live. The caller kills via edr_response_execute_target();
+     * `terminate` only says, in the log line, that it is about to. */
 }
 
 /**
@@ -624,14 +623,19 @@ void edr_advanced_periodic_check(void) {
         if ((task->state == TASK_STATE_RUNNING || task->state == TASK_STATE_READY) &&
             task->has_run_before) {
             if (task->edr_advanced && task->edr_advanced->advanced_detection_enabled) {
+                /* Identity BEFORE the analysis: the response must hit the
+                 * task that was analysed, not a later occupant of its slot. */
+                uint32_t pid = task->pid, generation = task->generation;
                 if (edr_network_analyze(task)) {
                     edr_advanced_raise_alert(task, EDR_SIG_ADV_C2_BEACON,
                                             "C2 beaconing detected", false);
 
                     /* Phase 4a: Automated Response - Block network and terminate */
                     if (edr_response_should_execute(85)) {  /* 85% threat score */
-                        edr_response_execute(task, RESPONSE_BLOCK_NETWORK, "C2 beaconing detected");
-                        edr_response_execute(task, RESPONSE_TERMINATE_PROCESS, "C2 communication");
+                        edr_response_execute_target(task, pid, generation,
+                                                    RESPONSE_BLOCK_NETWORK, "C2 beaconing detected");
+                        edr_response_execute_target(task, pid, generation,
+                                                    RESPONSE_TERMINATE_PROCESS, "C2 communication");
                     }
                 }
             }
@@ -650,15 +654,17 @@ void edr_advanced_periodic_check(void) {
         if ((task->state == TASK_STATE_RUNNING || task->state == TASK_STATE_READY) &&
             task->has_run_before) {
             if (task->edr_advanced && task->edr_advanced->advanced_detection_enabled) {
+                uint32_t pid = task->pid, generation = task->generation;
                 if (edr_crypto_analyze(task)) {
                     /* Ransomware is CRITICAL - terminate immediately */
                     edr_advanced_raise_alert(task, EDR_SIG_ADV_RANSOMWARE,
                                             "Ransomware activity detected!", true);
 
-                    /* Phase 4a: Automated Response - Terminate process immediately */
-                    if (edr_response_should_execute(100)) {  /* 100% threat score - CRITICAL */
-                        edr_response_execute(task, RESPONSE_TERMINATE_PROCESS, "Ransomware detected");
-                    }
+                    /* Unconditional, as it was when raise_alert did the
+                     * killing: the policy gate below it never decided whether
+                     * ransomware dies, only whether it died twice. */
+                    edr_response_execute_target(task, pid, generation,
+                                                RESPONSE_TERMINATE_PROCESS, "Ransomware detected");
                 }
             }
         }
