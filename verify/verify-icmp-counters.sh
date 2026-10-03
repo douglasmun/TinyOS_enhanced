@@ -30,21 +30,28 @@
 # FREE for an on-path one, because that identifier travels in cleartext in
 # every outbound ping.
 #
-# WHAT THIS HARNESS CAN AND CANNOT DRIVE (stated plainly, not papered over)
+# WHAT IS DRIVEN, AND WHAT IS WITNESSED ON THE WIRE
 #
-# The harness cannot know ping_identifier: it is CSPRNG-derived at boot and
-# never printed. So the echo-REPLY counter cannot be moved by injected traffic
-# without first observing a ping, which this harness does not do.
+# The guest sits on a unicast dgram netdev with tools/net_peer.py capturing
+# every frame it sends (on macOS the mcast netdev never emits guest frames;
+# see the header of net_peer.py). That capture is what makes both halves
+# end-to-end:
 #
-#   ECHO REQUEST  verified END-TO-END by traffic: the counter delta must equal
-#                 the number of frames sent, exactly.
-#   ECHO REPLY    verified STRUCTURALLY by the source guard: the print is gone
-#                 and a counter stands in its place.
+#   ECHO REQUEST  20 injected requests; the counters must account for every
+#                 frame, AND the wire must carry exactly as many echo replies
+#                 to the requester as the "answered" counter claims. The
+#                 counter bumps BEFORE an e1000_send whose result is ignored,
+#                 so on its own it proves acceptance, not a reply.
+#   ECHO REPLY    The guest pings a link-local peer (net_peer answers its ARP,
+#                 never its ping). The capture shows the outbound request's
+#                 identifier -- exactly what an on-path attacker learns -- and
+#                 the harness injects replies carrying it, plus replies with
+#                 the identifier inverted. The echo-reply counter must move by
+#                 the matching replies only, with no console line.
 #
-# That split is the honest description of what is proven here. It is the same
-# trade-off verify-rxdrop-counters.sh documents for its runt/CRC counters, and
-# it is stated for the same reason: a harness that implies more coverage than
-# it has is worse than one that admits the gap.
+# Until 2026-10 this harness ran on the mcast netdev and could prove the
+# echo-REPLY branch only structurally (the source guard below), because the
+# identifier is CSPRNG-chosen and was never observable.
 #
 # WHY THE DELTA IS NOT SIMPLY FRAME_COUNT FOR EVERY COUNTER
 #
@@ -76,6 +83,8 @@
 #     guard-only proof is weaker than an end-to-end one and should not be
 #     read as more.
 #
+#   (The three entries above predate the capture; they ran on mcast.)
+#
 #   NEGATIVE 2, echo-REQUEST print restored, source guard deliberately
 #     bypassed so the runtime half is tested in isolation
 #     -> FAIL: 'the console printed "Echo Request from" 1 time(s)'.
@@ -94,6 +103,18 @@
 #     by every reading except the counter under test. A ">= 1" assertion would
 #     have hidden both. The drop point was found by temporarily instrumenting
 #     each early return in handle_ip, not by reading the code harder.
+#
+#   ON THE WIRE (dgram netdev + tools/net_peer.py, 2026-10-03)
+#   POSITIVE, fixed build
+#     request delta 1 + rate-limited 19 = 20 of 20; 1 echo reply on the wire
+#     to 203.0.113.99 (= answered); echo-reply delta 5 of 8 injected -> PASS
+#   NEGATIVE 3, the echo-reply e1000_send() in handle_icmp removed
+#     -> FAIL: 'the wire carried 0 echo replies; the counter claims 1
+#     answered'. The counters alone read exactly as in the positive run --
+#     this leg is the only thing that sees it.
+#   NEGATIVE 4, the identifier check forced true ("1 ||" -- a plain
+#     self-compare is -Werror)
+#     -> FAIL: 'echo-reply counted 8, expected exactly 5'.
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
 # Logs: icmpctr.log (serial), icmpctr-trace.log.
@@ -126,6 +147,18 @@ GUEST_MAC=52:54:00:12:34:56
 # after the destination check that had already eaten the version before it.
 SRC_IP=203.0.113.99
 
+# The peer the guest pings to reveal its identifier. Link-local like the
+# guest, so the ping goes out directly after one ARP, which net_peer answers.
+PEER_IP=169.254.77.77
+PEER_MAC=52:54:00:11:11:11
+REPLY_MATCH=5      # injected echo replies carrying the guest's identifier
+REPLY_FOREIGN=3    # ...and carrying it inverted: must not be counted
+
+GUEST_EP=127.0.0.1:41245
+PEER_EP=127.0.0.1:41246
+PEER_LOG=icmpctr-peer.log
+PEER_PID_FILE=/tmp/tinyos-icmpctr-peer.pid
+
 guard_fail() { echo "RESULT: INCONCLUSIVE — $1"; exit 3; }
 
 # ---------------------------------------------------------------------------
@@ -156,13 +189,15 @@ command -v python3 >/dev/null 2>&1 || guard_fail "python3 not found"
 [ -f tools/inject_frames.py ] || guard_fail "tools/inject_frames.py is missing"
 python3 tools/inject_frames.py --help 2>&1 | grep -q "mode" \
     || guard_fail "tools/inject_frames.py has no --mode flag; it predates the ICMP injector"
+grep -q "id=0x" tools/net_peer.py 2>/dev/null \
+    || guard_fail "tools/net_peer.py does not log ICMP identifiers"
 
 echo "==> Building kernel + userspace + ISO..."
 (cd userspace && make) >/dev/null || exit 1
 python3 tools/sign_elf.py userspace/shell.elf userspace/shell.elf.signed >/dev/null 2>&1 || exit 1
 python3 tools/elf_to_c.py userspace/shell.elf.signed \
         src/shell_elf_data.c src/shell_elf_data.h shell_elf_data >/dev/null || exit 1
-make >/dev/null || exit 1
+make >/dev/null || { echo "RESULT: harness problem — build failed"; exit 2; }
 cp kernel.elf iso/boot/kernel.elf
 i686-elf-grub-mkrescue -o "$ISO" iso >/dev/null 2>&1
 
@@ -176,29 +211,39 @@ if [ "$ISO_MARKERS" -eq 0 ]; then
 fi
 
 echo "==> Copying pristine disk.img -> $RUN_DISK"
-rm -f "$RUN_DISK" "$SERIAL" "$TRACE" "$MON_SOCK"
+rm -f "$RUN_DISK" "$SERIAL" "$TRACE" "$MON_SOCK" "$PEER_LOG" "$PEER_PID_FILE"
 [ -f disk.img ] || { echo "ERROR: disk.img not found"; exit 1; }
 cp disk.img "$RUN_DISK"
 
-# A socket netdev rather than user-mode NAT. NAT would work for ICMP in
-# principle, but the guest's NAT address is not reachable from the host, so
-# injected echo requests would never arrive. Frames written to this multicast
-# group appear on the guest's wire verbatim.
-QEMU_MCAST=230.0.0.2:1235
-
-echo "==> Launching headless QEMU (monitor $MON_SOCK, mcast socket $QEMU_MCAST)"
+# dgram, not socket,mcast= and not user-mode NAT: NAT cannot deliver injected
+# frames, and on macOS the mcast netdev never emits the guest's frames, so
+# neither the echo replies nor the guest's ping identifier could be seen.
+echo "==> Launching headless QEMU (monitor $MON_SOCK, dgram $GUEST_EP <-> $PEER_EP)"
 qemu-system-i386 -cpu Broadwell,+rdrand,+rdseed -cdrom "$ISO" \
     -boot d -m 256M \
     -drive file="$RUN_DISK",format=raw,if=ide \
-    -netdev socket,id=net0,mcast="$QEMU_MCAST" \
+    -netdev dgram,id=net0,local.type=inet,local.host=127.0.0.1,local.port=${GUEST_EP##*:},remote.type=inet,remote.host=127.0.0.1,remote.port=${PEER_EP##*:} \
     -device e1000,netdev=net0,mac="$GUEST_MAC" \
     -serial "file:$SERIAL" \
     -monitor "unix:$MON_SOCK,server,nowait" \
     -no-reboot -d int,cpu_reset -D "$TRACE" -display none &
 QEMU_PID=$!
 
-cleanup() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; rm -f "$MON_SOCK"; }
+cleanup() {
+    [ -f "$PEER_PID_FILE" ] && kill "$(cat "$PEER_PID_FILE")" 2>/dev/null
+    rm -f "$PEER_PID_FILE"
+    kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; rm -f "$MON_SOCK"
+}
 trap cleanup EXIT
+
+# PEERUP: the capture runs for the rest of the boot and answers the guest's
+# ARP for PEER_IP, so `ping PEER_IP` puts an echo request on the wire.
+export TINYOS_HOOK_PEERUP="
+    nohup python3 tools/net_peer.py --listen $PEER_EP --send $GUEST_EP \
+        --guest $GUEST_MAC --duration 300 --out '$PEER_LOG' \
+        --arp-reply '$PEER_IP=$PEER_MAC' >/dev/null 2>&1 &
+    echo \$! > '$PEER_PID_FILE'
+    sleep 1; true"
 
 # The destination IP must be the guest's ACTUAL address, discovered at runtime
 # from the baseline ifconfig rather than assumed.
@@ -220,18 +265,42 @@ export TINYOS_HOOK_ICMPFLOOD="
         echo 'ICMPFLOOD: could not read guest IP from serial log' >&2
     else
         python3 tools/inject_frames.py \
-            --mcast '$QEMU_MCAST' --mode icmp --icmp-type 8 --count $FRAME_COUNT \
+            --mcast '$GUEST_EP' --mode icmp --icmp-type 8 --count $FRAME_COUNT \
             --dst $GUEST_MAC --dst-ip \"\$GUEST_IP\" --src-ip $SRC_IP \
             >/dev/null 2>&1
     fi
     sleep 5; true"
 
+# REPLIES: read the identifier of the guest's own ping off the wire and inject
+# echo replies carrying it, then the same number with it inverted (selectivity:
+# a counter that counted every reply would move by both).
+export TINYOS_HOOK_REPLIES="
+    GUEST_IP=\$(grep -a 'IP Address:' '$SERIAL' | tail -1 \
+                | sed -n 's/.*IP Address:  *\([0-9.][0-9.]*\).*/\1/p')
+    PING_ID=\$(grep 'icmp type=8 ' '$PEER_LOG' | grep 'dst=$PEER_IP ' | tail -1 \
+                | sed -n 's/.* id=\(0x[0-9a-f]*\).*/\1/p')
+    if [ -z \"\$GUEST_IP\" ] || [ -z \"\$PING_ID\" ]; then
+        echo 'REPLIES: no guest IP or no captured ping identifier' >&2
+    else
+        FOREIGN_ID=\$(python3 -c \"print(hex(int('\$PING_ID', 16) ^ 0xffff))\")
+        python3 tools/inject_frames.py --mcast '$GUEST_EP' --mode icmp \
+            --icmp-type 0 --icmp-id \$PING_ID --count $REPLY_MATCH \
+            --dst $GUEST_MAC --dst-ip \"\$GUEST_IP\" --src-ip $SRC_IP >/dev/null 2>&1
+        python3 tools/inject_frames.py --mcast '$GUEST_EP' --mode icmp \
+            --icmp-type 0 --icmp-id \$FOREIGN_ID --count $REPLY_FOREIGN \
+            --dst $GUEST_MAC --dst-ip \"\$GUEST_IP\" --src-ip $SRC_IP >/dev/null 2>&1
+    fi
+    sleep 3; true"
+
 # ifconfig is a kernel-shell command and is where the counters surface, so this
 # harness stays in the kernel shell.
 #
-#   ifconfig    : BASELINE (B)
-#   >ICMPFLOOD  : host hook -- injects the echo requests
-#   ifconfig    : AFTER (A)
+#   ifconfig      : BASELINE (B)
+#   >PEERUP       : capture + ARP responder up
+#   ping PEER 1   : puts the guest's identifier on the wire
+#   >ICMPFLOOD    : host hook -- injects the echo requests
+#   >REPLIES      : echo replies with the captured / inverted identifier
+#   ifconfig      : AFTER (A)
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
 TINYOS_PASSWORD="$PASSWORD" \
@@ -239,7 +308,10 @@ TINYOS_FOLLOWUP_TIMEOUT=600 \
 TINYOS_EXEC_CMD="ifconfig" \
 TINYOS_EXPECT="ICMP rx" \
 TINYOS_FOLLOWUP_CMDS="\
+>PEERUP;\
+ping $PEER_IP 1=>ping statistics;\
 >ICMPFLOOD;\
+>REPLIES;\
 ifconfig=>ICMP rx" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
@@ -256,6 +328,8 @@ fail_with() {
     echo "RESULT: FAIL — $1"
     shift
     for line in "$@"; do echo "  $line"; done
+    echo "  --- peer log (guest frames) ---"
+    head -40 "$PEER_LOG" 2>/dev/null
     echo "  --- last 40 serial lines ---"
     tail -40 "$SERIAL"
     exit 1
@@ -293,7 +367,8 @@ TOTAL=$((REQ_D + LIM_D))
 
 echo "  echo-request:  before=$REQ_B  after=$REQ_A  delta=$REQ_D"
 echo "  rate-limited:  before=$LIM_B  after=$LIM_A  delta=$LIM_D"
-echo "  echo-reply:    before=$REP_B  after=$REP_A  (not driven by this harness)"
+REP_D=$((REP_A - REP_B))
+echo "  echo-reply:    before=$REP_B  after=$REP_A  delta=$REP_D  (want $REPLY_MATCH of $((REPLY_MATCH + REPLY_FOREIGN)) injected)"
 echo "  accounted for: $TOTAL of $FRAME_COUNT frames sent"
 
 # --- POSITIVE: every injected frame landed in exactly one bucket -----------
@@ -317,6 +392,34 @@ if [ "$TOTAL" -ne "$FRAME_COUNT" ]; then
         "load these counters exist to measure."
 fi
 
+# --- ON THE WIRE: one echo reply per request the counter says it answered --
+[ -s "$PEER_LOG" ] || fail_with "the host-side capture never ran (no $PEER_LOG)"
+WIRE_REPLIES=$(grep "icmp type=0 " "$PEER_LOG" | grep -c "ip src=[0-9.]* dst=$SRC_IP ")
+echo "  echo replies on the wire to $SRC_IP: $WIRE_REPLIES (want $REQ_D, the answered count)"
+if [ "$REQ_D" -lt 1 ]; then
+    fail_with "no echo request was answered (echo-request delta $REQ_D)" \
+        "The first request of a burst must get the limiter's reply slot."
+fi
+if [ "$WIRE_REPLIES" -ne "$REQ_D" ]; then
+    fail_with "the wire carried $WIRE_REPLIES echo replies; the counter claims $REQ_D answered" \
+        "The counter increments before e1000_send(), whose result is ignored." \
+        "Fewer on the wire means replies were counted but never sent."
+fi
+
+# --- ECHO REPLY: driven with the identifier the guest itself revealed -------
+PING_LINES=$(grep "icmp type=8 " "$PEER_LOG" | grep -c "dst=$PEER_IP ")
+if [ "$PING_LINES" -eq 0 ]; then
+    echo "RESULT: INCONCLUSIVE — the guest's ping to $PEER_IP never reached the wire,"
+    echo "  so no identifier was learned and the echo-reply leg graded nothing."
+    exit 3
+fi
+if [ "$REP_D" -ne "$REPLY_MATCH" ]; then
+    fail_with "echo-reply counted $REP_D, expected exactly $REPLY_MATCH" \
+        "$REPLY_MATCH replies carried the guest's identifier and $REPLY_FOREIGN carried" \
+        "it inverted. 0 means matching replies are not counted (or never" \
+        "arrived); $((REPLY_MATCH + REPLY_FOREIGN)) means the identifier is not checked."
+fi
+
 # --- NEGATIVE: the console gained no per-packet ICMP lines -----------------
 #
 # This is the half that proves the FLOOD is closed rather than merely that
@@ -335,6 +438,6 @@ echo ""
 echo "RESULT: PASS"
 echo "  $FRAME_COUNT injected echo requests were fully accounted for"
 echo "  ($REQ_D answered, $LIM_D rate-limited) with no per-packet console output."
-echo "  The echo-REPLY print is proven gone by the source guard only -- see the"
-echo "  coverage note at the top of this file."
+echo "  Each answered request put one reply on the wire, and of the injected echo"
+echo "  replies exactly the $REPLY_MATCH carrying the guest's own identifier were counted."
 exit 0
