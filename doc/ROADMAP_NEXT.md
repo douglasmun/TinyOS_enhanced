@@ -190,7 +190,7 @@ mutate the identity every other gate is written against.
 through the generic `ls`.**
 
 The question as recorded ("gating polarity, plus the cross-drive behaviour in
-`doc/CROSS_DRIVE_ACCESS_ANALYSIS.md`") presumed the capability had to be
+`CROSS_DRIVE_ACCESS_ANALYSIS.md`", a working note never published) presumed the capability had to be
 carried across the boundary. It does not: the path is already complete and
 already compiled in.
 
