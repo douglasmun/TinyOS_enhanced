@@ -24,6 +24,25 @@
 /* Forward declarations */
 static const char* resolve_path(const char* path, char* abs_path, size_t abs_path_size);
 
+/* These commands modify the RAM disk through ramfs, below vfs_open()'s
+ * protected-path check, so they apply it themselves: creating, writing,
+ * renaming or removing under /bin /sbin /etc /boot needs CAP_SYS_ADMIN, which
+ * the kernel shell holds only while its euid is 0 (task_sync_identity_caps).
+ * ramfs's mode bits are checked as well; this is the second layer.
+ * verify-kshell-caps-follow-euid.sh. */
+/* Returned by the recursive helpers after kshell_may_modify() has printed the
+ * refusal. Distinct from every ramfs code (-1..-7), so no caller reports it as
+ * something else. */
+#define KSHELL_PROTECTED_REFUSED (-100)
+
+static bool kshell_may_modify(const char* cmd, const char* path) {
+    if (vfs_protected_modify_allowed(path)) {
+        return true;
+    }
+    kprintf("%s: '%s': Permission denied (protected system path)\n", cmd, path);
+    return false;
+}
+
 /*=============================================================================
  * COMMAND: cp - Copy file
  *=============================================================================*/
@@ -39,6 +58,9 @@ void cmd_cp(int argc, char** argv) {
     const char* dst_path = resolve_path(argv[2], dst_abs, sizeof(dst_abs));
     if (!src_path || !dst_path) {
         kprintf("cp: path too long (would be truncated) - refusing to operate\n");
+        return;
+    }
+    if (!kshell_may_modify("cp", dst_path)) {
         return;
     }
 
@@ -138,6 +160,9 @@ void cmd_mv(int argc, char** argv) {
         kprintf("mv: path too long (would be truncated) - refusing to operate\n");
         return;
     }
+    if (!kshell_may_modify("mv", src_path) || !kshell_may_modify("mv", dst_path)) {
+        return;
+    }
 
     /* SECURITY FIX: Use atomic rename operation instead of copy-then-delete
      * This prevents:
@@ -181,6 +206,9 @@ void cmd_chmod(int argc, char** argv) {
     if (!path) {
         kprintf("chmod: path too long (would be truncated) - refusing to operate\n");
         kprintf("chmod: this prevents accidentally changing permissions on wrong file\n");
+        return;
+    }
+    if (!kshell_may_modify("chmod", path)) {
         return;
     }
 
@@ -906,6 +934,9 @@ static int mkdir_recursive(const char* path) {
     if (ramfs_find(path)) {
         return 0;  /* Already exists, that's ok for -p */
     }
+    if (!kshell_may_modify("mkdir", path)) {
+        return KSHELL_PROTECTED_REFUSED;
+    }
 
     /* Try to create the directory */
     int result = ramfs_mkdir(path);
@@ -978,6 +1009,9 @@ void cmd_mkdir(int argc, char* argv[]) {
         kprintf("mkdir: path too long (would be truncated) - refusing to operate\n");
         return;
     }
+    if (!create_parents && !kshell_may_modify("mkdir", path)) {
+        return;
+    }
 
     int result;
     if (create_parents) {
@@ -995,6 +1029,8 @@ void cmd_mkdir(int argc, char* argv[]) {
         if (!create_parents) {
             kprintf("mkdir: try using -p to create parent directories\n");
         }
+    } else if (result == KSHELL_PROTECTED_REFUSED) {
+        /* mkdir_recursive refused a protected level and already said so. */
     } else {
         kprintf("mkdir: cannot create directory '%s' (error code: %d)\n", argv[path_arg], result);
     }
@@ -1195,6 +1231,9 @@ void cmd_touch(int argc, char* argv[]) {
         kprintf("touch: this prevents accidentally creating a file with wrong name\n");
         return;
     }
+    if (!kshell_may_modify("touch", path)) {
+        return;
+    }
 
     int fd = ramfs_open(path, RAMFS_FLAG_WRITE);
     if (fd < 0) {
@@ -1296,6 +1335,9 @@ void cmd_write(int argc, char* argv[]) {
         kprintf("write: this prevents accidentally writing to wrong file\n");
         return;
     }
+    if (!kshell_may_modify("write", path)) {
+        return;
+    }
 
     int fd = ramfs_open(path, RAMFS_FLAG_WRITE);
     if (fd < 0) {
@@ -1329,6 +1371,10 @@ static int rm_recursive(const char* path) {
     ramfs_node_t* node = ramfs_find(path);
     if (!node) {
         return -1;
+    }
+    /* Per level: `rm -r /etc` names an unprotected path whose children are. */
+    if (!kshell_may_modify("rm", path)) {
+        return KSHELL_PROTECTED_REFUSED;
     }
 
     if (node->type == RAMFS_TYPE_FILE) {
@@ -1403,6 +1449,9 @@ void cmd_rm(int argc, char* argv[]) {
         kprintf("rm: this prevents accidentally deleting the wrong file\n");
         return;
     }
+    if (!kshell_may_modify("rm", path)) {
+        return;
+    }
 
     /* Check if target exists and what type it is */
     ramfs_node_t* node = ramfs_find(path);
@@ -1430,6 +1479,8 @@ void cmd_rm(int argc, char* argv[]) {
                 kprintf("rm: removed directory '%s'\n", path);
             } else if (result == -5) {
                 kprintf("rm: cannot remove '%s': Permission denied\n", path);
+            } else if (result == KSHELL_PROTECTED_REFUSED) {
+                /* rm_recursive refused a protected entry and already said so. */
             } else {
                 kprintf("rm: cannot remove '%s' (error code: %d)\n", path, result);
             }

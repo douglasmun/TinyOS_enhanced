@@ -627,6 +627,7 @@ int shell_login_prompt(void) {
                 login_task->euid = 0;
                 login_task->gid = 0;
                 login_task->egid = 0;
+                task_sync_identity_caps(login_task);
             }
         }
 

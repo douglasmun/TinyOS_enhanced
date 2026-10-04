@@ -10,6 +10,7 @@
 #include "pit.h"
 #include "pmm.h"
 #include "stdio.h"
+#include "vfs.h"
 #include <stddef.h>
 
 /*=============================================================================
@@ -543,7 +544,13 @@ int editor_save(void) {
         file_buffer[pos++] = '\n';
     }
 
-    /* Write to file */
+    /* Write to file. E.filename is canonical (cmd_edit resolves it), and the
+     * save goes through ramfs below vfs_open(), so apply the protected-path
+     * rule here as the kernel shell's other file commands do. */
+    if (!vfs_protected_modify_allowed(E.filename)) {
+        editor_set_status_message("Permission denied (protected system path)");
+        return -1;
+    }
     int fd = ramfs_open(E.filename, RAMFS_FLAG_WRITE);
     if (fd < 0) {
         editor_set_status_message("Error opening file for write");

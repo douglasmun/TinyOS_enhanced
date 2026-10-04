@@ -2501,6 +2501,21 @@ const char* task_get_state_string(task_state_t state) {
 _Static_assert(TASK_CWD_MAX == VFS_MAX_PATH,
                "task cwd must hold any path the VFS accepts");
 
+/* See process.h. CAP_UNKILLABLE stays: the login task must survive whoever is
+ * logged in. CAP_DEFAULT is what a ring-3 task holds anyway. */
+#define CAP_IDENTITY_PRIVILEGED (CAP_ALL & ~(CAP_UNKILLABLE | CAP_DEFAULT))
+
+void task_sync_identity_caps(task_t* task) {
+    if (!task || !task->is_kernel_task) {
+        return;
+    }
+    if (task->euid == 0) {
+        task->capabilities |= CAP_IDENTITY_PRIVILEGED;
+    } else {
+        task->capabilities &= ~CAP_IDENTITY_PRIVILEGED;
+    }
+}
+
 void task_cwd_init(task_t* task) {
     if (!task) {
         return;
