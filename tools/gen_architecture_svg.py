@@ -185,7 +185,7 @@ def build(c):
     box(38, ys, 938, 50, c["rule"], sw=1.2, dash=True)
     text(50, ys + 20, "Kernel shell (fallback) · stream layer", 11.5, c["fg"], weight="700")
     text(50, ys + 38,
-         "reached with `kshell` · ~70 builtins · machine-state + networking tools stay here "
+         "reached with `kshell` · ~55 builtins · machine-state + networking tools stay here "
          "(pae, mem, wxaudit, auditlog) — together an ASLR defeat, so euid-0 gated",
          9.5, c["muted"], font=MONO)
 
