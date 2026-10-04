@@ -10,7 +10,7 @@
 > | #1 TOCTOU in syscall parameter validation (CRITICAL) | FIXED | `src/copy_user.c` — faulting copy-in/copy-out with `handle_copy_user_fault()` wired into the #PF handler (`src/idt.c`), so a concurrently unmapped user page unwinds instead of panicking |
 > | #2 Cooperative-only scheduling (HIGH) | FIXED | True preemption: the timer ISR calls `scheduler_schedule_from_interrupt()` (`src/interrupts.c:537`); the preempted task is suspended mid-ISR and resumes through `iret` |
 > | #3 Busy-wait synchronization (MEDIUM) | FIXED | `src/wait_queue.c` — blocking wait queues; `task_sleep()` removes the task from the ready queue rather than spinning |
-> | #4 Missing I/O abstraction layer (MEDIUM) | FIXED | VFS `file_operations_t` (`src/vfs.h:379`), dispatched per driver by fd |
+> | #4 Missing I/O abstraction layer (MEDIUM) | FIXED | VFS `file_operations_t` (`src/vfs.h:382`), dispatched per driver by fd |
 >
 > Do not re-open these from this document alone — read the current code first.
 > The *reasoning* is preserved because the failure classes recur.

@@ -382,10 +382,11 @@ int ids_remove_signature(int sig_id) {
  *
  * Deliberately NOT IDS_BRUTEFORCE_THRESHOLD (5), which is the network-side
  * constant. shell_login_prompt() allows max_attempts = 3 and then halts the
- * system outright, so a console spray can produce at most THREE distinct failed
- * usernames per boot. A threshold of 5 would be unreachable from the only path
- * that calls this -- a detector that cannot fire, which is the exact placebo
- * this file's AUDIT-8E note exists to prevent.
+ * system outright, so a console login spray can produce at most THREE distinct
+ * failed usernames per boot. A threshold of 5 would be unreachable from login
+ * -- a detector that cannot fire there, which is the exact placebo this file's
+ * AUDIT-8E note exists to prevent. (su and passwd also reach this through
+ * user_authenticate_for() without that ceiling; 3 still fires first on login.)
  *
  * 3 is therefore both the ceiling of what the login path can produce and the
  * point at which a spray is distinguishable from a typo: user.c's own lockout

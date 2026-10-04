@@ -1,8 +1,8 @@
 # Build + cheap invariant gate for TinyOS.
 #
-# SCOPE: 58 of the 63 harnesses in verify/ boot a QEMU guest and drive it with
-# a scripted typist. They are kept out of this workflow because a job that
-# boots 58 guests is slow and needs its own timeout/retry design, NOT because
+# SCOPE: most of the 98 harnesses in verify/ boot a QEMU guest and drive it
+# with a scripted typist. They are kept out of this workflow because a job that
+# boots that many guests is slow and needs its own timeout/retry design, NOT because
 # the typist is unreliable -- that claim used to stand here and it was wrong.
 #
 # It said keystrokes "drop under TCG load", citing CLAUDE.md. Measured: across

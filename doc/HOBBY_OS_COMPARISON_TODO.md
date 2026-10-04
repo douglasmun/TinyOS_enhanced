@@ -20,7 +20,7 @@ The reasoning, kept verbatim in substance because the distinction is the useful 
   AI-assisted audits.
 - What would raise confidence: years of hostile exposure, independent human review,
   sustained fuzzing, formal verification, extensive soak testing. TinyOS has none of
-  these.
+  these (one fuzzing campaign, `doc/FUZZ_REPORT_2026-10.md`, is not sustained fuzzing).
 - A critical ring-3-reachable memory corruption plus two high-severity
   authorization/firewall bugs surviving until the 2026-08 audit
   (`doc/SECURITY_AUDIT_2026-08.md`) is *simultaneously* evidence in TinyOS's favour
@@ -77,11 +77,14 @@ withdrawn D1). Ask what adopting the idea **buys**, not whether it is possible.
       surface may matter more than the randomisation.
 - [ ] **SerenityOS — their bug/regression-test discipline.** Arguably the highest-value
       item in this whole file, given the "assurance still converging" verdict. How do
-      they stop a fixed bug from returning? TinyOS has 63 harnesses and, until
-      PR #113, **no runner and no CI at all**. That is now partly closed: a
-      ~25 s workflow gates the `-Werror` build, a standalone-header check, and
-      (after PR #116) **all four** harnesses that boot nothing. **The other 58
-      remain ungated**, plus one that wraps an interactive GUI run.
+      they stop a fixed bug from returning? TinyOS has 98 `verify-*.sh`
+      harnesses and, until PR #113, had **no runner and no CI at all**. That is
+      now partly closed: `.github/workflows/build.yml` gates the `-Werror` build
+      (default and `-DTINYOS_FAULT_INJECT`), a standalone-header check, the
+      **four** `verify-*.sh` harnesses that boot nothing, and the two helper
+      unit tests (`edr-rejoin-test.sh`, `preserve-serial-test.sh`). **The other
+      94 boot a guest and remain ungated** — one of them (`verify-exec.sh`) an
+      interactive GUI run.
 
       The reason recorded here for leaving them out was that the typist "drops
       keystrokes under TCG load". **That was measured and it is false**: across
@@ -94,8 +97,9 @@ withdrawn D1). Ask what adopting the idea **buys**, not whether it is possible.
       about.
 
       So the question is no longer "how do you tolerate the flake" but the
-      plainer one: **58 guest boots is ~2.7 h serially** (median 169 s/run,
-      n=36 measured) -- how does SerenityOS gate tests that need a running
+      plainer one: **58 guest boots was ~2.7 h serially** (median 169 s/run,
+      n=36 measured); at that median the 93 automated booting harnesses now
+      extrapolate to ~4.4 h -- how does SerenityOS gate tests that need a running
       machine at that cost? Sharding, a nightly
       non-blocking job, and a fast subset on PRs are the obvious answers; which
       one they actually chose is the thing worth reading.
@@ -116,7 +120,11 @@ withdrawn D1). Ask what adopting the idea **buys**, not whether it is possible.
 - [ ] **AethelOS — cooperative scheduling.** Reject-with-reason is the likely outcome:
       TinyOS is preemptive round-robin and cooperative scheduling reintroduces
       denial-of-service by a non-yielding ring-3 task. Confirm and record.
-- [ ] **Cross-cutting: fuzzing.** None of the above matters as much as this. The
+- [x] **Cross-cutting: fuzzing.** DONE as one campaign, not continuous fuzzing:
+      `doc/FUZZ_REPORT_2026-10.md` (PR #141, release v2.8) — 9 libFuzzer targets
+      over the real kernel sources (RX path, DNS, DHCP, FAT32, ELF signature and
+      load, ramfs, shell parsers, editor), 35 defects fixed, regression seeds
+      committed. The original framing, kept for the record: None of the above matters as much as this. The
       syscall boundary (`MAX_SYSCALL_NUM`, ~40 syscalls) and the RX parser
       (`handle_packet()` and below, ~8,350 lines reachable from any host on the
       segment) are both fuzzable. `tools/inject_frames.py` already exists and already
@@ -143,10 +151,11 @@ of a real bug, so a good idea from another OS does not get to override them:
 ## Honest summary to keep on hand
 
 Strong defensive intent; unusually honest documentation of its own false-passes; single
-developer; no adversarial exposure; no fuzzing; CI gates the build and four
-source-level checks but not the 58 harnesses that need a running machine --
-which is a cost problem (~2.7 h serially), not the flake problem this file
-used to claim.
+developer; no adversarial exposure; one fuzzing campaign
+(`doc/FUZZ_REPORT_2026-10.md`), no continuous fuzzing; CI gates the build and
+the non-booting checks but not the 94 harnesses that need a running machine --
+which is a cost problem (~4.4 h serially, extrapolated), not the flake problem
+this file used to claim.
 **"One of the most security-oriented" is defensible. "Most secure" needs hostile
 exposure, and there is no shortcut to it.**
 

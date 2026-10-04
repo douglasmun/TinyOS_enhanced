@@ -11,7 +11,7 @@ a broken one. Full reasoning: `doc/RULES_THAT_BITE.md` and `doc/RING3_MIGRATION.
   correct kernel. Use `verify/edr-rejoin.sh` (tested by `verify/edr-rejoin-test.sh`) — never a
   hand-rolled splice; all five earlier copies had defects. Filter EDR spam with `grep -v Suspicious`.
 - **Don't echo-verify each character.** The ring-3 shell echoes the whole line *after*
-  `readline()` returns (`src/stdio.c:336`, `userspace/shell.c:2035`); a per-char wait blocks
+  `readline()` returns (`stdin_read()` in `src/stdio.c`; `main()` in `userspace/shell.c`); a per-char wait blocks
   and a resend loop types `kkkkshell`. Only the kernel shell echoes per keystroke. The typist
   is not flaky — ~45 boots, zero dropped keystrokes; every failure was a harness defect.
 - **A harness must not delete its own evidence.** Never `rm -rf` a `mktemp -d` holding

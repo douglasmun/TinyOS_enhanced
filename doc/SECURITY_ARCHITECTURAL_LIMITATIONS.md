@@ -40,50 +40,25 @@ Real-world kernels (Linux, FreeBSD, QNX) implement full PIP or priority ceiling 
 
 ---
 
-## 2. Kernel Stack Guard Pages - NOT IMPLEMENTED
+## 2. Kernel Stack Guard Pages - RESOLVED
 
-### Issue Description
-TinyOS does NOT use unmapped "guard pages" at the bottom of kernel stacks. This means kernel stack overflow can silently corrupt adjacent memory instead of triggering an immediate page fault.
+Originally listed here as NOT IMPLEMENTED (CRITICAL). Now implemented:
 
-### What are Guard Pages?
-A guard page is an unmapped memory page placed immediately below the stack:
-```
-[High addresses]
-+------------------+
-| Stack (grows ↓)  |  <- SP starts here
-+------------------+
-| Guard Page       |  <- UNMAPPED (triggers page fault on access)
-+------------------+
-| Adjacent Memory  |
-[Low addresses]
-```
+- Every task gets a **NOT-PRESENT guard page** immediately below its kernel
+  stack (`task->guard_page_phys`), and user tasks a second one below the user
+  stack (`task->user_guard_page_phys`) — `src/process.c`. An overflow faults
+  instead of silently corrupting adjacent memory.
+- A kernel-stack overflow that faults inside the #PF handler escalates to a
+  double fault, which cannot run on the overflowed stack. Vector 8 is therefore
+  a **task gate** to a dedicated TSS with its own stack
+  (`tss_init_double_fault()` in `src/tss.c`, `idt_install_double_fault_gate()`
+  in `src/idt.c`) — i386 has no IST, and a task gate is its only stack switch.
+- Kernel tasks run on a 128 KB stack (`KERNEL_TASK_STACK_PAGES = 32`,
+  `src/process.h`).
+- Freeing a guard page restores its mapping first, or the frame stays poisoned
+  for its next owner (see `doc/RULES_THAT_BITE.md`).
 
-Any stack overflow that crosses into the guard page triggers a **Page Fault Exception**, which the kernel catches and handles as a fatal error (kernel panic).
-
-### Security/Stability Impact
-**CRITICAL** - Without guard pages:
-- Recursive function calls can overflow into adjacent kernel memory
-- Large stack allocations (e.g., `char buf[4096]` in syscall) can corrupt heap
-- Malicious syscalls can intentionally overflow to achieve **kernel privilege escalation**
-- Silent corruption makes debugging extremely difficult
-
-### Why Not Implemented in TinyOS?
-Guard pages require:
-- Virtual memory management integration (map/unmap individual pages)
-- Page fault handler that can distinguish guard page faults from other faults
-- Memory layout changes to reserve guard pages for each kernel stack
-- Interrupt stack also needs guard page (but can't easily handle page fault in interrupt context!)
-
-This requires architectural changes to memory management, page fault handling, and interrupt handling - beyond the scope of this educational OS.
-
-### Mitigation in TinyOS
-- **Code review** - Avoid deep recursion, limit stack allocations
-- **Static analysis** - Tools like `stack` (from binutils) can estimate max stack usage
-- **Runtime monitoring** - Could implement stack canaries (cookies) at stack bottom
-- **Conservative allocation** - Use large stack sizes to reduce overflow risk
-
-### Production OS Requirements
-All production kernels (Linux, Windows, BSD) use guard pages. Some also use stack canaries as defense-in-depth. For production use, guard pages are **MANDATORY**.
+See `doc/SECURITY_HARDENING.md` ("Stack Guard Pages + TSS esp0/ss0 Integrity").
 
 ---
 
@@ -96,19 +71,18 @@ TinyOS is designed as a **single-core educational OS**. It does NOT implement me
 
 **Mitigation:** TinyOS should only be run on single-core systems (QEMU default is single-core).
 
-### No Resource Limits (rlimits)
-TinyOS does NOT implement per-process resource limits (max memory, max FDs, max CPU time, etc.).
+### Resource Limits: partial
+There is no general rlimit mechanism and **no per-process memory or CPU-time quota**. Specific exhaustion vectors are capped instead, each with a root reserve so an unprivileged user cannot lock root out:
 
-**Impact:** A single malicious process can exhaust system resources.
+- **Tasks:** per-uid cap of live tasks (`USER_MAX_CONCURRENT_TASKS`, 10) plus slots no non-root task may take (`TASK_ROOT_RESERVED_SLOTS`, 4); both refuse with `-EAGAIN` (`src/process.c`). uid 0 is exempt from the per-uid cap.
+- **Task-creation rate:** token bucket (burst 10, 5/s sustained), `-EAGAIN` when empty (`src/process.c`).
+- **ramfs file descriptors:** per-process `PROCESS_MAX_FDS` (`-EMFILE`), plus a per-uid cap (`RAMFS_USER_MAX_FDS`, 8) and a root reserve (`RAMFS_ROOT_RESERVED_FDS`, 4) — `src/ramfs.c`, `src/ramfs.h`.
+- **TCP sockets:** per-uid cap (`TCP_USER_MAX_SOCKETS`, 2) and a root reserve (`TCP_ROOT_RESERVED_SOCKETS`, 2) — `src/tcp.c`, `src/tcp.h`.
 
-**Mitigation:** Global limits exist (e.g., `RAMFS_MAX_FDS`, `VFS_MAX_FDS`), but no per-process quotas.
+**Remaining gap:** physical memory and CPU time are not accounted per process or per user.
 
-### No Stack Canaries
-TinyOS does NOT use stack canaries (random values placed before return addresses to detect buffer overflows).
-
-**Impact:** Stack buffer overflows can overwrite return addresses without detection.
-
-**Mitigation:** Code review, bounds checking in syscalls, limited user input.
+### Stack Canaries: implemented
+The whole kernel builds with `-fstack-protector-strong` (`CFLAGS` in `Makefile`). There is no per-file exception: the credential-path files (`user.o`, `shell_user.o`, `shell.o`) used to be built without it and now use the generic rule (see the comment in `Makefile`). The canary is seeded from `entropy_get_random32()` with the low byte cleared, and a mismatch calls `kernel_panic("Stack protection violation")` (`src/stack_guard.c`).
 
 ---
 
@@ -116,13 +90,18 @@ TinyOS does NOT use stack canaries (random values placed before return addresses
 
 If you plan to build a production OS based on TinyOS concepts:
 
-1. ✅ **MUST IMPLEMENT**: Kernel stack guard pages
-2. ✅ **MUST IMPLEMENT**: Multi-core memory barriers (if targeting SMP)
-3. ✅ **SHOULD IMPLEMENT**: Priority inheritance or ceiling protocols
-4. ✅ **SHOULD IMPLEMENT**: Per-process resource limits (rlimits)
-5. ✅ **SHOULD IMPLEMENT**: Stack canaries for kernel stacks
-6. ✅ **SHOULD IMPLEMENT**: Address Space Layout Randomization (ASLR)
-7. ✅ **SHOULD IMPLEMENT**: W^X (Writable XOR Executable) memory protections — *implemented for user mappings via the PAE NX bit (June 2026); see SECURITY_HARDENING.md*
+Done in TinyOS:
+
+- **Kernel stack guard pages** — section 2.
+- **Stack canaries** — `-fstack-protector-strong`, entropy-seeded canary.
+- **ASLR** — user stacks, 12 bits (`src/aslr.c`).
+- **W^X** — enforced via the PAE NX bit; see `SECURITY_HARDENING.md`.
+
+Still to implement:
+
+1. **MUST** (if targeting SMP): multi-core memory barriers — section 3.
+2. **SHOULD**: priority inheritance or ceiling protocols — section 1 (`mutex_lock()` in `src/mutex.c` carries a TODO stub, no boost).
+3. **SHOULD**: full per-process resource limits (memory, CPU time) — section 3.
 
 ---
 
@@ -136,6 +115,6 @@ For security-critical applications, use a mature, audited kernel (Linux, FreeBSD
 
 ---
 
-**Document Version:** 1.13
-**Last Updated:** 2025
+**Document Version:** 1.14
+**Last Updated:** 2026-10 (reviewed against v2.8)
 **Maintained by:** TinyOS Security Team

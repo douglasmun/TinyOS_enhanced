@@ -1,12 +1,14 @@
 # TinyOS Complete Security Status Report
 
+> **Historical document.** This is the audit-history index, kept for the record; much of the per-layer text below describes the system as it was when each layer ran, and some of it is superseded (marked *since fixed* inline). For the current state see [`SECURITY_HARDENING.md`](SECURITY_HARDENING.md) (mechanisms), [`SECURITY_AUDIT_2026-08.md`](SECURITY_AUDIT_2026-08.md) (Layer 6) and [`FUZZ_REPORT_2026-10.md`](FUZZ_REPORT_2026-10.md) (Layer 7, release v2.8).
+
 ## Executive Summary
 
 This document provides a comprehensive overview of ALL security work performed on TinyOS across multiple audit layers, from initial hardening through the fifth-layer multi-agent deep audit.
 
 **Overall Security Posture**: Production-ready for educational and research purposes with documented limitations for enterprise deployment.
 
-> **Layer 5 (June 2026)**: A 101-agent multi-agent audit added **73 verified findings (15 critical, 23 high, 22 medium, 13 low)** and **78 fixes** across 53 files. See [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECURITY_AUDIT_2026.md) for the full findings and the ELF-signing status. The earlier open follow-up — the P-256 `ecdsa_verify()` faulting on real inputs — is now **resolved**: it was preemption corrupting in-flight crypto state (not stack overflow), fixed by masking interrupts around the verify. Enforcement is now **fail-closed by default** (the embedded binaries are signed with the pinned key, so a normal build still boots and execs them); fast local dev can downgrade to warn-and-load with the explicitly named `-DELF_PERMISSIVE_SIGNATURES` opt-out. A follow-up adversarial review (2026-06-12) also fixed a CSPRNG reseed race: `csprng_reseed` (run from the timer softirq in task context) mutated `global_csprng` state without the critical section that `csprng_random_bytes` relies on, which could tear/duplicate keystream backing SSH DH secrets, password salts, ASLR, and DNS/TCP randomness — now masked.
+> **Layer 5 (June 2026)**: A 101-agent multi-agent audit added **73 verified findings (15 critical, 23 high, 22 medium, 13 low)** and **78 fixes** across 53 files. See [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECURITY_AUDIT_2026.md) for the full findings and the ELF-signing status. The earlier open follow-up — the P-256 `ecdsa_verify()` faulting on real inputs — is now **resolved**: it was preemption corrupting in-flight crypto state (not stack overflow), fixed by masking interrupts around the verify. Enforcement is now **fail-closed by default** (the embedded binaries are signed with the pinned key, so a normal build still boots and execs them); fast local dev can downgrade to warn-and-load with the explicitly named `-DELF_PERMISSIVE_SIGNATURES` opt-out. A follow-up adversarial review (2026-06-12) also fixed a CSPRNG reseed race: `csprng_reseed` (run from the timer softirq in task context) mutated `global_csprng` state without the critical section that `csprng_random_bytes` relies on, which could tear/duplicate keystream backing password salts, ASLR, and DNS/TCP randomness — now masked. (SSH, also named in the original finding, has since been removed from the build — see the `Makefile`.)
 
 ---
 
@@ -17,7 +19,7 @@ This document provides a comprehensive overview of ALL security work performed o
 - **ISO Size**: 4124 sectors
 - **Compiler Flags**: `-Werror` (warnings as errors), `-Wall -Wextra`
 - **Build Status**: ✅ Clean (0 warnings, 0 errors)
-- **Latest Version**: v1.9 (VFS foundation complete)
+- **Latest Version**: v2.8 (`TINYOS_VERSION`, `src/kernel.h`; signed GitHub Release). The build date, ID and ISO size above are from the 2025 layers and are historical.
 
 ---
 
@@ -55,7 +57,24 @@ This document provides a comprehensive overview of ALL security work performed o
 **Fixes**: 16 of 16 findings (1 CRITICAL, 2 HIGH, 8 MEDIUM, 5 LOW), each with a harness
 **Report**: [`SECURITY_AUDIT_2026-08.md`](SECURITY_AUDIT_2026-08.md)
 
-**Total Issues Addressed**: 115 security issues across 6 audit layers
+### Layer 7: Input-Surface Fuzzing
+**Date**: 2026-10
+**Focus**: Every surface where data the kernel does not control enters it — network frames, disk images, ELF files, typed shell lines, editor keystrokes, ring-3 syscall arguments — via 9 libFuzzer targets (real kernel sources on the host, ASan + UBSan), each with its own oracle
+**Fixes**: 35 distinct defects, shipped in release v2.8 (PR #141)
+**Report**: [`FUZZ_REPORT_2026-10.md`](FUZZ_REPORT_2026-10.md)
+
+**Follow-up PRs after v2.8:**
+- #143 — stale guard entries in private page-table copies; `SYS_TCPSOCK` ownership window
+- #144 — EDR kills routed through `task_terminate`; tasks killed off-CPU are reaped
+- #145 — `waitpid` admits only the caller's child; a lost status is `-ECHILD`
+- #146 — one line per ELF format refusal
+- #147 — ICMP replies witnessed on the wire; identifier check graded
+- #148 — EDR alert record, quiet dispatcher blocks, `curl` sanitizing, legacy credential syscalls, strict `stat`
+- #149 — three existence/identity oracles closed; ramfs path prints removed
+- #150 — lock/unlock prints removed; `chmod` and redirects canonicalize paths
+- #151 — four credential and path items (incl. `passwd` lockout, identical refusal text)
+
+**Total Issues Addressed**: 150 security issues across 7 audit layers (115 through Layer 6, plus 35)
 
 ---
 
@@ -139,6 +158,7 @@ This document provides a comprehensive overview of ALL security work performed o
 - **Why**: Requires sleep/wake primitives (architectural change)
 - **Mitigation**: Documented in code with 31-line comment block
 - **Future**: Implement wait queues + scheduler integration
+- *Since fixed*: `pipe_write()` now blocks on a wait queue while the pipe is full and returns `-EPIPE` once the read end is closed (`src/shell_redir.c`).
 
 **3. I/O State Decoupling** (Already fixed in Layer 1 #10)
 
@@ -240,6 +260,7 @@ This document provides a comprehensive overview of ALL security work performed o
 - **Fix Required**: Wait queues + scheduler integration
 - **Estimate**: 2-3 days development
 - **Status**: Documented with implementation plan
+- *Since fixed*: wait queues exist (`src/wait_queue.c`); pipes block instead of discarding data.
 
 **2. I/O Abstraction Layer** (`ARCHITECTURAL_SECURITY_ISSUES.md`)
 - **Issue**: Inconsistent I/O interfaces across file/console/network/pipe
@@ -247,6 +268,7 @@ This document provides a comprehensive overview of ALL security work performed o
 - **Fix Required**: Virtual file system (VFS) abstraction
 - **Estimate**: 4-5 days development
 - **Status**: Documented with implementation plan
+- *Since fixed*: a VFS layer exists (`src/vfs.h`), with ramfs and FAT32 (`src/fat32_vfs.c`) behind it.
 
 ---
 
@@ -309,8 +331,8 @@ sites; full breakdown in [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECU
 
 ### ⚠️ Known Limitations
 
-1. **Pipe Blocking**: Silent data loss instead of proper blocking (requires sleep/wake)
-2. **I/O Inconsistency**: Different interfaces for file/console/network (requires VFS)
+1. **Pipe Blocking**: Silent data loss instead of proper blocking (requires sleep/wake). *Since fixed*: blocking `pipe_write()`, `-EPIPE` on a closed reader.
+2. **I/O Inconsistency**: Different interfaces for file/console/network (requires VFS). *Since fixed*: `src/vfs.h`.
 
 ---
 
@@ -325,17 +347,17 @@ sites; full breakdown in [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECU
 - **Data Corruption**: CMOS read consistency, argv preservation
 - **Information Disclosure**: Format string defenses, bounds checking
 - **TOCTOU Races**: System calls use safe copy primitives with exception handling
-- **Stack Overflow**: Guard pages detect overflows immediately (16KB stacks with guard page protection)
+- **Stack Overflow**: Guard pages detect overflows immediately (16KB stacks with guard page protection; *since fixed*: kernel task stacks are now 128 KB, `KERNEL_TASK_STACK_PAGES` in `src/process.h`, with guard pages below kernel and user stacks)
 - **Task Starvation**: Preemptive scheduling ensures fair CPU allocation (100Hz round-robin)
 
 ### ⚠️ Partial Protection
 
-- **Pipe DoS**: Data loss possible under load (documented)
+- **Pipe DoS**: Data loss possible under load (documented). *Since fixed*: pipes block.
 
 ### ❌ Not Applicable (Design Choices)
 
-- **Multi-user Security**: Single-user educational OS
-- **Disk Persistence**: RAM-based filesystem only
+- **Multi-user Security**: Single-user educational OS. *Since fixed*: multi-user, with per-uid accounts (`src/user.c`), ramfs ownership and permissions, and own-only process visibility.
+- **Disk Persistence**: RAM-based filesystem only. *Since fixed*: the FAT32 `C:` drive persists across boots (`src/fat32.c`).
 - **Network Encryption**: Educational TCP/IP stack
 
 ---
@@ -376,11 +398,13 @@ sites; full breakdown in [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECU
    - Priority: MEDIUM
    - Effort: 2-3 days
    - Benefit: Eliminates pipe data loss, improves performance
+   - *Since fixed* (wait queues, blocking pipes)
 
 2. **Implement VFS Layer** (MEDIUM)
    - Priority: LOW
    - Effort: 4-5 days
    - Benefit: Maintainability, consistent security
+   - *Since fixed* (`src/vfs.h`)
 
 **Total Effort for Production-Ready**: 6-8 days (reduced from 8-11 days with preemptive scheduling verified)
 
@@ -393,7 +417,7 @@ sites; full breakdown in [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECU
 - Embedded systems prototyping (with caveats)
 
 **Use with awareness of**:
-- Pipe data loss under heavy load (no blocking writes)
+- Pipe data loss under heavy load (no blocking writes) — *since fixed*
 
 ---
 
@@ -430,7 +454,7 @@ TinyOS has undergone four comprehensive security audit layers, addressing 25 vul
 
 **Latest Updates**:
 - **v1.5**: TOCTOU vulnerability fixed with exception-handling framework (`copy_from_user()`/`copy_to_user()`)
-- **v1.6**: Stack guard pages implemented (16KB stacks with guard page protection)
+- **v1.6**: Stack guard pages implemented (16KB stacks with guard page protection; now 128 KB)
 - **v1.7**: Preemptive scheduling verified and tested (100Hz timer-based task switching operational)
 - **v1.8**: Wait queue mechanism implemented (blocking I/O, eliminates busy-wait CPU waste, fixes pipe data loss)
 - **v1.9**: VFS foundation complete (unified I/O abstraction layer with centralized security validation)

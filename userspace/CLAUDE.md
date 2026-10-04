@@ -1,7 +1,7 @@
 # userspace/ — ring-3 shell and libc
 
 - The ring-3 shell is the **default login shell** (PR #51); `kshell` hands over to the kernel
-  shell, `exit` logs out. It echoes a whole line after `readline()` returns (`shell.c:2035`).
+  shell, `exit` logs out. It echoes a whole line after `readline()` returns (in `main()`, `shell.c`).
 - `history`/`jobs` are ring-3-local **by design** — sharing the kernel shell's buffers would
   leak one session's command lines to another user.
 - **Machine-state commands stay kernel-shell only** (`pae`, `mem`, `wxaudit`, `auditlog`,
