@@ -123,8 +123,9 @@ trap cleanup EXIT
 # back in as the test user looked like the obvious route, and it does reach a
 # ring-3 shell -- but keystrokes sent to that re-logged-in session never reach
 # its readline: the session comes up, prints its prompt, and then ignores input
-# entirely. That is a separate defect in the login path, not something this
-# harness should work around silently; it is recorded in doc/KERNEL_BUGS.md.
+# entirely. That was recorded in doc/KERNEL_BUGS.md; it no longer reproduces
+# on main 0e3e610 and verify-ring3-relogin-input.sh now guards it. The route
+# below was kept because it is proven and the measurement does not depend on it.
 #
 # So the route is kshell -> su -> `exec /shell.elf`, which lands in a SECOND
 # ring-3 shell that has already inherited the test user's credentials. The
