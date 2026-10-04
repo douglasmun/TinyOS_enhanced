@@ -141,7 +141,7 @@ Login successful. Welcome, root!
 TinyOS login: hacker
 Password: ****
 
-Login incorrect (user not found)
+Login incorrect
 2 login attempts remaining
 
 TinyOS login: _

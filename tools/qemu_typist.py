@@ -351,9 +351,8 @@ def main():
     #     type at the login prompt with a wrong password, each expected to fail.
     #     Defaults to empty, so every existing harness is unaffected.
     #
-    #     This is the only way to reach user_authenticate()'s "user not found"
-    #     branch: `su` rejects a nonexistent user in the shell before it ever
-    #     calls the auth path, so the login prompt is the sole vehicle.
+    #     This reaches user_authenticate()'s "user not found" branch before any
+    #     session exists.
     prelogin = os.environ.get("TINYOS_PRELOGIN_USERS", "")
     if prelogin:
         for name in [u for u in prelogin.split(",") if u]:
@@ -362,9 +361,9 @@ def main():
             type_verified(sock, name + "\n", timeout=60)
             end = wait_for("Password:", timeout=60, since=end)
             type_str(sock, "wrongpassword\n")
-            # "Login incorrect" covers both auth failure branches (-2 user not
-            # found, -5 bad password). NOT "Login failed", which is only the
-            # `default` case of that switch and would never appear here.
+            # "Login incorrect" is the one line for every refusal -- unknown
+            # user, bad password, locked, inactive -- by design: the prompt
+            # does not say which.
             end = wait_for("Login incorrect", timeout=240, since=end)
 
         # TINYOS_PRELOGIN_ONLY: stop here. shell_login_prompt() halts the

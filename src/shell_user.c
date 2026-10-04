@@ -161,15 +161,16 @@ void shell_cmd_su(const char* args) {
         target_username = "root";  /* Default to root if no argument */
     }
 
-    /* Find target user */
-    user_account_t* target_user = user_find_by_username(target_username);
-    if (!target_user) {
-        kprintf("su: user '%s' does not exist\n", target_username);
-        return;
-    }
-
     /* Root can switch to any user without password */
     if (current->euid == 0) {
+        /* Only root learns whether the name exists. Everyone else is asked
+         * for a password either way, below. */
+        user_account_t* target_user = user_find_by_username(target_username);
+        if (!target_user) {
+            kprintf("su: user '%s' does not exist\n", target_username);
+            return;
+        }
+
         /* Root skips the PASSWORD, not the account state. This path goes
          * straight to sys_setgid/sys_setuid, which enforce privilege rules but
          * know nothing about the user database, so without this check a locked
@@ -249,23 +250,10 @@ void shell_cmd_su(const char* args) {
         /* SECURITY: Delay on failed authentication (prevent brute-force) */
         uint32_t delay_start = pit_get_ticks();
 
-        switch (auth_result) {
-            case -2:
-                kprintf("su: user '%s' does not exist\n", target_username);
-                break;
-            case -3:
-                kprintf("su: account locked (too many failed attempts)\n");
-                break;
-            case -4:
-                kprintf("su: account inactive\n");
-                break;
-            case -5:
-                kprintf("su: authentication failure\n");
-                break;
-            default:
-                kprintf("su: authentication error\n");
-                break;
-        }
+        /* One answer for every reason -- unknown user, wrong password,
+         * locked, inactive. Naming the reason told any user which accounts
+         * exist and when one had locked; the audit log keeps it. */
+        kprintf("su: authentication failure\n");
 
         /* Wait 3 seconds (150 ticks at 50 Hz) to slow down brute-force attacks */
         while (pit_get_ticks() < delay_start + 150) {
@@ -818,32 +806,13 @@ int shell_login_prompt(void) {
             attempts++;
             int remaining = max_attempts - attempts;
 
-            switch (auth_result) {
-                case -2:
-                    kprintf("\nLogin incorrect (user not found)\n");
-                    break;
-                case -3:
-                    kprintf("\nAccount locked (too many failed attempts)\n");
-                    kprintf("Please wait 60 seconds before trying again.\n");
-                    return -1;  /* Locked out - refuse login */
-                case -4:
-                    kprintf("\nAccount is inactive\n");
-                    break;
-                case -5:
-                    kprintf("\nLogin incorrect (bad password)\n");
-                    break;
-                case -6:
-                    /*=========================================================
-                     * No password set (should be rare - first-boot setup
-                     * should have handled this)
-                     *=======================================================*/
-                    kprintf("\nAccount '%s' has no password set.\n", username);
-                    kprintf("Contact your system administrator to set a password.\n");
-                    return -1;  /* Cannot login without password */
-                default:
-                    kprintf("\nLogin failed\n");
-                    break;
-            }
+            /* One answer for every reason, and the same control flow: an
+             * unknown name, a wrong password, a locked, inactive or
+             * passwordless account all spend an attempt and print this line.
+             * Naming the reason -- or ending the session early for only some
+             * of them -- told the person at the prompt which names exist and
+             * which accounts had locked. The audit log keeps the reason. */
+            kprintf("\nLogin incorrect\n");
 
             if (remaining > 0) {
                 kprintf("%d login attempt%s remaining\n\n",
