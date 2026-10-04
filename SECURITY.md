@@ -1,7 +1,7 @@
 # Security Policy
 
 TinyOS Enhanced is a **single-developer, educational / research operating-system kernel**.
-It is **not** production software (see the status notice in the README): it is 32-bit,
+It is **not** production software: it is 32-bit,
 single-core, console-only, intended to run under QEMU, and its from-scratch cryptography has
 **not** had external review. Please calibrate expectations accordingly — but security
 reports are genuinely welcome, since security mechanisms are the whole point of the project.
