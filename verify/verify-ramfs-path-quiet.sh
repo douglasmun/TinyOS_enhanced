@@ -10,13 +10,15 @@
 #
 #   - depth: the VFS canonicalizer allows 32 components, ramfs 16, so
 #     `stat` of a 17..32-component path reaches split_path through SYS_STAT
-#   - "..": SYS_CHMOD (and the redirect syscall) pass ramfs a path that was
-#     never canonicalized, so `chmod 600 D:/x/../f` reaches it with ".."
+#   - "..": the kernel shell's chmod (ungated `kshell`) passes ramfs its
+#     resolve_path() result, which is never canonicalized, so
+#     `chmod 600 /x/../f` reaches it with "..". SYS_CHMOD and the redirect
+#     syscall did too until they canonicalized (verify-syscall-dotdot.sh).
 #
 # Every caller already returns an errno, so the line recorded nothing the
 # caller did not get, on the console the ring-3 shell shares.
 #
-# ASSERTIONS (ring-3 shell, the boundary these syscalls live at)
+# ASSERTIONS (ring-3 shell for the depth legs, kernel shell for "..")
 #   1. POSITIVE CONTROL: each probe produced its own refusal line, so the
 #      syscall ran and refused
 #   2. zero "[RAMFS] SECURITY" lines in the whole log
@@ -29,7 +31,7 @@ cd "$(dirname "$0")/.."
 PASSWORD="${TINYOS_TEST_PASSWORD:-${TINYOS_PASSWORD:-rootpass1}}"
 
 FILE=D:/rpq.txt
-DOTDOT=D:/rpqdir/../rpq.txt
+DOTDOT=/rpqdir/../rpq.txt
 DEEP=D:/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t     # 20 components
 
 ISO=dist/tinyos.iso
@@ -72,11 +74,13 @@ TINYOS_EXPECT="change permission bits" \
 TINYOS_FOLLOWUP_CMDS="\
 !write $FILE x;\
 !stat $FILE=>mode=600;\
-!chmod 600 $DOTDOT;\
-!chmod 600 $DOTDOT;\
 !stat $DEEP;\
 !chmod 600 $DEEP;\
-!stat $FILE=>size=" \
+!stat $FILE=>size=;\
+kshell=>Switching to the kernel shell;\
+chmod 600 $DOTDOT=>cannot access;\
+chmod 600 $DOTDOT=>cannot access;\
+cat /rpq.txt=>x" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
@@ -89,7 +93,7 @@ echo ""
 echo "================ VERDICT ================"
 [ -s "$SERIAL" ] || { echo "RESULT: FAIL — no serial output (typist rc=$TYPIST_RC)"; exit 2; }
 
-DOTDOT_REF=$(grep -ac "^chmod: $DOTDOT: " "$REJOINED")
+DOTDOT_REF=$(grep -ac "^chmod: cannot access '$DOTDOT'" "$REJOINED")
 DEEP_STAT_REF=$(grep -ac "^stat: $DEEP: " "$REJOINED")
 DEEP_CHMOD_REF=$(grep -ac "^chmod: $DEEP: " "$REJOINED")
 echo "  refusals: chmod '..' x$DOTDOT_REF, stat deep x$DEEP_STAT_REF, chmod deep x$DEEP_CHMOD_REF"

@@ -956,22 +956,38 @@ int sys_spawn(const char* user_path, char* const* user_argv) {
  * @param user_path Path pointer from ring 3
  * @return 0 on success, negative errno otherwise
  *===========================================================================*/
-/* The RAMFS-relative part of a path syscall_copy_path() resolved, or NULL if
- * it names another drive. task_resolve_path() qualifies only RELATIVE paths:
+/* The RAMFS-relative part of a path syscall_copy_path() resolved, or -EXDEV
+ * if it names another drive. task_resolve_path() qualifies only RELATIVE paths:
  * a drive-qualified one comes back as given ("D:/x", "d:/x"), and so does a
  * leading-'/' one, which the VFS resolves against the default drive. Testing
  * for a "D:" prefix alone refused every absolute path, so from ring 3
  * `echo x > /scratch/f` and `chmod 600 /scratch/f` failed with -EXDEV while
  * the same names relative to cwd worked. */
-static const char* syscall_ramfs_path(const char* path) {
+/*
+ * The result is canonicalized ("." and ".." resolved, slashes collapsed) into
+ * out, which the caller sizes VFS_MAX_PATH. Both callers go to ramfs directly
+ * rather than through the VFS, so nothing else does this for them, and ramfs's
+ * splitter refuses any ".." component: `chmod 644 d/../f`, `echo x > d/../f`
+ * and -- because the cwd is joined in front -- `echo x > ../f` all failed with
+ * -ENOENT while stat, cat and write resolved the same strings.
+ * verify-syscall-dotdot.sh.
+ *
+ * Returns 0, -EXDEV for another drive, or -EINVAL when the canonical form does
+ * not fit (too long, or deeper than the canonicalizer's component limit). */
+static int syscall_ramfs_path(const char* path, char* out, size_t out_size) {
+    const char* rel;
     if (path[0] == '/') {
-        return path;
+        rel = path;
+    } else if ((path[0] == VFS_DEFAULT_DRIVE || path[0] == VFS_DEFAULT_DRIVE - 'A' + 'a')
+               && path[1] == ':') {
+        rel = path + 2;
+    } else {
+        return -EXDEV;
     }
-    if ((path[0] == VFS_DEFAULT_DRIVE || path[0] == VFS_DEFAULT_DRIVE - 'A' + 'a')
-        && path[1] == ':') {
-        return path + 2;
+    if (vfs_canonicalize_path(rel, out, out_size) < 0) {
+        return -EINVAL;
     }
-    return NULL;
+    return 0;
 }
 
 static int syscall_copy_path(char* out, size_t out_size, const char* user_path) {
@@ -1453,9 +1469,10 @@ int sys_chmod(const char* user_path, uint32_t mode) {
     /* FAT32 has no permission bits and there is no VFS .chmod op, so
      * anything off the RAMFS drive is refused rather than silently ignored --
      * a no-op success here would be a lie a script could not detect. */
-    const char* ramfs_path = syscall_ramfs_path(path);
-    if (!ramfs_path) {
-        return -EXDEV;
+    char ramfs_path[VFS_MAX_PATH];
+    rc = syscall_ramfs_path(path, ramfs_path, sizeof(ramfs_path));
+    if (rc < 0) {
+        return rc;
     }
 
     /* ramfs_find() walks a plain '/'-rooted path and does not know about
@@ -2474,9 +2491,10 @@ int sys_redirect(int fd, const char* user_path, int mode) {
     /* Anything not on the RAMFS drive cannot be represented by a
      * STREAM_TYPE_FILE stream. The stream helpers take the drive-relative
      * part. */
-    const char* ramfs_path = syscall_ramfs_path(path);
-    if (!ramfs_path) {
-        return -EXDEV;
+    char ramfs_path[VFS_MAX_PATH];
+    rc = syscall_ramfs_path(path, ramfs_path, sizeof(ramfs_path));
+    if (rc < 0) {
+        return rc;
     }
 
     int err;
