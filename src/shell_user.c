@@ -503,7 +503,8 @@ int shell_cmd_userdel(const char* args) {
 void shell_cmd_users(const char* args) {
     (void)args;  /* Unused */
 
-    user_list_all();
+    task_t* t = scheduler_get_current_task();
+    user_list_all(t && t->euid == 0);
 }
 
 /*=============================================================================

@@ -131,7 +131,9 @@ $ id nobody
 id: 'nobody': no such user
 ```
 
-`flags=0x01` means active. Root can `su` to any account without a password, and
+`flags=0x01` means active. The flags column is shown to root only: it carries
+the locked bit, which would tell anyone watching a login spray the moment an
+account locks. Root can `su` to any account without a password, and
 only root is told when the name does not exist:
 
 ```
