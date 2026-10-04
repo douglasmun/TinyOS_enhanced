@@ -118,6 +118,9 @@ jobs:
       #                                 control, so a vacuous pass is visible
       #   verify-entropy-pool-stir.sh : pool_counter is incremented
       #                                 unconditionally (source-level)
+      #   verify-ring3-help-complete.sh : every builtin the ring-3 shell
+      #                                 dispatches has a `help` line
+      #                                 (source-level)
       #   edr-rejoin-test.sh          : the shared EDR splice helper behaves on
       #                                 all 9 cases. Pure text -- it feeds
       #                                 fixtures through the awk and diffs the
@@ -154,6 +157,9 @@ jobs:
 
       - name: Entropy pool is actually stirred
         run: bash verify/verify-entropy-pool-stir.sh
+
+      - name: Ring-3 help lists every builtin
+        run: bash verify/verify-ring3-help-complete.sh
 
       - name: EDR splice helper unit tests
         run: bash verify/edr-rejoin-test.sh
