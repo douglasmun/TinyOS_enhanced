@@ -19,7 +19,7 @@ This document provides a comprehensive overview of ALL security work performed o
 - **ISO Size**: 4124 sectors
 - **Compiler Flags**: `-Werror` (warnings as errors), `-Wall -Wextra`
 - **Build Status**: ✅ Clean (0 warnings, 0 errors)
-- **Latest Version**: v2.8 (`TINYOS_VERSION`, `src/kernel.h`; signed GitHub Release). The build date, ID and ISO size above are from the 2025 layers and are historical.
+- **Latest Version**: v2.9 (`TINYOS_VERSION`, `src/kernel.h`; signed GitHub Release). The build date, ID and ISO size above are from the 2025 layers and are historical.
 
 ---
 
@@ -73,6 +73,10 @@ This document provides a comprehensive overview of ALL security work performed o
 - #149 — three existence/identity oracles closed; ramfs path prints removed
 - #150 — lock/unlock prints removed; `chmod` and redirects canonicalize paths
 - #151 — four credential and path items (incl. `passwd` lockout, identical refusal text)
+- #155 — ring-3 `help` lists every builtin it dispatches
+- #156 — protected-path refusals counted in `secstatus` instead of printed
+
+These shipped in release v2.9.
 
 **Total Issues Addressed**: 150 security issues across 7 audit layers (115 through Layer 6, plus 35)
 

@@ -1,7 +1,7 @@
 # TinyOS EDR: Quick Reference
 
 What the endpoint detection and response (EDR) code in `src/` actually does, as of
-v2.8 (reviewed 2026-10). Everything is configured at compile time; there is no EDR
+v2.9 (reviewed 2026-10). Everything is configured at compile time; there is no EDR
 shell command. `secstatus` is the only runtime view.
 
 ---

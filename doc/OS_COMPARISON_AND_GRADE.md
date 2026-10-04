@@ -3,8 +3,8 @@
 > **Grade as of 2026-06-14.** Not re-graded since. Later work:
 > `doc/SECURITY_AUDIT_2026-08.md` (16 findings, all fixed) and
 > `doc/FUZZ_REPORT_2026-10.md` (libFuzzer campaign, 9 targets, 35 defects fixed).
-> Current release is v2.8; the tree is now ~62K lines across 78 kernel C translation
-> units, with 98 `verify/verify-*.sh` harnesses and a CI build gate
+> Current release is v2.9; the tree is now ~62K lines across 78 kernel C translation
+> units, with 100 `verify/verify-*.sh` harnesses and a CI build gate
 > (`.github/workflows/build.yml`, PR #113).
 
 **Date:** 2026-06-10, re-graded **2026-06-14** after (a) removing SSH/SSHD from the
@@ -17,7 +17,7 @@ comparison set and external claims come from a fact-checked, multi-source resear
 pass (each claim adversarially verified 3-vote). TinyOS's own feature/LOC inventory
 and reliability state are taken from **direct inspection of the built `kernel.elf`**
 and **on-target QEMU runtime testing** (the `verify-exec.sh` harness, end-to-end;
-since then the suite has grown to 98 `verify/verify-*.sh` harnesses, and CI gates
+since then the suite has grown to 100 `verify/verify-*.sh` harnesses, and CI gates
 every PR on the `-Werror` build plus the non-booting source guards).
 
 Comparison set: xv6 (MIT), ToaruOS, SerenityOS, MikeOS, SkiftOS, Linux 0.01, and
@@ -151,7 +151,7 @@ production-grade."
 | Feature rarity / novelty | **A−** | ▼ from A+ | Signed secure boot + EDR remains a rare combination, but the once-"unique" SSH server is gone; the rarity case now rests on signed-boot + EDR alone. |
 | Breadth of working subsystems | **A−** | = | MM, scheduler, ring-3, VFS/FAT32, TCP/IP-to-DHCP, **and now exec-of-signed-ELF** all genuinely work and are runtime-verified. |
 | Reliability / correctness | **A−** | ▲ from B+ | The headline blocker is *actually* resolved this time (runtime-proven exec-in-ENFORCE), with the real root causes fixed rather than masked. Held below A only by the absence of long-soak testing and the single-core/32-bit/console scope. |
-| Docs / engineering hygiene | **A−** | = | A curated design/audit doc set; clean `-Werror` build; header-dep tracking; a reproducible `verify-exec.sh` runtime harness (now 98 harnesses plus a CI build gate, PR #113). Held at A− because several older docs (incl. the prior version of *this* one) carried a wrong root cause and stale SSH/feature claims now being corrected. |
+| Docs / engineering hygiene | **A−** | = | A curated design/audit doc set; clean `-Werror` build; header-dep tracking; a reproducible `verify-exec.sh` runtime harness (now 100 harnesses plus a CI build gate, PR #113). Held at A− because several older docs (incl. the prior version of *this* one) carried a wrong root cause and stale SSH/feature claims now being corrected. |
 | **Overall** | **A−** | = (composition changed) | A top-decile security-focused hobby OS. The grade is unchanged in letter but for sounder reasons: the reliability axis genuinely earned its rise (verified, not asserted), offsetting the scope/rarity loss from the SSH removal. |
 
 **One-line placement:** A top-tier, security-focused hobby OS — broader than xv6, with a

@@ -1,4 +1,4 @@
-# TinyOS v2.8 - Multi-User System Test Guide
+# TinyOS v2.9 - Multi-User System Test Guide
 
 A manual walkthrough of accounts, authentication and file permissions. Every
 output line below is the text the kernel or the ring-3 shell prints; `****`

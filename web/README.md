@@ -56,10 +56,10 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is built from `main` at **PR #141** (`0297df4`), and
-matches the signed `v2.8` release asset. It is a pinned image, not a rolling
-build of `main`: it only moves when someone runs the steps above, so expect it
-to fall behind again as work lands.
+The committed ISO is built from `main` at **PR #157** (`26bdc7a` plus the
+version bump), and matches the signed `v2.9` release asset. It is a pinned
+image, not a rolling build of `main`: it only moves when someone runs the steps
+above, so expect it to fall behind again as work lands.
 
 **Login drops straight into the ring-3 shell** (PR #51), which is what the demo
 shows. Run a signed program by its path (`/hello.elf`); type `kshell` to hand
@@ -68,38 +68,25 @@ over to the kernel shell for the privileged and introspection commands (`pae`,
 privileged commands are gated on **euid 0**, so a non-root user reaching the
 kernel shell still cannot run them.
 
-### What is new since v2.7
+### What is new since v2.8
 
-The headline is **PR #141: every input surface fuzzed, 35 defects fixed** — see
-[`../doc/FUZZ_REPORT_2026-10.md`](../doc/FUZZ_REPORT_2026-10.md). The ones you
-can reach from this demo, as an unprivileged user:
+Follow-up fixes to the v2.8 fuzz campaign (PRs #143–#156); the ones you can
+see from this demo:
 
-- **A pipe use-after-free**: a spawned child kept writing through frames its
-  pipe's owner had already freed.
-- **A kernel panic from spawn**: a child's guard page was marked not-present in
-  the *caller's* page table, so once the frame was reused a ring-0 page fault
-  took the kernel down.
-- **Writes landing in another user's file**, two ways: every `exec` closed
-  *every* process's close-on-exec fds, and an inherited redirected stdout was a
-  bare fd number its creator could close.
-- **RAMFS never checked the directory search bit**, so a root-only `0700`
-  directory hid nothing.
-- **One user could exhaust the RAMFS fd table**, blocking every `exec` including
-  root's. Now a per-user cap with a root reserve, released on normal exit.
-- **The editor's negative cursor read and wrote kernel memory**, alongside five
-  data-loss bugs in `edit`.
-- **Every spawn printed ~24 lines**, including the child's ASLR stack address and
-  page-table physical addresses. Now one verdict line; load counts are in
-  `secstatus`.
+- **Quieter console.** EDR blocks, lock/unlock, ramfs path errors, ELF refusals
+  and protected-path refusals no longer print a line per operation; `secstatus`
+  counts them instead (`Syscall blocks`, `Protected paths`, ...).
+- **`waitpid` admits only the caller's own child**, and EDR kills go through the
+  normal teardown, so killed tasks are reaped.
+- **Credential paths:** `passwd` honours the login lockout, `su`/`login` refuse
+  with identical text whether or not the user exists, and `stat` on a file you
+  cannot read is refused.
+- **`chmod` and redirects canonicalize paths**, so `..` cannot step around the
+  protected-path rule.
+- **Ring-3 `help` lists every builtin** (eight were missing).
 
-Also since v2.7: the DNS/DHCP/ICMP/ARP network audit (7 findings, PRs
-#135–#139), FAT32 hardening against hostile volumes, per-user TCP socket caps,
-and a double-fault task gate so a kernel stack overflow reports instead of
-triple-faulting. The demo has **no NIC and no disk attached**, so the network
-and FAT32 fixes matter for the QEMU configuration in the top-level README.
-
-SHA-256 `fd91ef42536947ed4170a250c7a7453e2eeb71f5cf0bfa9c5bb57180982a226b` as of
-2026-10-03. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
+SHA-256 `fd424f0c6ea9499a01efd402ef763bf6c8689271e1313e5750a8d73dde5e29f5` as of
+2026-10-04. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs — this hash identifies
 the committed artifact, it is not reproducible from source.
 
