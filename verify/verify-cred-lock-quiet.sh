@@ -19,9 +19,11 @@
 # su's to the victim with the new one.
 #
 # ASSERTIONS
-#   1. POSITIVE CONTROLS: the correct password was refused with "account
-#      locked" (the lock happened); the ring-3 passwd reported success; the
-#      new password then worked (the unlock happened)
+#   1. POSITIVE CONTROLS: the correct password was refused after the three
+#      wrong ones -- a fourth "authentication failure", since su no longer
+#      says why (verify-auth-user-oracle.sh) -- so the lock happened; the
+#      ring-3 passwd reported success; the new password then worked (the
+#      unlock happened)
 #   2. zero "[USER] Account" lines in the whole log
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = no output, 3 = INCONCLUSIVE.
@@ -64,7 +66,7 @@ cleanup() { kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; rm -f "$
 trap cleanup EXIT
 
 # The lock lasts USER_LOCKOUT_DURATION (60 s) from the third failure; the
-# "account locked" control comes right after it. The unlock is the password
+# refusal of the correct password comes right after it. The unlock is the password
 # reset, not the timeout: the final su is the only proof it happened.
 TINYOS_SERIAL="$SERIAL" \
 TINYOS_MON_SOCK="$MON_SOCK" \
@@ -87,7 +89,7 @@ su $VICTIM=>Password for;\
 su $VICTIM=>Password for;\
 !wrongpw3=>su:;\
 su $VICTIM=>Password for;\
-!$VICTIMPW=>account locked;\
+!$VICTIMPW=>authentication failure;\
 su root=>Password for;\
 !$PASSWORD=>Switched to user: root;\
 exec /shell.elf=>TinyOS shell (ring 3);\
@@ -110,7 +112,13 @@ echo ""
 echo "================ VERDICT ================"
 [ -s "$SERIAL" ] || { echo "RESULT: FAIL — no serial output (typist rc=$TYPIST_RC)"; exit 2; }
 
-for want in "su: account locked" "passwd: password updated successfully" "Switched to user: $VICTIM"; do
+REFUSED=$(grep -ac "^su: authentication failure" "$REJOINED")
+if [ "$REFUSED" -ne 4 ]; then
+    echo "RESULT: INCONCLUSIVE — expected 4 su refusals (3 wrong, then the right password locked out), saw $REFUSED"
+    grep -a "su:\|Switched to\|Now running" "$REJOINED" | tail -12 | sed 's/^/    /'
+    exit 3
+fi
+for want in "passwd: password updated successfully" "Switched to user: $VICTIM"; do
     if ! grep -aq "$want" "$REJOINED"; then
         echo "RESULT: INCONCLUSIVE — never saw '$want', so the lock/unlock was not driven"
         grep -a "su:\|passwd:\|Switched to\|Now running" "$REJOINED" | tail -12 | sed 's/^/    /'

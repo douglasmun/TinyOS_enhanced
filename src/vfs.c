@@ -410,6 +410,33 @@ static void vfs_free_fd(int fd) {
  * @param max_len Size of canonical buffer
  * @return 0 on success, negative error code on failure
  */
+/*=============================================================================
+ * vfs_path_is_protected - is a canonical path under a protected prefix?
+ *
+ * Writes, mkdir, rmdir and unlink under these prefixes need CAP_SYS_ADMIN.
+ * One list for every caller: sys_redirect() opens its file through ramfs, not
+ * vfs_open(), so it applies the same rule itself, and four private copies of
+ * the list could drift apart. The path must already be canonical -- a ".."
+ * would walk past the prefix test.
+ *===========================================================================*/
+bool vfs_path_is_protected(const char* canonical) {
+    static const char* const protected_paths[] = {
+        "/bin/",
+        "/sbin/",
+        "/etc/",
+        "/boot/",
+        "/kernel",
+        NULL
+    };
+
+    for (int i = 0; protected_paths[i] != NULL; i++) {
+        if (strncmp(canonical, protected_paths[i], strlen(protected_paths[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int vfs_canonicalize_path(const char* path, char* canonical, size_t max_len) {
     if (!path || !canonical || max_len == 0) {
         return VFS_EINVAL;
@@ -668,25 +695,7 @@ int vfs_open(const char* path, int flags) {
         /* This is a write operation - check if path is protected */
         task_t* current_task = scheduler_get_current_task();
 
-        /* List of protected path prefixes */
-        const char* protected_paths[] = {
-            "/bin/",
-            "/sbin/",
-            "/etc/",
-            "/boot/",
-            "/kernel",
-            NULL
-        };
-
-        /* Check if canonical actual_path matches any protected prefix */
-        bool is_protected = false;
-        for (int i = 0; protected_paths[i] != NULL; i++) {
-            size_t prefix_len = strlen(protected_paths[i]);
-            if (strncmp(actual_path, protected_paths[i], prefix_len) == 0) {
-                is_protected = true;
-                break;
-            }
-        }
+        bool is_protected = vfs_path_is_protected(actual_path);
 
         /* If protected, verify CAP_SYS_ADMIN capability */
         if (is_protected) {
@@ -973,25 +982,7 @@ int vfs_mkdir(const char* path) {
      *=======================================================================*/
     task_t* current_task = scheduler_get_current_task();
 
-    /* List of protected path prefixes */
-    const char* protected_paths[] = {
-        "/bin/",
-        "/sbin/",
-        "/etc/",
-        "/boot/",
-        "/kernel",
-        NULL
-    };
-
-    /* Check if canonical actual_path matches any protected prefix */
-    bool is_protected = false;
-    for (int i = 0; protected_paths[i] != NULL; i++) {
-        size_t prefix_len = strlen(protected_paths[i]);
-        if (strncmp(actual_path, protected_paths[i], prefix_len) == 0) {
-            is_protected = true;
-            break;
-        }
-    }
+    bool is_protected = vfs_path_is_protected(actual_path);
 
     /* If protected, verify CAP_SYS_ADMIN capability */
     if (is_protected) {
@@ -1098,25 +1089,7 @@ int vfs_rmdir(const char* path) {
      *=======================================================================*/
     task_t* current_task = scheduler_get_current_task();
 
-    /* List of protected path prefixes */
-    const char* protected_paths[] = {
-        "/bin/",
-        "/sbin/",
-        "/etc/",
-        "/boot/",
-        "/kernel",
-        NULL
-    };
-
-    /* Check if canonical actual_path matches any protected prefix */
-    bool is_protected = false;
-    for (int i = 0; protected_paths[i] != NULL; i++) {
-        size_t prefix_len = strlen(protected_paths[i]);
-        if (strncmp(actual_path, protected_paths[i], prefix_len) == 0) {
-            is_protected = true;
-            break;
-        }
-    }
+    bool is_protected = vfs_path_is_protected(actual_path);
 
     /* If protected, verify CAP_SYS_ADMIN capability */
     if (is_protected) {
@@ -1171,23 +1144,7 @@ int vfs_unlink(const char* path) {
 
     /* Protected paths: removing /bin/sh is as damaging as rmdir'ing /bin. */
     task_t* current_task = scheduler_get_current_task();
-    const char* protected_paths[] = {
-        "/bin/",
-        "/sbin/",
-        "/etc/",
-        "/boot/",
-        "/kernel",
-        NULL
-    };
-
-    bool is_protected = false;
-    for (int i = 0; protected_paths[i] != NULL; i++) {
-        size_t prefix_len = strlen(protected_paths[i]);
-        if (strncmp(actual_path, protected_paths[i], prefix_len) == 0) {
-            is_protected = true;
-            break;
-        }
-    }
+    bool is_protected = vfs_path_is_protected(actual_path);
 
     if (is_protected) {
         if (!current_task || !(current_task->capabilities & CAP_SYS_ADMIN)) {

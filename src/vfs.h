@@ -440,6 +440,12 @@ int vfs_mount(char drive_letter, const char* driver_name);
 int vfs_canonicalize_path(const char* path, char* canonical, size_t max_len);
 
 /**
+ * @brief Is a canonical path under a CAP_SYS_ADMIN-only prefix
+ *        (/bin/, /sbin/, /etc/, /boot/, /kernel)?
+ */
+bool vfs_path_is_protected(const char* canonical);
+
+/**
  * @brief Open a file/device/socket
  * @param path Path to open
  * @param flags Open flags (VFS_O_*)

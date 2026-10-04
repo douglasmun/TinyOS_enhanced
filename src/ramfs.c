@@ -300,11 +300,11 @@ static int split_path(const char* path, char components[][RAMFS_MAX_NAME], int m
      * Fail explicitly instead of truncating.
      *
      * All three refusals in this function are silent. Each used to print a
-     * "[RAMFS] SECURITY:" line, and ring 3 reaches them once per syscall:
-     * the VFS allows 32 components where this allows 16, and the kernel
-     * shell's chmod (ungated `kshell`) hands ramfs a path that was never
-     * canonicalized, ".." included. The caller gets its errno; that is the
-     * record.
+     * "[RAMFS] SECURITY:" line, and ring 3 reaches the depth one once per
+     * syscall: the VFS allows 32 components where this allows 16. Every
+     * caller now canonicalizes first (the syscalls, the kernel shell's
+     * resolve_path), so ".." is a backstop no path reaches. The caller gets
+     * its errno; that is the record.
      * verify-ramfs-path-quiet.sh.
      *========================================================================*/
     if (*path != '\0') {

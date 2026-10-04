@@ -10,15 +10,15 @@
 #
 #   - depth: the VFS canonicalizer allows 32 components, ramfs 16, so
 #     `stat` of a 17..32-component path reaches split_path through SYS_STAT
-#   - "..": the kernel shell's chmod (ungated `kshell`) passes ramfs its
-#     resolve_path() result, which is never canonicalized, so
-#     `chmod 600 /x/../f` reaches it with "..". SYS_CHMOD and the redirect
-#     syscall did too until they canonicalized (verify-syscall-dotdot.sh).
+#   - "..": no caller reaches it any more. SYS_CHMOD and the redirect
+#     syscall canonicalize (verify-syscall-dotdot.sh), and so does the kernel
+#     shell's resolve_path() (verify-kshell-dotdot.sh); the refusal stays as
+#     a backstop, so only the depth legs can drive it.
 #
 # Every caller already returns an errno, so the line recorded nothing the
 # caller did not get, on the console the ring-3 shell shares.
 #
-# ASSERTIONS (ring-3 shell for the depth legs, kernel shell for "..")
+# ASSERTIONS (ring-3 shell)
 #   1. POSITIVE CONTROL: each probe produced its own refusal line, so the
 #      syscall ran and refused
 #   2. zero "[RAMFS] SECURITY" lines in the whole log
@@ -31,7 +31,6 @@ cd "$(dirname "$0")/.."
 PASSWORD="${TINYOS_TEST_PASSWORD:-${TINYOS_PASSWORD:-rootpass1}}"
 
 FILE=D:/rpq.txt
-DOTDOT=/rpqdir/../rpq.txt
 DEEP=D:/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t     # 20 components
 
 ISO=dist/tinyos.iso
@@ -76,11 +75,7 @@ TINYOS_FOLLOWUP_CMDS="\
 !stat $FILE=>mode=600;\
 !stat $DEEP;\
 !chmod 600 $DEEP;\
-!stat $FILE=>size=;\
-kshell=>Switching to the kernel shell;\
-chmod 600 $DOTDOT=>cannot access;\
-chmod 600 $DOTDOT=>cannot access;\
-cat /rpq.txt=>x" \
+!stat $FILE=>size=" \
 python3 tools/qemu_typist.py
 TYPIST_RC=$?
 
@@ -93,11 +88,10 @@ echo ""
 echo "================ VERDICT ================"
 [ -s "$SERIAL" ] || { echo "RESULT: FAIL — no serial output (typist rc=$TYPIST_RC)"; exit 2; }
 
-DOTDOT_REF=$(grep -ac "^chmod: cannot access '$DOTDOT'" "$REJOINED")
 DEEP_STAT_REF=$(grep -ac "^stat: $DEEP: " "$REJOINED")
 DEEP_CHMOD_REF=$(grep -ac "^chmod: $DEEP: " "$REJOINED")
-echo "  refusals: chmod '..' x$DOTDOT_REF, stat deep x$DEEP_STAT_REF, chmod deep x$DEEP_CHMOD_REF"
-if [ "$DOTDOT_REF" -lt 2 ] || [ "$DEEP_STAT_REF" -lt 1 ] || [ "$DEEP_CHMOD_REF" -lt 1 ]; then
+echo "  refusals: stat deep x$DEEP_STAT_REF, chmod deep x$DEEP_CHMOD_REF"
+if [ "$DEEP_STAT_REF" -lt 1 ] || [ "$DEEP_CHMOD_REF" -lt 1 ]; then
     echo "RESULT: INCONCLUSIVE — a probe never produced its refusal line, so nothing below is graded"
     grep -a "rpq\|/a/b/c" "$REJOINED" | tail -10 | sed 's/^/    /'
     exit 3
@@ -114,5 +108,5 @@ if grep -aqi "triple fault\|PANIC" "$REJOINED"; then
     echo "RESULT: FAIL — kernel panicked during the run"
     exit 1
 fi
-echo "RESULT: PASS — four path refusals reached ramfs and printed nothing but their own errors"
+echo "RESULT: PASS — two path refusals reached ramfs and printed nothing but their own errors"
 exit 0

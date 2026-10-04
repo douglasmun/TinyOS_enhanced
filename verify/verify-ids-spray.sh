@@ -51,9 +51,9 @@
 # that explicit line the detection would be invisible to an operator and to
 # this harness alike.
 #
-# `su` cannot drive this: shell_cmd_su() rejects a nonexistent user in the shell
-# before it ever calls user_authenticate_for(), so the login prompt is the only
-# vehicle that reaches the not-found branch.
+# The login prompt is the vehicle. An unprivileged kernel-shell `su` now reaches
+# the not-found branch too (it asks for a password whatever the name), but it
+# needs a session and a second account first; login needs neither.
 #
 # VALIDATED BOTH WAYS: see the VALIDATION LOG at the end of this file.
 #

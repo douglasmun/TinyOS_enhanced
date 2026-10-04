@@ -33,8 +33,14 @@ void cmd_cp(int argc, char** argv) {
         return;
     }
 
-    const char* src_path = argv[1];
-    const char* dst_path = argv[2];
+    char src_abs[MAX_PATH];
+    char dst_abs[MAX_PATH];
+    const char* src_path = resolve_path(argv[1], src_abs, sizeof(src_abs));
+    const char* dst_path = resolve_path(argv[2], dst_abs, sizeof(dst_abs));
+    if (!src_path || !dst_path) {
+        kprintf("cp: path too long (would be truncated) - refusing to operate\n");
+        return;
+    }
 
     /*
      * TOCTOU Fix: Open file first, then verify type and size.
@@ -124,8 +130,14 @@ void cmd_mv(int argc, char** argv) {
         return;
     }
 
-    const char* src_path = argv[1];
-    const char* dst_path = argv[2];
+    char src_abs[MAX_PATH];
+    char dst_abs[MAX_PATH];
+    const char* src_path = resolve_path(argv[1], src_abs, sizeof(src_abs));
+    const char* dst_path = resolve_path(argv[2], dst_abs, sizeof(dst_abs));
+    if (!src_path || !dst_path) {
+        kprintf("mv: path too long (would be truncated) - refusing to operate\n");
+        return;
+    }
 
     /* SECURITY FIX: Use atomic rename operation instead of copy-then-delete
      * This prevents:
@@ -960,11 +972,18 @@ void cmd_mkdir(int argc, char* argv[]) {
         path_arg = 2;
     }
 
+    char abs_path[MAX_PATH];
+    const char* path = resolve_path(argv[path_arg], abs_path, sizeof(abs_path));
+    if (!path) {
+        kprintf("mkdir: path too long (would be truncated) - refusing to operate\n");
+        return;
+    }
+
     int result;
     if (create_parents) {
-        result = mkdir_recursive(argv[path_arg]);
+        result = mkdir_recursive(path);
     } else {
-        result = ramfs_mkdir(argv[path_arg]);
+        result = ramfs_mkdir(path);
     }
 
     if (result == 0) {
@@ -982,49 +1001,38 @@ void cmd_mkdir(int argc, char* argv[]) {
 }
 
 /*=============================================================================
- * HELPER: Resolve relative path to absolute path
+ * HELPER: Resolve a path to an absolute, canonical one
+ *
+ * Joins a relative path to current_dir, then canonicalizes the result, so
+ * every caller hands ramfs a path with no "." or ".." components. ramfs's
+ * split_path() refuses "..", so without this `chmod 644 /d/../f` failed with
+ * "cannot access" while the same path worked through the syscalls, which
+ * canonicalize (syscall_ramfs_path). Returns abs_path, or NULL if the path is
+ * too long or does not canonicalize.
  *=============================================================================*/
 static const char* resolve_path(const char* path, char* abs_path, size_t abs_path_size) {
-    /* If already absolute, check for truncation and use as-is */
-    if (path[0] == '/') {
-        size_t path_len = strlen(path);
-        if (path_len >= abs_path_size) {
-            /* Path too long - return NULL to signal error */
-            return NULL;
-        }
-        return path;
-    }
+    char joined[MAX_PATH];
 
-    /* Relative path - make it absolute WITH TRUNCATION DETECTION */
-    if (strcmp(current_dir, "/") == 0) {
-        /* In root, just prepend / */
-        if (abs_path_size < 2) {
-            return NULL;  /* Buffer too small */
-        }
-        abs_path[0] = '/';
-        size_t path_len = safe_strcpy(&abs_path[1], path, abs_path_size - 1);
-        /* Check for truncation: if path_len >= buffer_size-1, it was truncated */
-        if (path_len >= abs_path_size - 1) {
-            return NULL;  /* Path truncated */
+    if (path[0] == '/') {
+        if (safe_strcpy(joined, path, sizeof(joined)) >= sizeof(joined)) {
+            return NULL;  /* Path too long */
         }
     } else {
-        /* Append to current directory - check lengths first */
+        /* Relative path - join to the current directory WITH TRUNCATION
+         * DETECTION. A root cwd yields "//name", which canonicalizes. */
         size_t cwd_len = strlen(current_dir);
         size_t path_len = strlen(path);
         /* Need: cwd_len + 1 (for /) + path_len + 1 (for \0) */
-        if (cwd_len + 1 + path_len + 1 > abs_path_size) {
+        if (cwd_len + 1 + path_len + 1 > sizeof(joined)) {
             return NULL;  /* Would truncate */
         }
+        memcpy(joined, current_dir, cwd_len);
+        joined[cwd_len] = '/';
+        memcpy(&joined[cwd_len + 1], path, path_len + 1);
+    }
 
-        size_t pos = safe_strcpy(abs_path, current_dir, abs_path_size);
-        if (pos >= abs_path_size) {
-            return NULL;  /* Truncated */
-        }
-        abs_path[pos++] = '/';
-        size_t copied = safe_strcpy(&abs_path[pos], path, abs_path_size - pos);
-        if (copied >= abs_path_size - pos) {
-            return NULL;  /* Truncated */
-        }
+    if (vfs_canonicalize_path(joined, abs_path, abs_path_size) != 0) {
+        return NULL;
     }
     return abs_path;
 }
