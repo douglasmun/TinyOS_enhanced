@@ -60,7 +60,7 @@ After setup you reach the login prompt:
 
 ```
 *~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
-  TinyOS v2.8 Login System
+  TinyOS v2.9 Login System
 *~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
 
 TinyOS login: root

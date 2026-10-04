@@ -1,6 +1,6 @@
 # TinyOS documentation
 
-TinyOS (v2.8) is an educational 32-bit (i386) Multiboot2 kernel in freestanding C and
+TinyOS (v2.9) is an educational 32-bit (i386) Multiboot2 kernel in freestanding C and
 NASM: PAE paging with NX/W^X, ASLR, ring-3 user processes running ECDSA-signed ELF
 binaries (enforced by default), a ring-3 login shell, VFS over RAMFS and FAT32, an e1000
 TCP/IP stack with firewall, IDS and EDR. See [`../README.md`](../README.md) for the
