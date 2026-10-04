@@ -2497,6 +2497,15 @@ int sys_redirect(int fd, const char* user_path, int mode) {
         return rc;
     }
 
+    /* The stream helpers open through ramfs, below vfs_open()'s protected-path
+     * check, so apply it here: writing /etc/motd with `>` needs the same
+     * CAP_SYS_ADMIN that `write` does. Ring-3 tasks hold no capabilities, root
+     * included. ramfs_path is canonical, which the prefix test needs. */
+    if (fd != STDIN_FILENO && vfs_path_is_protected(ramfs_path) &&
+        !(self->capabilities & CAP_SYS_ADMIN)) {
+        return -EACCES;
+    }
+
     int err;
     if (fd == STDIN_FILENO) {
         err = stdin_redirect_from_file(streams, ramfs_path);
