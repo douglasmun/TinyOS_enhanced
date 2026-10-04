@@ -16,7 +16,7 @@ work in those directories.
 |---|---|
 | **Full text of every rule below, with the failure behind it** | `doc/RULES_THAT_BITE.md` |
 | Ring-3 migration: every syscall's design rationale, PRs #43–#58, harness traps | `doc/RING3_MIGRATION.md` |
-| Fixed kernel bugs worth remembering (ISR EAX clobber, exec triple-fault, sha256/PMM/COW faults) | `doc/KERNEL_BUGS.md` |
+| Fixed kernel bugs worth remembering (ISR EAX clobber, context_switch ESP off-by-4 = #126, exec triple-fault, sha256/PMM/COW faults) | `doc/KERNEL_BUGS.md` |
 | Crypto invariants, ELF signing, what a harness must prove | `doc/CRYPTO_INVARIANTS.md` |
 | `SYS_MSEAL` audit: the disproved latency hypothesis, the 16 kprintf sites | `doc/MSEAL_AUDIT.md` |
 | Post-v2.2 roadmap with rationale | `doc/ROADMAP_NEXT.md` |

@@ -1397,3 +1397,63 @@ void scheduler_handle_fpu_exception(void) {
      *         current->pid, current->name);
      *=======================================================================*/
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * verify-context-switch-esp.sh only (kernel-shell `ctxswtest`).
+ *
+ * A task resumed by context_switch() must get back exactly the ESP it called
+ * with -- that is the C calling convention, and the only thing a caller's
+ * epilogue may assume. Issue #126: the save path recorded ESP pointing AT the
+ * return address instead of past it, so every resumed task came back 4 bytes
+ * low. An EBP-framed caller's `leave` silently repaired it; a caller with an
+ * ESP-relative epilogue popped shifted registers and returned to the word
+ * below its real return address (EIP=0 on CI).
+ *
+ * ctxsw_esp_probe() switches the current task to itself -- a full save and
+ * resume on one stack -- and returns ESP-after minus ESP-before, measured in
+ * asm so no compiler framing can mask it. It restores ESP from the callee-saved
+ * ESI before returning, so a wrong delta is reported rather than crashed on.
+ *=============================================================================*/
+extern int ctxsw_esp_probe(task_t* self);
+__asm__(
+    ".text\n"
+    ".globl ctxsw_esp_probe\n"
+    "ctxsw_esp_probe:\n"
+    "    pushl %ebx\n"
+    "    pushl %esi\n"
+    "    pushl %edi\n"
+    "    pushl %ebp\n"
+    "    movl 20(%esp), %eax\n"   /* self */
+    "    movl %esp, %esi\n"       /* ESP before (context_switch restores ESI) */
+    "    pushl %eax\n"            /* next = self */
+    "    pushl %eax\n"            /* current = self */
+    "    call context_switch\n"
+    "    addl $8, %esp\n"
+    "    movl %esp, %eax\n"
+    "    subl %esi, %eax\n"       /* 0 = correct, -4 = issue #126 */
+    "    movl %esi, %esp\n"
+    "    popl %ebp\n"
+    "    popl %edi\n"
+    "    popl %esi\n"
+    "    popl %ebx\n"
+    "    ret\n"
+);
+
+void scheduler_ctxsw_esp_test(void) {
+    stream_context_t* out = get_current_streams();
+    task_t* self = scheduler_get_current_task();
+    if (!self) {
+        stream_printf(out, "[CTXSW] CONTROL-DEAD: no current task\n");
+        return;
+    }
+    int bad = 0;
+    for (int i = 0; i < 4; i++) {
+        int delta = ctxsw_esp_probe(self);
+        stream_printf(out, "[CTXSW] round %d: ESP delta across context_switch = %d\n", i, delta);
+        if (delta != 0) bad++;
+    }
+    stream_printf(out, "[CTXSW] VERDICT: %s (%d of 4 rounds came back with a moved ESP)\n",
+                  bad ? "FAIL" : "PASS", bad);
+}
+#endif

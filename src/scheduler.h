@@ -136,3 +136,8 @@ void scheduler_wakeup_task(task_t* task);
  * SECURITY FIX (Issue 5.3): Lazy FPU Switching Optimization
  */
 void scheduler_handle_fpu_exception(void);
+
+#ifdef TINYOS_FAULT_INJECT
+/* verify-context-switch-esp.sh only (kernel-shell `ctxswtest`). */
+void scheduler_ctxsw_esp_test(void);
+#endif
