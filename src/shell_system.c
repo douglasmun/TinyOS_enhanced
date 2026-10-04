@@ -289,42 +289,39 @@ void cmd_pae(int argc, char* argv[]) {
     stream_printf(ctx, "\nCurrent Status:\n");
     stream_printf(ctx, "  CR4.PAE: %s\n", pae_enabled ? "ENABLED" : "DISABLED");
 
+    bool nx_enabled = false;
     if (nx_supported && max_extended >= 0x80000001) {
         /* Check EFER.NXE */
         uint32_t eax, edx;
         __asm__ volatile("rdmsr" : "=a"(eax), "=d"(edx) : "c"(0xC0000080));
-        bool nx_enabled = (eax & (1 << 11)) != 0;
+        nx_enabled = (eax & (1 << 11)) != 0;
         stream_printf(ctx, "  EFER.NXE: %s\n", nx_enabled ? "ENABLED" : "DISABLED");
-
-        if (!nx_enabled) {
-            stream_printf(ctx, "\nNote: NX bit is supported but not enabled.\n");
-            stream_printf(ctx, "      Call pae_enable_nx() to enable W^X protection.\n");
-        }
     }
 
+    /* Status reads the live CR4.PAE and EFER.NXE bits, not CPU support: the
+     * kernel sets both in pae_init() at boot, so there is nothing left for a
+     * user to do, and a status that said READY from CPUID alone would claim
+     * enforcement it never checked. */
     stream_printf(ctx, "\nW^X Enforcement:\n");
-    if (pae_enabled && nx_supported) {
-        stream_printf(ctx, "  Status: READY ✅\n");
+    if (pae_enabled && nx_enabled) {
+        stream_printf(ctx, "  Status: ACTIVE ✅\n");
         stream_printf(ctx, "  Memory pages can be:\n");
         stream_printf(ctx, "    - Writable (data/stack) with NX bit set\n");
         stream_printf(ctx, "    - Executable (code) without NX bit\n");
         stream_printf(ctx, "    - Never BOTH writable AND executable\n");
     } else {
-        stream_printf(ctx, "  Status: UNAVAILABLE ❌\n");
+        stream_printf(ctx, "  Status: NOT ACTIVE ❌\n");
         if (!pae_enabled) {
             stream_printf(ctx, "  Reason: PAE mode not enabled\n");
         }
         if (!nx_supported) {
             stream_printf(ctx, "  Reason: CPU lacks NX bit support\n");
+        } else if (!nx_enabled) {
+            stream_printf(ctx, "  Reason: EFER.NXE is clear, so no page is non-executable\n");
         }
     }
 
-    stream_printf(ctx, "\nTo enable W^X:\n");
-    stream_printf(ctx, "  1. Ensure PAE-capable CPU (done ✅)\n");
-    stream_printf(ctx, "  2. Enable PAE in boot code (boot.s)\n");
-    stream_printf(ctx, "  3. Call pae_init() during kernel init\n");
-    stream_printf(ctx, "  4. Use pae_map_page() with NX flags\n");
-    stream_printf(ctx, "  5. Run 'wxaudit' to verify enforcement\n");
+    stream_printf(ctx, "\nRun 'wxaudit' to check every mapping for W^X violations.\n");
     stream_printf(ctx, "\n");
 }
 
