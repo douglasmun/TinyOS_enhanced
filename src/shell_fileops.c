@@ -1009,9 +1009,23 @@ void cmd_mkdir(int argc, char* argv[]) {
  * "cannot access" while the same path worked through the syscalls, which
  * canonicalize (syscall_ramfs_path). Returns abs_path, or NULL if the path is
  * too long or does not canonicalize.
+ *
+ * A leading default-drive prefix ("D:" or "d:") names the RAM disk these
+ * commands operate on, so it is dropped and the rest is treated as absolute.
+ * Without this "D:/f" was joined to the cwd as "/D:/f" and chmod, cp, mv,
+ * mkdir, touch, write, rm and edit all reported a file that cat could read as
+ * missing (verify-kshell-drive-prefix.sh). syscall_ramfs_path does the same.
  *=============================================================================*/
 static const char* resolve_path(const char* path, char* abs_path, size_t abs_path_size) {
     char joined[MAX_PATH];
+
+    if ((path[0] == VFS_DEFAULT_DRIVE || path[0] == VFS_DEFAULT_DRIVE - 'A' + 'a')
+        && path[1] == ':') {
+        path += 2;
+        if (path[0] == '\0') {
+            path = "/";
+        }
+    }
 
     if (path[0] == '/') {
         if (safe_strcpy(joined, path, sizeof(joined)) >= sizeof(joined)) {
