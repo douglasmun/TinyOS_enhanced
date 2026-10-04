@@ -316,7 +316,15 @@ Latent for the usual reason — while the only interesting user was the uid-1000
 default, "hardcoded 1000" and "inherited" were indistinguishable. It became
 observable the moment a harness created a user with a different uid.
 
-## OPEN: a re-logged-in ring-3 session never receives keyboard input
+## NO LONGER REPRODUCES: a re-logged-in ring-3 session never receives keyboard input
+
+**Status (2026-10-04):** this does not reproduce on main `0e3e610`. In 3 of 3 boots,
+after `logout` from the ring-3 shell and a login as a new user, the second session
+ran `echo` and `id` (which reported the new uid). The change that made it go away
+was not identified: no bisect was done, and the original report was never
+diagnosed. `verify-ring3-relogin-input.sh` now guards exactly this path. The original
+report is kept below.
+
 
 Found while building `verify-ring3-ps.sh` (2026-08-16). The harness needed an
 unprivileged ring-3 shell, and the obvious route — `logout` from the ring-3
