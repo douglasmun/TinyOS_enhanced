@@ -130,8 +130,7 @@ group_t* group_find_by_gid(uint16_t gid);
 int group_create(const char* groupname, uint16_t gid);
 
 /* Debugging */
-void user_list_all(void);
-void user_print_info(uint16_t uid);
+void user_list_all(bool show_flags);  /* flags (lock state) for root only */
 int user_count(void);  /* Count number of users in database */
 
 /* /etc directory structure */

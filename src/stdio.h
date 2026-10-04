@@ -221,12 +221,14 @@ bool stdin_is_pipe(stream_context_t* ctx);
  *=============================================================================*/
 
 /**
- * @brief Get global stream context for current shell
+ * @brief Get the stream context of the running task
  *
- * @return Pointer to global stream context
+ * @return Pointer to the current task's own stream context (embedded in its
+ *         task_t), or NULL when no task is running (early boot)
  *
- * Note: This returns a global context. In a multi-process system,
- * each process would have its own context.
+ * Note: Each task has its own context, so a redirection bound in one task
+ * never captures another's output. stream_printf() and printf_stream() fall
+ * back to kprintf on NULL.
  */
 stream_context_t* get_current_streams(void);
 

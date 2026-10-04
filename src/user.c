@@ -4,6 +4,7 @@
 #include "user.h"
 #include "kernel.h"  /* TINYOS_VERSION_NAME for /etc/issue and /etc/motd */
 #include "kprintf.h"
+#include "stdio.h"    /* stream_printf: `users` output goes to the caller */
 #include "util.h"
 #include "time.h"
 #include "critical.h"
@@ -1188,36 +1189,26 @@ int group_create(const char* groupname, uint16_t gid) {
  * DEBUGGING
  *=============================================================================*/
 
-void user_list_all(void) {
-    kprintf("[USER] User list:\n");
+/* `users`. Reachable by any user through `kshell`, so the flags byte -- which
+ * carries USER_FLAG_LOCKED, telling a login sprayer the moment an account
+ * locks -- is shown only when the caller says the viewer is root. Names, ids
+ * and home directories are what every listing shows. Output goes to the
+ * caller's stream so `users > f` works. verify-users-flags-root-only.sh. */
+void user_list_all(bool show_flags) {
+    stream_context_t* ctx = get_current_streams();
+    stream_printf(ctx, "[USER] User list:\n");
     for (int i = 0; i < USER_MAX_USERS; i++) {
         if (user_database[i].in_use) {
             user_account_t* u = &user_database[i];
-            kprintf("  %-12s uid=%5d gid=%5d home=%s flags=0x%02x\n",
-                    u->username, u->uid, u->gid, u->home_dir, u->flags);
+            if (show_flags) {
+                stream_printf(ctx, "  %-12s uid=%5d gid=%5d home=%s flags=0x%02x\n",
+                              u->username, u->uid, u->gid, u->home_dir, u->flags);
+            } else {
+                stream_printf(ctx, "  %-12s uid=%5d gid=%5d home=%s\n",
+                              u->username, u->uid, u->gid, u->home_dir);
+            }
         }
     }
-}
-
-void user_print_info(uint16_t uid) {
-    user_account_t* user = user_find_by_uid(uid);
-    if (!user) {
-        kprintf("[USER] User with uid=%d not found\n", uid);
-        return;
-    }
-
-    kprintf("[USER] User info:\n");
-    kprintf("  Username:  %s\n", user->username);
-    kprintf("  UID:       %d\n", user->uid);
-    kprintf("  GID:       %d\n", user->gid);
-    kprintf("  Home:      %s\n", user->home_dir);
-    kprintf("  Shell:     %s\n", user->shell);
-    kprintf("  Flags:     0x%02x ", user->flags);
-    if (user->flags & USER_FLAG_ACTIVE) kprintf("[ACTIVE] ");
-    if (user->flags & USER_FLAG_LOCKED) kprintf("[LOCKED] ");
-    if (user->flags & USER_FLAG_NOLOGIN) kprintf("[NOLOGIN] ");
-    kprintf("\n");
-    kprintf("  Failed:    %d attempts\n", user->failed_attempts);
 }
 
 int user_count(void) {

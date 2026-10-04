@@ -663,6 +663,11 @@ static void parse_and_execute(char* cmd_line) {
                     kprintf("shell: cannot create %s\n", cmd_ctx.redirects[i].filename);
                     return;
                 }
+                /* ramfs_open does not truncate and ramfs_write only grows
+                 * the file, so without this `>` onto a longer file left its
+                 * old tail behind. Same fix as the ring-3 shell's stdio.c.
+                 * verify-kshell-redirect-trunc.sh. */
+                ramfs_truncate(redir_fd);
             } else if (cmd_ctx.redirects[i].type == REDIR_APPEND) {
                 /* SECURITY (v1.12): Use NOFOLLOW for append redirection too */
                 /* Close fd from any earlier redirect so it doesn't leak */
@@ -693,7 +698,12 @@ static void parse_and_execute(char* cmd_line) {
                     kprintf("shell: cannot create %s\n", cmd_ctx.redirects[i].filename);
                     return;
                 }
-                /* TODO: Seek to end for append mode */
+                /* The cursor starts at 0 on open, so without the seek `>>`
+                 * overwrote the data it was asked to keep. */
+                int end = ramfs_fd_size(redir_fd);
+                if (end > 0) {
+                    ramfs_seek(redir_fd, (uint32_t)end);
+                }
             }
         }
     }

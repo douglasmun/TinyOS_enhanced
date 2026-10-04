@@ -89,11 +89,12 @@ Four slots are left free for user aliases.
 **Files**: `src/shell_redir.h`, `src/shell_redir.c`, `src/shell.c`
 
 #### Operators:
-- `>` - Send stdout to a file
-- `>>` - Send stdout to a file (append form)
+- `>` - Send stdout to a file, replacing its contents
+- `>>` - Send stdout to the end of a file, keeping its contents
 - `<` - Read stdin from a file
 
 The target of `>`/`>>` is opened for writing, and created if it does not exist;
+`>` truncates it first and `>>` writes after its last byte;
 the command's stdout stream is bound to it, so output printed through
 `stream_printf()` lands in the file. `<` binds stdin to the file. In the kernel
 shell `cat` is the command that reads stdin.
