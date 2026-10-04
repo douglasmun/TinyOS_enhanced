@@ -6,7 +6,7 @@
 #
 # WHY THIS HARNESS EXISTS. `fatls` was carried on the roadmap as one of item
 # 4's two open DESIGN calls: the questions recorded were its gating polarity
-# and the cross-drive behaviour in doc/CROSS_DRIVE_ACCESS_ANALYSIS.md. Both
+# and the cross-drive behaviour in an unpublished cross-drive note. Both
 # questions presume the capability has to be MIGRATED. It does not. The chain
 #
 #     cmd_ls  ->  open(path, O_RDONLY|O_DIRECTORY)   [SYS_OPEN 20]

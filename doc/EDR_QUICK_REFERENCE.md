@@ -34,6 +34,13 @@ the ML phase was never built.
 | `edr_behavioral_check(current_task, syscall_num, arg1)` | `syscall_dispatch()`, `syscall.c` | Every syscall, after the per-task syscall filter |
 | `edr_advanced_periodic_check()` | timer softirq, `interrupts.c` | Every 100 ticks (~1 s) |
 
+**Per-task syscall filter.** Each task carries a bitmap of allowed syscalls
+(`syscall_filter[]`, `syscall_filter_enabled` in `process.h`). When enabled, a call
+whose bit is clear returns `-ENOSYS` and is counted in `syscall_block_filter`; it
+prints nothing. New tasks start with the filter disabled (allow-all), and nothing
+in a normal build enables it: the only code that does is the `TINYOS_FAULT_INJECT`
+test path in `syscall.c`.
+
 In the dispatcher: if the check returns false the call is refused, counted in
 `syscall_block_edr`, and audited once per task (`EDR blocked syscall %d for PID %d
 (%s)`). If a response marked the calling task (`edr_kill_pending`), the dispatcher

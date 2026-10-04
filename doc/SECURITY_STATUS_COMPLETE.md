@@ -258,7 +258,7 @@ These shipped in release v2.9.
 
 ### ⚠️ MEDIUM - Requires Architectural Changes (2)
 
-**1. Busy-Wait Loops (Sleep/Wake Mechanism)** (`ARCHITECTURAL_SECURITY_ISSUES.md`)
+**1. Busy-Wait Loops (Sleep/Wake Mechanism)** (see [Folded historical documents](#folded-historical-documents))
 - **Issue**: No proper sleep/wake primitives → CPU waste, silent pipe data loss
 - **Impact**: Performance degradation, DoS under load
 - **Fix Required**: Wait queues + scheduler integration
@@ -266,7 +266,7 @@ These shipped in release v2.9.
 - **Status**: Documented with implementation plan
 - *Since fixed*: wait queues exist (`src/wait_queue.c`); pipes block instead of discarding data.
 
-**2. I/O Abstraction Layer** (`ARCHITECTURAL_SECURITY_ISSUES.md`)
+**2. I/O Abstraction Layer** (see [Folded historical documents](#folded-historical-documents))
 - **Issue**: Inconsistent I/O interfaces across file/console/network/pipe
 - **Impact**: Code duplication, harder to audit, inconsistent security checks
 - **Fix Required**: Virtual file system (VFS) abstraction
@@ -428,7 +428,7 @@ sites; full breakdown in [`MULTI_AGENT_SECURITY_AUDIT_2026.md`](MULTI_AGENT_SECU
 ## Security Contact
 
 For security issues or questions:
-- Review: `ARCHITECTURAL_SECURITY_ISSUES.md` for known limitations
+- Known limitations: `SECURITY_ARCHITECTURAL_LIMITATIONS.md`
 - Audit history: `MULTI_AGENT_SECURITY_AUDIT_2026.md` for the latest findings/fixes
 - Hardening: `SECURITY_HARDENING.md` for the implemented protections
 
@@ -463,11 +463,49 @@ TinyOS has undergone four comprehensive security audit layers, addressing 25 vul
 - **v1.8**: Wait queue mechanism implemented (blocking I/O, eliminates busy-wait CPU waste, fixes pipe data loss)
 - **v1.9**: VFS foundation complete (unified I/O abstraction layer with centralized security validation)
 
-The system is **production-ready for educational and research purposes**. The blocking I/O infrastructure (v1.8) and VFS security foundation (v1.9) provide immediate benefits. For complete VFS integration, driver implementation remains (~4-5 days effort).
+The system is **production-ready for educational and research purposes**. The blocking I/O infrastructure (v1.8) and VFS security foundation (v1.9) provide immediate benefits. The VFS drivers have since landed (`src/ramfs_vfs.c`, `src/fat32_vfs.c`).
 
-All CRITICAL and HIGH severity issues that could be fixed without major architectural changes have been addressed. The wait queue mechanism (v1.8) is now complete. The VFS foundation (v1.9) provides unified security validation; full driver integration requires the refactoring effort detailed in `ARCHITECTURAL_SECURITY_ISSUES.md`.
+All CRITICAL and HIGH severity issues that could be fixed without major architectural changes have been addressed. The wait queue mechanism (v1.8) is now complete. The VFS foundation (v1.9) provides unified security validation, and ramfs and FAT32 now sit behind it.
 
 **Overall Assessment**: Excellent security posture for an educational OS, with TOCTOU protection, stack overflow detection, and preemptive multitasking now complete. Clear path to production-grade hardening.
+
+---
+
+## Folded historical documents
+
+Four 2025 documents used to be published alongside this one. Everything they
+proposed has either shipped or been dropped, so they were removed; the links
+below are their last published text, and what is still true now lives in the
+living documents named here.
+
+- **ARCHITECTURAL_SECURITY_ISSUES.md** ([last version](https://github.com/douglasmun/TinyOS_enhanced/blob/249273f/doc/ARCHITECTURAL_SECURITY_ISSUES.md)),
+  2025-01-14. Four issues needing refactoring: TOCTOU in syscall argument
+  validation, cooperative-only scheduling, busy-wait sleep/wake, and no I/O
+  abstraction. All four are fixed: `handle_copy_user_fault` (`src/copy_user.c`),
+  `scheduler_schedule_from_interrupt` (`src/interrupts.c`), `src/wait_queue.c`,
+  and the VFS (`file_operations_t` in `src/vfs.h`, `src/fat32_vfs.c`). Current
+  limitations: `SECURITY_ARCHITECTURAL_LIMITATIONS.md`.
+- **CRYPTO_PHASE1_COMPLETE.md** ([last version](https://github.com/douglasmun/TinyOS_enhanced/blob/249273f/doc/CRYPTO_PHASE1_COMPLETE.md)),
+  2025-01-14 (v1.14). Completion report for `src/crypto.c`: AES-256,
+  HMAC-SHA512, a ChaCha20 CSPRNG, PBKDF2-HMAC-SHA512, zeroization and
+  constant-time compare. Of its follow-ups, ECDSA ELF signing and the HMAC-chained
+  audit log shipped; secure-boot verification and rollback protection were
+  removed (PR #91). It listed an AES ECB mode that never existed. The AES code
+  that does exist has no caller in the build (see `SECURITY_HARDENING.md`,
+  "Crypto Hardening Primitives").
+- **SECURITY_ROADMAP_2025.md** ([last version](https://github.com/douglasmun/TinyOS_enhanced/blob/249273f/doc/SECURITY_ROADMAP_2025.md)),
+  v1.13. An 18-month plan for a "v2.0 Fortress Edition". Shipped: the crypto
+  library, ECDSA ELF signing, the audit log, the firewall and the IDS. TLS and SSH
+  were built and then dropped from the build. MAC, sandboxing, TPM, memory
+  encryption, an RT scheduler, a watchdog and certification never happened; its
+  attack-scenario table ticked several of those as mitigations. Non-goals are
+  listed in `SECURITY_ARCHITECTURAL_LIMITATIONS.md`.
+- **EDR_FEATURES_ASSESSMENT.md** ([last version](https://github.com/douglasmun/TinyOS_enhanced/blob/249273f/doc/EDR_FEATURES_ASSESSMENT.md)),
+  2025-01-19. Triage of proposed EDR features. Shipped: the per-task syscall
+  filter, `CAP_*` capabilities, ransomware-rate detection, and W^X via PAE NX
+  (which it had called blocked by the architecture). Syscall-table integrity and
+  VFS write hooks never shipped; CFI, MAC, a journaling FS and an overlay FS were
+  recommended against. Current EDR reference: `EDR_QUICK_REFERENCE.md`.
 
 ---
 

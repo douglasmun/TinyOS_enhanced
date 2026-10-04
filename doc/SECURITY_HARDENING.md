@@ -1285,6 +1285,9 @@ Defensive practices applied across the from-scratch crypto.
   `csprng_reseed`) — an unmasked
   reseed from the timer softirq could tear or duplicate keystream feeding password
   salts, ECDHE keys, ASLR, and TCP/DNS randomness. This mask is **load-bearing**.
+- **AES is compiled but unused:** AES-256 CBC/CTR (`src/crypto.c`) and AES-GCM
+  (`src/aes_gcm.c`, linked by the `Makefile`) have no caller in the build. Their
+  only user was `tls13_demo.c`, which is not compiled. There is no ECB mode.
 
 **Implementation:** `src/crypto.c`.
 

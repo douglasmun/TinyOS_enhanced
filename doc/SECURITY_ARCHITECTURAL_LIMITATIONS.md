@@ -81,6 +81,15 @@ There is no general rlimit mechanism and **no per-process memory or CPU-time quo
 
 **Remaining gap:** physical memory and CPU time are not accounted per process or per user.
 
+### Deliberate non-goals
+These were considered and are out of scope, not pending:
+
+- **No TLS or SSH.** Both were built and then removed from the build (`Makefile`); `tls13_demo.c` is not compiled.
+- **No disk encryption and no secure deletion** (`secure_delete.c` is not compiled).
+- **No mandatory access control.** Access control is Unix DAC plus the `CAP_*` bits; there is no SELinux-style policy engine.
+- **No CFI.** Control-flow integrity is not implemented.
+- **No journaling or overlay filesystem.** ramfs is volatile and FAT32 has no journal.
+
 ### Stack Canaries: implemented
 The whole kernel builds with `-fstack-protector-strong` (`CFLAGS` in `Makefile`). There is no per-file exception: the credential-path files (`user.o`, `shell_user.o`, `shell.o`) used to be built without it and now use the generic rule (see the comment in `Makefile`). The canary is seeded from `entropy_get_random32()` with the low byte cleared, and a mismatch calls `kernel_panic("Stack protection violation")` (`src/stack_guard.c`).
 

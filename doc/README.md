@@ -57,16 +57,5 @@ code, the code wins.
 | [`HOBBY_OS_COMPARISON_TODO.md`](HOBBY_OS_COMPARISON_TODO.md) | What to study from other hobby OSes, and what (if anything) to adopt |
 | [`WASM_BROWSER_FEASIBILITY.md`](WASM_BROWSER_FEASIBILITY.md) | Running the ISO in the browser via v86 (the web demo) |
 
-## Historical
-
-Kept for the record; superseded by the code and the documents above.
-
-| Document | What it covers |
-|---|---|
-| [`ARCHITECTURAL_SECURITY_ISSUES.md`](ARCHITECTURAL_SECURITY_ISSUES.md) | Four architectural issues, all superseded by shipped code |
-| [`CRYPTO_PHASE1_COMPLETE.md`](CRYPTO_PHASE1_COMPLETE.md) | Crypto infrastructure phase 1 (2025, v1.14) |
-| [`SECURITY_ROADMAP_2025.md`](SECURITY_ROADMAP_2025.md) | 2025 security roadmap (v1.13) |
-| [`EDR_FEATURES_ASSESSMENT.md`](EDR_FEATURES_ASSESSMENT.md) | 2025 assessment of proposed EDR features |
-
 Harness rules live in [`../verify/CLAUDE.md`](../verify/CLAUDE.md); the ring-3 shell's
 notes in [`../userspace/CLAUDE.md`](../userspace/CLAUDE.md).
