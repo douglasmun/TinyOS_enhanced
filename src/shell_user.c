@@ -344,7 +344,12 @@ int shell_cmd_passwd(const char* args) {
         cred_printf("(current) ");
         read_password(old_password, sizeof(old_password));
 
-        if (!user_verify_password(target_username, old_password)) {
+        /* Through the authentication policy, not the bare hash comparison:
+         * a wrong current password counts toward the lockout, and a locked
+         * account is refused even with the right one, as at login and su.
+         * Every refusal reads the same. */
+        if (user_authenticate_for(target_username, old_password,
+                                  USER_AUTH_OP_PASSWD) < 0) {
             SECURE_ZERO_PASSWORD(old_password);
             cred_printf("passwd: authentication token manipulation error\n");
             return -EACCES;
