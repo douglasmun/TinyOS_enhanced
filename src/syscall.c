@@ -2987,6 +2987,7 @@ int sys_setuid(uint16_t uid) {
     if (current->euid == 0) {
         current->uid = uid;
         current->euid = uid;  /* Also set euid for simplicity */
+        task_sync_identity_caps(current);
         return 0;
     }
 
@@ -3042,12 +3043,14 @@ int sys_seteuid(uint16_t euid) {
     /* Root can set to any euid */
     if (current->euid == 0) {
         current->euid = euid;
+        task_sync_identity_caps(current);
         return 0;
     }
 
     /* Non-root can toggle between uid and current euid */
     if (euid == current->uid || euid == current->euid) {
         current->euid = euid;
+        task_sync_identity_caps(current);
         return 0;
     }
 
@@ -3316,6 +3319,7 @@ static int switch_user_commit(task_t* current, user_account_t* target,
     current->euid = target->uid;
     current->gid  = target->gid;
     current->egid = target->gid;
+    task_sync_identity_caps(current);
     return 0;
 }
 

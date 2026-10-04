@@ -112,6 +112,9 @@ Hello
 - At most 255 characters.
 - Output files are opened without following symlinks.
 - File permissions are enforced by the RAM disk itself, as for any other open.
+- Targets under a protected system path (`/bin`, `/sbin`, `/etc`, `/boot`,
+  `/kernel`) are refused unless the shell is running as root. The same rule
+  covers `cp`, `mv`, `rm`, `mkdir`, `touch`, `write`, `chmod` and `edit` saves.
 
 A malformed redirection prints `shell: invalid redirection syntax`. A target that
 cannot be opened prints `shell: cannot create <file>` or

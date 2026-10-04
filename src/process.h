@@ -827,6 +827,20 @@ const char* task_get_state_string(task_state_t state);
  *===========================================================================*/
 
 /**
+ * @brief Make a kernel task's privileged capabilities follow its euid.
+ *
+ * Kernel tasks are created with CAP_ALL. The login task is the one kernel
+ * task whose identity changes: it runs the kernel shell as whoever logged in
+ * (or su'd), and kept CAP_ALL as that user, so CAP_SYS_ADMIN checks (the
+ * protected /bin /etc /boot paths) passed for any user who typed `kshell`.
+ * With euid != 0 every capability except CAP_UNKILLABLE and CAP_DEFAULT is
+ * cleared; with euid == 0 they are restored. Ring-3 tasks are left alone --
+ * they never hold these bits, root included. Call after every identity change.
+ * verify-kshell-caps-follow-euid.sh.
+ */
+void task_sync_identity_caps(task_t* task);
+
+/**
  * @brief Set the task's cwd to the default drive root. Call before it runs.
  * @param task Task to initialize (ignored if NULL)
  */

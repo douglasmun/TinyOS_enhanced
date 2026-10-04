@@ -573,6 +573,17 @@ static bool vfs_protected_access_allowed(const task_t* task)
     return true;
 }
 
+/* The same rule and counters for callers that modify the RAM disk through
+ * ramfs directly (the kernel shell's file commands, its redirection and the
+ * editor), below vfs_open()'s own check. */
+bool vfs_protected_modify_allowed(const char* canonical)
+{
+    if (!vfs_path_is_protected(canonical)) {
+        return true;
+    }
+    return vfs_protected_access_allowed(scheduler_get_current_task());
+}
+
 void vfs_get_protected_stats(uint32_t* denied, uint32_t* granted)
 {
     if (denied)  *denied  = vfs_protected_denied;

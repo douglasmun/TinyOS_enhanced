@@ -446,6 +446,13 @@ int vfs_canonicalize_path(const char* path, char* canonical, size_t max_len);
 bool vfs_path_is_protected(const char* canonical);
 
 /**
+ * @brief May the current task create, write or remove this canonical path?
+ *        True unless it is protected and the task lacks CAP_SYS_ADMIN.
+ *        Counted in secstatus like vfs_open()'s own decisions.
+ */
+bool vfs_protected_modify_allowed(const char* canonical);
+
+/**
  * @brief Open a file/device/socket
  * @param path Path to open
  * @param flags Open flags (VFS_O_*)

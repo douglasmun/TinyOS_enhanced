@@ -22,6 +22,7 @@
 #include "shell_redir.h"
 #include "shell_user.h"  /* User management commands (v1.10) */
 #include "ramfs.h"
+#include "vfs.h"         /* vfs_protected_modify_allowed() for redirects */
 #include "stdio.h"
 #include "elf.h"       /* elf_exec_from_path() — launching the ring-3 login shell */
 #include "process.h"
@@ -620,6 +621,24 @@ static void parse_and_execute(char* cmd_line) {
 
     for (int i = 0; i < cmd_ctx.redir_count; i++) {
         if (cmd_ctx.redirects[i].active) {
+            /* The redirect opens through ramfs, below vfs_open()'s
+             * protected-path check, so apply it here as the file commands do:
+             * `> /etc/x` needs CAP_SYS_ADMIN, held only while euid is 0
+             * (task_sync_identity_caps). verify-kshell-caps-follow-euid.sh. */
+            if (cmd_ctx.redirects[i].type == REDIR_OUTPUT ||
+                cmd_ctx.redirects[i].type == REDIR_APPEND) {
+                char canon[256];
+                if (canonicalize_path(cmd_ctx.redirects[i].filename, canon,
+                                      sizeof(canon)) != 0 ||
+                    !vfs_protected_modify_allowed(canon)) {
+                    kprintf("shell: %s: Permission denied (protected system path)\n",
+                            cmd_ctx.redirects[i].filename);
+                    if (redir_fd >= 0) {
+                        ramfs_close(redir_fd);
+                    }
+                    return;
+                }
+            }
             if (cmd_ctx.redirects[i].type == REDIR_OUTPUT) {
                 /*=============================================================
                  * SECURITY (v1.12): Shell Redirection with O_NOFOLLOW
@@ -1235,6 +1254,7 @@ void shell_task(void) {
                 self->euid = 0;
                 self->gid = 0;
                 self->egid = 0;
+                task_sync_identity_caps(self);
             }
         }
 
