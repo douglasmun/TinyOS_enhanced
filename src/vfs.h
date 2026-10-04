@@ -511,6 +511,13 @@ ssize_t vfs_write(int fd, const void* buf, size_t size);
 const vfs_file_descriptor_t* vfs_get_fd_info(int fd);
 
 /**
+ * @brief Protected-path decisions since boot (counted, never printed)
+ * @param denied  Writes/mkdir/rmdir/unlink refused for lack of CAP_SYS_ADMIN
+ * @param granted The same operations allowed because the caller held it
+ */
+void vfs_get_protected_stats(uint32_t* denied, uint32_t* granted);
+
+/**
  * @brief Print VFS statistics (for debugging)
  */
 void vfs_stats(void);

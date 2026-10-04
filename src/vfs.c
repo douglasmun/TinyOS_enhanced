@@ -557,6 +557,28 @@ int vfs_canonicalize_path(const char* path, char* canonical, size_t max_len) {
     return 0;
 }
 
+/* Protected-path decisions are counted, not printed: ring 3 reaches all four
+ * callers through SYS_OPEN/MKDIR/RMDIR/UNLINK, and a console line per refusal
+ * let any user flood the shared serial stream. secstatus shows the totals. */
+static uint32_t vfs_protected_denied = 0;
+static uint32_t vfs_protected_granted = 0;
+
+static bool vfs_protected_access_allowed(const task_t* task)
+{
+    if (!task || !(task->capabilities & CAP_SYS_ADMIN)) {
+        vfs_protected_denied++;
+        return false;
+    }
+    vfs_protected_granted++;
+    return true;
+}
+
+void vfs_get_protected_stats(uint32_t* denied, uint32_t* granted)
+{
+    if (denied)  *denied  = vfs_protected_denied;
+    if (granted) *granted = vfs_protected_granted;
+}
+
 /*=============================================================================
  * VFS OPEN - Unified security validation and driver dispatch
  *=============================================================================*/
@@ -616,7 +638,6 @@ int vfs_open(const char* path, int flags) {
             /* Skip drive letter in path (e.g., "C:/file" -> "/file") */
             actual_path = path + 2;
         } else {
-            kprintf("[VFS] ERROR: Drive %c: not mounted (mount_idx=%d)\n", drive, mount_idx);
             vfs_free_fd(fd);
             return VFS_ENOENT;
         }
@@ -699,15 +720,10 @@ int vfs_open(const char* path, int flags) {
 
         /* If protected, verify CAP_SYS_ADMIN capability */
         if (is_protected) {
-            if (!current_task || !(current_task->capabilities & CAP_SYS_ADMIN)) {
-                kprintf("[VFS SECURITY] PID %d: Denied write to protected path '%s'\n",
-                        current_task ? current_task->pid : 0, path);
+            if (!vfs_protected_access_allowed(current_task)) {
                 vfs_free_fd(fd);
                 return VFS_EACCES;  /* Permission denied */
             }
-            /* Allowed - log for audit */
-            kprintf("[VFS] PID %d: Granted write to protected path '%s' (has CAP_SYS_ADMIN)\n",
-                    current_task->pid, path);
         }
     }
 
@@ -939,7 +955,6 @@ int vfs_mkdir(const char* path) {
             /* Skip drive letter in path (e.g., "C:/file" -> "/file") */
             actual_path = path + 2;
         } else {
-            kprintf("[VFS] ERROR: Drive %c: not mounted\n", drive);
             return VFS_ENOENT;
         }
     } else {
@@ -986,9 +1001,7 @@ int vfs_mkdir(const char* path) {
 
     /* If protected, verify CAP_SYS_ADMIN capability */
     if (is_protected) {
-        if (!current_task || !(current_task->capabilities & CAP_SYS_ADMIN)) {
-            kprintf("[VFS SECURITY] PID %d: Denied mkdir to protected path '%s'\n",
-                    current_task ? current_task->pid : 0, path);
+        if (!vfs_protected_access_allowed(current_task)) {
             return VFS_EACCES;
         }
     }
@@ -1046,7 +1059,6 @@ int vfs_rmdir(const char* path) {
             /* Skip drive letter in path */
             actual_path = path + 2;
         } else {
-            kprintf("[VFS] ERROR: Drive %c: not mounted\n", drive);
             return VFS_ENOENT;
         }
     } else {
@@ -1093,9 +1105,7 @@ int vfs_rmdir(const char* path) {
 
     /* If protected, verify CAP_SYS_ADMIN capability */
     if (is_protected) {
-        if (!current_task || !(current_task->capabilities & CAP_SYS_ADMIN)) {
-            kprintf("[VFS SECURITY] PID %d: Denied rmdir to protected path '%s'\n",
-                    current_task ? current_task->pid : 0, path);
+        if (!vfs_protected_access_allowed(current_task)) {
             return VFS_EACCES;
         }
     }
@@ -1147,9 +1157,7 @@ int vfs_unlink(const char* path) {
     bool is_protected = vfs_path_is_protected(actual_path);
 
     if (is_protected) {
-        if (!current_task || !(current_task->capabilities & CAP_SYS_ADMIN)) {
-            kprintf("[VFS SECURITY] PID %d: Denied unlink of protected path '%s'\n",
-                    current_task ? current_task->pid : 0, path);
+        if (!vfs_protected_access_allowed(current_task)) {
             return VFS_EACCES;
         }
     }

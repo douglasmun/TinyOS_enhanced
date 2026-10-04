@@ -215,7 +215,8 @@ Paths may be absolute or relative, and `..` is resolved before the file is
 opened. In the ring-3 shell the target must be on `D:` (the RAM disk); writing to
 anything under `/bin/`, `/sbin/`, `/etc/`, `/boot/` or `/kernel` is refused
 (`>: /etc/motd: permission denied`) — those paths need a capability that no
-ring-3 process holds, root included. `passwd`, `useradd` and `userdel` cannot be
+ring-3 process holds, root included. Refusals are not logged to the console;
+`secstatus` in the kernel shell counts them (`Protected paths`). `passwd`, `useradd` and `userdel` cannot be
 redirected: they prompt on the console. The kernel shell parses the same three
 operators; see [`SHELL_FEATURES.md`](SHELL_FEATURES.md).
 
