@@ -1324,6 +1324,10 @@ void cmd_secstatus(int argc, char* argv[]) {
     syscall_get_block_stats(&blk_filter, &blk_edr);
     stream_printf(ctx, "    Syscall blocks ...... %u filter-blocked, %u edr-blocked\n",
                   blk_filter, blk_edr);
+    uint32_t pp_denied = 0, pp_granted = 0;
+    vfs_get_protected_stats(&pp_denied, &pp_granted);
+    stream_printf(ctx, "    Protected paths ..... %u denied, %u granted\n",
+                  pp_denied, pp_granted);
     uint32_t io_bad = 0, io_spawn = 0;
     syscall_get_io_reject_stats(&io_bad, &io_spawn);
     stream_printf(ctx, "    Syscall arg rejects . %u bad-buffer, %u spawn-failed\n",
