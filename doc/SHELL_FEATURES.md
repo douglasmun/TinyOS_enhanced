@@ -1,24 +1,26 @@
 # TinyOS Shell Features
 
-## Overview
-TinyOS now includes a comprehensive bash-like shell with environment variables, command aliases, and I/O redirection infrastructure.
+## Scope
 
-## Features Implemented
+This document describes the **kernel shell** (`src/shell.c`), reached by typing
+`kshell` at the login shell: environment variables, aliases, I/O redirection and
+pipelines. The default login shell is the **ring-3 shell** (`userspace/shell.c`);
+its differences are summarised in [Ring-3 shell](#ring-3-shell) below, and its
+command set is in [`USER_GUIDE.md`](USER_GUIDE.md).
 
-### 1. Environment Variables
-**Files**: `src/env.h`, `src/env.c`
-
-The shell now supports full environment variable management similar to bash:
+## 1. Environment Variables
+**Files**: `src/env.h`, `src/env.c`, `src/shell_system.c`
 
 #### Commands:
 - `set VAR=value` - Set a shell variable
 - `set` - Display all variables
-- `export VAR` - Mark variable for export to child processes
-- `unset VAR` - Remove a variable
-- `env` - Display exported variables
+- `export VAR` - Mark an existing variable for export to child processes
+- `export VAR=value` - Set and export in one step
+- `export` / `env` - Display exported variables
+- `unset VAR...` - Remove one or more variables
 
 #### Variable Expansion:
-The shell supports both `$VAR` and `${VAR}` syntax for variable expansion:
+Both `$VAR` and `${VAR}` are expanded:
 ```bash
 $ set MESSAGE=Hello
 $ echo $MESSAGE
@@ -28,359 +30,186 @@ Hello_World
 ```
 
 #### Default Environment Variables:
-- `PATH=/bin` - Command search path
-- `HOME=/` - Home directory
-- `USER=root` - Current user
-- `SHELL=/bin/shell` - Shell path
-- `TERM=vga` - Terminal type
-- `PWD=/` - Current working directory
-- `OLDPWD=/` - Previous working directory
-- `HOSTNAME=tinyos` - System hostname
-- `EDITOR=edit` - Default text editor
-- `PAGER=cat` - Default pager
+Every login starts from a fresh table with these, all exported:
 
-### 2. Command Aliases
-**Files**: `src/env.h`, `src/env.c`
+- `PATH=/bin`
+- `HOME=/`
+- `USER=root`
+- `SHELL=/bin/shell`
+- `TERM=vga`
+- `PWD=/`
+- `OLDPWD=/`
+- `HOSTNAME=tinyos`
+- `EDITOR=edit`
+- `PAGER=cat`
 
-Create shortcuts for commonly-used commands:
+After login, `USER` is set to the logged-in user's name and `HOME` to `/` for
+root or `/home` for anyone else.
+
+#### Per-task storage and inheritance:
+Variables and aliases live in a per-task 4 KB page, allocated the first time a
+task writes one. A program started with `exec` (or `spawn` from ring 3) receives
+a **snapshot of the exported variables only**; later changes on either side are
+invisible to the other. Aliases are never inherited.
+
+## 2. Command Aliases
+**Files**: `src/env.h`, `src/env.c`, `src/shell_system.c`
 
 #### Commands:
-- `alias name='command'` - Create an alias
-- `alias` - Display all aliases
-- `unalias name` - Remove an alias
+- `alias name=command` - Create an alias
+- `alias name` - Show one alias
+- `alias` - Display all aliases (`alias name='command'` per line)
+- `unalias name...` - Remove one or more aliases
 
-#### Default Aliases (15 total):
+The kernel shell splits a line on spaces and has no quoting, so an alias value
+must be a single word (`alias cl=clear`). Surrounding quotes are stripped. For a multi-word alias use the ring-3 shell.
+
+Only the first word of a line is checked against the alias table, and expansion
+happens once (no recursion).
+
+#### Default Aliases (12 of 16 slots):
 ```bash
-ll    -> ls -l          # Long listing
-la    -> ls -a          # Show all files
-l     -> ls             # Simple listing
-cls   -> clear          # DOS-style clear
-dir   -> ls             # DOS-style directory listing
-copy  -> cp             # DOS-style copy
-move  -> mv             # DOS-style move
-del   -> rm             # DOS-style delete
-md    -> mkdir          # DOS-style make directory
-rd    -> rm -r          # DOS-style remove directory
-type  -> cat            # DOS-style type
-..    -> cd ..          # Quick parent directory
-...   -> cd ../..       # Quick grandparent directory
-h     -> history        # Short history
-k     -> kill           # Short kill
-please -> sudo          # Easter egg (sudo not implemented)
+ll    -> ls -l
+la    -> ls -a
+cls   -> clear
+dir   -> ls
+copy  -> cp
+move  -> mv
+del   -> rm
+md    -> mkdir
+rd    -> rm -r
+type  -> cat
+..    -> cd ..
+h     -> history
 ```
 
-### 3. I/O Redirection Infrastructure
-**Files**: `src/shell_redir.h`, `src/shell_redir.c`
+Four slots are left free for user aliases.
 
-The shell now parses I/O redirection operators and creates files accordingly:
+## 3. I/O Redirection
+**Files**: `src/shell_redir.h`, `src/shell_redir.c`, `src/shell.c`
 
-#### Supported Operators:
-- `>` - Output redirection (truncate)
-- `>>` - Output redirection (append)
-- `<` - Input redirection
+#### Operators:
+- `>` - Send stdout to a file
+- `>>` - Send stdout to a file (append form)
+- `<` - Read stdin from a file
 
-#### Security Features:
-All redirection filenames are validated to prevent security issues:
-- ✅ Only relative paths allowed (no `/etc/passwd`)
-- ✅ No parent directory traversal (no `../../../system`)
-- ✅ Whitelist of allowed characters (alphanumeric, dash, underscore, dot, slash)
-- ✅ Length limits (255 characters max)
-- ✅ Buffer overflow protection
+The target of `>`/`>>` is opened for writing, and created if it does not exist;
+the command's stdout stream is bound to it, so output printed through
+`stream_printf()` lands in the file. `<` binds stdin to the file. In the kernel
+shell `cat` is the command that reads stdin.
 
-#### Example Usage:
 ```bash
-$ echo Hello > output.txt
-$ cat output.txt
+$ echo Hello > /scratch/out.txt
+$ cat < /scratch/out.txt
 Hello
-
-$ echo World >> output.txt
-$ cat output.txt
-Hello
-World
 ```
 
-### 4. Pipe Buffer System
-**Files**: `src/shell_redir.h`, `src/shell_redir.c`
+#### Filename validation:
+- The path is canonicalized before use, so absolute paths and `..` are accepted
+  and resolved.
+- Allowed characters: letters, digits, `-`, `_`, `.` and `/`.
+- At most 255 characters.
+- Output files are opened without following symlinks.
+- File permissions are enforced by the RAM disk itself, as for any other open.
 
-A 4KB circular buffer implementation for pipe support:
-- `pipe_init()` - Initialize pipe buffer
-- `pipe_write()` - Write data to pipe
-- `pipe_read()` - Read data from pipe
-- `pipe_available()` - Check available data
+A malformed redirection prints `shell: invalid redirection syntax`. A target that
+cannot be opened prints `shell: cannot create <file>` or
+`shell: <file>: cannot open file for reading`.
 
-This infrastructure is ready for implementing shell pipes (`|`).
+## 4. Pipelines
 
-## Command Processing Order
-
-The shell processes commands in the following order (bash-compliant):
-
-1. **TOCTOU Protection** - Copy command to prevent time-of-check-time-of-use attacks
-2. **Alias Expansion** - Expand command aliases (first word only)
-3. **Variable Expansion** - Expand `$VAR` and `${VAR}` references
-4. **Redirection Parsing** - Extract and validate I/O redirections
-5. **Command Execution** - Execute the clean command
-6. **Cleanup** - Close redirection file descriptors
-
-This order prevents alias loops, command injection, and buffer overflows.
-
-## Security Features
-
-### 1. TOCTOU Prevention
-Commands are copied before processing to prevent race conditions where user input could modify the command during execution.
-
-### 2. Buffer Overflow Protection
-All string operations use bounded functions with size limits:
-- Command buffer: 256 bytes
-- Environment variable names: 32 bytes
-- Environment variable values: 256 bytes
-- Alias names: 32 bytes
-- Alias commands: 128 bytes
-
-### 3. Input Validation
-- Environment variable names must be alphanumeric + underscore
-- First character must be letter or underscore
-- Redirection filenames validated with whitelist
-
-### 4. Filename Security
-Redirection filenames are validated to prevent:
-- Absolute path access (`/etc/passwd`)
-- Directory traversal attacks (`../../../`)
-- Special characters that could cause issues
-- Excessively long filenames (>255 chars)
-
-## Current Limitations
-
-### Output Capture Not Fully Implemented
-The redirection infrastructure is complete and files are created properly, but actual output capture requires deeper kernel integration:
-
-**Why**: All commands use `kprintf()` directly, which writes to VGA console. To capture output, we would need:
-1. A kernel-level redirection context
-2. Modify `kprintf()` to check for active redirections
-3. Buffer management for redirected output
-4. Write buffered output to files
-
-**Current Behavior**:
-- Redirection syntax is parsed correctly ✅
-- Files are created/opened properly ✅
-- Command output still goes to console ⚠️
-- Files remain empty (no output captured) ⚠️
-
-**Future Enhancement**: Implement a kernel-level output buffer system that `kprintf()` can check for active redirections.
-
-### Input Redirection - ✅ IMPLEMENTED
-Input redirection (`<`) is now fully functional for compatible commands:
-
-**How It Works**:
-- Syntax: `command < input_file.txt`
-- The shell parses the `<` operator and extracts the filename
-- For compatible commands (cat, grep, wc), the filename is appended as an argument
-- Example: `cat < readme.txt` becomes `cat readme.txt` internally
-
-**Supported Commands**:
-- `cat < file.txt` - Display file contents via redirection
-- `grep pattern < file.txt` - Search pattern in file via redirection
-
-**Security**: All filenames are validated (no absolute paths, no directory traversal, whitelist characters)
-
-**Unsupported Commands**: Commands that don't accept file input (like `echo`) will show an error
-
-### Pipes - ✅ IMPLEMENTED (Parsing Complete)
-Pipe operator (`|`) support is implemented with pipeline parsing and sequential execution:
-
-**How It Works**:
-- Syntax: `command1 | command2 | command3`
-- The shell detects the pipe operator and splits the command line
-- Each command in the pipeline is executed sequentially
-- The pipeline structure is parsed and validated
-
-**Current Behavior**:
-- Pipeline syntax is parsed correctly ✅
-- Commands are split and identified ✅
-- Each command executes independently ✅
-- Output capture between commands not yet implemented ⚠️
-
-**Example**:
 ```bash
-$ ls | grep txt | wc
-shell: executing pipeline with 3 commands
-  [1] ls
-  [2] grep txt
-  [3] wc
-shell: note: pipes parse correctly but output capture not yet implemented
+$ echo hello | cat
+hello
+$ ls | cat -n
 ```
 
-**Limitation**: Like output redirection, connecting command outputs requires kernel-level output buffering. The pipe buffer infrastructure is ready, but capturing output from one command and feeding it to the next requires deeper `kprintf()` integration.
+- Up to **4 stages** (`MAX_PIPE_STAGES`). More prints
+  `shell: invalid pipeline (max 4 stages)`; a `|` with nothing on one side prints
+  `shell: syntax error near '|'`.
+- Stages run **one after another**. Each stage's output is captured into a
+  4 KB buffer (`PIPE_BUFFER_SIZE`) and fed to the next stage's stdin. Output
+  beyond 4 KB is dropped and reported:
+  `shell: stage N output truncated at 4096 bytes (M dropped)`.
+- Each stage is parsed as a full command line, so aliases, variables and
+  redirections apply per stage.
+- Builtins can be stages. Of the builtins, `cat` reads stdin, so the useful form
+  is `cmd | cat`.
 
-**Security**: Up to 4 commands per pipeline (MAX_PIPE_STAGES), with buffer overflow protection.
+The ring-3 shell runs pipelines concurrently over a kernel pipe instead; see
+below.
 
-## Testing the Features
+## 5. Background Jobs
 
-### Test Environment Variables:
-```bash
-$ set NAME=TinyOS
-$ echo Hello $NAME
-Hello TinyOS
+`exec <file> &` starts a signed program without waiting for it. `jobs` lists the
+background jobs, `ps` all visible processes, and `kill <pid>` ends one.
 
-$ set VERSION=1.0
-$ echo $NAME version $VERSION
-TinyOS version 1.0
+## 6. Command Processing Order
 
-$ env
-PATH=/bin
-HOME=/
-USER=root
-...
+1. **Copy** - The line is copied before processing.
+2. **Pipeline split** - If the line contains `|`, it is split and each stage is
+   run through steps 3-6 on its own.
+3. **Alias expansion** - First word only, one pass.
+4. **Variable expansion** - `$VAR` and `${VAR}`; the result may be at most 512
+   bytes (`shell: command too long after variable expansion`).
+5. **Redirection parsing** - Operators are extracted and filenames validated.
+6. **Execution** - The line is split on spaces into at most 10 arguments
+   (`MAX_ARGS`) and dispatched; streams are reset afterwards.
+
+An unknown command prints:
+
+```
+Unknown command: <cmd>
+Type 'help' for available commands, or 'man <cmd>' for details.
 ```
 
-### Test Aliases:
-```bash
-$ alias test='echo Testing'
-$ test
-Testing
+## 7. Limits
 
-$ alias
-ll='ls -l'
-la='ls -a'
-test='echo Testing'
-...
+| Item | Limit |
+|------|-------|
+| Command line | 256 bytes (`SHELL_BUFFER_SIZE`) |
+| Arguments | 10 (`MAX_ARGS`) |
+| Expanded line | 512 bytes (`ENV_MAX_EXPAND_LEN`) |
+| Variables | 16 (`ENV_MAX_VARS`) |
+| Variable name / value | 32 / 64 bytes (`ENV_MAX_NAME_LEN`, `ENV_MAX_VALUE_LEN`) |
+| Aliases | 16 (`ALIAS_MAX_COUNT`) |
+| Alias name / command | 32 / 64 bytes (`ALIAS_MAX_NAME_LEN`, `ALIAS_MAX_CMD_LEN`) |
+| Pipeline stages | 4 (`MAX_PIPE_STAGES`) |
+| Pipe buffer | 4096 bytes (`PIPE_BUFFER_SIZE`) |
+| Redirection filename | 255 characters |
 
-$ unalias test
-$ test
-Unknown command: test
-```
+Variable names must start with a letter or underscore, followed by letters,
+digits or underscores.
 
-### Test Output Redirection:
-```bash
-$ echo test > output.txt
-(Syntax is parsed, file created, but output not captured yet)
+## Ring-3 shell
 
-$ ls
-output.txt
-```
+The login shell shares the same per-task environment mechanism (through the
+`SYS_ENV` syscall) and the same `$VAR` / `${VAR}` syntax, with these differences:
 
-### Test Input Redirection:
-```bash
-$ cat readme.txt
-Hello TinyOS!
-
-$ cat < readme.txt
-Hello TinyOS!
-(Functionally equivalent - input redirection working)
-
-$ grep Hello < readme.txt
-Hello TinyOS!
-(Searching with input redirection working)
-
-$ echo test < readme.txt
-shell: echo: input redirection not supported for this command
-(Unsupported command properly rejected)
-```
-
-### Test Pipes:
-```bash
-$ ls | grep txt
-shell: executing pipeline with 2 commands
-  [1] ls
-  [2] grep txt
-shell: note: pipes parse correctly but output capture not yet implemented
-(Both commands execute, showing pipeline parsing works)
-
-$ echo Hello | cat | grep llo
-shell: executing pipeline with 3 commands
-  [1] echo Hello
-  [2] cat
-  [3] grep llo
-shell: note: pipes parse correctly but output capture not yet implemented
-(3-stage pipeline correctly parsed and executed)
-```
-
-### Test Security:
-```bash
-$ echo test > /etc/passwd
-shell: cannot create /etc/passwd
-(Absolute paths rejected)
-
-$ echo test > ../../../dangerous
-shell: invalid redirection syntax
-(Directory traversal rejected)
-
-$ cat < /etc/passwd
-shell: invalid redirection syntax
-(Absolute paths in input redirection rejected)
-
-$ cat < ../../system.conf
-shell: invalid redirection syntax
-(Directory traversal in input redirection rejected)
-```
+- It starts with the session's exported variables and **no aliases**.
+- `alias` handles quotes and multi-word values (`alias ll='ls -l'`).
+- `>` truncates, `>>` appends and `<` reads, for builtins and programs alike.
+  Targets must be on `D:`, and protected system paths are refused.
+- A pipeline joins exactly **two programs**, which run concurrently over a
+  kernel pipe; a builtin cannot be a stage.
+- `cmd &` runs a program in the background; `jobs` lists them.
+- An unknown command prints `<cmd>: not found (try 'help')`.
 
 ## Architecture
 
-### File Organization:
 ```
 src/
-├── env.h                 # Environment & alias declarations
-├── env.c                 # Environment & alias implementation
-├── shell_redir.h         # Redirection & pipe declarations
-├── shell_redir.c         # Redirection & pipe implementation
-├── shell.c               # Main shell (integrated with env & redir)
-├── shell_system.c        # System commands (env, set, alias, etc.)
-└── kernel.c              # Calls env_init() at boot
+├── env.h, env.c          # Environment and alias tables (per-task page)
+├── shell_redir.h/.c      # Redirection parsing, filename validation, pipe buffer
+├── stdio.h, stdio.c      # Per-task stdin/stdout/stderr streams
+├── shell.c               # Kernel shell: dispatch, pipelines, redirection binding
+└── shell_system.c        # env, set, export, unset, alias, unalias
+userspace/
+└── shell.c               # Ring-3 login shell
 ```
 
-### Integration Points:
-1. **kernel.c** - Calls `env_init()` during boot
-2. **shell.c** - Uses `env_expand()`, `alias_get()`, `parse_redirections()`, `parse_pipeline()`
-3. **shell_system.c** - Implements `cmd_env()`, `cmd_set()`, `cmd_alias()`, etc.
-4. **shell_redir.c** - Implements `parse_redirections()` and `parse_pipeline()` for I/O handling
-
-## Memory Usage
-
-### Static Allocations:
-- Environment table: 64 variables × 288 bytes = 18,432 bytes
-- Alias table: 32 aliases × 168 bytes = 5,376 bytes
-- Pipe buffers: 4,096 bytes per pipe
-- Total: ~28KB for environment and alias management
-
-### Stack Usage:
-- Command processing: ~2KB for expanded command buffers
-- Redirection context: ~1KB for redirection structures
-
-## Future Enhancements
-
-1. **Output Capture**: Implement kernel-level output buffer for full redirection and pipe support
-2. ~~**Input Redirection**: Read file contents and pass to commands~~ ✅ COMPLETED
-3. ~~**Pipe Operator**: Implement command pipelines (`cmd1 | cmd2`)~~ ✅ COMPLETED (parsing)
-4. **Full Pipe Output Capture**: Connect command outputs in pipelines
-5. **Job Control**: Background processes (`&`), foreground/background switching
-6. **Command Substitution**: `$(command)` syntax
-7. **Wildcards**: `*.txt` pattern matching
-8. **Quoting**: Proper handling of single/double quotes
-9. **Escape Sequences**: Backslash escaping
-
-## Testing
-
-The system has been tested with:
-- ✅ Boot test in QEMU
-- ✅ Environment variable setting and expansion
-- ✅ Alias creation and expansion
-- ✅ Output redirection parsing and security validation
-- ✅ Input redirection parsing and file appending
-- ✅ Pipe operator parsing and pipeline splitting
-- ✅ File creation for redirections
-- ✅ Command processing order
-- ✅ Buffer overflow protection
-- ✅ TOCTOU protection
-- ✅ Input filename validation and security
-- ✅ Pipeline command extraction (up to 4 stages)
-- ✅ Sequential pipeline execution
-
-## Documentation
-
-For more details on specific components:
-- Environment variables: See `src/env.h` header comments
-- Redirection: See `src/shell_redir.h` header comments
-- Shell integration: See `src/shell.c` parse_and_execute() function
+See [`STDIN_FEATURES.md`](STDIN_FEATURES.md) for the stream layer.
 
 ---
-**Last Updated**: 2025-11-14
-**TinyOS Version**: v1.0 (Build 20251110)
+**Last Updated**: 2026-10-04
+**TinyOS Version**: v2.8

@@ -67,6 +67,21 @@ host, and on-target (i386/QEMU) the P-256 primitives (`on_curve`, `mod_inv`,
 
 ### Remaining blocker — interrupt corruption (separate bug)
 
+> **RESOLVED (historical section).** Two corrections to what follows:
+> - The interrupt corruption was real and is fixed: `isr_common` reloaded the data
+>   selector (`mov ax,0x18`) before `pusha`, stamping the low word of EAX in any
+>   preempted code. `pusha` now comes first and a Makefile post-link guard keeps it
+>   there — see `doc/KERNEL_BUGS.md` §1 (PR #11).
+> - The ENFORCE-mode `exec` triple-fault was **not** preemption corrupting P-256
+>   state. The ECDSA verify completed and passed; the fault came afterward, from
+>   four OS bugs (kernel-stack overflow on the exec chain, `tss.ss0` set to the code
+>   selector, an unarmed user stack guard page, two EDR false positives) — see
+>   `doc/KERNEL_BUGS.md`, "`exec` triple-fault in ENFORCE mode".
+>
+> Signing is now **enforced (fail-closed) by default**; `-DELF_PERMISSIVE_SIGNATURES`
+> is the explicitly named opt-out (`src/elf.c`, `Makefile`). There is no
+> `-DELF_ENFORCE_SIGNATURES` flag any more.
+
 On-target, a long-running `ecdsa_verify` still faults/produces garbage **when
 interruptible**: the same `mod_inv` that returns the correct value with interrupts
 masked (`cli`) returns non-deterministic garbage across boots when interruptible. The
@@ -75,7 +90,7 @@ timer IRQ does heavy work in interrupt context (`tcp_tick`, `dhcp_tick`,
 computation preempted by it comes back corrupted. This is an **interrupt-handler bug
 that corrupts preempted state**, not an ECDSA bug — the crypto is correct.
 
-**Status: signing ships permissive by default**, and the verifier is only invoked in
+**Status at audit time (superseded — see note above): signing ships permissive by default**, and the verifier is only invoked in
 enforce mode (`-DELF_ENFORCE_SIGNATURES`) so permissive boot/exec never hits the
 corruption. Enforcement becomes safe once the ISR-corruption bug is fixed (likely in
 the `isr_common` save/restore or the heavy IRQ0 work running on the interrupted

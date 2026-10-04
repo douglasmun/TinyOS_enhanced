@@ -4,6 +4,10 @@ Context: v2.2 shipped fbcon (VBE framebuffer console), userspace libc + VFS/FAT3
 ELF exec, and blocking syscalls (SYS_SLEEP, SYS_WAITPID, wait-queue keyboard).
 PR #26 merged (`d8d38b8`), release v2.2 cut and signed, web demo refreshed.
 
+> **Status (2026-10):** every item below is done or closed. Current release is
+> v2.8; later work is in `doc/SECURITY_AUDIT_2026-08.md` (audit, all findings
+> fixed) and `doc/FUZZ_REPORT_2026-10.md` (libFuzzer campaign, PR #141).
+
 Priority order for the next round:
 
 ## 1. Real multitasking at the shell: background jobs — DONE
@@ -104,8 +108,9 @@ stack, `reboot`/`shutdown`/`mount`) that **should stay kernel-only**: PR #58
 gated the first four behind `require_root` precisely because
 `pae`+`mem`+`aslr`+`wxaudit` together are an ASLR defeat readable by any user.
 Exposing them to ring 3 would re-open that. `exec` is not a gap either — the
-ring-3 shell dispatches any word ending `.elf` straight through `spawn()`, so
-there is no verb to migrate.
+ring-3 shell dispatches any word containing `/` or ending `.elf` straight
+through `spawn()` (`looks_like_program()` in `userspace/shell.c`), so there is no
+verb to migrate.
 
 What is genuinely left splits by whether it needs kernel surface, and that
 line falls in a different place than a first pass suggests.
@@ -381,9 +386,8 @@ One consequence worth not undoing: `cpl3 == 0` in `verify-netd-ring3.sh` is now 
 protocol means the witness is broken or something moved that must not have.
 
 ## Recommendation
-1, 2 and 3 are done. Next: 4 (move the shell to userspace) — its stated
-dependencies (spawn, waitpid, file syscalls) are now all in place, as is the
-new-syscall group it once blocked on. The seven no-new-syscall builtins are
+Items 1–4 are all done or closed. Item 4's stated dependencies (spawn, waitpid,
+file syscalls) all landed, as did the new-syscall group it once blocked on. The seven no-new-syscall builtins are
 done, and `unalias` has since landed with the ninth `SYS_ENV` subcommand it
 needed. Item 4 is **closed**: `edit` is decided and stays kernel-shell only (it needs a
 raw-input TTY discipline, not a syscall — its write-back was already reachable);

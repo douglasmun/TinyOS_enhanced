@@ -59,82 +59,185 @@ no hard-coded credentials anywhere in the system.
 After setup you reach the login prompt:
 
 ```
-  TinyOS v2.0 Login System
+*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
+  TinyOS v2.8 Login System
+*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
+
 TinyOS login: root
 Password: ********
+
 Login successful. Welcome, root!
 ```
 
-Wrong passwords are counted; after several failed attempts the account locks
-temporarily. Once logged in you get the shell prompt:
+The first time `root` logs in while it is the only account, TinyOS offers to
+create a regular user for daily work (`Would you like to create a regular user
+now? (y/n):`). Answer `y` to create one, or `n` and use `useradd` later.
+
+**Failed logins.** Every failure prints the same `Login incorrect`, whatever the
+reason, followed by the number of attempts left. The prompt allows **3 attempts**;
+after the third it prints `Login failed. System halted.` and you must restart the
+VM (and, since accounts live only in memory, set the root password again).
+Separately, **3 consecutive wrong passwords for one account lock it for 60
+seconds**. Wrong passwords given to `su` and to `passwd` (the current-password
+check) count toward the same lockout. A successful authentication resets the count.
+
+Once logged in you land in the **ring-3 shell**, the default login shell. Its
+prompt shows the working directory:
 
 ```
-$
+TinyOS shell (ring 3) - 'help' for builtins, 'kshell' for the kernel shell, 'exit' to log out
+D:/ $
 ```
 
 ---
 
 ## 4. The shell
 
-Type `help` for the full command list. Commonly used commands:
+TinyOS has two shells:
+
+- the **ring-3 shell** (`/shell.elf`), the login shell. It is an ordinary user
+  process and reaches the kernel only through syscalls;
+- the **kernel shell**, reached by typing `kshell`. It holds everything the ring-3
+  shell does not have yet: networking, security tooling, `exec`, `edit`, `su`,
+  `shutdown`/`reboot`. `logout` (or `exit`) there returns to the login prompt.
+
+`kshell` keeps your identity: an unprivileged user is still unprivileged in the
+kernel shell. Type `help` in either shell; in the kernel shell `help` lists
+categories (`help file`, `help net`, `help security`, ... or `help all`).
+
+### Ring-3 shell (default)
 
 | Command | What it does |
 |---------|--------------|
-| `help`, `man <cmd>` | List commands / show help for one |
-| `ls`, `ls C:`, `ls D:` | List the current dir, the FAT32 `C:` drive, the RAMFS `D:` drive |
-| `cd`, `pwd` | Change / print working directory |
-| `cat`, `edit <file>` | View / edit a file |
-| `cp`, `mv`, `rm`, `mkdir`, `touch` | File operations |
-| `find`, `grep`, `echo` | Search and text utilities |
-| `mount` | Show mounted drives (`C:`=FAT32, `D:`=RAMFS) |
-| `fatls` | List files on the FAT32 `C:` drive |
-| `exec /hello.elf [&]` | Load and run a **signed** user program in ring 3 (`&` = background) |
-| `jobs` | List this shell's background jobs |
-| `ps`, `kill <pid>` | List / terminate processes |
-| `passwd [user]`, `su [user]`, `logout` | Account management |
-| `whoami`, `id`, `env`, `set`, `export`, `alias`, `history` | Session/environment |
-| `dhcp [renew]`, `ifconfig`, `ping`, `curl <url>`, `dig`/`net` | Networking |
-| `aslr`, `pae`, `mem`, `auditlog`, `date`, `clear`, `reboot` | System / security info |
+| `help`, `man <cmd>` | List builtins / show help for one |
+| `ls [dir]`, `cd [dir]`, `pwd` | List, change, print working directory (`cd` alone: `D:/`) |
+| `cat [file]...`, `stat <path>...` | Print files (no argument: copy stdin) / show size, mode, type |
+| `write <f> <text>`, `touch`, `cp`, `mv`, `rm`, `mkdir`, `rmdir` | File operations |
+| `chmod <mode> <file>` | Change permission bits (octal; RAM disk only) |
+| `grep`, `find`, `echo`, `clear`, `history` | Search and text utilities |
+| `ps [-l]`, `top`, `kill <pid>`, `jobs`, `getpid` | Processes (`ps` shows your own; root sees all) |
+| `id`, `whoami`, `date` | Identity and time |
+| `env`, `set`, `unset`, `export`, `alias`, `unalias` | Environment and aliases |
+| `passwd [user]`, `useradd <user>`, `userdel <user>` | Accounts (`useradd`/`userdel`: root only) |
+| `kshell` | Switch to the kernel shell |
+| `exit`, `logout` | Log out |
+
+There is **no `exec`** builtin. Any word containing `/` or ending in `.elf` is run
+as a program; the shell waits for it unless the line ends in `&`. Anything else
+unknown prints `<cmd>: not found (try 'help')`.
+
+### Kernel shell (`kshell`)
+
+Root-only commands are marked **(root)**; for anyone else they print
+`<cmd>: permission denied (must be root)`.
+
+| Command | What it does |
+|---------|--------------|
+| `ls`, `ls C:`, `ls D:`, `cd`, `pwd`, `cat`, `edit <file>` | List, navigate, view and edit files |
+| `cp`, `mv`, `rm`, `mkdir`, `touch`, `write`, `chmod`, `find`, `grep`, `echo` | File operations and search |
+| `mount`, `fatls` | Show drives (`C:`=FAT32, `D:`=RAMFS) / list the FAT32 drive |
+| `exec <file> [&]` | Load and run a **signed** program (`&` = background) |
+| `ps`, `jobs`, `top`, `kill <pid>` | Processes (`top` is live; `q` quits) |
+| `whoami`, `id [user]`, `users`, `su [user]`, `passwd`, `useradd`, `userdel` | Accounts |
+| `env`, `set`, `unset`, `export`, `alias`, `unalias`, `history`, `date`, `clear` | Session |
+| `ifconfig`, `ping <host>`, `dig <name>`, `dhcp [renew]`, `curl <url>` | Networking |
+| `secstatus` | Summary of the security subsystems |
+| `aslr`, `pae`, `mem`, `wxaudit`, `auditlog`, `loglevel`, `sectest` | Security tooling **(root)** |
+| `shutdown`, `reboot` | Power **(root)** |
+| `logout`, `exit` | Return to the login prompt |
+
+An unknown command prints `Unknown command: <cmd>`.
 
 ### Running a signed program
 
 ```
-$ exec /hello.elf
+D:/ $ /hello.elf
 Hello from ELF!
 ```
 
-Every user binary is verified against a **pinned ECDSA P-256 key** before it runs.
-The bundled `hello.elf`/`shell` are signed with that key, so they execute;
-unsigned or tampered binaries are **rejected (fail-closed)** by default. (For local
-development that accepts unsigned binaries, the kernel can be built with
-`-DELF_PERMISSIVE_SIGNATURES` — see the README. The demo ISO is the enforced build.)
+Every user binary is verified against a **pinned ECDSA P-256 key** before it runs,
+whether started from the ring-3 shell or with `exec` in the kernel shell. The
+bundled programs are signed with that key; unsigned or tampered binaries are
+**rejected (fail-closed)** by default. (For local development that accepts
+unsigned binaries, the kernel can be built with `-DELF_PERMISSIVE_SIGNATURES` —
+see the README. The demo ISO is the enforced build.)
 
 ### Background jobs
 
-Append `&` to run a program in the background: the shell prints `[pid] name` and
-returns to the prompt immediately instead of blocking until the child exits.
+End the line with `&` to run a program in the background: the shell prints
+`[pid] name` and returns to the prompt immediately.
 
 ```
-$ exec /sleeper.elf &
-[25160] sleeper.elf
+D:/ $ /sleeper.elf &
+[25160] /sleeper.elf
 Sleeper started
-$ jobs
-PID    STATE  NAME
-25160  SLEEP  sleeper.elf
+D:/ $ jobs
+[1]  25160  /sleeper.elf
 ```
 
-`jobs` lists only *this* shell's children (matched on both PID and generation, so
-a recycled PID can't impersonate a job); `ps` shows every process on the system.
-A background job you never wait for is still reaped automatically when it exits.
+`jobs` lists only this shell's background children that are still running
+(`no background jobs` otherwise); `ps` shows every process you can see. A
+background job you never wait for is still reaped when it exits. PIDs are not
+sequential.
+
+### Pipelines
+
+In the ring-3 shell a pipeline joins **two programs** with one `|`. Both stages
+run at the same time over a kernel pipe, so output larger than the pipe buffer
+streams through:
+
+```
+D:/ $ /producer.elf 800 | /counter.elf
+counter: lines=801 bytes=11107
+```
+
+A builtin cannot be a stage (it runs inside the shell itself); the shell says so
+and points to `kshell`. The kernel shell's pipelines accept builtins and up to 4
+stages, but run the stages one after another through a 4 KB buffer: a stage that
+produces more is truncated, and the shell reports
+`shell: stage N output truncated at 4096 bytes (M dropped)`. In the kernel shell
+only `cat` reads its stdin, so the useful form is `cmd | cat` (e.g. `ls | cat -n`).
+
+### Redirection
+
+In the ring-3 shell `>` (truncate), `>>` (append) and `<` work on builtins and
+programs alike:
+
+```
+D:/ $ echo hello > /scratch/note.txt
+D:/ $ echo again >> /scratch/note.txt
+D:/ $ cat < /scratch/note.txt
+hello
+again
+```
+
+Paths may be absolute or relative, and `..` is resolved before the file is
+opened. In the ring-3 shell the target must be on `D:` (the RAM disk); writing to
+anything under `/bin/`, `/sbin/`, `/etc/`, `/boot/` or `/kernel` is refused
+(`>: /etc/motd: permission denied`) — those paths need a capability that no
+ring-3 process holds, root included. `passwd`, `useradd` and `userdel` cannot be
+redirected: they prompt on the console. The kernel shell parses the same three
+operators; see [`SHELL_FEATURES.md`](SHELL_FEATURES.md).
+
+### Files and permissions
+
+The RAM disk (`D:`) enforces owner/group/other permission bits. Its root `/` is
+mode `0711`: anyone can use it as a working directory, but only root can list it
+or create entries in it. `/scratch` is `0777` for everyone's use. New files are
+created `0600` and new directories `0700`. A name you neither own nor hold any
+permission on, in a directory you cannot list, reads as nonexistent.
 
 ---
 
 ## 5. Networking — what to expect
 
 With the recommended QEMU command above, DHCP completes at boot and you can reach
-the internet from the shell:
+the internet. The networking commands live in the kernel shell, so type `kshell`
+first:
 
 ```
+D:/ $ kshell
+Switching to the kernel shell; `logout` there returns to login.
 $ dhcp
   State:        BOUND
   Offered IP:   10.0.2.15
@@ -170,14 +273,15 @@ shell. That wait is expected, not a hang.
 
 ## 6. Shutting down
 
-Use `reboot` from the shell, or just close the QEMU window / press **Ctrl-C** in the
+As root, type `kshell` and then `shutdown` or `reboot` (both are root-only and
+kernel-shell only). Otherwise just close the QEMU window / press **Ctrl-C** in the
 terminal running QEMU (or **Ctrl-A** then **X** if you launched with
 `-nographic`/`-serial mon:stdio`).
 
 ---
 
 See also: [`SHELL_FEATURES.md`](SHELL_FEATURES.md) and
-[`STDIN_FEATURES.md`](STDIN_FEATURES.md) for shell internals,
-[`USER_SYSTEM_TEST_GUIDE.md`](USER_SYSTEM_TEST_GUIDE.md) for the account system,
+[`STDIN_FEATURES.md`](STDIN_FEATURES.md) for kernel-shell internals,
+[`USER_SYSTEM_TEST_GUIDE.md`](USER_SYSTEM_TEST_GUIDE.md) for a walkthrough of the account system,
 [`EDR_QUICK_REFERENCE.md`](EDR_QUICK_REFERENCE.md) for the security-monitoring layer, and
 [`FIREWALL_AND_IDS_CONFIG.md`](FIREWALL_AND_IDS_CONFIG.md) for configuring the firewall and IDS.

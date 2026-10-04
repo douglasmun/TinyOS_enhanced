@@ -315,6 +315,13 @@ void crypto_secure_zero(void* ptr, size_t len) {
 
 **Current State**: Placeholder entropy collection (deterministic)
 
+> **SUPERSEDED.** This placeholder is long gone. `crypto_collect_entropy()`
+> (`src/crypto.c`) now mixes TSC timing jitter, PIT ticks, stack/buffer addresses,
+> the global entropy pool (`entropy_get_bytes()`, which carries keystroke timing)
+> and RDRAND when the CPU has it. `src/entropy.c` detects RDRAND/RDSEED via CPUID,
+> health-checks both at boot, and seeds the pool from them. The Phase 2 sketch
+> below is kept as written for the record.
+
 **Future Enhancement** (TODO for Phase 2):
 ```c
 void crypto_collect_entropy(uint8_t* output, size_t len) {

@@ -1,10 +1,9 @@
 # TinyOS Security Hardening Documentation
 
-**Version**: 1.22
-**Date**: 2025-01-17
-**Features**: Stack Guard Canaries + ASLR + PAE/W^X Infrastructure + Lazy FPU Switching
+**Status**: living reference, reviewed 2026-10 against v2.8 (`TINYOS_VERSION`, `src/kernel.h`)
+**Features**: Stack Guard Canaries + ASLR + PAE/NX W^X + Lazy FPU Switching + the mechanisms in sections 5-15
 
-**Latest Update (v1.22)**: Lazy FPU switching with CR0.TS implemented for performance optimization and security hardening
+The `(v1.19)`-style tags in headings record when a mechanism first landed; the text describes the current code.
 
 ---
 
@@ -16,7 +15,7 @@
 4. [Lazy FPU Switching (v1.22)](#lazy-fpu-switching-v122)
 5. [Kernel-Only Credential Store — no on-disk `/etc/shadow`](#kernel-only-credential-store--no-on-disk-etcshadow)
 6. [ELF Code Signing — ECDSA P-256, key pinning, fail-closed](#elf-code-signing--ecdsa-p-256-key-pinning-fail-closed)
-7. [Secure Boot Chain — measured boot, anti-rollback, fail-closed](#secure-boot-chain--measured-boot-anti-rollback-fail-closed)
+7. [Pinned code-signing key — fail-closed](#pinned-code-signing-key--fail-closed)
 8. [Crypto Hardening Primitives](#crypto-hardening-primitives)
 9. [Hardware RNG Health Checks + Entropy Pool](#hardware-rng-health-checks--entropy-pool)
 10. [Tamper-Evident Audit Log (HMAC-SHA512 hash chain)](#tamper-evident-audit-log-hmac-sha512-hash-chain)
@@ -33,12 +32,14 @@
 
 ## Overview
 
-TinyOS now implements **industry-grade exploit mitigation** through two complementary security mechanisms:
+TinyOS layers several exploit mitigations. The first four sections cover the memory-safety layer:
 
-- **Stack Guard Canaries**: Detects buffer overflow attacks at runtime
-- **ASLR**: Randomizes memory layout to prevent exploitation
+- **Stack Guard Canaries**: detect stack buffer overflows at function return
+- **ASLR**: randomizes each user stack base
+- **Lazy FPU switching**: FPU state stays with its owner task
+- **PAE/NX W^X**: no page is both writable and executable (see "PAE/W^X")
 
-These work together to provide **defense in depth** against common exploit techniques.
+Sections 5-15 cover credentials, code signing, crypto, audit, the user/kernel boundary and networking.
 
 ---
 
@@ -65,7 +66,7 @@ If overflow occurs:
 1. Attacker writes past buf[] boundary
 2. Overwrites canary value
 3. Stack guard check detects mismatch
-4. System terminates process before exploit
+4. __stack_chk_fail() halts the kernel before the return
 ```
 
 ### Implementation Details
@@ -73,26 +74,20 @@ If overflow occurs:
 **Location**: `src/stack_guard.c`, `src/stack_guard.h`
 
 **Key Features**:
-- **Canary Generation**: Uses TSC (Time Stamp Counter) + mixing for entropy
+- **Canary Generation**: `entropy_get_random32()` (RDRAND or the entropy pool)
 - **Null Byte Termination**: Canary ends with 0x00 to stop string functions
-- **Compiler Integration**: Uses GCC's `-fstack-protector-strong`
-- **Runtime Validation**: `__stack_chk_fail()` handler terminates on mismatch
+- **Compiler Integration**: GCC's `-fstack-protector-strong`, whole kernel, no per-file exception
+- **Runtime Validation**: `__stack_chk_fail()` audits the event and calls `kernel_panic()`
 
 **Canary Initialization**:
 ```c
 void stack_guard_init(void) {
-    uint32_t seed = read_tsc();
-
-    // Mix in multiple TSC reads for better entropy
-    for (int i = 0; i < 8; i++) {
-        for (volatile int j = 0; j < 1000; j++);
-        seed ^= read_tsc();
-        seed = (seed << 3) ^ (seed >> 13);
+    __stack_chk_guard = entropy_get_random32();
+    __stack_chk_guard = (__stack_chk_guard & 0xFFFFFF00) | 0x00;  // null LSB
+    if (__stack_chk_guard == 0) {
+        __stack_chk_guard = 0xDEADBE00;  /* Fallback canary */
     }
-
-    // Ensure non-zero and set null byte terminator
-    if (seed == 0) seed = 0xDEADBEEF;
-    __stack_chk_guard = (seed & 0xFFFFFF00);  // Force null byte
+    /* The canary is never logged. */
 }
 ```
 
@@ -106,7 +101,6 @@ void stack_guard_init(void) {
 
 ```
 [STACK_GUARD] Initialized......... [OK]
-[STACK_GUARD] Canary: 0x00025000 (null byte: 0x00)
 [STACK_GUARD] Protection enabled for:
 [STACK_GUARD]   - Buffers > 8 bytes
 [STACK_GUARD]   - Address-taken variables
@@ -115,19 +109,15 @@ void stack_guard_init(void) {
 
 ### Attack Detection Example
 
-```
-=== STACK GUARD VIOLATION DETECTED ===
-Process: evil_program (PID 42)
-Canary Expected: 0xDEADBE00
-Canary Found:    0x41414141  (overwritten)
-Action: Process terminated (SIGKILL)
-===================================
-```
+On a mismatch `__stack_chk_fail()` writes an `AUDIT_SEC_STACK_CORRUPTION` record,
+prints a `STACK CORRUPTION DETECTED` banner with context, and calls
+`kernel_panic("Stack protection violation")`. The system halts; no task is killed
+and resumed, because the corrupted frame cannot be trusted.
 
 ### Security Impact
 
 - **Pre-Stack Guard**: Buffer overflows → 100% exploit success
-- **With Stack Guard**: Exploits detected → 0% success rate
+- **With Stack Guard**: a linear overwrite of the return address is detected (non-linear writes that skip the canary are not)
 - **Performance Cost**: ~1-2% overhead (negligible)
 
 ---
@@ -160,10 +150,9 @@ Process 3: Stack at 0xBFAF3000  ← Random
 
 **Key Features**:
 - **Entropy**: 12 bits (4096 page range = 16 MB)
-- **RNG**: Xorshift32 PRNG (period: 2^32 - 1)
-- **Seed Source**: TSC with multiple reads + mixing
-- **Reseeding**: Every 16 process creations
-- **Statistics**: Real-time tracking via `aslr_get_stats()`
+- **RNG**: `aslr_random32()` returns `entropy_get_random32()` (RDRAND when present, else the entropy pool)
+- **Reseeding**: `entropy_reseed()` once at init, then every 16 randomized stacks
+- **Statistics**: `aslr_get_stats()`; the reseed count is stored obfuscated and no seed is ever printed
 
 **Address Range**:
 ```c
@@ -188,17 +177,24 @@ uint32_t aslr_get_random_stack_base(uint32_t stack_size_pages) {
 ```
 
 **Integration Points**:
-1. **Kernel Init** (`src/kernel.c:235`): Initialize ASLR subsystem
-2. **Process Creation** (`src/process.c:524`): Randomize each user stack
-3. **Shell Command** (`src/shell_system.c:128`): `aslr` command for stats
+1. **Kernel Init** (`aslr_init()` in `src/kernel.c`, after `entropy_init()` and `stack_guard_init()`)
+2. **Process Creation** (`aslr_get_random_stack_base()` from `src/process.c`): randomize each user stack
+3. **Shell Command** (`cmd_aslr()` in `src/shell_system.c`): root-only, kernel shell only (`kshell` from the ring-3 shell)
 
 ### Boot Log Output
 
 ```
-[ASLR] Initialized................ [OK]
+[ASLR] Initializing with multi-source entropy...
 [ASLR] Entropy: 12 bits (range: 4096 pages)
-[ASLR] Seed: 0xb7e93401
+[ASLR] Entropy quality: STRONG (RDRAND)
+[ASLR] Using hardware RNG (RDRAND)... [EXCELLENT]
+[ASLR] RDRAND verified operational
+[ASLR] Performing initial entropy mixing...
+[ASLR] Statistics obfuscation key initialized
+[ASLR] Initialized................ [OK]
 ```
+
+The quality line reads `MEDIUM (Pool)` or `WEAK (TSC)` when RDRAND is absent.
 
 ### Process Creation Log (ASLR Demo)
 
@@ -224,7 +220,7 @@ spawned child's randomized stack address in front of whoever was reading it.
 ### Shell Command Usage
 
 ```bash
-TinyOS> aslr
+# aslr        (as root, kernel shell)
 
 === ASLR (Address Space Layout Randomization) ===
 Status: ENABLED
@@ -233,11 +229,11 @@ Entropy:
   Bits:           12 bits
   Page range:     4096 pages (16 MB)
   Possible addrs: 4096 (2^12)
-  Exploit chance: 1/4096 (~0.0244%)
+  Exploit chance: 1 in 4096
 
 Statistics:
   Stacks randomized: 8
-  RNG reseeds:       1
+  RNG reseeds:       <obfuscated count>
 
 Address Range:
   Minimum: 0xbf012000
@@ -245,15 +241,15 @@ Address Range:
   Spread:  15308 KB
 
 Security Impact:
-  Without ASLR: Exploits work 100% of the time
-  With ASLR:    Exploits work 0.0244% of the time
+  Without ASLR: Exploits work every time
+  With ASLR:    Exploits work 1 attempt in 4096
   Protection:   ~4096x harder to exploit
 ```
 
 ### Security Impact
 
 - **Exploit Success Rate**: 1/4096 = **0.0244%**
-- **Brute Force**: Would take ~4096 attempts (system likely detects/blocks)
+- **Brute Force**: ~4096 attempts on average
 - **Protection Factor**: 4096x harder to exploit
 - **Performance Cost**: <0.1% overhead
 
@@ -312,7 +308,7 @@ Cost: Only paid when FPU is actually used
 
 **Key Components**:
 
-#### 1. FPU Owner Tracking (scheduler.c:65)
+#### 1. FPU Owner Tracking (`fpu_owner`, scheduler.c)
 
 ```c
 /*
@@ -322,7 +318,7 @@ Cost: Only paid when FPU is actually used
 static volatile task_t* fpu_owner = NULL;
 ```
 
-#### 2. Context Switch Modification (context_switch.S:215-219)
+#### 2. Context Switch Modification (CR0 writes in context_switch.S)
 
 ```nasm
 ; OLD: Eagerly restore FPU state
@@ -335,7 +331,7 @@ mov cr0, eax
 ; FPU state will be restored on demand
 ```
 
-#### 3. Device Not Available Handler (interrupts.c:127-134)
+#### 3. Device Not Available Handler (`vector == 7` in interrupts.c)
 
 ```c
 if (vector == 7) {  // #NM - Device Not Available
@@ -348,7 +344,7 @@ if (vector == 7) {  // #NM - Device Not Available
 }
 ```
 
-#### 4. Lazy FPU Handler (scheduler.c:1139-1203)
+#### 4. Lazy FPU Handler (`scheduler_handle_fpu_exception()`, scheduler.c)
 
 ```c
 void scheduler_handle_fpu_exception(void) {
@@ -375,18 +371,27 @@ void scheduler_handle_fpu_exception(void) {
 }
 ```
 
-#### 5. Cleanup Protection (scheduler.c:599-601, 914-916)
+#### 5. Cleanup Protection (`scheduler_fpu_release()`, scheduler.c)
 
 ```c
-/* When task terminates, clear FPU owner to prevent dangling pointer */
-if (fpu_owner == task_to_cleanup) {
-    fpu_owner = NULL;
+/* Called from the post-switch reaper (scheduler.c) and from
+ * task_free_resources() (process.c), so a task killed from outside
+ * cannot leave fpu_owner dangling into a recycled slot. */
+void scheduler_fpu_release(task_t* task) {
+    CRITICAL_SECTION_ENTER();
+    if (fpu_owner == task) {
+        fpu_owner = NULL;
+    }
+    CRITICAL_SECTION_EXIT();
 }
 ```
 
 ### Performance Impact
 
 #### Benchmark Scenario
+
+The cycle counts below are design estimates, not measurements, and the SSH server
+in the examples is not built in the current kernel; read them as an illustration.
 
 **System**: 3 tasks (Shell, SSHServer, Idle)
 - **Shell**: Minimal FPU use (only for formatting)
@@ -489,7 +494,7 @@ Lazy approach minimizes secret data movement!
 | `src/scheduler.c` | Global variables | Add `fpu_owner` tracking | +24 |
 | `src/scheduler.c` | `scheduler_handle_fpu_exception()` | New lazy FPU handler | +64 |
 | `src/scheduler.c` | `scheduler_schedule_from_interrupt()` | Remove eager fxsave, add CR0.TS | Modified |
-| `src/scheduler.c` | Task cleanup (2 places) | Clear fpu_owner on termination | +4 each |
+| `src/scheduler.c` / `src/process.c` | `scheduler_fpu_release()` from both teardown paths | Clear fpu_owner on termination | Modified |
 | `src/scheduler.h` | Function declaration | Add `scheduler_handle_fpu_exception()` | +12 |
 | `src/context_switch.S` | `context_switch` save | Remove fxsave | Removed |
 | `src/context_switch.S` | `context_switch` load | Remove fxrstor, add CR0.TS | Modified |
@@ -540,15 +545,12 @@ Task A (owns FPU) → Context Switch → Task B (no FPU yet)
 
 ### Boot Log Output
 
-```
-[SCHEDULER] Initializing scheduler.. [OK]
-[SCHEDULER] Round-robin initialized. [OK]
-[SCHEDULER] Lazy FPU switching enabled
-```
-
-**Note**: Lazy FPU switching is transparent—no explicit boot message, just reduced context switch overhead.
+Lazy FPU switching prints no boot line of its own; it is transparent.
 
 ### Testing & Verification
+
+Tests 2 and 3 date from when an SSH server was built; it no longer is, so read them
+as a description of the mechanism rather than a current test.
 
 #### Test 1: System Boot
 
@@ -604,13 +606,8 @@ Switch back to SSHServer:
 
 **Method**: Terminate task that owns FPU, ensure no dangling pointer
 
-**Code**:
-```c
-/* In scheduler cleanup */
-if (fpu_owner == task_to_cleanup) {
-    fpu_owner = NULL;  // Prevent use-after-free
-}
-```
+**Code**: `scheduler_fpu_release(task)` from both the reaper and
+`task_free_resources()` (see "Cleanup Protection" above).
 
 **Result**: ✅ **PASS** (No crashes when terminating FPU-using tasks)
 
@@ -684,13 +681,11 @@ Attack surface: LOW (minimal data movement)
 
 | Operating System | FPU Switching Strategy | Notes |
 |------------------|------------------------|-------|
-| **Linux** | Lazy FPU (since 2.x) | Uses `fpu_owner` tracking, identical algorithm |
+| **Linux** | Eager FPU (default since 4.6; lazy mode removed in 4.14) | Historically lazy, with owner tracking |
 | **FreeBSD** | Lazy FPU | `FNSAVE`/`FXSAVE` on-demand |
 | **Windows** | Lazy FPU | Thread-local FPU ownership |
 | **macOS** | Lazy FPU | XNU kernel uses lazy restoration |
-| **TinyOS v1.22** | Lazy FPU | ✅ Industry-standard implementation |
-
-**Conclusion**: TinyOS now uses the **same FPU optimization** as production operating systems!
+| **TinyOS** | Lazy FPU | CR0.TS + #NM, `fpu_owner` tracking |
 
 ### Future Enhancements
 
@@ -731,8 +726,8 @@ Step 1: Attacker sends malicious input
 Step 2: Buffer overflow occurs
         ↓
 Step 3: Stack Guard canary overwritten → DETECTED ✅
-        → Process terminated
-        → Attack FAILS
+        → kernel_panic() halts the system
+        → Attack FAILS (as a denial of service)
 
 Alternative: Attacker tries to bypass canary
         ↓
@@ -780,7 +775,7 @@ void test_stack_overflow() {
 }
 
 Result: ✅ DETECTED
-Output: "STACK GUARD VIOLATION DETECTED"
+Output: "STACK CORRUPTION DETECTED" banner, then kernel_panic
 ```
 
 ### ASLR Testing
@@ -802,16 +797,18 @@ Process 5: 0xbfec3000  ← Different
 
 #### Test 2: Reboot Randomization
 
-**Method**: Boot 3 times, check RNG seeds
+**Method**: Boot 3 times, compare stack addresses. (This was recorded when the
+boot log still printed an ASLR seed; it no longer prints one, and stack addresses
+are `kdbg` traces visible only under `loglevel debug`.)
 
 **Results**:
 ```
-Boot 1: Seed 0x1eb5ea59 → Stacks: 0xbf01a000, 0xbf03a000...
-Boot 2: Seed 0x6c7a2d92 → Stacks: 0xbf7ca000, 0xbf012000...
-Boot 3: Seed 0x76a975e9 → Stacks: 0xbf9fd000, 0xbf12a000...
+Boot 1: Stacks: 0xbf01a000, 0xbf03a000...
+Boot 2: Stacks: 0xbf7ca000, 0xbf012000...
+Boot 3: Stacks: 0xbf9fd000, 0xbf12a000...
 ```
 
-✅ **PASS**: Different seeds and addresses each boot
+✅ **PASS**: Different addresses each boot
 
 #### Test 3: Entropy Distribution
 
@@ -841,9 +838,8 @@ Address range:     0xbefff000 - 0xbff4a000 (4+ MB spread)
 | `Makefile` | Build flags (`-fstack-protector-strong`) | Modified |
 
 **Key Functions**:
-- `stack_guard_init()` - Initialize canary with entropy
-- `__stack_chk_fail()` - Handle violations (terminate process)
-- `read_tsc()` - Read CPU timestamp counter for entropy
+- `stack_guard_init()` - Initialize canary from `entropy_get_random32()`
+- `__stack_chk_fail()` - Audit record, banner, `kernel_panic()`
 
 ### ASLR (v1.20)
 
@@ -852,16 +848,16 @@ Address range:     0xbefff000 - 0xbff4a000 (4+ MB spread)
 | `src/aslr.h` | API, constants, statistics struct | 79 |
 | `src/aslr.c` | RNG, randomization, stats tracking | 208 |
 | `src/process.c` | Use ASLR for user stack addresses | Modified |
-| `src/kernel.c` | Init ASLR, demo tasks | Modified |
+| `src/kernel.c` | Init ASLR (the boot demo tasks were removed) | Modified |
 | `src/shell_system.c` | `aslr` command (stats viewer) | +56 |
 | `src/shell_system.h` | Function declaration | +7 |
 | `src/shell.c` | Command dispatcher integration | +2 |
 | `Makefile` | Add aslr.c to build | +1 |
 
 **Key Functions**:
-- `aslr_init()` - Initialize RNG with TSC entropy
+- `aslr_init()` - Report entropy quality, initial `aslr_reseed()`, stats obfuscation key
 - `aslr_get_random_stack_base()` - Get randomized stack address
-- `aslr_random32()` - Xorshift32 PRNG
+- `aslr_random32()` - Returns `entropy_get_random32()`
 - `aslr_get_stats()` - Retrieve statistics
 - `cmd_aslr()` - Shell command implementation
 
@@ -872,7 +868,7 @@ src/stack_guard.c     [NEW]    - Stack canary implementation
 src/stack_guard.h     [NEW]    - Stack guard API
 src/aslr.c            [NEW]    - ASLR implementation
 src/aslr.h            [NEW]    - ASLR API
-src/kernel.c          [MODIFIED] - Init stack guard + ASLR + demo
+src/kernel.c          [MODIFIED] - Init stack guard + ASLR
 src/process.c         [MODIFIED] - Use ASLR for user stacks + debug logging
 src/shell_system.c    [MODIFIED] - Add aslr command
 src/shell_system.h    [MODIFIED] - Add aslr command declaration
@@ -888,8 +884,11 @@ Makefile              [MODIFIED] - Add flags + source files
 
 ```makefile
 CFLAGS += -fstack-protector-strong  # Enable stack canaries
-CFLAGS += -Wstack-protector         # Warn if not protected
 ```
+
+It applies to every object; there is no per-file `-fno-stack-protector` exception
+(the credential-path files that once had one now use the generic rule — see the
+comment in `Makefile`).
 
 **Why `-fstack-protector-strong`?**
 - More aggressive than `-fstack-protector` (only >8 byte buffers)
@@ -920,19 +919,19 @@ CFLAGS += -fno-pic       # No position-independent code (kernel)
 
 ## Future Enhancements
 
-### Short Term (v1.21)
+### Done
 - ✅ **Stack Guard**: Complete
 - ✅ **ASLR**: Complete
 - ✅ **W^X (Write XOR Execute)**: Enforced for user mappings via the PAE NX bit (June 2026) — writable pages are NX, code is R+X read-only, W+X ELF segments rejected
 
-### Medium Term (v1.22+)
+### Not implemented
 - 🔜 **Heap ASLR**: Randomize heap allocations (requires heap implementation)
 - 🔜 **Code Segment ASLR**: Randomize .text section (requires PIE/PIC)
 - 🔜 **Full ASLR**: Randomize all mappings (libraries, mmap, vDSO)
 
-### Long Term (v2.0+)
+### Longer term
 - 🔜 **KASLR**: Kernel ASLR (randomize kernel itself)
-- 🔜 **Hardware RNG**: Use RDRAND if available for better entropy
+- ✅ **Hardware RNG**: RDRAND used when present, via the entropy module
 - 🔜 **Re-randomization**: Periodic ASLR updates during runtime
 
 ---
@@ -959,17 +958,16 @@ CFLAGS += -fno-pic       # No position-independent code (kernel)
 
 ## Conclusion
 
-TinyOS v1.20 now implements **production-grade exploit mitigation** comparable to modern operating systems:
+TinyOS implements the standard memory-safety mitigations of a modern kernel, at
+educational scale:
 
-✅ **Stack Guard**: Runtime buffer overflow detection
-✅ **ASLR**: Memory layout randomization
-✅ **W^X**: Code/data separation enforced for user mappings via the PAE NX bit (June 2026)
+✅ **Stack Guard**: Runtime buffer overflow detection (panics on a violation)
+✅ **ASLR**: User stack randomization (12 bits)
+✅ **W^X**: Code/data separation via the PAE NX bit, kernel and user
 
-**Security Posture**: From **vulnerable** to **hardened** in two major releases.
-
-**Exploit Success Rate**: 100% → ~0.00001% (5-6 orders of magnitude improvement)
-
-**Production Ready**: ✅ These protections are enabled by default and transparent to applications.
+They are enabled by default and transparent to applications. They raise the cost
+of an exploit; they do not make one impossible (12 bits of ASLR is brute-forceable,
+and nothing here randomizes the kernel or user code).
 
 ---
 
@@ -1029,162 +1027,37 @@ TinyOS v1.20 now implements **production-grade exploit mitigation** comparable t
 - `pae_dump_tables()`: Debugging page table walker
 - Shell commands: `pae` and `wxaudit`
 
+### Status: active
+
+- `pae_init()` (`src/kernel.c`, after the PMM) switches to PAE paging with EFER.NXE;
+  PAE is the active paging mode.
+- Kernel W^X: `pae_apply_kernel_wx()` (`src/pae.c`) maps kernel text R+X and data NX,
+  and `pae_verify_kernel_layout()` runs at boot and calls `kernel_panic()` on any
+  W+X kernel page.
+- User W^X: the ELF loader maps non-executable segments NX, rejects W+X load
+  segments, and re-maps code read-only after copy; user stacks are `PAE_PAGE_STACK`
+  (RW+NX).
+- `secstatus` reports the `pae_wx_audit()` result as `CLEAN` or `VIOLATIONS` with a
+  count.
+
+| Attack Vector | Without W^X | With W^X |
+|---------------|-------------|----------|
+| **Stack Shellcode** | Works | Blocked (stack is NX) |
+| **Data Segment Code** | Works | Blocked (data is NX) |
+| **Code Modification** | Works | Blocked (code not writable) |
+
 ### Shell Commands
 
-#### `pae` - Display PAE/W^X Status
-
-```bash
-TinyOS> pae
-
-=== PAE (Physical Address Extension) Status ===
-
-CPU Support:
-  PAE: SUPPORTED ✅
-  NX bit: SUPPORTED ✅
-
-Current Status:
-  CR4.PAE: DISABLED
-  EFER.NXE: DISABLED
-
-W^X Enforcement:
-  Status: UNAVAILABLE ❌
-  Reason: PAE mode not enabled
-
-To enable W^X:
-  1. Ensure PAE-capable CPU (done ✅)
-  2. Enable PAE in boot code (boot.s)
-  3. Call pae_init() during kernel init
-  4. Use pae_map_page() with NX flags
-  5. Run 'wxaudit' to verify enforcement
-```
-
-#### `wxaudit` - Audit W^X Violations
-
-```bash
-TinyOS> wxaudit
-
-=== W^X Memory Audit (PAE) ===
-
-Summary:
-  Total pages:      1024
-  Executable (X):   128
-  Writable (W):     896
-  W+X violations:   0
-
-W^X Policy: ENFORCED ✅
-```
-
-### Next Steps for Full W^X
-
-To **fully enable** W^X protection, the following steps are required:
-
-#### 1. Enable PAE in Boot Sequence (`src/boot.s`)
-
-```nasm
-; Before enabling paging (before setting CR0.PG)
-mov eax, cr4
-or eax, 0x20        ; Set CR4.PAE (bit 5)
-mov cr4, eax
-
-; Load PDPT address into CR3
-mov eax, pdpt_physical_address
-mov cr3, eax
-
-; Now enable paging
-mov eax, cr0
-or eax, 0x80000001  ; CR0.PG | CR0.PE
-mov cr0, eax
-```
-
-#### 2. Initialize PAE in Kernel (`src/kernel.c`)
-
-```c
-// After pmm_init(), before creating processes
-pae_init();  // Sets up PDPT, page directories, enables NX
-```
-
-#### 3. Migrate Page Mappings
-
-Convert all `map_page()` calls to `pae_map_page()` with appropriate flags:
-
-```c
-// Kernel code: R+X (executable, not writable)
-pae_map_page(virt, phys, PAE_PAGE_KERNEL_CODE);
-
-// Kernel data: R+W+NX (writable, not executable)
-pae_map_page(virt, phys, PAE_PAGE_KERNEL_DATA);
-
-// User stack: R+W+NX (writable, not executable)
-pae_map_page(virt, phys, PAE_PAGE_STACK);
-```
-
-#### 4. Update ELF Loader (`src/elf.c`)
-
-Parse ELF program header flags and apply W^X policy:
-
-```c
-if (phdr->p_flags & PF_X) {
-    // Executable segment: R+X (no NX bit)
-    pae_flags = PAE_PAGE_CODE;
-} else if (phdr->p_flags & PF_W) {
-    // Writable segment: R+W+NX (set NX bit)
-    pae_flags = PAE_PAGE_DATA;
-}
-```
-
-#### 5. Verify with Audit
-
-```bash
-TinyOS> wxaudit
-# Should report 0 violations
-```
-
-### Security Impact (When Fully Enabled)
-
-**Current (v1.21)**: Infrastructure in place, not yet active
-**When Enabled**: W^X enforcement prevents code injection attacks
-
-| Attack Vector | Pre-W^X | With W^X |
-|---------------|---------|----------|
-| **Stack Shellcode** | ✅ Works | ❌ Blocked (stack is NX) |
-| **Heap Shellcode** | ✅ Works | ❌ Blocked (heap is NX) |
-| **Data Segment Code** | ✅ Works | ❌ Blocked (data is NX) |
-| **Code Modification** | ✅ Works | ❌ Blocked (code not writable) |
-
-**Combined Protection** (Stack Guard + ASLR + W^X):
-```
-Success Rate ≈ P(bypass_canary) × P(guess_address) × P(find_executable_mem)
-             ≈ 0.01% × 0.0244% × 0%
-             ≈ 0% (effectively impossible)
-```
-
-### File Summary
-
-| File | Description | Lines | Status |
-|------|-------------|-------|--------|
-| `src/pae.c` | PAE implementation | 700+ | ✅ Complete |
-| `src/paging.h` | PAE structures & declarations | +150 | ✅ Complete |
-| `src/shell_system.c` | `pae` and `wxaudit` commands | +110 | ✅ Complete |
-| `src/shell_system.h` | Command declarations | +14 | ✅ Complete |
-| `src/shell.c` | Command dispatcher | +6 | ✅ Complete |
-| `Makefile` | Build system | +1 | ✅ Complete |
-| `src/boot.s` | PAE enablement | 0 | ⏳ Pending |
-| `src/kernel.c` | PAE initialization | 0 | ⏳ Pending |
+`pae` (PAE/NX status and page-table details) and `wxaudit` (full W+X scan) are
+**root-only and kernel-shell only** — run `kshell` from the ring-3 shell first. Both
+print kernel physical addresses, which is why they are gated (`require_root()` in
+`src/shell_system.c`). Do not rely on the "To enable W^X" text `pae` still prints;
+it predates the boot integration.
 
 ### Performance Considerations
 
-- **PAE Overhead**: 3-level page walks vs 2-level (~5% slower)
-- **TLB Efficiency**: Modern CPUs mitigate with hardware page walkers
-- **Memory Overhead**: 64-bit PTEs use 2x space (negligible for embedded)
-- **Security Gain**: Complete elimination of W+X vulnerabilities
-
-### Testing Status
-
-✅ **Build Test**: Compiles cleanly with strict `-Werror` flags
-✅ **Boot Test**: System boots successfully with PAE infrastructure
-✅ **Shell Commands**: `pae` and `wxaudit` commands functional
-⏳ **Runtime Test**: Awaiting full PAE enablement in boot sequence
-⏳ **NX Enforcement Test**: Awaiting migration to `pae_map_page()`
+- **PAE Overhead**: 3-level page walks vs 2-level
+- **Memory Overhead**: 64-bit PTEs use 2x space
 
 ### References
 
@@ -1272,8 +1145,10 @@ have been two generations of it:
   removed. Ring-3 dispatch returns **`-ENOSYS`**. Build
   `-DTINYOS_LEGACY_CRED_SYSCALLS` to re-enable it (an explicitly named opt-out,
   never a default). The underlying C functions remain available to **kernel**
-  callers — the kernel shell's `su` calls `sys_switch_user()` directly rather
-  than through `int 0x80`, so gating the dispatch does not remove the command.
+  callers. The kernel shell's `su` does not go through `int 0x80` at all: it
+  calls `user_authenticate_for(target, pw, USER_AUTH_OP_SU)` and, on success,
+  `sys_switch_user_preauth(target)` (`src/shell_user.c`), so gating the dispatch
+  does not remove the command.
 
 Both surviving entry points authenticate through the **`user_authenticate()`
 family** (`user_authenticate_for()`, see below), not the bare
@@ -1317,7 +1192,7 @@ now map.
 program that issues both deprecated syscalls **directly through `int 0x80`**, and
 asserts the exact errno. The probe is a separate program by necessity, not
 convenience: no shell offers these calls, and the kernel shell's `su` calls
-`user_authenticate()` itself before reaching the syscall — so a shell-driven test
+`user_authenticate_for()` itself and never reaches the syscall — so a shell-driven test
 exercises the shell's throttling and passes identically against a vulnerable
 kernel. Only a caller that bypasses the shell tests the boundary.
 
@@ -1332,26 +1207,29 @@ been suppressed as well, which a presence test would not catch.
 
 ## ELF Code Signing — ECDSA P-256, key pinning, fail-closed
 
-Every binary launched via `exec` is cryptographically verified before it runs.
+Every binary is cryptographically verified before it runs. Verification sits in
+the common load path (`elf_load_process_argv_impl()`, reached through
+`elf_exec_from_path()`), which serves `SYS_SPAWN`, the kernel shell's `exec` and the
+login-shell launch alike — there is no unverified way to start an ELF.
 
 - **What is verified:** the loader extracts a signature trailer from the end of
   the ELF, checks a magic and a self-consistent size, computes **SHA-256** over
   the ELF body, and compares it to the signed hash; then it verifies an
   **ECDSA P-256** signature over that hash.
-  (`elf_verify_signature`, `src/elf.c:158`.)
+  (`elf_verify_signature`, `src/elf.c`.)
 - **Key pinning (critical):** the trailer carries the signer's public key, but an
   attacker controls the trailer — so the loader does **not** trust it. It compares
   the trailer's `pub_key_x`/`pub_key_y` byte-for-byte against the **pinned trusted
-  key** from the secure-boot config and rejects any mismatch (`src/elf.c:216-229`,
-  pinned key `src/trusted_signing_key.h`). This closes the classic
+  key** from the secure-boot config and rejects any mismatch (the `memcmp` in
+  `elf_verify_signature`, pinned key `src/trusted_signing_key.h`). This closes the classic
   "sign-it-yourself" bypass.
 - **Fail-closed enforcement:** with signatures enforced (the default build), an
   unsigned, tampered, or wrong-key binary is **rejected** — it does not run.
   Permissive mode (`-DELF_PERMISSIVE_SIGNATURES`) is an explicitly named opt-out
   that only warns; it is never the default.
 - **Preemption-safe:** both the SHA-256 digest and the ECDSA verify run with
-  **interrupts masked** (`disable_interrupts()/restore_interrupts()`,
-  `src/elf.c:199, 249`). A long crypto computation preempted mid-flight returns
+  **interrupts masked** (`disable_interrupts()/restore_interrupts()` around each,
+  in `elf_verify_signature`). A long crypto computation preempted mid-flight returns
   corrupted state; masking the one-shot exec-time check is what makes enforce mode
   reliable. (See the in-source root-cause comment — this was misdiagnosed as buffer
   corruption before the real preemption cause was proven.)
@@ -1393,17 +1271,18 @@ Defensive practices applied across the from-scratch crypto.
 
 - **Compiler-proof zeroization:** secrets (keys, password buffers, intermediate
   state) are wiped with a zeroization routine the compiler cannot optimize away
-  (`crypto_secure_zero`, `src/crypto.c:833`), so key material doesn't linger in
+  (`crypto_secure_zero`, `src/crypto.c`), so key material doesn't linger in
   freed stack/heap.
 - **Constant-time comparison:** hash/MAC/secret comparisons use a constant-time
-  compare (`crypto_constant_time_compare`, `src/crypto.c:855`) instead of `memcmp`,
+  compare (`crypto_constant_time_compare`, `src/crypto.c`) instead of `memcmp`,
   removing timing side channels from auth checks.
 - **CSPRNG with forward secrecy:** a ChaCha20-based CSPRNG reseeds both on a byte
   limit (~1 MB) and on a periodic timer (`csprng_periodic_reseed`, ~60 s), so
   compromise of one state window doesn't expose past/future output
-  (`src/crypto.c:584, 703`).
+  (`csprng_random_bytes`, `csprng_periodic_reseed`, `src/crypto.c`).
 - **Preemption-safe generation/reseed:** keystream generation and reseed run inside
-  a critical section / with interrupts masked (`src/crypto.c:572-579`) — an unmasked
+  a critical section (`CRITICAL_SECTION_ENTER` in `csprng_random_bytes` and
+  `csprng_reseed`) — an unmasked
   reseed from the timer softirq could tear or duplicate keystream feeding password
   salts, ECDHE keys, ASLR, and TCP/DNS randomness. This mask is **load-bearing**.
 
@@ -1417,11 +1296,11 @@ The CSPRNG is seeded from validated hardware entropy, not blind trust.
 
 - **RDRAND/RDSEED health checks:** hardware RNG output passes FIPS-style checks —
   stuck-at/repetition, degenerate values, and a min-entropy bit-count test — before
-  it is trusted (`hw_rng_health_check`, `src/entropy.c:204`). A failing source is
+  it is trusted (`hw_rng_health_check`, `src/entropy.c`). A failing source is
   not used as if healthy.
 - **Mixed entropy pool:** a 64-word pool is stirred in batches from multiple
   sources (TSC jitter and others) with bounded interrupt latency
-  (`pool_stir`, `src/entropy.c:303-355`), so seeding doesn't depend on a single
+  (`pool_stir` / `pool_stir_batch`, `src/entropy.c`), so seeding doesn't depend on a single
   source. Availability is detected at boot (`cpu_has_rdrand`, `src/crypto.c`).
 
 **Implementation:** `src/entropy.c`, `src/crypto.c`.
@@ -1435,12 +1314,14 @@ The security audit trail is designed so edits and deletions are detectable.
 - **Hash-chained events:** each entry's authenticator is
   `HMAC(prev_hmac || event_fields)` under a **boot-time CSPRNG key**, so any
   insertion, deletion, or modification breaks the chain from that point on
-  (`audit_compute_hmac`, `src/audit.c:52-68`; key `src/audit.c:83`).
+  (`audit_compute_hmac`, key `audit_hmac_key` filled from the CSPRNG at init,
+  `src/audit.c`).
 - **Monotonic sequence numbers** and a **security event taxonomy** (tamper,
   stack-corruption, syscall-violation, privilege events, etc., `src/audit.h`) make
   gaps and anomalies visible.
 - **Storage:** a 1000-entry circular buffer in kernel memory; viewable via the
-  `auditlog` shell command (`-n`, `--warn`, `--error`, `--critical`, `-v`).
+  `auditlog` command (`-n`, `--warn`, `--error`, `--critical`, `-v`), which is
+  root-only and kernel-shell only (`kshell` from the ring-3 shell).
 
 **Implementation:** `src/audit.c`, `src/audit.h`.
 
@@ -1472,7 +1353,10 @@ Hardware-enforced stack-overflow containment and a correct ring-transition path.
 - **Guard pages:** every task is allocated a **NOT-PRESENT** guard page just below
   its kernel stack (and user stack), so an overflow faults instead of silently
   corrupting adjacent memory — including the global stack canary
-  (`src/process.c:470-566`, `task->guard_page_phys`).
+  (`task->guard_page_phys` and `task->user_guard_page_phys`, `src/process.c`).
+  A double fault, which cannot run on the overflowed stack, goes through a task
+  gate to a dedicated TSS (`tss_init_double_fault()`, `src/tss.c`;
+  `idt_install_double_fault_gate()`, `src/idt.c`).
 - **Page-fault overflow detection:** the #PF handler recognizes a guard-page hit
   and terminates the offending task / panics cleanly rather than continuing on
   corrupt state (`src/interrupts.c:296-356`; double-fault path `:572-588`).
@@ -1497,12 +1381,23 @@ Hardware-enforced stack-overflow containment and a correct ring-transition path.
 - **Strong KDF:** PBKDF2-HMAC-SHA256 at **100,000 iterations** (OWASP), decoupled
   from any dev/build-speed flag, in a self-describing
   `$pbkdf2-sha256$i=100000$salt$hash$` format with a legacy-upgrade path
-  (`src/user.c:82, 262-328`).
+  (`PBKDF2_ITERATIONS`, `user_hash_password()`, `src/user.c`; 1,000 only under the
+  explicitly named `-DTINYOS_FAST_KDF` opt-out).
 - **No default credentials:** all accounts — **including root** — are created
-  **LOCKED with no password** (`USER_FLAG_LOCKED`, `src/user.c:456`); the root
+  **LOCKED with no password** (`USER_FLAG_LOCKED`, `src/user.c`); the root
   password is set interactively on first boot. There is nothing to guess.
 - **Account lockout:** per-account failed-attempt counting locks an account after
-  repeated failures (`user_authenticate`, `src/user.c:849`).
+  repeated failures (`user_authenticate_for()`, `src/user.c`). Login, `su` and
+  `passwd` (via `SYS_CRED`) all go through it, so a wrong current password at
+  `passwd` counts toward the lockout and a locked account cannot change its own
+  password (PR #151, `verify-passwd-lockout.sh`).
+- **Identical refusal text:** login prints `Login incorrect` and `su` prints
+  `su: authentication failure` whether the user does not exist, the password is
+  wrong or the account is locked; `su` asks an unknown name for a password like
+  any other. The reason goes to the audit log, not the terminal (PR #151,
+  `verify-auth-user-oracle.sh`).
+- **Login ceiling:** three failed logins halt the console (`Login failed. System
+  halted.`).
 - **Constant-time + preemption-safe verify:** password comparison is constant-time
   and the PBKDF2 derivation runs interrupt-masked (a preempted derivation would
   corrupt the shared workspace adjacent to `user_database`).
@@ -1518,9 +1413,9 @@ Connection and transaction identifiers are unpredictable, sourced from the CSPRN
 
 - **TCP ISN (RFC 6528):** initial sequence numbers are
   `M + HMAC-SHA256(4-tuple, boot secret)` — unpredictable per-connection, resisting
-  blind injection/spoofing (`tcp_generate_isn`, `src/tcp.c:269`).
+  blind injection/spoofing (`tcp_generate_isn`, `src/tcp.c`).
 - **DHCP XID:** transaction IDs come from the CSPRNG (not a predictable LCG),
-  resisting lease spoofing (`generate_xid`, `src/dhcp.c:51`).
+  resisting lease spoofing (`generate_xid`, `src/dhcp.c`).
 - **DNS:** transaction IDs from the CSPRNG **plus a randomized source port**,
   raising the bar against cache-poisoning (`src/dns.c:719, 786`).
 
@@ -1541,63 +1436,34 @@ Connection and transaction identifiers are unpredictable, sourced from the CSPRN
 
 ---
 
-## Combined Security Summary (v1.22)
+## Combined Security Summary
 
-TinyOS now has **four layers** of security hardening:
+The memory-safety layer, all active in the default build:
 
-### Layer 1: Stack Guard (v1.19) ✅ **ACTIVE**
-- **What**: Runtime canary checks detect buffer overflows
-- **When**: Before return from functions
-- **Impact**: ~100% detection of stack-based exploits
-- **Performance**: 1-2% overhead
+### Layer 1: Stack Guard ✅ **ACTIVE**
+- **What**: `-fstack-protector-strong` canaries, seeded from `entropy_get_random32()`
+- **When**: Checked before return from protected functions
+- **On violation**: audit record, then `kernel_panic()`
 
-### Layer 2: ASLR (v1.20) ✅ **ACTIVE**
-- **What**: Randomize stack addresses (12 bits entropy)
+### Layer 2: ASLR ✅ **ACTIVE**
+- **What**: Randomized user stack base (12 bits, 4096 page positions)
 - **When**: Process creation
-- **Impact**: 1/4096 exploit success rate
-- **Performance**: <0.1% overhead
+- **Source**: the entropy module (RDRAND when present)
 
-### Layer 3: Lazy FPU Switching (v1.22) ✅ **ACTIVE**
-- **What**: Defer FPU state save/restore until needed
-- **When**: Every context switch + FPU usage
-- **Impact**: 50-75% faster context switches, reduced crypto key exposure
-- **Performance**: **IMPROVEMENT** (-50% scheduler overhead)
+### Layer 3: Lazy FPU Switching ✅ **ACTIVE**
+- **What**: FPU state saved/restored on first use after a switch (CR0.TS + #NM)
+- **When**: Context switch + first FPU instruction
 
-### Layer 4: W^X (v1.21) ⏳ **INFRASTRUCTURE READY**
-- **What**: Memory pages cannot be both writable and executable
-- **When**: All memory operations (when enabled)
-- **Impact**: 0% code injection success rate
-- **Performance**: ~5% overhead (3-level page walks)
+### Layer 4: W^X ✅ **ACTIVE**
+- **What**: No page is both writable and executable (PAE NX bit), kernel and user
+- **When**: Enforced at map time; kernel layout verified at boot (panics on a violation)
 
-**Overall Protection** (when W^X is enabled):
-```
-Exploit Success = Stack Guard × ASLR × W^X
-                ≈ 0% × 0.0244% × 0%
-                ≈ 0% (virtually impossible)
-
-Crypto Key Leakage = Lazy FPU × Side-Channel Resistance
-                   ≈ Minimized (fewer state copies)
-```
-
-**Performance Impact**:
-```
-Stack Guard:      +1-2% CPU overhead
-ASLR:             +0.1% CPU overhead
-Lazy FPU:         -50% scheduler overhead (IMPROVEMENT!)
-W^X (future):     +5% CPU overhead
-──────────────────────────────────────
-Net Impact:       -47% (FASTER with security!)
-```
-
-**Production Readiness**:
-- Stack Guard: ✅ Production ready (v1.19)
-- ASLR: ✅ Production ready (v1.20)
-- **Lazy FPU: ✅ Production ready (v1.22)** ← NEW!
-- W^X: ⏳ Infrastructure complete, awaiting boot integration (v1.21)
+Sections 5-15 above (credentials, code signing, crypto, audit, user-copy, guard
+pages, accounts, network, PMM) describe the rest.
 
 ---
 
-**Document Version**: 1.2
-**Last Updated**: 2025-01-17
+**Document Version**: 2.0 (living reference)
+**Last Reviewed**: 2026-10, against v2.8
 **Maintained By**: TinyOS Security Team
 **License**: Same as TinyOS project

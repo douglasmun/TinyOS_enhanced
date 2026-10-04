@@ -9,8 +9,10 @@ behavioral EDR subsystem).
 > shell command** to add, remove, or edit firewall rules or IDS signatures while
 > running. Rules are defined in C source and applied at boot. To change them you
 > edit the source and **rebuild the kernel**. The shell only *views* security
-> state (`secstatus`, `auditlog`) — it does not configure it. This matches the
-> project's educational scope; a runtime rule-management CLI is not implemented.
+> state (`secstatus`, `auditlog`) — it does not configure it. Both are
+> kernel-shell builtins: from the ring-3 login shell, run `kshell` first.
+> `auditlog` is root-only. This matches the project's educational scope; a
+> runtime rule-management CLI is not implemented.
 
 ---
 
@@ -99,9 +101,9 @@ from one — see the README).
 
 ### Viewing firewall state at runtime
 
-From the shell, `secstatus` shows a firewall summary (packets processed,
-dropped, and rejected, plus SYN-flood / port-scan counts). There is no command
-to edit rules live.
+From the kernel shell (`kshell`), `secstatus` shows a firewall summary (packets
+processed, dropped, and rejected, plus SYN-flood / port-scan counts). There is no
+command to edit rules live.
 
 ---
 
@@ -200,8 +202,11 @@ Two things not to undo:
 - **The threshold is `IDS_SPRAY_THRESHOLD` (3), not the network-side
   `IDS_BRUTEFORCE_THRESHOLD` (5).** `shell_login_prompt()` allows `max_attempts = 3`
   and then halts the machine, so a console spray can produce at most three distinct
-  failed usernames per boot. A threshold of 5 would be **unreachable from the only
-  path that calls this** — a detector that cannot fire.
+  failed usernames per boot. A threshold of 5 would be **unreachable from login** —
+  a detector that cannot fire on the main path. `su` and `passwd` also reach it
+  through `user_authenticate_for()` without that ceiling; 3 still fires first on
+  login. It remembers up to 16 distinct usernames per window and alerts once per
+  window.
 - **It alerts; it does not deny.** Denying on username diversity is a self-inflicted
   DoS: one attacker could lock the console for everyone by failing three names.
   Enforcement stays per-account in `user.c`.
@@ -218,17 +223,20 @@ negative is the half that separates this from a duplicate of `user.c`).
 
 ### Viewing IDS state
 
-`secstatus` shows the loaded signature count and IDS stats; `auditlog` shows
-recorded security events (it supports `-n`, `--warn`, `--error`, `--critical`,
-`-v`). No command edits signatures live.
+`secstatus` shows the loaded signature count and IDS stats; `auditlog` (root
+only) shows recorded security events (it supports `-n`, `--warn`, `--error`,
+`--critical`, `-v`). Both are kernel-shell builtins — run `kshell` first from the
+ring-3 shell. No command edits signatures live.
 
 ---
 
 ## 3. Related: EDR
 
-The behavioral **EDR** subsystem (memory / network / crypto / file-integrity
-monitoring) is also configured in C and viewed via `secstatus`. Its policy,
-whitelist/blacklist, and detector toggles are compile-time C API. See
+The behavioral **EDR** subsystem (per-syscall signatures, periodic file-integrity
+/ C2 / ransomware checks, a background scanner) is also configured at compile time
+and viewed via `secstatus`. Its thresholds are `#define`s in `src/edr_behavioral.h`
+and `src/edr_advanced.h`; the response threshold is the `g_response_policy`
+initializer in `src/edr_response.c`. See
 [`EDR_QUICK_REFERENCE.md`](EDR_QUICK_REFERENCE.md).
 
 ---
@@ -238,8 +246,10 @@ whitelist/blacklist, and detector toggles are compile-time C API. See
 | Component | Configured in | Runtime shell config? | View with |
 |-----------|---------------|-----------------------|-----------|
 | Firewall  | `src/kernel.c` + `firewall.c/.h` API | No | `secstatus` |
-| IDS       | `ids_load_default_signatures()` in `src/ids.c` | No | `secstatus`, `auditlog` |
-| EDR       | C API (`edr_*`) | No (`secstatus` view only) | `secstatus` |
+| IDS       | `ids_load_default_signatures()` in `src/ids.c` | No | `secstatus`, `auditlog` (root) |
+| EDR       | `#define`s in `edr_behavioral.h` / `edr_advanced.h`, policy in `edr_response.c` | No | `secstatus` |
+
+All views are kernel-shell builtins (`kshell` from the ring-3 shell).
 
 To change firewall or IDS behavior: **edit the source, rebuild the kernel,
 re-make the ISO.** There is no live reconfiguration interface — by design, for an

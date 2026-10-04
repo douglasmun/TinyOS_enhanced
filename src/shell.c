@@ -698,10 +698,9 @@ static void parse_and_execute(char* cmd_line) {
         }
     }
 
-    /* Note: Output redirection is parsed but command output capture
-     * requires deeper integration with kprintf(). For now, redirection
-     * files are created but output still goes to console.
-     * Full implementation would require a kernel-level output buffer. */
+    /* Output redirection: the file opened above becomes this command's
+     * stdout stream (bound below); builtins write through stream_printf(), so their
+     * output lands in the file rather than on the console. */
 
     /*=========================================================================
      * SECURITY (v1.13): Argument Parsing Buffer Overflow Protection

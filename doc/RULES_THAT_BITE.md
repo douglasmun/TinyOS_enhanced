@@ -20,7 +20,7 @@ rules are also in `verify/CLAUDE.md`.
   own.
 - First boot asks to set a root password, then login. **Do not try to echo-verify each
   character**: the ring-3 shell echoes the whole accepted line *after* `readline()`
-  returns (`src/stdio.c:336`, `userspace/shell.c:2035`), so a per-char wait blocks on an
+  returns (`stdin_read()` in `src/stdio.c`, the `printf("%s\n", line)` in `main()` of `userspace/shell.c`), so a per-char wait blocks on an
   echo that cannot arrive and a resend loop types `kkkkshell` into a live boot. Only the
   kernel shell echoes per keystroke. The typist is **not** the flaky part — measured
   across ~45 boots, **zero** keystrokes dropped; every failure was a harness defect.

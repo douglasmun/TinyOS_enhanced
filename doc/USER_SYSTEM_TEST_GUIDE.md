@@ -1,246 +1,263 @@
-# TinyOS v1.10 - User Management System Test Guide
+# TinyOS v2.8 - Multi-User System Test Guide
 
-## System Status
-✅ **Build**: Successful (ISO: 4130 sectors)
-✅ **User Database**: Initialized (3 users, 2 groups)
-✅ **Shell Commands**: Integrated (7 commands)
-✅ **Login System**: Interactive authentication at boot
+A manual walkthrough of accounts, authentication and file permissions. Every
+output line below is the text the kernel or the ring-3 shell prints; `****`
+stands for a password typed at a hidden prompt.
 
-## Default User Accounts
+Run it in a window so you can type:
 
-| Username | UID  | GID | Password | Notes                    |
-|----------|------|-----|----------|--------------------------|
-| root     | 0    | 0   | root     | Administrator account    |
-| user     | 1000 | 100 | user     | Regular user account     |
-| guest    | 1001 | 100 | (none)   | No-login guest account   |
-
-## Available Commands
-
-### 1. `whoami` - Display current username
-```bash
-$ whoami
-user
-```
-
-### 2. `id [username]` - Display user/group IDs
-```bash
-$ id
-uid=1000(user) gid=100 euid=1000 egid=100
-
-$ id root
-uid=0(root) gid=0
-```
-
-### 3. `users` - List all users
-```bash
-$ users
-Users in system:
-  [0] root (uid=0, gid=0) ACTIVE
-  [1] user (uid=1000, gid=100) ACTIVE
-  [2] guest (uid=1001, gid=100) INACTIVE
-Total users: 3
-```
-
-### 4. `su [username]` - Switch user
-```bash
-$ whoami
-user
-
-$ su root
-Password: **** (type: root)
-Switched to user: root
-
-$ whoami
-root
-```
-
-**Notes:**
-- Root can switch to any user without password
-- Non-root users must provide password
-- Default target is `root` if no username specified
-- Failed attempts are tracked (3 max, 60-second lockout)
-
-### 5. `passwd [username]` - Change password
-```bash
-# Change own password
-$ passwd
-Changing password for user
-(current) Password: ****
-Enter new password: ****
-Retype new password: ****
-passwd: password updated successfully
-
-# Root can change any user's password
-$ su root
-Password: ****
-$ passwd user
-Enter new password: ****
-Retype new password: ****
-passwd: password updated successfully
-```
-
-### 6. `useradd <username>` - Create new user (root only)
-```bash
-$ su root
-Password: ****
-$ useradd alice
-Enter password for new user: ****
-useradd: user 'alice' created (uid=1002, gid=100)
-
-$ users
-Users in system:
-  [0] root (uid=0, gid=0) ACTIVE
-  [1] user (uid=1000, gid=100) ACTIVE
-  [2] guest (uid=1001, gid=100) INACTIVE
-  [3] alice (uid=1002, gid=100) ACTIVE
-```
-
-### 7. `userdel <username>` - Delete user (root only)
-```bash
-$ su root
-Password: ****
-$ userdel alice
-userdel: user 'alice' deleted
-
-# Cannot delete root
-$ userdel root
-userdel: cannot delete root user
-```
-
-## Testing Procedure
-
-### Login System Test (FIRST STEP - Required for all tests)
-When TinyOS boots, you will see the login prompt:
-
-```
-*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
-  TinyOS v1.10 Login System
-*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
-
-TinyOS login: _
-```
-
-**Login with user account:**
-```
-TinyOS login: user
-Password: **** (type: user)
-
-Login successful. Welcome, user!
-```
-
-**Login with root account:**
-```
-TinyOS login: root
-Password: **** (type: root)
-
-Login successful. Welcome, root!
-```
-
-**Failed login (3 attempts max):**
-```
-TinyOS login: hacker
-Password: ****
-
-Login incorrect
-2 login attempts remaining
-
-TinyOS login: _
-```
-
-### Quick Test (GUI Mode - Recommended for Interactive Testing)
 ```bash
 make run-gui
 ```
 
-**Step 1: Login**
-1. At login prompt, enter username: `user`
-2. Enter password: `user`
-3. You should see "Login successful. Welcome, user!"
+Accounts live only in kernel memory, so every boot starts from step 1.
 
-**Step 2: Test Commands**
-Then in the shell:
-1. Type `whoami` → should show "user"
-2. Type `id` → should show "uid=1000(user) gid=100..."
-3. Type `users` → should list 3 users
-4. Type `su root` → enter password "root" → should switch to root
-5. Type `passwd` → change password (follow prompts)
-6. Type `useradd test123` → create new user
-7. Type `userdel test123` → delete user
+## Background
 
-### Security Features Implemented
+- At boot the database holds one account, `root` (uid 0, gid 0), **locked with no
+  password**, plus the groups `root` (0) and `users` (100).
+- Passwords are hashed with PBKDF2-HMAC-SHA256 (100,000 iterations) and a
+  random 16-byte salt.
+- Three consecutive failed authentications lock an account for 60 seconds. Login,
+  `su` and the current-password check in `passwd` all count, and a success resets
+  the count.
+- The login shell is the ring-3 shell (`D:/ $` prompt). `kshell` switches to the
+  kernel shell (`$ ` prompt), which keeps your identity.
 
-✅ **Password Hashing**: DJB2 algorithm with 1000 rounds + salt
-✅ **Password Hiding**: Input displayed as asterisks (*)
-✅ **Account Lockout**: 3 failed attempts = 60-second lockout
-✅ **Permission Checks**: Root-only operations (useradd, userdel)
-✅ **Password Verification**: Must match for passwd command
-✅ **Memory Security**: Passwords cleared with memset() after use
-✅ **Privilege Separation**: Real vs Effective UID/GID support
+## 1. First boot: set the root password
 
-### Permission Enforcement
+```
+First-Time Setup: Let's Create Your Password
+...
+This is your first time booting TinyOS!
+For security, let's set up a root password.
+...
+Enter new root password: ****
+Confirm new root password: ****
 
-The system now enforces proper permissions on all file operations:
-
-```bash
-# Create file as root
-$ su root
-Password: ****
-$ echo "secret" > /root_file.txt
-
-# Switch to regular user
-$ su user
-Password: ****
-$ cat /root_file.txt
-Permission denied (owner: 0:0, mode: 0644, caller: 1000:100)
+Root password set successfully!
+Root account is now active and unlocked.
 ```
 
-### Process Credentials
+An empty password or a mismatch prints `Password cannot be empty. Please try
+again.` or `Passwords do not match. Please try again.` and asks again.
 
-All processes now carry proper credentials:
+## 2. Log in as root
 
-| Process Type  | UID  | GID | EUID | EGID | Notes                    |
-|---------------|------|-----|------|------|--------------------------|
-| Kernel Tasks  | 0    | 0   | 0    | 0    | Always run as root       |
-| Shell (login) | Set by login | Set by login | Set by login | Set by login | Based on authenticated user |
-| After su root | 0    | 0   | 0    | 0    | Full root privileges     |
+```
+TinyOS login: root
+Password: ****
 
-## Known Limitations (Current v1.10)
+Login successful. Welcome, root!
+```
 
-⚠️ **No Persistent Storage**: User database is in-memory only (lost on reboot)
-⚠️ **No /etc/passwd**: Users hardcoded in user_init()
-⚠️ **No Groups Management**: Groups are static (0=root, 100=users)
-⚠️ **No Home Directories**: Home paths stored but not enforced
+Because root is the only account, TinyOS offers to create a regular user
+(`Would you like to create a regular user now? (y/n):`). Answering `y` creates
+one with uid 1000. For this walkthrough answer `n`:
 
-## Next Enhancements (v1.11 Roadmap)
+```
+Skipping user creation.
+You can create users later with: useradd <username>
+```
 
-1. /etc directory structure (passwd, shadow, group)
-2. Persistent user database (save to RAMFS)
-3. Persistent configuration across reboots
-4. Group management commands (groupadd, groupdel, groups)
-5. User profile support (.profile, .bashrc equivalent)
-6. Setuid/setgid program support (sudo-like mechanism)
+The ring-3 shell starts:
 
-## Security Status
+```
+TinyOS shell (ring 3) - 'help' for builtins, 'kshell' for the kernel shell, 'exit' to log out
+D:/ $ id
+uid=0 gid=0
+```
 
-**TinyOS v1.10** implements a **production-grade multi-user security model**:
+## 3. Create, change and delete accounts (ring 3)
 
-- ✅ Multi-user operating system (was single-user)
-- ✅ Per-process credentials (uid, gid, euid, egid)
-- ✅ User database with password authentication
-- ✅ Permission enforcement on all file operations
-- ✅ Syscall security (privilege checks)
-- ✅ Password hashing and secure input
-- ✅ Account lockout mechanism
-- ✅ Root privilege separation
+`useradd`, `userdel` and `passwd` work from the ring-3 shell. The prompts come
+from the kernel, so these commands cannot be redirected.
 
-The system has transformed from a **decorative permission system** (all processes ran as root) to a **real privilege separation model** where each process carries its own credentials and permissions are actively enforced.
+```
+D:/ $ useradd alice
+Enter password for new user: ****
+useradd: user 'alice' created (uid=1002, gid=100)
+D:/ $ useradd bob
+Enter password for new user: ****
+useradd: user 'bob' created (uid=1003, gid=100)
+D:/ $ useradd alice
+useradd: user 'alice' already exists
+useradd: alice: file exists
+```
 
-## Build Info
+New uids start at 1002. When a command refuses, the kernel's reason is followed
+by the shell's errno line, as in the last example.
 
-**Compiled**: $(date)
-**Makefile**: Updated with shell_user.c
-**ISO Size**: 4128 sectors
-**Source Files**: 76 C files + 5 assembly files
+Root sets another user's password without the old one:
 
----
-*TinyOS v1.10 - User Management System Complete*
+```
+D:/ $ passwd alice
+Enter new password: ****
+Retype new password: ****
+passwd: password updated successfully
+```
+
+Deletion, and its two refusals:
+
+```
+D:/ $ useradd tmpuser
+Enter password for new user: ****
+useradd: user 'tmpuser' created (uid=1004, gid=100)
+D:/ $ userdel tmpuser
+userdel: user 'tmpuser' deleted
+D:/ $ userdel root
+userdel: cannot delete root user
+userdel: root: operation not permitted
+```
+
+`userdel` also refuses the account you are logged in as
+(`userdel: cannot delete the current user`).
+
+## 4. The kernel shell: `users`, `id`, `su`
+
+```
+D:/ $ kshell
+Switching to the kernel shell; `logout` there returns to login.
+$ users
+[USER] User list:
+  root         uid=    0 gid=    0 home=/root flags=0x01
+  alice        uid= 1002 gid=  100 home=/ flags=0x01
+  bob          uid= 1003 gid=  100 home=/ flags=0x01
+$ id
+uid=0(root) gid=0 euid=0 egid=0
+$ id alice
+uid=1002(alice) gid=100
+$ id nobody
+id: 'nobody': no such user
+```
+
+`flags=0x01` means active. Root can `su` to any account without a password, and
+only root is told when the name does not exist:
+
+```
+$ su nobody
+su: user 'nobody' does not exist
+$ su alice
+Switching to alice (no password required for root)
+Now running as: alice
+$ id
+uid=1002(alice) gid=100 euid=1002 egid=100
+```
+
+The session is now alice's. `logout` returns to the login prompt.
+
+## 5. Unprivileged user: refusals and uniform failures
+
+Log in as alice. In the ring-3 shell:
+
+```
+D:/ $ id
+uid=1002 gid=100
+D:/ $ useradd mallory
+useradd: permission denied (must be root)
+useradd: mallory: operation not permitted
+D:/ $ passwd bob
+passwd: only root can change other users' passwords
+passwd: bob: operation not permitted
+```
+
+Changing your own password asks for the current one first:
+
+```
+D:/ $ passwd
+Changing password for alice
+(current) ****
+Enter new password: ****
+Retype new password: ****
+passwd: password updated successfully
+```
+
+A wrong current password prints `passwd: authentication token manipulation
+error` and counts toward alice's lockout.
+
+In the kernel shell, a non-root `su` always asks for a password and every failure
+reads the same, whether the name is unknown or the password is wrong:
+
+```
+D:/ $ kshell
+Switching to the kernel shell; `logout` there returns to login.
+$ su nobody
+Switching to user 'nobody'
+Password for nobody: ****
+su: authentication failure
+$ su bob
+Switching to user 'bob'
+Password for bob: ****
+su: authentication failure
+```
+
+Each failure is followed by a short delay. The login prompt behaves the same way:
+an unknown name and a wrong password both print
+
+```
+Login incorrect
+2 login attempts remaining
+```
+
+The reason is recorded only in the audit log (`auditlog`, root only).
+
+## 6. File permissions in `/scratch`
+
+`/scratch` is mode 0777, so every user can create files there. New files are
+created 0600.
+
+Log in as root:
+
+```
+D:/ $ write /scratch/secret.txt top secret
+D:/ $ chmod 600 /scratch/secret.txt
+D:/ $ stat /scratch/secret.txt
+/scratch/secret.txt  size=11  mode=600  file
+D:/ $ exit
+```
+
+Log in as alice:
+
+```
+D:/ $ cat /scratch/secret.txt
+cat: /scratch/secret.txt: no such file or directory
+D:/ $ chmod 644 /scratch/secret.txt
+chmod: /scratch/secret.txt: operation not permitted
+```
+
+A file you may not open reads as nonexistent, and only the owner (or root) can
+change its mode. Log back in as root, run `chmod 644 /scratch/secret.txt`, then
+as alice:
+
+```
+D:/ $ cat /scratch/secret.txt
+top secret
+```
+
+## 7. Account lockout
+
+As alice, in the kernel shell, give `su bob` a wrong password three times. Bob's
+account is now locked for 60 seconds: a fourth `su bob`, even with the correct
+password, still prints `su: authentication failure`. Wait 60 seconds and the
+correct password works again:
+
+```
+$ su bob
+Switching to user 'bob'
+Password for bob: ****
+Switched to user: bob
+```
+
+While an account is locked, root sees the state directly
+(`su: account 'bob' is locked`), and setting a new password with `passwd bob`
+clears the lock.
+
+At the login prompt itself the limit is per session: after the third failure it
+prints `Too many login failures. Access denied.` and `Login failed. System
+halted.`, and the VM must be restarted (which also resets the accounts).
+
+## See also
+
+- [`USER_GUIDE.md`](USER_GUIDE.md) - boot, login and both shells
+- [`SECURITY_HARDENING.md`](SECURITY_HARDENING.md) - the authentication and
+  permission mechanisms
