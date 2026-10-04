@@ -954,6 +954,10 @@ static void parse_and_execute(char* cmd_line) {
     else if (strcmp(argv[0], "edrkill") == 0) {
         task_edrkill_test();
     }
+    /* verify-context-switch-esp.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "ctxswtest") == 0) {
+        scheduler_ctxsw_esp_test();
+    }
     /* verify-waitpid-gate.sh only. Not in the command table. */
     else if (strcmp(argv[0], "waitgate") == 0) {
         sys_waitgate_test();

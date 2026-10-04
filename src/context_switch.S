@@ -90,11 +90,19 @@ context_switch:
     mov [eax + 4], esi    ; Save ESI
     mov [eax + 8], ebp    ; Save EBP
 
-    ; Save ESP (stack pointer) - need to account for our stack usage
-    ; Stack layout: ESP+0=EAX, ESP+4=ECX, ESP+8=EDX, ESP+12=EBX, ESP+16=EFLAGS, ESP+20=retaddr
+    ; Save ESP as the CALLER will see it once we return: just past the return
+    ; address. Stack layout: ESP+0=EAX, ESP+4=ECX, ESP+8=EDX, ESP+12=EBX,
+    ; ESP+16=EFLAGS, ESP+20=retaddr, ESP+24=current (caller's ESP after ret).
+    ;
+    ; Resume stages EIP and EFLAGS below the saved ESP and ends popf; ret, so
+    ; the resumed caller lands on exactly this value. Issue #126: this used to
+    ; be ESP+20 (AT the return address), resuming every task 4 bytes low. An
+    ; EBP-framed caller's `leave` hid it; a caller with an ESP-relative
+    ; epilogue (CI's gcc) popped shifted registers and returned to EIP=0.
+    ; verify-context-switch-esp.sh measures the delta directly.
     mov edx, esp
-    add edx, 20           ; BUG FIX: Correct offset to return address (5 pushes * 4 bytes)
-    mov [eax + 12], edx   ; Save adjusted ESP (points to return address)
+    add edx, 24
+    mov [eax + 12], edx   ; Save caller's post-return ESP
 
     ; Get registers from our stack and save them
     mov ecx, [esp]        ; ESP+0 = saved EAX

@@ -4,6 +4,44 @@ Fixed bugs whose *diagnosis* is reusable: each one names a class of mistake that
 can recur elsewhere in the tree. Where a wrong theory was held first, it is kept
 on the record — knowing what the symptom did NOT mean is most of the value.
 
+## FIXED: every resumed task came back 4 bytes low (context_switch ESP, issue #126)
+
+Every CI boot panicked with a page fault at `EIP=0`, `CS=0x10`, in the kernel
+task `Shell`; every local boot was clean. Fixed 2026-10-04.
+
+**Root cause — `src/context_switch.S` saved ESP pointing AT the return address
+(`esp+20`) instead of past it (`esp+24`).** Resume stages EIP and EFLAGS below
+the saved ESP and ends `popf; ret`, so every resumed task got back an ESP 4
+bytes lower than its `call` left it. On Homebrew's `i686-elf-gcc` 16.2 every
+caller is EBP-framed: registers come back through `[ebp-N]` and `leave` resets
+ESP from EBP, so nothing ever read the wrong ESP. CI's Ubuntu
+`i686-linux-gnu-gcc` 13.3 compiled `scheduler_schedule` without a frame pointer:
+
+    call context_switch
+    push edi ; popf
+    add  esp,0x10
+    pop  ebx ; pop esi ; pop edi
+    ret                  ; loads the word BELOW the real return address
+
+The shifted pops left that slot holding 0. The panic's ESP was exactly the real
+return slot, which held `shell_task+0x35`: the return from `scheduler_yield()`
+in the shell's startup loop. The stack words `00000000 00000010 00000206` are
+the fault's own EIP/CS/EFLAGS frame.
+
+**What it was not.** At first the CI-only behaviour pointed at the environment:
+an unsigned build (CI has no signing key) or a runner difference. A bare `make`
+in a keyless worktree booted clean. The tell was that the "identical kernel" premise
+was stale — CI's symbol addresses differed from local ones because the
+*compiler* differed (`toolchain.txt` in the repro run).
+
+**Lesson.** An assembly routine that hands control to C code must restore the
+exact ABI state, not a state that "works with" the current callers' codegen.
+`leave` repairs ESP, so an EBP-framed caller cannot witness an ESP bug. The
+witness has to be asm: `verify-context-switch-esp.sh` (kernel-shell
+`ctxswtest`, `TINYOS_FAULT_INJECT`) switches the current task to itself
+from an asm probe and reports the ESP delta. The unfixed kernel shows −4 on
+every toolchain; the fixed one shows 0.
+
 ## FIXED: intermittent `Invalid TSS esp0` panic on `exec` (isr.S EAX clobber)
 
 `exec /hello.elf` intermittently (~1/9 boots) panicked with `Invalid TSS esp0:
