@@ -621,8 +621,9 @@ int user_set_password(uint16_t uid, const char* password) {
 
     /* Unlock account if it was locked */
     if (user->flags & USER_FLAG_LOCKED) {
+        /* No console line: the AUDIT_AUTH_PASSWORD_CHANGE below records it,
+         * and ring-3 `passwd USER` reaches this. verify-cred-lock-quiet.sh. */
         user->flags &= ~USER_FLAG_LOCKED;  /* Clear LOCKED flag */
-        kprintf("[USER] Account '%s' unlocked after password set\n", user->username);
     }
 
     /* Set account to active if not already */
@@ -1002,10 +1003,11 @@ int user_authenticate_for(const char* username, const char* password,
         /* Lock account after too many attempts */
         if (user->failed_attempts >= USER_MAX_LOGIN_ATTEMPTS) {
             user->flags |= USER_FLAG_LOCKED;
-            kprintf("[USER] Account '%s' locked after %d failed attempts\n",
-                    username, user->failed_attempts);
 
-            /* Audit: Account locked due to failed attempts */
+            /* Audit: Account locked due to failed attempts. The audit record
+             * is the only one: a console line here was reachable by any user
+             * (kernel-shell su; SYS_SWITCH_USER in the legacy build) on the
+             * console the ring-3 shell shares. verify-cred-lock-quiet.sh. */
             audit_log(AUDIT_AUTH_ACCOUNT_LOCKED, AUDIT_ERROR, user->uid,
                       "Account '%s' locked after %lu failed login attempts",
                       username, (unsigned long)user->failed_attempts);
