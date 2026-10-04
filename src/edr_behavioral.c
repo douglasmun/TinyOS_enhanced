@@ -215,32 +215,51 @@ bool edr_detect_shellcode(task_t* task, uint32_t syscall_num) {
  * - Setuid/setgid after exploit indicators (rare syscalls, anomalies)
  *
  * INDICATORS:
- * - Setuid/setgid to uid=0 or gid=0
+ * - Setuid/setgid to uid=0 or gid=0 by a task that holds no root id
  * - Setuid/setgid after anomaly score > threshold
+ *
+ * Runs before the syscall, so the task's ids are the ones it holds now. A
+ * change TO 0 is a reach for root only when the task has no root id to return
+ * to: root dropping to itself, or seteuid(0) back from a temporary seteuid
+ * drop (uid still 0), are ordinary. This used to fire on "any second
+ * credential call" -- and edr_behavioral_check() set the flag before calling
+ * it, so the FIRST setgid(getgid()) of any process was a CRITICAL alert and
+ * the task was killed. verify-edr-setuid-fp.sh.
  *=============================================================================*/
 
-bool edr_detect_privilege_escalation(task_t* task, uint32_t syscall_num) {
+bool edr_detect_privilege_escalation(task_t* task, uint32_t syscall_num, uint32_t target) {
     if (!task) return false;
 
-    /* Check if current syscall is privilege-changing */
-    if (syscall_num == SYS_SETUID || syscall_num == SYS_SETGID ||
-        syscall_num == SYS_SETEUID || syscall_num == SYS_SETEGID) {
-
-        /* If process already has high anomaly score, this is suspicious */
-        if (task->edr_state.anomaly_score > 1000) {
-            return true;
-        }
-
-        /* If process already attempted privilege changes, this is suspicious */
-        if (task->edr_state.flags & EDR_FLAG_PRIVILEGE_CHANGE) {
-            return true;
-        }
-
-        /* Mark that privilege change was attempted */
-        task->edr_state.flags |= EDR_FLAG_PRIVILEGE_CHANGE;
+    bool uid_call = (syscall_num == SYS_SETUID || syscall_num == SYS_SETEUID);
+    bool gid_call = (syscall_num == SYS_SETGID || syscall_num == SYS_SETEGID);
+    if (!uid_call && !gid_call) {
+        return false;
     }
 
-    return false;
+    bool suspicious = false;
+
+    /* If process already has high anomaly score, this is suspicious */
+    if (task->edr_state.anomaly_score > 1000) {
+        suspicious = true;
+    }
+
+    /* Asking for id 0 without holding it. The syscalls take a uint16_t, so
+     * compare the truncated value they will actually act on. Any gid is
+     * open to euid 0, so only a non-root task can reach for gid 0. */
+    if ((uint16_t)target == 0 && task->euid != 0) {
+        if (uid_call && task->uid != 0) {
+            suspicious = true;
+        }
+        if (gid_call && task->gid != 0 && task->egid != 0) {
+            suspicious = true;
+        }
+    }
+
+    /* Telemetry for edr_daemon: this task has changed credentials. Set after
+     * the check, never read by it. */
+    task->edr_state.flags |= EDR_FLAG_PRIVILEGE_CHANGE;
+
+    return suspicious;
 }
 
 /*=============================================================================
@@ -375,10 +394,9 @@ bool edr_behavioral_check(task_t* task, uint32_t syscall_num, uint32_t arg0) {
 
     /* Track behavioral flags */
     /* FUTURE: Set EDR_FLAG_NETWORK_ACTIVITY when network syscalls added */
-    if (syscall_num == SYS_SETUID || syscall_num == SYS_SETGID ||
-        syscall_num == SYS_SETEUID || syscall_num == SYS_SETEGID) {
-        task->edr_state.flags |= EDR_FLAG_PRIVILEGE_CHANGE;
-    }
+    /* EDR_FLAG_PRIVILEGE_CHANGE is set by edr_detect_privilege_escalation(),
+     * after it has looked: setting it here first made every credential call
+     * look like a repeat. */
 
     /* Run detection signatures */
     bool allow_syscall = true;
@@ -409,7 +427,7 @@ bool edr_behavioral_check(task_t* task, uint32_t syscall_num, uint32_t arg0) {
     }
 
     /* 3. Privilege Escalation Detection */
-    if (edr_detect_privilege_escalation(task, syscall_num)) {
+    if (edr_detect_privilege_escalation(task, syscall_num, arg0)) {
         edr_raise_alert(task, EDR_SEVERITY_CRITICAL, EDR_SIG_PRIVILEGE_ESCALATION,
                        "Suspicious privilege escalation attempt");
         task->edr_state.anomaly_score += 750;

@@ -48,7 +48,7 @@ Rare syscalls: `SYS_SETUID`, `SYS_SETGID`, `SYS_SETEUID`, `SYS_SETEGID`.
 | Signature | Trigger | Severity | Score | Response |
 |---|---|---|---|---|
 | `ROP_CHAIN` | >= 5 rare syscalls among the last 10, spanning < 10 ticks | CRITICAL | +500 | terminate (95) |
-| `PRIVILEGE_ESCALATION` | setuid-family call while `EDR_FLAG_PRIVILEGE_CHANGE` is set or score > 1000 | CRITICAL | +750 | terminate (90) |
+| `PRIVILEGE_ESCALATION` | setuid-family call asking for uid/gid 0 by a task holding no root id, or any setuid-family call once score > 1000 | CRITICAL | +750 | terminate (90) |
 | `SYSCALL_FLOOD` | the whole 32-entry history inside < 2 ticks | WARNING | +200 | none |
 | `ANOMALY` | each rare syscall +10; alert once score > 500 | WARNING | +10 | none |
 | `SHELLCODE_EXEC` | placeholder, always false | — | — | — |

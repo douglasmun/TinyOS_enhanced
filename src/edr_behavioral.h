@@ -187,9 +187,10 @@ bool edr_detect_shellcode(task_t* task, uint32_t syscall_num);
  * @brief Detect privilege escalation attempts
  * @param task Process to analyze
  * @param syscall_num Current syscall
+ * @param target The uid/gid the call asks for (its first argument)
  * @return true if privilege escalation detected
  */
-bool edr_detect_privilege_escalation(task_t* task, uint32_t syscall_num);
+bool edr_detect_privilege_escalation(task_t* task, uint32_t syscall_num, uint32_t target);
 
 /**
  * @brief Detect data exfiltration patterns

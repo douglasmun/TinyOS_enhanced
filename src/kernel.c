@@ -35,6 +35,7 @@
 #include "producer_elf_data.h"
 #include "counter_elf_data.h"
 #include "credprobe_elf_data.h"
+#include "setuidprobe_elf_data.h"
 #include "netprobe_elf_data.h"
 #include "msealprobe_elf_data.h"
 #include "callprobe_elf_data.h"
@@ -957,6 +958,18 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(credprobe_fd, credprobe_elf_data, credprobe_elf_data_len);
             ramfs_close(credprobe_fd);
             ramfs_chmod("/credprobe.elf", 0755);
+        }
+    }
+
+    /* setuidprobe.elf makes setuid/setgid/seteuid/setegid calls straight
+     * through int 0x80 to grade EDR's privilege-escalation signature from the
+     * ring-3 side: verify-edr-setuid-fp.sh. */
+    {
+        int setuidprobe_fd = ramfs_open("/setuidprobe.elf", RAMFS_FLAG_WRITE);
+        if (setuidprobe_fd >= 0) {
+            ramfs_write(setuidprobe_fd, setuidprobe_elf_data, setuidprobe_elf_data_len);
+            ramfs_close(setuidprobe_fd);
+            ramfs_chmod("/setuidprobe.elf", 0755);
         }
     }
 

@@ -17,7 +17,8 @@ LDFLAGS := -T user.ld -ffreestanding -nostdlib -Wl,--build-id=none
 PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
             netprobe.elf msealprobe.elf callprobe.elf \
-            busyprobe.elf pipeprobe.elf fdprobe.elf tcpcap.elf
+            busyprobe.elf pipeprobe.elf fdprobe.elf tcpcap.elf \
+            setuidprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -91,6 +92,14 @@ credprobe.elf: credprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c credprobe.c -o credprobe.o
 	$(LD) $(LDFLAGS) -o credprobe.elf crt0.o credprobe.o libc.o -lgcc
 	@echo "Built credprobe.elf"
+
+# setuidprobe.elf makes credential-changing syscalls straight through int 0x80
+# to grade EDR's privilege-escalation signature: benign drops must survive, a
+# reach for root the task does not hold must be killed.
+setuidprobe.elf: setuidprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c setuidprobe.c -o setuidprobe.o
+	$(LD) $(LDFLAGS) -o setuidprobe.elf crt0.o setuidprobe.o libc.o -lgcc
+	@echo "Built setuidprobe.elf"
 
 # netprobe.elf drives SYS_NETRX/SYS_NETTX straight through int 0x80. Nothing in
 # the kernel calls them yet (the parser has not moved to ring 3), so this is the
