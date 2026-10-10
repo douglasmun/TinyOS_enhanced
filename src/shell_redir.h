@@ -134,6 +134,12 @@ typedef struct {
     struct wait_queue* writers;       /* Tasks waiting for space (allocated) */
     bool write_closed;                /* Write end closed (readers get EOF) */
     bool read_closed;                 /* Read end closed (writers get EPIPE) */
+    /* Capture mode (the kernel shell's stage-output pipe): the only reader
+     * drains it after the stage RETURNS, so a writer must never block -- a
+     * ring-3 `exec` stage blocked on a full pipe waited forever on a shell
+     * that was waiting on it. Overflow is refused with -EPIPE and counted. */
+    bool capture;
+    size_t dropped;                   /* bytes a capture pipe refused */
 } pipe_buffer_t;
 
 /**

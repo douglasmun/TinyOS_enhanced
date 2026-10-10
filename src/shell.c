@@ -425,6 +425,10 @@ static void run_pipeline(const char* cmd_line) {
          *     which writes to wherever the shell's stdout already points. --- */
         if (!is_last) {
             pipe_init(&out_pipe);
+            /* Never blocks: the shell drains it only after the stage returns,
+             * and a ring-3 `exec` stage that filled it waited forever on a
+             * shell that was waiting on it (see pipe_buffer_t.capture). */
+            out_pipe.capture = true;
             out_pipe_live = true;
             streams->stdout_stream.type = STREAM_TYPE_PIPE;
             streams->stdout_stream.data = &out_pipe;
@@ -483,20 +487,23 @@ static void run_pipeline(const char* cmd_line) {
             /* Closing the read end turns any further writes into -EPIPE, so a
              * stage that overran cannot block on a pipe nobody will drain. */
             pipe_close_read(&out_pipe);
+            size_t dropped = sink.dropped + out_pipe.dropped;
+            pipe_detach_streams(&out_pipe);
             pipe_destroy(&out_pipe);
             out_pipe_live = false;
 
-            if (sink.dropped > 0) {
+            if (dropped > 0) {
                 kprintf("shell: stage %d output truncated at %u bytes "
                         "(%u dropped)\n",
                         stage + 1, (unsigned)PIPE_BUFFER_SIZE,
-                        (unsigned)sink.dropped);
+                        (unsigned)dropped);
             }
         }
 
         /* Release this stage's stdin pipe now that the stage has finished. */
         if (stage > 0) {
             stdin_reset(streams);
+            pipe_detach_streams(&stage_pipe);
             pipe_destroy(&stage_pipe);
             stage_pipe_live = false;
         }
@@ -512,10 +519,12 @@ cleanup:
     if (out_pipe_live) {
         stdout_reset(streams);
         pipe_close_read(&out_pipe);
+        pipe_detach_streams(&out_pipe);
         pipe_destroy(&out_pipe);
     }
     if (stage_pipe_live) {
         stdin_reset(streams);
+        pipe_detach_streams(&stage_pipe);
         pipe_destroy(&stage_pipe);
     }
 }

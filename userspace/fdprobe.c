@@ -270,6 +270,43 @@ int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "noop")) {
         return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "count")) {
+        /* verify-pipe-fixes.sh: how many RAMFS slots the uid can still open. */
+        int fds[CAP_TRIES], refused;
+        int n = open_until_refused(fds, &refused);
+        for (int i = 0; i < n; i++) close(fds[i]);
+        printf("PROBE count opened=%d refused=%d\n", n, refused);
+        /* Nonzero so the shell prints "exited with status": the harness
+         * waits on that, not on our own line, before typing again. */
+        return 3;
+    }
+    if (argc > 1 && !strcmp(argv[1], "pipebind")) {
+        /* verify-pipe-fixes.sh: run as `fdprobe.elf pipebind < f > g`, so both
+         * streams own a RAMFS ref, then rebind both to a pipe and back -- the
+         * sequence a shell runs for every pipeline. The ref each rebind
+         * overwrote must not outlive this process. */
+        int id = pipe_op(PIPE_CREATE, 0);
+        int b = id > 0 ? pipe_op(PIPE_BIND_STDIN, id) : id;
+        if (id > 0) {
+            pipe_op(PIPE_RESTORE, id);
+            pipe_op(PIPE_CLOSE_WRITE, id);
+            pipe_op(PIPE_DESTROY, id);
+        }
+        printf("PROBE pipebind id=%d bind=%d\n", id > 0 ? 1 : id, b);
+        return 3;
+    }
+    if (argc > 1 && !strcmp(argv[1], "orphan")) {
+        /* verify-pipe-fixes.sh: run as a kernel-shell pipeline stage
+         * (`exec /fdprobe.elf orphan | cat`). The sleeper inherits this
+         * stage's stdout -- the shell's static capture pipe -- and outlives
+         * the pipeline, so its second line is written after that pipe is
+         * destroyed. The pause lets its first line land inside the pipe. */
+        char* sargv[] = { "sleeper.elf", 0 };
+        int pid = spawn("/sleeper.elf", sargv);
+        sleep_ms(1500);
+        printf("PROBE orphan spawn=%d\n", pid > 0 ? 1 : pid);
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "cap-hold")) {
         int fds[CAP_CHILD];
         printf("PROBE cap child-held=%d\n", hold_files(fds, CAP_CHILD, 'c'));

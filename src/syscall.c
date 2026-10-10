@@ -2583,8 +2583,19 @@ static pipe_slot_t* pipe_slot_for(int id, task_t* self, int* err) {
 
 /* Point one stream at a pipe. Not borrowed: the shell owns this pipe, and a
  * child that inherits the stream gets borrowed=true from streams_inherit, so
- * only the shell's own reset can unbind it. */
+ * only the shell's own reset can unbind it.
+ *
+ * A redirected RAMFS file the stream owns is closed first, exactly as
+ * stdout_redirect_to_file() does when it rebinds. Overwriting it leaked the
+ * slot for good: once the type is PIPE, neither the reset nor exit-time
+ * cleanup knows a file was there. A shell started as `/shell.elf < script`
+ * (or `> out`) leaked one per pipeline, and 8 leaks used up the uid's RAMFS
+ * quota -- after which every open, and so every exec, failed until reboot. */
 static void pipe_bind_stream(stream_t* s, pipe_buffer_t* buf) {
+    if (!s->borrowed && s->type == STREAM_TYPE_FILE &&
+        s->fd >= 0 && s->fd < RAMFS_MAX_FDS) {
+        ramfs_close(s->fd);
+    }
     s->type      = STREAM_TYPE_PIPE;
     s->data      = buf;
     s->fd        = -1;
@@ -2615,6 +2626,30 @@ static bool pipe_buf_referenced(const pipe_buffer_t* buf) {
     }
     CRITICAL_SECTION_EXIT();
     return found;
+}
+
+void pipe_detach_streams(const void* buf) {
+    CRITICAL_SECTION_ENTER();
+    for (int i = 0; i < MAX_TASKS; i++) {
+        task_t* t = task_get_slot(i);
+        if (!t) {
+            continue;
+        }
+        stream_t* s[3] = { &t->streams.stdin_stream,
+                           &t->streams.stdout_stream,
+                           &t->streams.stderr_stream };
+        for (int k = 0; k < 3; k++) {
+            if (s[k]->type == STREAM_TYPE_PIPE && s[k]->data == buf) {
+                /* A pipe stream holds no fd, so there is nothing to close. */
+                s[k]->type     = STREAM_TYPE_CONSOLE;
+                s[k]->data     = NULL;
+                s[k]->fd       = -1;
+                s[k]->is_open  = true;
+                s[k]->borrowed = false;
+            }
+        }
+    }
+    CRITICAL_SECTION_EXIT();
 }
 
 /* Free an orphaned slot's buffer once nothing can reach it. */

@@ -293,6 +293,8 @@ void pipe_init(pipe_buffer_t* pipe) {
     pipe->data_size = 0;
     pipe->write_closed = false;
     pipe->read_closed = false;
+    pipe->capture = false;
+    pipe->dropped = 0;
 
     /* Clear buffer */
     for (size_t i = 0; i < PIPE_BUFFER_SIZE; i++) {
@@ -307,7 +309,7 @@ void pipe_init(pipe_buffer_t* pipe) {
      *=======================================================================*/
     uint32_t wq_page = pmm_alloc();
     if (wq_page == 0) {
-        kprintf("[PIPE] WARNING: Failed to allocate wait queues, blocking disabled\n");
+        kdbg("[PIPE] WARNING: Failed to allocate wait queues, blocking disabled\n");
         pipe->readers = NULL;
         pipe->writers = NULL;
         return;
@@ -370,6 +372,23 @@ int pipe_write(pipe_buffer_t* pipe, const char* data, size_t size) {
         return -EPIPE;  /* errno.h:56 */
     }
 
+    /* Capture mode: never block (see pipe_buffer_t). Take what fits; refuse
+     * the rest. A short count is followed by -EPIPE on the retry, so a writer
+     * that loops on partial writes stops instead of spinning. */
+    if (pipe->capture) {
+        CRITICAL_SECTION_ENTER();
+        size_t available = PIPE_BUFFER_SIZE - pipe->data_size;
+        size_t to_write = (size < available) ? size : available;
+        for (size_t i = 0; i < to_write; i++) {
+            pipe->buffer[pipe->write_pos] = data[i];
+            pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUFFER_SIZE;
+        }
+        pipe->data_size += to_write;
+        pipe->dropped += size - to_write;
+        CRITICAL_SECTION_EXIT();
+        return to_write > 0 ? (int)to_write : -EPIPE;
+    }
+
     /*=========================================================================
      * FALLBACK MODE: No wait queues (compatibility)
      *=======================================================================*/
@@ -396,43 +415,36 @@ int pipe_write(pipe_buffer_t* pipe, const char* data, size_t size) {
      * pattern required by wait_queue_sleep().
      *=======================================================================*/
     size_t total_written = 0;
-    wait_queue_t* writers = (wait_queue_t*)pipe->writers;
-    wait_queue_t* readers = (wait_queue_t*)pipe->readers;
 
     while (total_written < size) {
         CRITICAL_SECTION_ENTER();
 
+        /* The queue pointers are re-read under the lock on every pass, never
+         * cached at entry: pipe_destroy() can run while this task sleeps or
+         * sits preempted between passes, and it frees the page they point
+         * into. A cached pointer then fed wait_queue_wakeup() a freed (and
+         * possibly reused) page. NULL means the pipe is gone. */
+        wait_queue_t* writers = (wait_queue_t*)pipe->writers;
+        wait_queue_t* readers = (wait_queue_t*)pipe->readers;
+        if (!writers || !readers || pipe->read_closed) {
+            CRITICAL_SECTION_EXIT();
+            return total_written > 0 ? (int)total_written : -EPIPE;
+        }
+
         /*=====================================================================
          * ATOMICITY: Block until space available
          *
-         * This while loop implements the correct lock juggling pattern:
-         * 1. Hold lock while checking condition (pipe->data_size)
-         * 2. Call wait_queue_sleep() which releases lock and blocks
-         * 3. Re-acquire lock immediately after wakeup
-         * 4. Re-check condition (handles spurious wakeups)
-         *
-         * VERIFIED CORRECT: This matches the documented pattern in
-         * wait_queue.h lines 84-93 and wait_queue.c lines 71-107.
+         * Lock juggling: check the condition with the lock held, and let
+         * wait_queue_sleep() release it while blocked. On wakeup the lock is
+         * NOT held, so go round the outer loop: it re-acquires, re-reads the
+         * queue pointers and re-checks read_closed. That re-check is what
+         * releases a writer parked on a full pipe when pipe_close_read() wakes
+         * it because the reader went away -- without it the writer slept
+         * again forever. Partial progress is reported as a short count.
          *===================================================================*/
-        while (pipe->data_size >= PIPE_BUFFER_SIZE) {
-            /*=================================================================
-             * BROKEN PIPE (re-check): the entry test above only proves the
-             * read end was open when the write STARTED. A writer parked here
-             * on a full pipe is woken by pipe_close_read() precisely because
-             * the reader went away; without this re-check it would loop
-             * straight back to sleep and block forever on a pipe nobody will
-             * ever drain. Report partial progress if we already wrote some
-             * bytes, so the caller can tell how much made it through.
-             *===============================================================*/
-            if (pipe->read_closed) {
-                CRITICAL_SECTION_EXIT();
-                return total_written > 0 ? (int)total_written : -EPIPE;
-            }
-
-            /* Pipe is full, block until space available */
+        if (pipe->data_size >= PIPE_BUFFER_SIZE) {
             wait_queue_sleep(writers);
-            /* When we wake up, critical section is NOT held, re-acquire */
-            CRITICAL_SECTION_ENTER();
+            continue;
         }
 
         /* Write as much as we can (lock held, condition verified) */
@@ -501,36 +513,31 @@ int pipe_read(pipe_buffer_t* pipe, char* data, size_t size) {
      * This implementation correctly handles the atomic lock release/re-acquire
      * pattern required by wait_queue_sleep().
      *=======================================================================*/
-    wait_queue_t* readers = (wait_queue_t*)pipe->readers;
-    wait_queue_t* writers = (wait_queue_t*)pipe->writers;
-
-    CRITICAL_SECTION_ENTER();
-
     /*=========================================================================
      * ATOMICITY: Block until data available
      *
-     * This while loop implements the correct lock juggling pattern:
-     * 1. Hold lock while checking condition (pipe->data_size)
-     * 2. Call wait_queue_sleep() which releases lock and blocks
-     * 3. Re-acquire lock immediately after wakeup
-     * 4. Re-check condition (handles spurious wakeups)
-     *
-     * VERIFIED CORRECT: This matches the documented pattern in
-     * wait_queue.h lines 97-103 and wait_queue.c lines 71-107.
+     * Same lock juggling as pipe_write, and the same rule: the queue pointers
+     * are re-read under the lock after every sleep, never cached at entry,
+     * because pipe_destroy() may have freed their page meanwhile (NULL = the
+     * pipe is gone, read as EOF).
      *
      * EOF DETECTION (v1.14): Return 0 when pipe is empty and write end closed
      *=======================================================================*/
-    while (pipe->data_size == 0) {
-        /* Check for EOF: pipe empty and write end closed */
-        if (pipe->write_closed) {
+    wait_queue_t* writers;
+    for (;;) {
+        CRITICAL_SECTION_ENTER();
+        wait_queue_t* readers = (wait_queue_t*)pipe->readers;
+        writers = (wait_queue_t*)pipe->writers;
+        if (!readers || !writers ||
+            (pipe->data_size == 0 && pipe->write_closed)) {
             CRITICAL_SECTION_EXIT();
             return 0;  /* EOF */
         }
-
+        if (pipe->data_size > 0) {
+            break;      /* lock held */
+        }
         /* Pipe is empty, block until data available */
         wait_queue_sleep(readers);
-        /* When we wake up, critical section is NOT held, re-acquire */
-        CRITICAL_SECTION_ENTER();
     }
 
     /* Read as much as we can (lock held, condition verified) */
