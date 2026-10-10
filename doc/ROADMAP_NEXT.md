@@ -81,8 +81,29 @@ with a shorter body to prove `O_TRUNC` truncates. Credentials are kernel-only
 and not persisted, so both boots re-run first-boot setup while the FAT32
 volume persists.
 
-Still limited to the **root directory** and to `fat32_create`'s first root
-cluster; subdirectory creation and multi-cluster root scans remain future work.
+### Subdirectories at any depth — DONE (`daface1`)
+The earlier limitation to the **root directory** is closed. A shared
+`resolve_parent_dir()` walks all-but-the-last path component, and
+`create`/`unlink`/`mkdir`/`rmdir` build on it, so creation works at any depth
+(`fat32_mkdir` also stopped hardcoding `..` to the root and now splits the 8.3
+extension). Reads were already nested-capable (`fat32_open` and
+`find_dir_entry` walk the whole cluster chain); `fat32_list_root_cb` became a
+wrapper over `fat32_list_dir_cb(path, …)`, and directory scans follow the chain
+rather than a single cluster.
+
+The one surface that is NOT nested-capable is by design: the **kernel shell's**
+own `cmd_mkdir` still calls `ramfs_mkdir` and its `cmd_ls` drops the path when
+routing `C:` to `fatls`, so FAT32 subdirectories are reached through the
+**ring-3 shell** (`mkdir`/`ls`/`cat` over `SYS_MKDIR`→`vfs_mkdir`→`fat32_mkdir`
+and `open(O_DIRECTORY)`+`readdir`), not the kernel shell.
+
+Test harness: `verify-fat32-subdir.sh` — two boots against the same disk, in
+the ring-3 shell. Boot 1 builds `C:/SUBDIR/NESTED/` and writes a file three
+levels deep; boot 2 (fresh kernel) proves `ls C:/SUBDIR` still lists `NESTED/`,
+`ls C:/SUBDIR/NESTED` still lists the file, and the file reads back its marker —
+the nested dirents and the leaf's dirent survived the remount. It FAILs on the
+pre-`daface1` tree, where `resolve_parent_dir` does not exist and the nested
+`mkdir` cannot resolve its parent.
 
 ## 4. Move the shell to userspace (capstone) — CLOSED
 Deferred design item; depends on 1–3 (shell needs spawn, waitpid, file
