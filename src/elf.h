@@ -154,9 +154,15 @@ bool elf_validate(const void* elf_data);
  * @brief Verify ECDSA P-256 signature on ELF binary
  * @param elf_data Pointer to ELF file data in memory (may include appended signature)
  * @param elf_size Total size of ELF file buffer (including signature if present)
+ * @param signed_size Optional out; on success receives the length actually
+ *        covered by the signature (elf_size minus the 184-byte trailer). The
+ *        loader bounds every parse offset against THIS, not elf_size, so the
+ *        bytes it parses are exactly the bytes that were hashed -- a phdr or a
+ *        segment cannot reference into the attacker-controlled trailer. NULL to
+ *        ignore. Untouched when the function returns false.
  * @return true if valid signature found and verified, false otherwise
  */
-bool elf_verify_signature(const void* elf_data, size_t elf_size);
+bool elf_verify_signature(const void* elf_data, size_t elf_size, size_t* signed_size);
 
 /* Load outcomes since boot (secstatus). `refused` counts every failed load;
  * `refused_signature` is the subset refused for a missing or bad signature. */
@@ -172,34 +178,18 @@ void elf_get_load_stats(uint32_t* verified, uint32_t* unsigned_loaded,
  *---------------------------------------------------------------------------*/
 bool elf_signatures_enforced(void);
 
-/**
- * @brief Load ELF executable and create a process
- * @param elf_data Pointer to ELF file data in memory
- * @param elf_size Actual size of ELF file buffer (SECURITY: prevents out-of-bounds reads)
- * @param name Name for the process
- * @return Process ID (PID) on success, -1 on failure
+/*
+ * The actual loader (elf_load_process_argv) is deliberately NOT exported.
+ *
+ * It fills the static allocated_frames[] tracking array and must only run with
+ * elf_exec_lock() held (see below) — the sole correct way in is through
+ * elf_exec_from_path(), which takes the lock across both the file read and the
+ * load. Exporting the loader left the lock contract as prose that nothing
+ * enforced: a future caller wiring it up directly would silently race the
+ * static array (double-free / leak). Keeping it file-local makes that misuse a
+ * link error instead of a latent corruption. The unused no-argv wrapper that
+ * used to sit here (elf_load_process) was dead and has been removed.
  */
-int elf_load_process(const void* elf_data, size_t elf_size, const char* name);
-
-/**
- * @brief Load an ELF executable and create a process with an argv vector
- *
- * Identical to elf_load_process() except that the new process's main() gets
- * the given arguments. By convention argv[0] is the program name, but this
- * function does not enforce that — it passes through whatever it is handed.
- *
- * argv is copied onto the child's user stack during creation; the caller keeps
- * ownership and neither the array nor the strings need to outlive this call.
- *
- * @param elf_data Pointer to ELF file data in memory
- * @param elf_size Actual size of ELF file buffer
- * @param name     Name for the process
- * @param argc     Number of argv entries (0 to USER_ARGV_MAX)
- * @param argv     Array of argc NUL-terminated strings, or NULL when argc==0
- * @return Process ID (PID) on success, -1 on failure
- */
-int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
-                          int argc, const char* const* argv);
 
 /**
  * @brief Serialize the whole exec path (loader + caller's load buffer)

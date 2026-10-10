@@ -177,6 +177,17 @@ jobs:
       - name: Mutex waiter handoff is generation-validated
         run: bash verify/verify-waiter-generation.sh
 
+      # The three defence-in-depth hardenings on the ELF loader from the 2026-10
+      # audit: the loader is file-local (its lock contract is a link error to
+      # break, not prose), parse offsets are bound to the SIGNED length so what
+      # is parsed equals what was hashed, and the segment-overlap check is
+      # page-granular. Source-level with a negative control per leg -- the
+      # audit found no exploitable bug, so there is no signed ENFORCE-mode guest
+      # input that drives the new rejection paths, and a permissive build would
+      # prove nothing about the shipped default.
+      - name: ELF loader hardening is in place
+        run: bash verify/verify-elf-loader-hardening.sh
+
       - name: EDR splice helper unit tests
         run: bash verify/edr-rejoin-test.sh
 
