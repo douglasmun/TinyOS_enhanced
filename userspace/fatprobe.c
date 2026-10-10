@@ -16,6 +16,9 @@
  *   PROBE big append size=2148 read=2148 bad=-1  2048, then lseek END + 100
  *   PROBE done
  *
+ * Mode "stale" (see stale() below): unlink and O_TRUNC must not strand
+ * another open fd on storage that was released. See verify-fat32-stale-fd.sh.
+ *
  * bad= is the first differing offset, -1 when the content matches. Runs
  * unprivileged: C: has no ownership model, so uid does not change the path.
  *===========================================================================*/
@@ -108,11 +111,104 @@ static void big(void) {
     report("append", "C:/BIGAPP.BIN", APPEND_BASE + APPEND_MORE);
 }
 
+/* Mode "stale": another fd must never act on a file whose storage was
+ * released under it. Both legs run in a fresh directory, so the slot and
+ * cluster that get reused are the ones the leg just freed.
+ *
+ *   PROBE stale unlink busy=<rc> victim_size=12 victim_bad=-1 after=0
+ *     unlink of an open EMPTY file is refused (busy < 0). The victim created
+ *     next lands in the slot a successful unlink would have freed; the open
+ *     fd then writes and closes, and must not rewrite the victim's entry.
+ *     after=0 is the positive control: once closed, the unlink succeeds.
+ *   PROBE stale trunc size=100 bad=-1 other_size=3000 other_bad=-1
+ *     fd1 is open on a 3000-byte file when fd2 truncates it; OTHER is then
+ *     written into the freed clusters. fd1 writes 100 bytes at its cursor:
+ *     the file must hold exactly those, and OTHER must be untouched. */
+#define VICTIM_LEN 12
+
+static int compare_file(const char* path, int expect, int (*want)(int)) {
+    memset(rbuf, 0, sizeof(rbuf));
+    int got = read_all(path);
+    if (got != expect) return got < 0 ? -2 : (got < expect ? got : expect);
+    for (int i = 0; i < expect; i++) {
+        if (rbuf[i] != (unsigned char)want(i)) return i;
+    }
+    return -1;
+}
+
+static int want_victim(int i) { return 'V' + (i % 3); }
+static int want_z(int i) { (void)i; return 'Z'; }
+static int want_pat(int i) { return pat(i); }
+
+static void stale(void) {
+    for (int i = 0; i < (int)sizeof(wbuf); i++) wbuf[i] = pat(i);
+    unsigned char vbuf[VICTIM_LEN];
+    for (int i = 0; i < VICTIM_LEN; i++) vbuf[i] = (unsigned char)want_victim(i);
+    unsigned char zbuf[100];
+    memset(zbuf, 'Z', sizeof(zbuf));
+
+    /* --- leg unlink -------------------------------------------------- */
+    int rc = mkdir("C:/STALEU");
+    if (rc < 0) printf("PROBE mkdir C:/STALEU failed %d\n", rc);
+    int fd = create("C:/STALEU/EMPTY.TXT");
+    if (fd >= 0) close(fd);
+    int held = open("C:/STALEU/EMPTY.TXT", O_WRONLY);
+    int busy = unlink("C:/STALEU/EMPTY.TXT");
+    fd = create("C:/STALEU/VICTIM.TXT");
+    if (fd >= 0) {
+        write(fd, vbuf, VICTIM_LEN);
+        close(fd);
+    }
+    if (held >= 0) {
+        write(held, zbuf, 5);   /* flushes the held fd's dirent */
+        close(held);
+    } else {
+        printf("PROBE open held failed %d\n", held);
+    }
+    int vsize = stat_size("C:/STALEU/VICTIM.TXT");
+    int vbad = compare_file("C:/STALEU/VICTIM.TXT", VICTIM_LEN, want_victim);
+    int after = unlink("C:/STALEU/EMPTY.TXT");
+    if (busy == 0) after = 0;   /* already gone; the control is moot */
+    printf("PROBE stale unlink busy=%d victim_size=%d victim_bad=%d after=%d\n",
+           busy, vsize, vbad, after);
+
+    /* --- leg trunc --------------------------------------------------- */
+    rc = mkdir("C:/STALET");
+    if (rc < 0) printf("PROBE mkdir C:/STALET failed %d\n", rc);
+    fd = create("C:/STALET/TRUNC.BIN");
+    if (fd >= 0) {
+        write(fd, wbuf, BIG);
+        close(fd);
+    }
+    int fd1 = open("C:/STALET/TRUNC.BIN", O_RDWR);
+    int fd2 = open("C:/STALET/TRUNC.BIN", O_WRONLY | O_TRUNC);
+    if (fd2 >= 0) close(fd2);
+    fd = create("C:/STALET/OTHER.BIN");
+    if (fd >= 0) {
+        write(fd, wbuf, BIG);
+        close(fd);
+    }
+    if (fd1 >= 0) {
+        write(fd1, zbuf, sizeof(zbuf));
+        close(fd1);
+    } else {
+        printf("PROBE open fd1 failed %d\n", fd1);
+    }
+    int tsize = stat_size("C:/STALET/TRUNC.BIN");
+    int tbad = compare_file("C:/STALET/TRUNC.BIN", (int)sizeof(zbuf), want_z);
+    int osize = stat_size("C:/STALET/OTHER.BIN");
+    int obad = compare_file("C:/STALET/OTHER.BIN", BIG, want_pat);
+    printf("PROBE stale trunc size=%d bad=%d other_size=%d other_bad=%d\n",
+           tsize, tbad, osize, obad);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "big")) {
         big();
+    } else if (argc > 1 && !strcmp(argv[1], "stale")) {
+        stale();
     } else {
-        print("usage: fatprobe big\n");
+        print("usage: fatprobe big|stale\n");
     }
     print("PROBE done\n");
     return 0;
