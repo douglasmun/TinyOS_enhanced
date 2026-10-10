@@ -420,17 +420,33 @@ static void vfs_free_fd(int fd) {
  * would walk past the prefix test.
  *===========================================================================*/
 bool vfs_path_is_protected(const char* canonical) {
+    /* Each entry protects the node itself AND everything under it. The match is
+     * "exact-equal OR entry followed by '/'", never a bare prefix:
+     *
+     *   - A bare strncmp(canonical, "/etc/", 5) UNDER-matched the directory node
+     *     itself -- the canonical form of the node is "/etc" (no trailing
+     *     slash), which differs from "/etc/" at the NUL, so creating or
+     *     unlinking a root node literally named "/etc" dodged the CAP_SYS_ADMIN
+     *     gate. (Ramfs ownership backstops it, but the gate must still hold.)
+     *   - A bare prefix also OVER-matched: "/kernel" as a prefix flagged
+     *     "/kernelfoo". That fails safe (it denies), but it is still wrong.
+     *
+     * So compare the whole entry, then require the next char to be end-of-string
+     * or '/'. Input is already canonical (absolute, no "." / ".."), so no
+     * traversal can slip a protected path past this. */
     static const char* const protected_paths[] = {
-        "/bin/",
-        "/sbin/",
-        "/etc/",
-        "/boot/",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/boot",
         "/kernel",
         NULL
     };
 
     for (int i = 0; protected_paths[i] != NULL; i++) {
-        if (strncmp(canonical, protected_paths[i], strlen(protected_paths[i])) == 0) {
+        size_t len = strlen(protected_paths[i]);
+        if (strncmp(canonical, protected_paths[i], len) == 0 &&
+            (canonical[len] == '\0' || canonical[len] == '/')) {
             return true;
         }
     }

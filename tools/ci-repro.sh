@@ -27,7 +27,7 @@
 #   source-guards job (the non-QEMU harnesses):
 #     arch-svg, shell-path-overflow, entropy-pool-stir, ring3-help-complete,
 #     waiter-generation, elf-loader-hardening, copyuser-fault-trace,
-#     edr-rejoin, preserve-serial, elf-enforce-report
+#     protected-path-match, edr-rejoin, preserve-serial, elf-enforce-report
 #
 # NOTES
 #
@@ -37,10 +37,11 @@
 #     this equivalent.)
 #   - build-essential and python3 are installed on top of the workflow's
 #     package list because the real ubuntu-latest runner ships them and two
-#     guards rely on them: verify-shell-path-overflow.sh's boundary proof
-#     compiles with a host cc against <stdio.h>, and verify-arch-svg.sh runs
-#     tools/gen_architecture_svg.py. A bare container lacks both, and the
-#     resulting FAILs are environment gaps, not defects.
+#     guards rely on them: verify-shell-path-overflow.sh and
+#     verify-protected-path-match.sh compile a boundary proof with a host cc,
+#     and verify-arch-svg.sh runs tools/gen_architecture_svg.py. A bare
+#     container lacks both, and the resulting FAILs are environment gaps, not
+#     defects.
 #
 # USAGE
 #   tools/ci-repro.sh            # both jobs
@@ -130,6 +131,7 @@ run_guards() {
         verify/verify-waiter-generation.sh \
         verify/verify-elf-loader-hardening.sh \
         verify/verify-copyuser-fault-trace.sh \
+        verify/verify-protected-path-match.sh \
         verify/edr-rejoin-test.sh \
         verify/preserve-serial-test.sh
     do
