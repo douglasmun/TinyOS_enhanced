@@ -507,10 +507,17 @@ bool edr_behavioral_check(task_t* task, uint32_t syscall_num, uint32_t arg0) {
             /* Update last decay timestamp */
             task->edr_state.last_decay_tick = current_tick;
 
-            /* SECURITY: Log significant decay events for forensic analysis */
+            /* Forensic trace of a large decay gap. This is a per-event trace,
+             * not a verdict, and edr_behavioral_check() runs on EVERY syscall
+             * (syscall.c dispatcher) -- a plain kprintf here is a per-operation
+             * print on a ring-3-reachable path, which CLAUDE.md forbids because
+             * the kernel console and the ring-3 shell share one serial stream.
+             * kdbg() keeps it recoverable (`loglevel debug`) without flooding
+             * that stream. A real detection event still prints: edr_raise_alert()
+             * is the rate-limited verdict line and stays on kprintf. */
             if (decay_periods > 10) {  /* More than 1000 ticks elapsed */
-                kprintf("[EDR BEHAVIORAL] PID %u: Large decay gap (%u periods, %u ticks)\n",
-                        task->pid, decay_periods, ticks_since_decay);
+                kdbg("[EDR BEHAVIORAL] PID %u: Large decay gap (%u periods, %u ticks)\n",
+                     task->pid, decay_periods, ticks_since_decay);
             }
         }
     }
