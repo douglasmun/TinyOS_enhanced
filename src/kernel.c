@@ -43,6 +43,7 @@
 #include "pipeprobe_elf_data.h"
 #include "fdprobe_elf_data.h"
 #include "tcpcap_elf_data.h"
+#include "fatprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -1072,6 +1073,17 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(tcpcap_fd, tcpcap_elf_data, tcpcap_elf_data_len);
             ramfs_close(tcpcap_fd);
             ramfs_chmod("/tcpcap.elf", 0755);
+        }
+    }
+
+    /* fatprobe.elf writes multi-cluster files on C: and reads them back,
+     * unprivileged. See verify-fat32-content.sh. */
+    {
+        int fatprobe_fd = ramfs_open("/fatprobe.elf", RAMFS_FLAG_WRITE);
+        if (fatprobe_fd >= 0) {
+            ramfs_write(fatprobe_fd, fatprobe_elf_data, fatprobe_elf_data_len);
+            ramfs_close(fatprobe_fd);
+            ramfs_chmod("/fatprobe.elf", 0755);
         }
     }
 

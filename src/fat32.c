@@ -13,6 +13,8 @@
 #include "util.h"
 #include "pmm.h"
 #include "mutex.h"
+#include "process.h"     /* task_t, for the per-uid open cap */
+#include "scheduler.h"   /* scheduler_get_current_task() */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -210,7 +212,7 @@ static uint32_t find_free_cluster(void) {
 static uint32_t allocate_cluster(uint32_t previous_cluster) {
     uint32_t new_cluster = find_free_cluster();
     if (new_cluster == 0) {
-        kprintf("[FAT32] ERROR: Disk full\n");
+        kdbg("[FAT32] Disk full\n");  /* per write once full; the writer sees the failure */
         return 0;
     }
 
@@ -318,6 +320,56 @@ static int flush_dirent(fat32_file_t* file) {
 }
 
 /*-----------------------------------------------------------------------------
+ * Open files are identified by their directory entry, not their first cluster.
+ *
+ * Each descriptor carries its own copy of first_cluster and file_size. The
+ * unlink busy check used to compare first_cluster, which is 0 for an empty
+ * file, so an open empty file could be unlinked: its fd's later flush_dirent
+ * rewrote whichever new file had reused the 0xE5 slot. And O_TRUNC through
+ * one fd freed the chain while every other fd on the file kept its cached
+ * clusters, reading and writing storage the allocator had handed elsewhere.
+ * The dirent location is the one identity that neither of those changes.
+ *---------------------------------------------------------------------------*/
+static bool dirent_is_open(uint32_t dirent_cluster, uint32_t dirent_index) {
+    for (int f = 0; f < FAT32_MAX_OPEN_FILES; f++) {
+        if (open_files[f].in_use && open_files[f].dirent_cluster != 0 &&
+            open_files[f].dirent_cluster == dirent_cluster &&
+            open_files[f].dirent_index == dirent_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Copy `file`'s chain head and size to every other fd on the same dirent.
+ * After a truncate their cursors point into the freed chain, so they restart
+ * at 0 (the only valid offset in an empty file, as fat32_seek also enforces).
+ * After a write the chain only grew, so an existing cursor stays valid; an fd
+ * opened while the file was still empty picks up the new first cluster. */
+static void sync_open_siblings(const fat32_file_t* file, bool truncated) {
+    if (file->dirent_cluster == 0) {
+        return;
+    }
+    for (int f = 0; f < FAT32_MAX_OPEN_FILES; f++) {
+        fat32_file_t* other = &open_files[f];
+        if (other == file || !other->in_use ||
+            other->dirent_cluster != file->dirent_cluster ||
+            other->dirent_index != file->dirent_index) {
+            continue;
+        }
+        other->first_cluster = file->first_cluster;
+        other->file_size = file->file_size;
+        other->dirty = file->dirty;
+        if (truncated) {
+            other->current_cluster = 0;
+            other->position = 0;
+        } else if (other->current_cluster == 0) {
+            other->current_cluster = file->first_cluster;
+        }
+    }
+}
+
+/*-----------------------------------------------------------------------------
  * FUNCTION: parse_path
  * PURPOSE: Parse path into directory components
  *---------------------------------------------------------------------------*/
@@ -331,6 +383,9 @@ static bool component_is_83(const char* name, int len) {
     }
     int dot = -1;
     for (int i = 0; i < len; i++) {
+        /* '\\' is not a separator here (see parse_path) and not a legal
+         * FAT name character, so a component carrying one names nothing. */
+        if (name[i] == '\\') return false;
         if (name[i] == '.') {
             if (dot >= 0) return false;
             dot = i;
@@ -353,17 +408,22 @@ static bool component_is_83(const char* name, int len) {
  * after max_components, and filename_to_83() clipped long names, so
  * "/LONGDIRNAME1/X.TXT" resolved to "/X.TXT" and "/REPORTFINAL.TXT" to
  * "/REPORTFI.TXT" -- an unlink or a write landed on a file the caller never
- * named. Found reviewing the fat32 fuzz target's path inputs. */
+ * named. Found reviewing the fat32 fuzz target's path inputs.
+ *
+ * Only '/' separates. '\\' used to as well, but vfs_open canonicalizes and
+ * screens the path on '/' alone, so "/X\..\ETC\F" was one harmless-looking
+ * component to the protected-path gate and /ETC/F to this parser. The driver
+ * must not resolve a name differently from the path the VFS checked. */
 static int parse_path(const char* path, char components[][FAT32_COMPONENT_LEN], int max_components) {
     int count = 0;
     const char* start = path;
 
     // Skip leading slashes
-    while (*start == '/' || *start == '\\') start++;
+    while (*start == '/') start++;
 
     while (*start) {
         const char* end = start;
-        while (*end && *end != '/' && *end != '\\') end++;
+        while (*end && *end != '/') end++;
 
         int len = end - start;
         if (count >= max_components || !component_is_83(start, len)) {
@@ -374,7 +434,7 @@ static int parse_path(const char* path, char components[][FAT32_COMPONENT_LEN], 
         count++;
 
         start = end;
-        while (*start == '/' || *start == '\\') start++;
+        while (*start == '/') start++;
     }
 
     return count;
@@ -876,19 +936,35 @@ int fat32_open(const char* path) {
 
     mutex_lock(&fat32_mutex);
 
-    // Find free file descriptor
-    int fd = -1;
+    /* Find a free slot, counting what the caller's uid already holds. The
+     * count comes from the slots' owner fields, so it cannot drift. Before
+     * the scheduler runs (no current task) only the table size applies. */
+    task_t* self = scheduler_get_current_task();
+    int fd = -1, avail = 0, uid_held = 0;
     for (int i = 0; i < FAT32_MAX_OPEN_FILES; i++) {
         if (!open_files[i].in_use) {
-            fd = i;
-            break;
+            avail++;
+            if (fd < 0) {
+                fd = i;
+            }
+        } else if (self && open_files[i].owner_uid == self->uid) {
+            uid_held++;
         }
     }
 
+    /* Ring 3 reaches this, and the caller gets the refusal as an errno: a
+     * console line per refused open is the per-op print CLAUDE.md forbids. */
     if (fd == -1) {
-        kprintf("[FAT32] ERROR: Too many open files\n");
+        kdbg("[FAT32] open refused: all %d slots in use\n", FAT32_MAX_OPEN_FILES);
         mutex_unlock(&fat32_mutex);
         return -1;
+    }
+    if (self && self->euid != 0 &&
+        (uid_held >= FAT32_USER_MAX_FDS || avail <= FAT32_ROOT_RESERVED_FDS)) {
+        kdbg("[FAT32] open refused: uid %u holds %d, %d slots free\n",
+             (unsigned)self->uid, uid_held, avail);
+        mutex_unlock(&fat32_mutex);
+        return FAT32_OPEN_LIMIT;
     }
 
     // Parse path
@@ -910,6 +986,7 @@ int fat32_open(const char* path) {
         open_files[fd].dirent_cluster = 0;   /* root dir has no dirent of its own */
         open_files[fd].dirent_index = 0;
         open_files[fd].dirty = false;
+        open_files[fd].owner_uid = self ? self->uid : 0;
         mutex_unlock(&fat32_mutex);
         return fd;
     }
@@ -940,7 +1017,7 @@ int fat32_open(const char* path) {
         if (i < depth - 1) {
             // Must be directory for intermediate components
             if (!(entry.attributes & FAT32_ATTR_DIRECTORY)) {
-                kprintf("[FAT32] ERROR: Not a directory: %s\n", components[i]);
+                kdbg("[FAT32] Not a directory: %s\n", components[i]);
                 mutex_unlock(&fat32_mutex);
                 return -1;
             }
@@ -958,6 +1035,7 @@ int fat32_open(const char* path) {
     open_files[fd].dirent_cluster = dirent_cluster;
     open_files[fd].dirent_index = dirent_index;
     open_files[fd].dirty = false;
+    open_files[fd].owner_uid = self ? self->uid : 0;
 
     mutex_unlock(&fat32_mutex);
     return fd;
@@ -999,7 +1077,7 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
     fat32_file_t* file = &open_files[fd];
 
     if (file->is_directory) {
-        kprintf("[FAT32] ERROR: Cannot read from directory\n");
+        kdbg("[FAT32] Cannot read from directory\n");
         mutex_unlock(&fat32_mutex);
         return -1;
     }
@@ -1030,11 +1108,32 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
             return bytes_read > 0 ? (int)bytes_read : -1;  // Return partial read or error
         }
 
-        // Read cluster
-        if (read_cluster(file->current_cluster, cluster_buffer) != 0) {
+        /*=====================================================================
+         * Cursor convention (shared with fat32_write and fat32_seek): when
+         * `position` sits exactly on a cluster boundary, current_cluster is
+         * still the cluster holding byte position-1. Step onto the successor
+         * only here, once a byte from it is actually wanted.
+         *
+         * The old loop stepped at the BOTTOM, and only if this call still had
+         * bytes to read. A call that ended exactly on a boundary left the
+         * cursor behind, and the next call re-read the same cluster at offset
+         * 0. sys_read reads in 1024-byte chunks and the shipped volume has
+         * 1024-byte clusters, so every file over 1 KB read back as its first
+         * cluster repeated.
+         *===================================================================*/
+        uint32_t cluster = file->current_cluster;
+        if (file->position > 0 && (file->position % bytes_per_cluster) == 0) {
+            cluster = read_fat_entry(cluster);
+            if (cluster < 2 || cluster >= FAT32_BAD_CLUSTER) {
+                break;  /* chain ends before file_size: reported below */
+            }
+        }
+
+        if (read_cluster(cluster, cluster_buffer) != 0) {
             mutex_unlock(&fat32_mutex);
             return -1;
         }
+        file->current_cluster = cluster;
 
         uint32_t cluster_offset = file->position % bytes_per_cluster;
         uint32_t bytes_to_copy = bytes_per_cluster - cluster_offset;
@@ -1045,11 +1144,6 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
         memcpy(buf + bytes_read, cluster_buffer + cluster_offset, bytes_to_copy);
         bytes_read += bytes_to_copy;
         file->position += bytes_to_copy;
-
-        // Move to next cluster if needed
-        if (file->position % bytes_per_cluster == 0 && bytes_read < size) {
-            file->current_cluster = read_fat_entry(file->current_cluster);
-        }
     }
 
     mutex_unlock(&fat32_mutex);
@@ -1079,7 +1173,7 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
     fat32_file_t* file = &open_files[fd];
 
     if (file->is_directory) {
-        kprintf("[FAT32] ERROR: Cannot write to directory\n");
+        kdbg("[FAT32] Cannot write to directory\n");
         return -1;
     }
 
@@ -1126,8 +1220,42 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
             break;
         }
 
-        // Read current cluster (preserves bytes we're not overwriting)
-        if (read_cluster(file->current_cluster, cluster_buffer) != 0) {
+        /*=====================================================================
+         * Same cursor convention as fat32_read: at a cluster boundary the
+         * cursor is still on the cluster holding byte position-1, so step
+         * onto the successor here -- following the chain if it continues,
+         * extending it if not. The old loop stepped at the bottom and only
+         * when this call had more to write, so a write ending exactly on a
+         * boundary left the cursor behind and the NEXT write overwrote that
+         * same cluster from offset 0. sys_write feeds the VFS in 512-byte
+         * chunks; on the shipped 1024-byte-cluster volume, every write past
+         * 1 KB clobbered the file's first cluster and never grew the chain.
+         *
+         * The cursor only moves once the cluster has been written, so a
+         * failed write leaves it where the next call expects it.
+         *===================================================================*/
+        uint32_t cluster = file->current_cluster;
+        if (file->position > 0 && (file->position % bytes_per_cluster) == 0) {
+            uint32_t next = read_fat_entry(cluster);
+
+            if (next == FAT32_BAD_CLUSTER) {
+                break;  /* FAT read failure */
+            }
+
+            if (next >= FAT32_EOC) {
+                next = allocate_cluster(cluster);
+                if (next == 0) {
+                    break;  /* disk full — return the partial write below */
+                }
+            } else if (next < 2) {
+                break;  /* corrupt chain */
+            }
+
+            cluster = next;
+        }
+
+        // Read the cluster (preserves bytes we're not overwriting)
+        if (read_cluster(cluster, cluster_buffer) != 0) {
             break;
         }
 
@@ -1140,9 +1268,10 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
 
         memcpy(cluster_buffer + cluster_offset, buf + bytes_written, bytes_to_write);
 
-        if (write_cluster(file->current_cluster, cluster_buffer) != 0) {
+        if (write_cluster(cluster, cluster_buffer) != 0) {
             break;
         }
+        file->current_cluster = cluster;
 
         bytes_written += bytes_to_write;
         file->position += bytes_to_write;
@@ -1152,30 +1281,6 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
             file->file_size = file->position;
             file->dirty = true;
         }
-
-        /*=====================================================================
-         * Advance to the next cluster only when this one is exactly full AND
-         * there is more to write. Follow the existing chain if it continues;
-         * otherwise extend it. The old code `continue`d here and relied on the
-         * top-of-loop test to allocate, which re-read the boundary condition
-         * and could allocate twice or spin.
-         *===================================================================*/
-        if (bytes_written < size && (file->position % bytes_per_cluster) == 0) {
-            uint32_t next = read_fat_entry(file->current_cluster);
-
-            if (next == FAT32_BAD_CLUSTER) {
-                break;  /* FAT read failure */
-            }
-
-            if (next >= FAT32_EOC) {
-                next = allocate_cluster(file->current_cluster);
-                if (next == 0) {
-                    break;  /* disk full — return the partial write below */
-                }
-            }
-
-            file->current_cluster = next;
-        }
     }
 
     /* Make the write durable: the data and FAT chain are on disk, but the
@@ -1183,6 +1288,7 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
     if (flush_dirent(file) != 0 && bytes_written > 0) {
         kprintf("[FAT32] WARNING: data written but directory entry not updated\n");
     }
+    sync_open_siblings(file, false);
 
     mutex_unlock(&fat32_mutex);
 
@@ -1238,6 +1344,7 @@ int fat32_truncate(int fd) {
     file->dirty = true;
 
     int rc = flush_dirent(file);
+    sync_open_siblings(file, true);
 
     mutex_unlock(&fat32_mutex);
     return rc;
@@ -1482,16 +1589,14 @@ int fat32_unlink(const char* path) {
      * someone else, so a later read or write through that fd would touch
      * another file's data. Without a real unlink-on-last-close this is the
      * only safe answer.
+     *
+     * Matched on the dirent, not the first cluster: an empty file has
+     * cluster 0, and its fd would flush its size into whatever file reused
+     * the freed slot (see dirent_is_open).
      *=======================================================================*/
-    uint32_t ent_cluster = ((uint32_t)found.first_cluster_high << 16) |
-                           found.first_cluster_low;
-    for (int f = 0; f < FAT32_MAX_OPEN_FILES; f++) {
-        if (open_files[f].in_use &&
-            open_files[f].first_cluster == ent_cluster &&
-            ent_cluster != 0) {
-            mutex_unlock(&fat32_mutex);
-            return -3;  // Busy: file is open
-        }
+    if (dirent_is_open(dirent_cluster, dirent_index)) {
+        mutex_unlock(&fat32_mutex);
+        return -3;  // Busy: file is open
     }
 
     /* Clear the directory entry BEFORE freeing the chain. If the entry
@@ -1513,7 +1618,8 @@ int fat32_unlink(const char* path) {
     }
 
     /* Now free the file's clusters, bounded against a cyclic FAT. */
-    uint32_t cluster = ent_cluster;
+    uint32_t cluster = ((uint32_t)found.first_cluster_high << 16) |
+                       found.first_cluster_low;
     uint32_t iteration_count = 0;
     while (cluster > 0 && cluster < FAT32_EOC) {
         if (++iteration_count > chain_limit) {

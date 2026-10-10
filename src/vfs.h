@@ -133,6 +133,20 @@ typedef int32_t ssize_t;                /* Signed size type for I/O operations *
 #define VFS_O_APPEND        0x0400  /* Append mode */
 #define VFS_O_DIRECTORY     0x0800  /* Open a directory for readdir, not a file */
 
+#define VFS_O_ACCMODE       0x0003  /* Mask for the access mode bits */
+
+/* Access mode 3 (both bits) is neither readable nor writable: sys_open
+ * refuses it, and these make an in-kernel caller that passes it fail safe. */
+static inline bool vfs_flags_readable(int flags) {
+    int mode = flags & VFS_O_ACCMODE;
+    return mode == VFS_O_RDONLY || mode == VFS_O_RDWR;
+}
+
+static inline bool vfs_flags_writable(int flags) {
+    int mode = flags & VFS_O_ACCMODE;
+    return mode == VFS_O_WRONLY || mode == VFS_O_RDWR;
+}
+
 /*=============================================================================
  * SEEK ORIGINS (vfs_lseek `whence`)
  *
