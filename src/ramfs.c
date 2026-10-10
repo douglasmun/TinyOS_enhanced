@@ -1011,24 +1011,18 @@ int ramfs_write(int fd, const void* buf, size_t count) {
      * This defense ensures we detect overflow conditions before they can
      * be exploited to corrupt kernel memory.
      *=========================================================================*/
-    if (pos > RAMFS_MAX_DATA) {
-        // Already at or beyond max file size
-        return 0;  // No bytes written
+    if (pos >= RAMFS_MAX_DATA) {
+        /* Nothing can land. For a nonzero count that is an error, not a 0:
+         * write() returning 0 tells a caller looping on the return value to
+         * try again, and it spun for good. */
+        return count > 0 ? RAMFS_WRITE_EFBIG : 0;
     }
 
-    /*=========================================================================
-     * SECURITY FIX (v1.18): Log short writes
-     *
-     * When write is truncated, caller may not check return value and assume
-     * all data was written. Log this condition to aid debugging and detect
-     * potential data loss issues.
-     *=======================================================================*/
-    size_t original_count = count;
+    /* Short write at the cap: the return value says how much landed. Not
+     * logged -- any ring-3 write that crosses the cap reached this, and a
+     * kprintf per write is console output ring 3 can drive at will. */
     if (count > (RAMFS_MAX_DATA - pos)) {
-        // Truncate write to fit within max file size
         count = RAMFS_MAX_DATA - pos;
-        kprintf("[RAMFS] WARNING: Short write on fd=%d: requested=%u, actual=%u (truncated at max file size)\n",
-                fd, (unsigned int)original_count, (unsigned int)count);
     }
 
     uint32_t needed_size;
@@ -1462,58 +1456,51 @@ int ramfs_rmdir(const char* path) {
 }
 
 /**
- * List directory contents (with Unix-like permissions)
+ * The listing primitive behind the kernel shell's `ls` and `find`.
+ *
+ * Both walked node->children themselves, past every permission the ring-3
+ * path enforces: any user could list root's 0711 `/`, or a 0700 directory,
+ * and read the mode, owner and size of a file stat refuses them. The check
+ * now lives here, where the commands cannot skip it (the same reason
+ * ramfs_check_permission() sits in the ramfs primitives):
+ *
+ *   - a directory is listed only if the caller may READ it -- what
+ *     ramfs_vfs_open() requires of a ring-3 O_DIRECTORY open;
+ *   - a file's metadata needs READ on the file -- what ramfs_vfs_stat()
+ *     requires (verify-stat-unreadable.sh).
+ *
+ * A readable directory hides none of its children (hidden_from_caller() is
+ * false for every child of a directory the caller can read), and the lookup
+ * already treats a hidden name as absent, so nothing else needs filtering.
+ *
+ * Returns the number of entries copied into `entries` (0 for a file), with
+ * the named node in *node_out; RAMFS_LIST_ENOENT or RAMFS_LIST_EACCES.
  */
-void ramfs_list(const char* path) {
-    ramfs_node_t* node = ramfs_find(path);
+int ramfs_list(const char* path, ramfs_node_t** node_out,
+               ramfs_node_t** entries, int max) {
+    uint16_t uid, gid;
+    ramfs_get_current_credentials(&uid, &gid);
 
+    mutex_lock(&ramfs_mutex);
+    ramfs_node_t* node = ramfs_find_locked(path);
     if (!node) {
-        kprintf("Not found: %s\n", path);
-        return;
+        mutex_unlock(&ramfs_mutex);
+        return RAMFS_LIST_ENOENT;
+    }
+    if (!ramfs_check_permission(node, uid, gid, RAMFS_FLAG_READ)) {
+        mutex_unlock(&ramfs_mutex);
+        return RAMFS_LIST_EACCES;
     }
 
-    // If it's a file, just display that file's information
-    if (node->type == RAMFS_TYPE_FILE) {
-        char perm_str[10];
-        ramfs_format_permissions(node->mode, perm_str);
-        kprintf("  -%s %u:%u %8u %s\n",
-                perm_str, node->uid, node->gid, node->size, node->name);
-        return;
-    }
-
-    // It's a directory, list its contents
-    kprintf("Contents of %s:\n", path);
-
-    ramfs_node_t* child = node->children;
-    if (!child) {
-        kprintf("  (empty)\n");
-        return;
-    }
-
-    while (child) {
-        char perm_str[10];
-        ramfs_format_permissions(child->mode, perm_str);
-
-        if (child->type == RAMFS_TYPE_DIR) {
-            kprintf("  d%s %u:%u %8s %s/\n",
-                    perm_str, child->uid, child->gid, "-", child->name);
-        } else {
-            kprintf("  -%s %u:%u %8u %s\n",
-                    perm_str, child->uid, child->gid, child->size, child->name);
+    int n = 0;
+    if (node->type == RAMFS_TYPE_DIR) {
+        for (ramfs_node_t* c = node->children; c && n < max; c = c->next) {
+            entries[n++] = c;
         }
-        child = child->next;
     }
-}
-
-/**
- * Get directory contents (for iteration)
- */
-ramfs_node_t* ramfs_readdir(const char* path) {
-    ramfs_node_t* dir = ramfs_find(path);
-    if (!dir || dir->type != RAMFS_TYPE_DIR) {
-        return NULL;
-    }
-    return dir->children;
+    *node_out = node;
+    mutex_unlock(&ramfs_mutex);
+    return n;
 }
 
 /**

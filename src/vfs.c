@@ -280,8 +280,10 @@ void vfs_foreach_mount(void (*callback)(char drive_letter, const char* driver_na
  * If a critical process needs an FD and primary pool is exhausted, it
  * falls back to the reserved pool (last VFS_RESERVED_FDS entries).
  *
- * If reserved pool is also exhausted for a critical process, we trigger
- * a kernel panic as this indicates catastrophic system failure.
+ * If the reserved pool is exhausted too, the open fails with VFS_ENFILE.
+ * It used to panic: root's ring-3 processes can hold every slot (directory
+ * opens count against no per-uid cap, and a process may hold 16), so a few
+ * of them opening D:/ until refused took the whole system down.
  *---------------------------------------------------------------------------*/
 static int vfs_alloc_fd(void) {
     CRITICAL_SECTION_ENTER();
@@ -308,9 +310,7 @@ static int vfs_alloc_fd(void) {
     /* Primary pool exhausted - non-privileged processes fail here */
     if (!is_privileged) {
         CRITICAL_SECTION_EXIT();
-        // kprintf("[VFS] FD exhaustion for non-privileged process (PID=%u)\n",
-        //         current ? current->pid : 0);
-        return VFS_ENOMEM;
+        return VFS_ENFILE;
     }
 
     /* Reserved pool: only for privileged processes */
@@ -318,18 +318,12 @@ static int vfs_alloc_fd(void) {
         if (!vfs_fd_table[i].in_use) {
             vfs_fd_table[i].in_use = true;
             CRITICAL_SECTION_EXIT();
-            kprintf("[VFS] WARNING: Using reserved FD %d for critical process (PID=%u)\n",
-                    i, current ? current->pid : 0);
-            return i;
+            return i;   /* Not logged: root's opens reach it at will */
         }
     }
 
-    /* CATASTROPHIC: Even reserved pool exhausted for critical process */
     CRITICAL_SECTION_EXIT();
-    // kprintf("[VFS] CRITICAL: Reserved FD pool exhausted for PID=%u\n",
-    //         current ? current->pid : 0);
-    panic("VFS: Critical resource exhaustion - system cannot continue");
-    return VFS_ENOMEM;  /* Unreachable, but satisfies compiler */
+    return VFS_ENFILE;
 }
 
 /*=============================================================================
@@ -650,7 +644,7 @@ int vfs_open(const char* path, int flags) {
     /* Allocate FD */
     int fd = vfs_alloc_fd();
     if (fd < 0) {
-        return fd;  /* VFS_ENOMEM */
+        return fd;  /* VFS_ENFILE */
     }
 
     /*=========================================================================

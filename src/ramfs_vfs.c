@@ -332,6 +332,9 @@ static ssize_t ramfs_vfs_write(void* private_data, const void* buf, size_t size)
 
     int bytes_written = ramfs_write(handle->ramfs_fd, buf, size);
 
+    if (bytes_written == RAMFS_WRITE_EFBIG) {
+        return VFS_EFBIG;   /* At the per-file cap: nothing more will fit */
+    }
     if (bytes_written < 0) {
         return VFS_EINVAL;  /* Write error */
     }

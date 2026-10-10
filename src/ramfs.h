@@ -359,14 +359,20 @@ int ramfs_rename(const char* old_path, const char* new_path);
 /* Directory operations */
 int ramfs_mkdir(const char* path);
 int ramfs_rmdir(const char* path);
-ramfs_node_t* ramfs_readdir(const char* path);
 
 /* Debug function: Check RAMFS root integrity */
 void ramfs_debug_root(void);
 
 /* Utility functions */
 ramfs_node_t* ramfs_find(const char* path);
-void ramfs_list(const char* path);
+
+/* ramfs_list() refusals: no such (visible) node, and no READ on the directory
+ * listed or the file described. Its success value is an entry count, so both
+ * are simply negative. */
+#define RAMFS_LIST_ENOENT (-1)
+#define RAMFS_LIST_EACCES (-2)
+int ramfs_list(const char* path, ramfs_node_t** node_out,
+               ramfs_node_t** entries, int max);
 ramfs_node_t* ramfs_get_root(void);
 
 /* Permission operations */
@@ -381,6 +387,10 @@ ramfs_node_t* ramfs_get_root(void);
  * the way -EPERM once collided with "not found" (see RAMFS_CHMOD_EPERM).
  * ramfs_vfs.c maps it onto VFS_EBUSY, which reaches ring 3 as -EBUSY. */
 #define RAMFS_BUSY (-7)
+
+/* ramfs_write() at RAMFS_MAX_DATA with bytes still to write. ramfs_write
+ * spends -1..-3; ramfs_vfs.c maps this onto VFS_EFBIG (ring 3: -EFBIG). */
+#define RAMFS_WRITE_EFBIG (-4)
 
 /* ramfs_open()'s create path refusing a caller without write permission on the
  * PARENT directory. ramfs_open already spends -1..-9 on its own failures, so

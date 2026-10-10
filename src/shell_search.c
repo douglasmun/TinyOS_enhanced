@@ -305,25 +305,29 @@ void cmd_find(int argc, char** argv) {
         return;
     }
 
-    ramfs_node_t* root = ramfs_get_root();
-    if (!root) {
-        kprintf("find: Cannot access root directory\n");
+    /* Through the listing primitive, which requires READ on the directory:
+     * walking root->children directly listed root's 0711 `/` to anyone. */
+    ramfs_node_t* entries[RAMFS_MAX_CHILDREN_PER_DIR];
+    ramfs_node_t* dir = NULL;
+    int listed = ramfs_list("/", &dir, entries, RAMFS_MAX_CHILDREN_PER_DIR);
+    if (listed < 0) {
+        kprintf("find: cannot read '/': %s\n",
+                listed == RAMFS_LIST_EACCES ? "Permission denied"
+                                            : "No such file or directory");
         return;
     }
 
     kprintf("Searching for: %s\n", pattern);
 
-    ramfs_node_t* current = root->children;
     int count = 0;
-
-    while (current) {
+    for (int i = 0; i < listed; i++) {
+        ramfs_node_t* current = entries[i];
         if (wildcard_match(current->name, pattern)) {
             const char* type_str = (current->type == RAMFS_TYPE_FILE) ? "file" : "dir";
             kprintf("./%s  (%s, %u bytes)\n",
                     current->name, type_str, current->size);
             count++;
         }
-        current = current->next;
     }
 
     if (count == 0) {
