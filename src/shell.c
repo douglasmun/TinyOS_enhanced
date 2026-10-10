@@ -1257,6 +1257,26 @@ void shell_task(void) {
     while (1) {
         should_logout = false;  /* Reset logout flag */
 
+        /* End the previous session before anyone can type at the login
+         * prompt. Both logout paths -- the ring-3 shell exiting and the
+         * kernel loop's `logout` -- come back here, so this is the one place
+         * that covers them. Any ring-3 task the session left behind (an `&`
+         * job, or a child it spawned) is terminated: a leftover read(0)
+         * shares the keyboard ring with the login prompt and would receive
+         * the next user's credentials. Keystrokes still buffered from the
+         * old session are dropped for the same reason in reverse -- they
+         * belong to the previous user, not to the next login. */
+        {
+            task_t* self = scheduler_get_current_task();
+            if (self && self->session_id != 0) {
+                task_kill_session(self->session_id);
+                self->session_id = 0;
+            }
+            while (keyboard_has_data()) {
+                (void)keyboard_getchar_nonblock();
+            }
+        }
+
         /* The login prompt must run privileged so it can switch to ANY user
          * via sys_setuid/sys_setgid. The previous session left this task with
          * the logged-out user's credentials; reset to root before prompting,
@@ -1279,6 +1299,20 @@ void shell_task(void) {
             kprintf("\nLogin failed. System halted.\n");
             while (1) {
                 scheduler_yield();  /* Halt task - login failed */
+            }
+        }
+
+        /* Open a new session: every ring-3 task created from here inherits
+         * this id (task_create_user copies the creator's), and the teardown
+         * at the top of this loop kills by it. Never 0, which means "none". */
+        {
+            static uint32_t next_session_id = 0;
+            task_t* self = scheduler_get_current_task();
+            if (++next_session_id == 0) {
+                next_session_id = 1;
+            }
+            if (self) {
+                self->session_id = next_session_id;
             }
         }
 

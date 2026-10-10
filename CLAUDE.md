@@ -83,6 +83,9 @@ Condensed; full reasoning in `doc/RULES_THAT_BITE.md`. Harness names are in `ver
   `CAP_ALL` incl. `CAP_UNKILLABLE`. `task_exit()` is inert for scheduler-run tasks — use
   `task_terminate(pid)`. The reaper removes from the ready queue **before**
   `task_free_resources()`.
+- **Logout kills the session.** `task_t.session_id` is stamped per login and inherited in
+  `task_create_user`; `shell_task()` calls `task_kill_session()` before the next login prompt.
+  A surviving `read(0)` shares the keyboard ring with login/`su`. `verify-logout-session-teardown.sh`.
 - **Teardown frees only what a `task_t` field names.** ELF image frames are tracked in
   `image_pages_phys[]`, registered only after the last failure return (earlier = double-free).
   Oversize images are refused. `verify-exec-frame-leak.sh` asserts exact equality.
