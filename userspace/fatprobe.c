@@ -19,6 +19,9 @@
  * Mode "stale" (see stale() below): unlink and O_TRUNC must not strand
  * another open fd on storage that was released. See verify-fat32-stale-fd.sh.
  *
+ * Mode "mode" (see mode() below): access mode, O_APPEND and the protected-path
+ * gate on C:. See verify-fat32-access-mode.sh.
+ *
  * bad= is the first differing offset, -1 when the content matches. Runs
  * unprivileged: C: has no ownership model, so uid does not change the path.
  *===========================================================================*/
@@ -202,13 +205,130 @@ static void stale(void) {
            tsize, tbad, osize, obad);
 }
 
+/* Mode "mode": run as a NON-ROOT user. disk.img has no /etc, so every
+ * refusal of a protected name below is the gate's -13, never "exists".
+ *
+ *   PROBE mode bs dir=<rc> file=<rc> file_size=<rc>
+ *     A backslash is not a separator to the VFS, so C:/<bs>etc is one
+ *     unprotected component to the gate. Both must fail; file_size is stat
+ *     of the /MODE/BS.TXT a backslash-splitting driver would have created
+ *     (want < 0).
+ *     Runs first, so a bypass cannot hide behind the case leg's EEXIST.
+ *   PROBE mode case lower=-13 upper=-13 file=-13 ctl=0
+ *     mkdir C:/etc (positive control: the gate is live for this uid),
+ *     mkdir C:/ETC, open C:/Etc/X.TXT for create; ctl = mkdir C:/MODE/SUB.
+ *   PROBE mode access trunc_size=100 rdwrite=-9 wrread=-9 bad=-1 wctl=5 rctl=100
+ *     O_RDONLY|O_TRUNC must not empty the file; write on an O_RDONLY fd and
+ *     read on an O_WRONLY fd are refused; the file keeps its content. wctl
+ *     and rctl are the same calls on correctly opened fds.
+ *   PROBE mode append c_size=15 c_bad=-1 d_size=15 d_bad=-1
+ *     10 'A's, then O_WRONLY|O_APPEND writes 5 'B's: on C: and on D:. */
+#define APP_BASE 10
+#define APP_MORE 5
+
+static int want_app(int i) { return i < APP_BASE ? 'A' : 'B'; }
+
+static void append_leg(const char* path, int* size, int* bad) {
+    unsigned char a[APP_BASE], b[APP_MORE];
+    memset(a, 'A', sizeof(a));
+    memset(b, 'B', sizeof(b));
+    int fd = create(path);
+    if (fd >= 0) {
+        write(fd, a, sizeof(a));
+        close(fd);
+    }
+    fd = open(path, O_WRONLY | O_APPEND);
+    if (fd >= 0) {
+        write(fd, b, sizeof(b));
+        close(fd);
+    } else {
+        printf("PROBE open %s failed %d\n", path, fd);
+    }
+    *size = stat_size(path);
+    *bad = compare_file(path, APP_BASE + APP_MORE, want_app);
+}
+
+static void mode(void) {
+    for (int i = 0; i < (int)sizeof(wbuf); i++) wbuf[i] = pat(i);
+    unsigned char zbuf[5];
+    memset(zbuf, 'Z', sizeof(zbuf));
+
+    int rc = mkdir("C:/MODE");
+    if (rc < 0) printf("PROBE mkdir C:/MODE failed %d\n", rc);
+
+    /* --- leg bs ------------------------------------------------------ */
+    int bsdir = mkdir("C:/\\etc");
+    int bsfile = open("C:/MODE\\BS.TXT", O_WRONLY | O_CREAT);
+    if (bsfile >= 0) close(bsfile);
+    printf("PROBE mode bs dir=%d file=%d file_size=%d\n",
+           bsdir, bsfile, stat_size("C:/MODE/BS.TXT"));
+
+    /* --- leg case ---------------------------------------------------- */
+    int lower = mkdir("C:/etc");
+    int upper = mkdir("C:/ETC");
+    int cfile = open("C:/Etc/X.TXT", O_WRONLY | O_CREAT);
+    if (cfile >= 0) close(cfile);
+    int ctl = mkdir("C:/MODE/SUB");
+    printf("PROBE mode case lower=%d upper=%d file=%d ctl=%d\n",
+           lower, upper, cfile, ctl);
+
+    /* --- leg access -------------------------------------------------- */
+    int fd = create("C:/MODE/T.BIN");
+    if (fd >= 0) {
+        write(fd, wbuf, 100);
+        close(fd);
+    }
+    fd = open("C:/MODE/T.BIN", O_RDONLY | O_TRUNC);
+    if (fd >= 0) close(fd);
+    int tsize = stat_size("C:/MODE/T.BIN");
+
+    int rdwrite = -999;
+    fd = open("C:/MODE/T.BIN", O_RDONLY);
+    if (fd >= 0) {
+        rdwrite = write(fd, zbuf, sizeof(zbuf));
+        close(fd);
+    }
+    int wrread = -999;
+    fd = open("C:/MODE/T.BIN", O_WRONLY);
+    if (fd >= 0) {
+        wrread = read(fd, rbuf, 10);
+        close(fd);
+    }
+    int bad = compare_file("C:/MODE/T.BIN", 100, want_pat);
+
+    int wctl = -999;
+    fd = create("C:/MODE/W.BIN");
+    if (fd >= 0) {
+        wctl = write(fd, zbuf, sizeof(zbuf));
+        close(fd);
+    }
+    /* rctl reads its own file: T.BIN is the one the bugs damage. */
+    fd = create("C:/MODE/R.BIN");
+    if (fd >= 0) {
+        write(fd, wbuf, 100);
+        close(fd);
+    }
+    int rctl = read_all("C:/MODE/R.BIN");
+    printf("PROBE mode access trunc_size=%d rdwrite=%d wrread=%d bad=%d wctl=%d rctl=%d\n",
+           tsize, rdwrite, wrread, bad, wctl, rctl);
+
+    /* --- leg append -------------------------------------------------- */
+    int csize, cbad, dsize, dbad;
+    append_leg("C:/MODE/A.BIN", &csize, &cbad);
+    append_leg("D:/scratch/fpapp.txt", &dsize, &dbad);
+    printf("PROBE mode append c_size=%d c_bad=%d d_size=%d d_bad=%d\n",
+           csize, cbad, dsize, dbad);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "big")) {
         big();
     } else if (argc > 1 && !strcmp(argv[1], "stale")) {
         stale();
+    } else if (argc > 1 && !strcmp(argv[1], "mode")) {
+        mode();
     } else {
-        print("usage: fatprobe big|stale\n");
+        print("usage: fatprobe big|stale|mode\n");
     }
     print("PROBE done\n");
     return 0;

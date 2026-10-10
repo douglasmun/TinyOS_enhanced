@@ -120,7 +120,8 @@ echo "================ VERDICT ================"
 echo "  passed: $PASS   failed: $FAIL"
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: PASS -- the protected-path gate matches exact-or-slash; the"
-    echo "  directory node itself is protected and a same-prefix sibling is not."
+    echo "  directory node itself is protected, a same-prefix sibling is not, and"
+    echo "  a case variant (FAT32 is case-insensitive) is protected too."
     exit 0
 else
     echo "RESULT: FAIL"

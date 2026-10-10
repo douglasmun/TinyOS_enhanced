@@ -381,6 +381,9 @@ static bool component_is_83(const char* name, int len) {
     }
     int dot = -1;
     for (int i = 0; i < len; i++) {
+        /* '\\' is not a separator here (see parse_path) and not a legal
+         * FAT name character, so a component carrying one names nothing. */
+        if (name[i] == '\\') return false;
         if (name[i] == '.') {
             if (dot >= 0) return false;
             dot = i;
@@ -395,17 +398,22 @@ static bool component_is_83(const char* name, int len) {
  * after max_components, and filename_to_83() clipped long names, so
  * "/LONGDIRNAME1/X.TXT" resolved to "/X.TXT" and "/REPORTFINAL.TXT" to
  * "/REPORTFI.TXT" -- an unlink or a write landed on a file the caller never
- * named. Found reviewing the fat32 fuzz target's path inputs. */
+ * named. Found reviewing the fat32 fuzz target's path inputs.
+ *
+ * Only '/' separates. '\\' used to as well, but vfs_open canonicalizes and
+ * screens the path on '/' alone, so "/X\..\ETC\F" was one harmless-looking
+ * component to the protected-path gate and /ETC/F to this parser. The driver
+ * must not resolve a name differently from the path the VFS checked. */
 static int parse_path(const char* path, char components[][12], int max_components) {
     int count = 0;
     const char* start = path;
 
     // Skip leading slashes
-    while (*start == '/' || *start == '\\') start++;
+    while (*start == '/') start++;
 
     while (*start) {
         const char* end = start;
-        while (*end && *end != '/' && *end != '\\') end++;
+        while (*end && *end != '/') end++;
 
         int len = end - start;
         if (count >= max_components || !component_is_83(start, len)) {
@@ -416,7 +424,7 @@ static int parse_path(const char* path, char components[][12], int max_component
         count++;
 
         start = end;
-        while (*start == '/' || *start == '\\') start++;
+        while (*start == '/') start++;
     }
 
     return count;

@@ -11,12 +11,16 @@
  *   - contents under it ("/etc/passwd") must stay protected;
  *   - a sibling whose name merely STARTS with a protected name ("/kernelfoo",
  *     "/etcfoo") must NOT be protected (the over-match the old prefix hit);
- *   - unrelated paths must not be protected.
+ *   - unrelated paths must not be protected;
+ *   - a case variant ("/ETC/passwd") must be protected: FAT32 (C:) names are
+ *     case-insensitive, so it is the same file as "/etc/passwd" there.
  *
  * A PRE-FIX arm replays the old bare-prefix shape as a negative control: it
  * MUST get the "/etc" (under) and "/kernelfoo" (over) cases wrong, or the test
  * is not actually discriminating and reports INCONCLUSIVE (exit 2) rather than
- * passing -- same discipline as path_bound_test.c.
+ * passing -- same discipline as path_bound_test.c. A second negative control,
+ * the case-sensitive exact-or-slash shape that shipped before the case fold,
+ * must report "/ETC" unprotected, or the case rows are not discriminating.
  *
  * Host-compiled (freestanding kernel strncmp/strlen are just the C library's
  * here), -O0. Exit 0 = fixed arm correct AND pre-fix arm demonstrably wrong;
@@ -42,7 +46,18 @@ bool vfs_path_is_protected(const char* canonical) {
     };
     for (int i = 0; protected_paths[i] != NULL; i++) {
         size_t len = strlen(protected_paths[i]);
-        if (strncmp(canonical, protected_paths[i], len) == 0 &&
+        size_t j = 0;
+        while (j < len) {
+            char c = canonical[j];
+            if (c >= 'A' && c <= 'Z') {
+                c = (char)(c + ('a' - 'A'));
+            }
+            if (c != protected_paths[i][j]) {
+                break;
+            }
+            j++;
+        }
+        if (j == len &&
             (canonical[len] == '\0' || canonical[len] == '/')) {
             return true;
         }
@@ -50,6 +65,22 @@ bool vfs_path_is_protected(const char* canonical) {
     return false;
 }
 #endif
+
+/* The case-sensitive exact-or-slash shape: correct at the boundary, but
+ * "/ETC/passwd" on C: slipped past it -- the second negative control. */
+static bool case_shape(const char* canonical) {
+    static const char* const paths[] = {
+        "/bin", "/sbin", "/etc", "/boot", "/kernel", NULL
+    };
+    for (int i = 0; paths[i] != NULL; i++) {
+        size_t len = strlen(paths[i]);
+        if (strncmp(canonical, paths[i], len) == 0 &&
+            (canonical[len] == '\0' || canonical[len] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /* The PRE-FIX shape: bare strncmp prefix against slash-suffixed entries.
  * Exactly what shipped before the tightening -- the negative control. */
@@ -83,6 +114,12 @@ int main(void) {
         { "/kernelfoo",  false, "sibling, not /kernel" },
         { "/kernel_bak", false, "sibling, not /kernel" },
         { "/binary",     false, "sibling, not under /bin" },
+        /* case variants -- the same node on case-insensitive FAT32 */
+        { "/ETC",        true,  "case variant of protected dir" },
+        { "/Etc/passwd", true,  "case variant, content under it" },
+        { "/BIN/sh",     true,  "case variant, content under it" },
+        { "/KERNEL",     true,  "case variant of protected file" },
+        { "/ETCFOO",     false, "case-variant sibling, not under /etc" },
         /* unrelated */
         { "/",           false, "root is not protected" },
         { "/scratch/x",  false, "unrelated path" },
@@ -114,11 +151,13 @@ int main(void) {
     printf("fixed arm: %d/%d correct\n", n - fixed_wrong, n);
     printf("pre-fix arm under-match bug reproduced: %s\n", prefix_under_bug ? "yes" : "no");
     printf("pre-fix arm over-match bug reproduced:  %s\n", prefix_over_bug ? "yes" : "no");
+    bool case_bug = (case_shape("/ETC/passwd") == false);
+    printf("case-sensitive arm misses /ETC/passwd:   %s\n", case_bug ? "yes" : "no");
 
     if (fixed_wrong != 0) {
         return 1;  /* the shipping function gets a case wrong */
     }
-    if (!prefix_under_bug || !prefix_over_bug) {
+    if (!prefix_under_bug || !prefix_over_bug || !case_bug) {
         return 2;  /* negative control not discriminating */
     }
     return 0;
