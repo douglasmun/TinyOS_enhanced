@@ -188,6 +188,17 @@ jobs:
       - name: ELF loader hardening is in place
         run: bash verify/verify-elf-loader-hardening.sh
 
+      # The copy_*_user() page-fault line in the #PF handler is a kdbg trace,
+      # not a plain kprintf: it is ring-3-reachable (a syscall handed a present-
+      # but-faulting user pointer) and the kernel console shares the ring-3
+      # shell's serial stream, so a bare kprintf there is a log-spam primitive.
+      # The -EFAULT return is the real signal; the line is pure diagnostic.
+      # Source-level with a negative control (the pre-fix kprintf shape) -- the
+      # fault window is closed on single-CPU by the copy primitive's critical
+      # section, so there is no deterministic guest input that drives it.
+      - name: copy_*_user fault line is a kdbg trace, not a kprintf
+        run: bash verify/verify-copyuser-fault-trace.sh
+
       - name: EDR splice helper unit tests
         run: bash verify/edr-rejoin-test.sh
 
