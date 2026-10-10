@@ -13,6 +13,8 @@
 #include "util.h"
 #include "pmm.h"
 #include "mutex.h"
+#include "process.h"     /* task_t, for the per-uid open cap */
+#include "scheduler.h"   /* scheduler_get_current_task() */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -210,7 +212,7 @@ static uint32_t find_free_cluster(void) {
 static uint32_t allocate_cluster(uint32_t previous_cluster) {
     uint32_t new_cluster = find_free_cluster();
     if (new_cluster == 0) {
-        kprintf("[FAT32] ERROR: Disk full\n");
+        kdbg("[FAT32] Disk full\n");  /* per write once full; the writer sees the failure */
         return 0;
     }
 
@@ -926,19 +928,35 @@ int fat32_open(const char* path) {
 
     mutex_lock(&fat32_mutex);
 
-    // Find free file descriptor
-    int fd = -1;
+    /* Find a free slot, counting what the caller's uid already holds. The
+     * count comes from the slots' owner fields, so it cannot drift. Before
+     * the scheduler runs (no current task) only the table size applies. */
+    task_t* self = scheduler_get_current_task();
+    int fd = -1, avail = 0, uid_held = 0;
     for (int i = 0; i < FAT32_MAX_OPEN_FILES; i++) {
         if (!open_files[i].in_use) {
-            fd = i;
-            break;
+            avail++;
+            if (fd < 0) {
+                fd = i;
+            }
+        } else if (self && open_files[i].owner_uid == self->uid) {
+            uid_held++;
         }
     }
 
+    /* Ring 3 reaches this, and the caller gets the refusal as an errno: a
+     * console line per refused open is the per-op print CLAUDE.md forbids. */
     if (fd == -1) {
-        kprintf("[FAT32] ERROR: Too many open files\n");
+        kdbg("[FAT32] open refused: all %d slots in use\n", FAT32_MAX_OPEN_FILES);
         mutex_unlock(&fat32_mutex);
         return -1;
+    }
+    if (self && self->euid != 0 &&
+        (uid_held >= FAT32_USER_MAX_FDS || avail <= FAT32_ROOT_RESERVED_FDS)) {
+        kdbg("[FAT32] open refused: uid %u holds %d, %d slots free\n",
+             (unsigned)self->uid, uid_held, avail);
+        mutex_unlock(&fat32_mutex);
+        return FAT32_OPEN_LIMIT;
     }
 
     // Parse path
@@ -960,6 +978,7 @@ int fat32_open(const char* path) {
         open_files[fd].dirent_cluster = 0;   /* root dir has no dirent of its own */
         open_files[fd].dirent_index = 0;
         open_files[fd].dirty = false;
+        open_files[fd].owner_uid = self ? self->uid : 0;
         mutex_unlock(&fat32_mutex);
         return fd;
     }
@@ -990,7 +1009,7 @@ int fat32_open(const char* path) {
         if (i < depth - 1) {
             // Must be directory for intermediate components
             if (!(entry.attributes & FAT32_ATTR_DIRECTORY)) {
-                kprintf("[FAT32] ERROR: Not a directory: %s\n", components[i]);
+                kdbg("[FAT32] Not a directory: %s\n", components[i]);
                 mutex_unlock(&fat32_mutex);
                 return -1;
             }
@@ -1008,6 +1027,7 @@ int fat32_open(const char* path) {
     open_files[fd].dirent_cluster = dirent_cluster;
     open_files[fd].dirent_index = dirent_index;
     open_files[fd].dirty = false;
+    open_files[fd].owner_uid = self ? self->uid : 0;
 
     mutex_unlock(&fat32_mutex);
     return fd;
@@ -1049,7 +1069,7 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
     fat32_file_t* file = &open_files[fd];
 
     if (file->is_directory) {
-        kprintf("[FAT32] ERROR: Cannot read from directory\n");
+        kdbg("[FAT32] Cannot read from directory\n");
         mutex_unlock(&fat32_mutex);
         return -1;
     }
@@ -1145,7 +1165,7 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
     fat32_file_t* file = &open_files[fd];
 
     if (file->is_directory) {
-        kprintf("[FAT32] ERROR: Cannot write to directory\n");
+        kdbg("[FAT32] Cannot write to directory\n");
         return -1;
     }
 

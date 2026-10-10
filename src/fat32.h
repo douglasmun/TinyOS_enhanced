@@ -13,6 +13,16 @@
  *============================================================================*/
 #define FAT32_MAX_PATH          256
 #define FAT32_MAX_OPEN_FILES    32
+
+/* open_files is one table for the whole system, and C: has no ownership
+ * model, so nothing stopped one uid holding all 32 slots -- after which no
+ * one, root included, could open a C: file. As in ramfs: a non-root uid holds
+ * at most FAT32_USER_MAX_FDS, and the last FAT32_ROOT_RESERVED_FDS free slots
+ * are root's. fat32_open() returns FAT32_OPEN_LIMIT for that refusal; every
+ * other failure is -1. */
+#define FAT32_USER_MAX_FDS      8
+#define FAT32_ROOT_RESERVED_FDS 4
+#define FAT32_OPEN_LIMIT        (-11)
 #define FAT32_SECTOR_SIZE       512
 #define FAT32_DIR_ENTRY_SIZE    32
 
@@ -120,6 +130,7 @@ typedef struct {
     uint32_t dirent_cluster;        // Directory cluster holding the entry
     uint32_t dirent_index;          // Entry index within that cluster
     bool     dirty;                 // Size/first_cluster changed since flush
+    uint16_t owner_uid;             // Real uid of the opener (per-uid cap)
 } fat32_file_t;
 
 /*=============================================================================
