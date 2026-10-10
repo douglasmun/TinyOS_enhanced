@@ -247,4 +247,11 @@ const char* edr_severity_to_string(edr_severity_t severity);
  */
 const char* edr_signature_to_string(edr_signature_t signature);
 
+#ifdef TINYOS_FAULT_INJECT
+/* verify-edr-decay-gap.sh only: drive the "Large decay gap" trace so the
+ * harness can witness it is kdbg() (suppressed at normal loglevel), not a
+ * per-syscall kprintf on the ring-3-reachable path. */
+void edr_decay_gap_selftest(void);
+#endif
+
 #endif /* EDR_BEHAVIORAL_H */
