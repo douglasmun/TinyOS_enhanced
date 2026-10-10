@@ -53,6 +53,20 @@ typedef struct {
     uint32_t owner_pid;             /* PID of the thread that owns the lock */
     uint32_t lock_count;            /* For recursive mutexes */
     uint32_t waiters[MUTEX_MAX_WAITERS]; /* PIDs waiting for this mutex */
+    uint32_t waiter_gens[MUTEX_MAX_WAITERS]; /* Generation of each waiter, paired
+                                              * with waiters[]. A bare PID is not
+                                              * enough to re-find a waiter at
+                                              * unlock time: PIDs are drawn at
+                                              * random over ~65k values and the
+                                              * allocator's collision check skips
+                                              * TERMINATED slots, so a waiter
+                                              * killed-but-unreaped can have its
+                                              * PID handed to an unrelated new
+                                              * task. task_get(pid) would then
+                                              * return that task and unlock would
+                                              * transfer the mutex to it. Pair
+                                              * the generation and resolve with
+                                              * task_get_validated(). */
     uint32_t num_waiters;           /* Number of waiting threads */
     uint8_t flags;                  /* Mutex flags (recursive, etc.) */
     const char* name;               /* For debugging */

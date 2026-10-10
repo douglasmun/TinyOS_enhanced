@@ -338,6 +338,7 @@ static mutex_t exec_path_mutex = {
     .owner_pid = 0,
     .lock_count = 0,
     .waiters = {0},
+    .waiter_gens = {0},
     .num_waiters = 0,
     .flags = 0,          /* non-recursive: re-entering the exec path is a bug */
     .name = "exec_path",

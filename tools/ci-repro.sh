@@ -126,6 +126,7 @@ run_guards() {
         verify/verify-shell-path-overflow.sh \
         verify/verify-entropy-pool-stir.sh \
         verify/verify-ring3-help-complete.sh \
+        verify/verify-waiter-generation.sh \
         verify/edr-rejoin-test.sh \
         verify/preserve-serial-test.sh
     do
