@@ -935,6 +935,20 @@ void task_fdtable_cleanup(task_t* task);
 void task_pipes_cleanup(task_t* task);
 
 /**
+ * @brief Point every task stream that names a pipe buffer back at the console.
+ *
+ * For the kernel shell's static pipeline pipes, which are outside the pipe
+ * table and so have no lifetime tracking: a ring-3 `exec` stage can spawn a
+ * background job that inherits the pipe and outlives the pipeline, and the
+ * next pipeline's pipe_init() reopened the same buffer under it -- its writes
+ * landed in someone else's pipeline (root's, after `su`). Called before each
+ * static pipe is torn down. Implemented in syscall.c.
+ *
+ * @param buf The pipe_buffer_t being torn down
+ */
+void pipe_detach_streams(const void* buf);
+
+/**
  * @brief Install a global VFS fd in the first free slot.
  * @param task Task to install into
  * @param vfs_fd Global VFS descriptor (from vfs_open)
