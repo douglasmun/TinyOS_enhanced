@@ -24,6 +24,10 @@
 # -Werror=implicit-function-declaration and -Werror=uninitialized have each
 # caught real kernel bugs in this tree.
 #
+# LOCAL REPRO: tools/ci-repro.sh runs these two jobs' steps in an ubuntu
+# container (same gcc-i686-linux-gnu, same flags) -- the only way to exercise
+# this -Werror gate on a macOS dev box, where only the i686-elf cross exists.
+#
 # TOOLCHAIN: the tree builds with any i686 ELF-targeting gcc. It includes only
 # genuine freestanding headers (stdarg/stdbool/stddef/stdint/limits -- the
 # lone <stdio.h> is in src/test_offset.c, which is not in OBJ), links with
