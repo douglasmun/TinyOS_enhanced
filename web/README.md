@@ -56,10 +56,11 @@ cp dist/tinyos.iso web/tinyos.iso
 git add -f web/tinyos.iso
 ```
 
-The committed ISO is built from `main` at **PR #157** (`26bdc7a` plus the
-version bump), and matches the signed `v2.9` release asset. It is a pinned
-image, not a rolling build of `main`: it only moves when someone runs the steps
-above, so expect it to fall behind again as work lands.
+The committed ISO is built from `main` at the **v3.0** tree (the four 2026-10
+audits, the #126 context_switch fix and the dead-TLS-crypto removal, plus the
+`TINYOS_VERSION` bump), and matches the signed `v3.0` release asset. It is a
+pinned image, not a rolling build of `main`: it only moves when someone runs the
+steps above, so expect it to fall behind again as work lands.
 
 **Login drops straight into the ring-3 shell** (PR #51), which is what the demo
 shows. Run a signed program by its path (`/hello.elf`); type `kshell` to hand
@@ -68,25 +69,28 @@ over to the kernel shell for the privileged and introspection commands (`pae`,
 privileged commands are gated on **euid 0**, so a non-root user reaching the
 kernel shell still cannot run them.
 
-### What is new since v2.8
+### What is new since v2.9
 
-Follow-up fixes to the v2.8 fuzz campaign (PRs #143–#156); the ones you can
-see from this demo:
+A round of CVE-class audits (ELF loader, syscall boundary, VFS path resolution,
+concurrency) and a hardening sweep. Most of it is internal and not visible from
+this offline demo, but for the record:
 
-- **Quieter console.** EDR blocks, lock/unlock, ramfs path errors, ELF refusals
-  and protected-path refusals no longer print a line per operation; `secstatus`
-  counts them instead (`Syscall blocks`, `Protected paths`, ...).
-- **`waitpid` admits only the caller's own child**, and EDR kills go through the
-  normal teardown, so killed tasks are reaped.
-- **Credential paths:** `passwd` honours the login lockout, `su`/`login` refuse
-  with identical text whether or not the user exists, and `stat` on a file you
-  cannot read is refused.
-- **`chmod` and redirects canonicalize paths**, so `..` cannot step around the
-  protected-path rule.
-- **Ring-3 `help` lists every builtin** (eight were missing).
+- **ELF loader** (PR #167): static loader, `parse == signed` size bound, and a
+  page-granular segment-overlap check — three defence-in-depth hardenings.
+- **VFS protected-path gate** (PR #169): `/bin /sbin /etc /boot` and `/kernel`
+  now match exact-or-slash, not a bare prefix, so the directory node itself is
+  protected and a same-prefix sibling is not.
+- **Scheduler/mutex** (PRs #162, #166): the `context_switch` ESP off-by-4 that
+  triple-faulted some builds (#126) is fixed; mutex waiters are generation-
+  validated and double-enqueue is guarded.
+- **Dead TLS1.3 crypto removed from the build** (PR #170): the unreachable
+  HKDF/AES-GCM/ECDHE demo surface (with a latent stack overflow in a never-
+  compiled caller) is no longer compiled or linked.
+- **Copy-user fault line demoted to a kdbg trace** (PR #168), so a faulting
+  user buffer no longer prints a per-fault console line.
 
-SHA-256 `fd424f0c6ea9499a01efd402ef763bf6c8689271e1313e5750a8d73dde5e29f5` as of
-2026-10-04. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
+SHA-256 `31e858092e022cb53f4faf6fb60b99e1fe169092600240ac5299394279821487` as of
+2026-10-10. Note `i686-elf-grub-mkrescue` is non-deterministic, so a fresh
 rebuild will hash differently even with identical inputs — this hash identifies
 the committed artifact, it is not reproducible from source.
 
