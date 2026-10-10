@@ -226,8 +226,15 @@ void page_fault_handler(struct regs* r) {
      * validation but before kernel accesses it.
      *=======================================================================*/
     if (is_copy_user_active()) {
-        kprintf("[PAGE FAULT] Caught during copy_*_user() at 0x%08x, returning -EFAULT\n",
-                faulting_address);
+        /* Per-fault TRACE, not a verdict: the copy primitive returns -EFAULT to
+         * its caller, which is the real signal. This line only repeats on a
+         * faulting user pointer, and that path is ring-3-reachable (hand a
+         * syscall an in-bounds pointer that faults on access), so a plain
+         * kprintf here is a log-spam primitive on the shared serial stream --
+         * the "no per-op kprintf on a ring-3-reachable path" rule. Demoted to
+         * kdbg (recoverable with `loglevel debug`); see kprintf.h. */
+        kdbg("[PAGE FAULT] Caught during copy_*_user() at 0x%08x, returning -EFAULT\n",
+             faulting_address);
         handle_copy_user_fault();  /* Does not return - jumps back to copy_*_user() */
     }
 
