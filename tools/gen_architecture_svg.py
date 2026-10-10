@@ -69,7 +69,7 @@ def build(c):
 
     # ---- header ----
     text(24, 30, "TinyOS Enhanced — architecture", 19, c["fg"], weight="700")
-    text(24, 50, "32-bit i386 · Multiboot2 · 96 kernel modules · preemptive, single core",
+    text(24, 50, "32-bit i386 · Multiboot2 · 93 kernel modules · preemptive, single core",
          12, c["muted"])
 
     # ---- RING 3 ----
@@ -145,8 +145,8 @@ def build(c):
             "drivers stay stdio-agnostic",
         ]),
         (746, y0 + 32, 230, 96, "Security & crypto", [
-            "AES · SHA-2 · HMAC · PBKDF2",
-            "ECDSA · ECDHE · HKDF",
+            "SHA-2 · HMAC · PBKDF2",
+            "ECDSA P-256 signed exec",
             "EDR daemon (supervised)",
             "tamper-evident audit log",
             "credential store",

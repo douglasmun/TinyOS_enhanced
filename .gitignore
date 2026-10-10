@@ -80,6 +80,17 @@ src/ssh.c.backup
 src/ssh.c.bak
 src/ssh_clean.txt
 
+# --- TLS 1.3 HKDF/AES-GCM/ECDHE demo surface removed from the build ---
+# (kept on disk for future reference, not compiled or linked). Their only
+# caller was src/tls13_demo.c, itself never built; see the Makefile NOTE.
+src/hkdf.c
+src/hkdf.h
+src/aes_gcm.c
+src/aes_gcm.h
+src/ecdhe.c
+src/ecdhe.h
+src/tls13_demo.c
+
 # --- OS / editor cruft ---
 .DS_Store
 .playwright-mcp/

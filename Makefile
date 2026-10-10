@@ -93,9 +93,6 @@ SRC := \
   src/sha256.c \
   src/crypto.c \
   src/ecdsa.c \
-  src/aes_gcm.c \
-  src/ecdhe.c \
-  src/hkdf.c \
   src/firewall.c \
   src/ids.c \
   src/audit.c \
@@ -181,6 +178,18 @@ src/context_switch.o: src/context_switch.S
 # NOTE: SSH (src/ssh.c, src/ssh_crypto.c) and its RSA dependency (src/rsa.c)
 # were removed from the build. The source is retained on disk (gitignored) but
 # is no longer compiled or linked. See .gitignore.
+#
+# NOTE: the TLS 1.3 HKDF/AES-GCM/ECDHE surface (src/hkdf.c, src/aes_gcm.c,
+# src/ecdhe.c and the src/tls13_demo.c that was their only caller) was removed
+# from the build, same as ssh/rsa above: the source is retained on disk
+# (gitignored) but is no longer compiled or linked. The 2026-10 crypto audit
+# found they had no compiled caller (nm showed zero undefined refs to any
+# gcm_/ecdhe_/hkdf_ symbol across the linked objects; their sole user
+# tls13_demo.c and the gitignored ssh/rsa files are not compiled), and
+# hkdf_expand_label carried a latent stack overflow reachable only from that
+# dead caller. Dropping them from the build removes that hazard while keeping
+# the code for future reference. The live signing path uses ecdsa.c + sha256.c;
+# the live CSPRNG uses sha512.c -- all retained.
 #
 # src/user.o, src/shell_user.o and src/shell.o used to be built with
 # -fno-stack-protector -U_FORTIFY_SOURCE -O1, because PBKDF2's deep call stacks
