@@ -125,6 +125,15 @@ jobs:
       #   verify-ring3-help-complete.sh : every builtin the ring-3 shell
       #                                 dispatches has a `help` line
       #                                 (source-level)
+      #   verify-waiter-generation.sh : the mutex waiter handoff re-finds its
+      #                                 waiter by (pid, generation) not a bare
+      #                                 pid, and scheduler_add_task refuses a
+      #                                 double enqueue. Source-level: the
+      #                                 PID-reuse window is ~1/65k and has no
+      #                                 fault-injection hook, so there is no
+      #                                 deterministic guest path -- each leg
+      #                                 carries a negative control against the
+      #                                 pre-fix shape.
       #   edr-rejoin-test.sh          : the shared EDR splice helper behaves on
       #                                 all 9 cases. Pure text -- it feeds
       #                                 fixtures through the awk and diffs the
@@ -164,6 +173,9 @@ jobs:
 
       - name: Ring-3 help lists every builtin
         run: bash verify/verify-ring3-help-complete.sh
+
+      - name: Mutex waiter handoff is generation-validated
+        run: bash verify/verify-waiter-generation.sh
 
       - name: EDR splice helper unit tests
         run: bash verify/edr-rejoin-test.sh

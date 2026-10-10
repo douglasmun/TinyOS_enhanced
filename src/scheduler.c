@@ -206,6 +206,34 @@ void scheduler_add_task(task_t* task) {
     // CRITICAL SECTION: Protect ready queue manipulation from timer interrupts
     CRITICAL_SECTION_ENTER();
 
+    /*=========================================================================
+     * IDEMPOTENCE GUARD: refuse to enqueue a task that is already linked.
+     *
+     * The relink below unconditionally overwrites task->next. If the task is
+     * already a node in the circular ready queue, that overwrite breaks the
+     * ring (the old predecessor still points at this node, whose next now
+     * points wherever the tail splice put it), and the corruption surfaces
+     * later as a panic in scheduler_remove_task_locked()'s cycle check.
+     *
+     * There is no live double-enqueue caller today (scheduler_tick is dead
+     * code and the IRQ wake scan runs interrupts-off), but scheduler_add_task
+     * is the queue's single mutator and nothing else prevents a double insert.
+     * Make it self-defending: walk the bounded (<= MAX_TASKS) ring and bail if
+     * the task is already present. Cheap, and it converts a latent list-
+     * corruption panic into a no-op.
+     *=======================================================================*/
+    if (ready_queue_head) {
+        task_t* scan = (task_t*)ready_queue_head;
+        uint32_t steps = 0;
+        do {
+            if (scan == task) {
+                CRITICAL_SECTION_EXIT();
+                return;  /* already queued -- nothing to do */
+            }
+            scan = scan->next;
+        } while (scan && scan != ready_queue_head && ++steps <= MAX_TASKS);
+    }
+
     // Ensure task is in READY state
     task->state = TASK_STATE_READY;
     task->ticks_remaining = task->time_slice;

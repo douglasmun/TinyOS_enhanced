@@ -45,6 +45,7 @@ void mutex_init(mutex_t* mutex, const char* name, uint8_t flags) {
 
     for (uint32_t i = 0; i < MUTEX_MAX_WAITERS; i++) {
         mutex->waiters[i] = 0;
+        mutex->waiter_gens[i] = 0;
     }
 }
 
@@ -145,6 +146,7 @@ int mutex_lock(mutex_t* mutex) {
     }
 
     mutex->waiters[mutex->num_waiters] = current->pid;
+    mutex->waiter_gens[mutex->num_waiters] = current->generation;
     mutex->num_waiters++;
 
     /* Priority inheritance: boost owner priority if needed */
@@ -242,15 +244,23 @@ int mutex_unlock(mutex_t* mutex) {
     while (mutex->num_waiters > 0) {
         /* Get first waiter */
         uint32_t waiter_pid = mutex->waiters[0];
+        uint32_t waiter_gen = mutex->waiter_gens[0];
 
-        /* Shift wait queue */
+        /* Shift wait queue (pid and generation in lockstep) */
         for (uint32_t i = 0; i < mutex->num_waiters - 1; i++) {
             mutex->waiters[i] = mutex->waiters[i + 1];
+            mutex->waiter_gens[i] = mutex->waiter_gens[i + 1];
         }
         mutex->num_waiters--;
 
-        /* Wake up the waiter */
-        task_t* waiter = task_get(waiter_pid);
+        /*
+         * Resolve by (pid, generation), NOT a bare pid. task_get(pid) returns
+         * the first non-TERMINATED slot with that pid -- which, after PID reuse,
+         * can be an unrelated task. task_get_validated() also requires the
+         * generation to match, so a recycled slot (bumped generation) misses and
+         * we correctly treat the original waiter as dead.
+         */
+        task_t* waiter = task_get_validated(waiter_pid, waiter_gen);
         if (waiter) {
             /* Transfer ownership to waiter */
             mutex->owner_pid = waiter_pid;
