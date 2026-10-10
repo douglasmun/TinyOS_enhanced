@@ -26,7 +26,8 @@
 #     4. every header compiles standalone
 #   source-guards job (the non-QEMU harnesses):
 #     arch-svg, shell-path-overflow, entropy-pool-stir, ring3-help-complete,
-#     edr-rejoin, preserve-serial, elf-enforce-report
+#     waiter-generation, elf-loader-hardening, edr-rejoin, preserve-serial,
+#     elf-enforce-report
 #
 # NOTES
 #
@@ -127,6 +128,7 @@ run_guards() {
         verify/verify-entropy-pool-stir.sh \
         verify/verify-ring3-help-complete.sh \
         verify/verify-waiter-generation.sh \
+        verify/verify-elf-loader-hardening.sh \
         verify/edr-rejoin-test.sh \
         verify/preserve-serial-test.sh
     do

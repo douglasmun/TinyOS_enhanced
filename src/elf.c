@@ -182,7 +182,7 @@ void elf_dump_header(const void* elf_data) {
  * FUNCTION: elf_verify_signature
  * PURPOSE: Verify ECDSA P-256 signature on ELF binary
  *===========================================================================*/
-bool elf_verify_signature(const void* elf_data, size_t elf_size) {
+bool elf_verify_signature(const void* elf_data, size_t elf_size, size_t* signed_size) {
     /* Check if file is large enough to contain signature */
     if (elf_size < ELF_SIG_SIZE) {
         kprintf("[ELF] No signature (file too small: %zu < %d)\n", elf_size, ELF_SIG_SIZE);
@@ -284,6 +284,13 @@ bool elf_verify_signature(const void* elf_data, size_t elf_size) {
         kprintf("[ELF] ERROR: Signature verification FAILED!\n");
     }
 
+    /* Hand back the signed payload length so the loader parses only hashed
+     * bytes. sig->elf_size was already checked == elf_size - ELF_SIG_SIZE
+     * above, so this is the verified length, not an attacker claim. */
+    if (valid && signed_size) {
+        *signed_size = sig->elf_size;
+    }
+
     return valid;
 }
 
@@ -357,6 +364,11 @@ void elf_exec_unlock(void) {
  * PURPOSE: Read an executable from the VFS and start it, under the exec lock
  *===========================================================================*/
 #define EXEC_MAX_FILE_SIZE 65536  /* 64KB maximum ELF size (DoS prevention) */
+
+/* File-local loader (see elf.h). Forward-declared here for elf_exec_from_path. */
+static int elf_load_process_argv(const void* elf_data, size_t elf_size,
+                                 const char* name, int argc,
+                                 const char* const* argv);
 
 int elf_exec_from_path(const char* path, const char* name,
                        int argc, const char* const* argv,
@@ -469,16 +481,12 @@ out:
 }
 
 /*=============================================================================
- * FUNCTION: elf_load_process
- * PURPOSE: Load ELF executable and create a process
- *=============================================================================*/
-int elf_load_process(const void* elf_data, size_t elf_size, const char* name) {
-    return elf_load_process_argv(elf_data, elf_size, name, 0, NULL);
-}
-
-/*=============================================================================
  * FUNCTION: elf_load_process_argv
  * PURPOSE: Load ELF executable and create a process, passing it an argv vector
+ *
+ * File-local on purpose (see elf.h): it fills the static allocated_frames[]
+ * array and is correct only under elf_exec_lock(), which just elf_exec_from_path()
+ * (this file) holds. A link error is a better failure than a silent race.
  *=============================================================================*/
 /* Load outcomes, shown by secstatus. SYS_SPAWN lets any ring-3 caller run
  * this path in a loop; the load trace it used to print (file size, signer key,
@@ -501,8 +509,8 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
                                       const char* name, int argc,
                                       const char* const* argv);
 
-int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
-                          int argc, const char* const* argv) {
+static int elf_load_process_argv(const void* elf_data, size_t elf_size, const char* name,
+                                 int argc, const char* const* argv) {
     int pid = elf_load_process_argv_impl(elf_data, elf_size, name, argc, argv);
     if (pid < 0) {
         elf_loads_refused++;
@@ -603,10 +611,20 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
     static bool elf_require_signatures = true;
 #endif
 
-    /* Verify signature (skipped only in the explicit permissive opt-out) */
+    /* Verify signature (skipped only in the explicit permissive opt-out).
+     *
+     * parse_size is the length the loader is allowed to parse. The signature
+     * covers [0, signed_size); the 184-byte trailer after it is attacker
+     * controlled (it IS the signature). Bounding phdr and segment offsets
+     * against signed_size -- not elf_size -- makes "what we parse" equal to
+     * "what we hashed" by construction, so a crafted phdr can never point a
+     * segment into the trailer. In the permissive opt-out there is no trailer
+     * to exclude, so the whole buffer is parseable. */
+    size_t signed_size = elf_size;
     bool has_valid_signature = elf_require_signatures
-                                   ? elf_verify_signature(elf_data, elf_size)
+                                   ? elf_verify_signature(elf_data, elf_size, &signed_size)
                                    : false;
+    size_t parse_size = has_valid_signature ? signed_size : elf_size;
 
     /* One verdict line per load, either way (kprintf.h: verdicts are never
      * kdbg). It used to be three lines on each side plus the signer key. */
@@ -693,8 +711,9 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
     /* ...and inside THIS file. The bounds above are a fixed 1MB, not the
      * buffer: a 60-byte file with e_phoff=52, e_phnum=4 passed them and the
      * segment loop read program headers out of whatever followed the exec
-     * buffer. Found by fuzz_elfload. */
-    if (ehdr->e_phoff > elf_size || phdr_table_size > elf_size - ehdr->e_phoff) {
+     * buffer. Found by fuzz_elfload. Bound against parse_size (the signed
+     * length), so a signed binary cannot place its phdr table in the trailer. */
+    if (ehdr->e_phoff > parse_size || phdr_table_size > parse_size - ehdr->e_phoff) {
         kprintf("[ELF] SECURITY: Program header table extends beyond the file\n");
         return -1;
     }
@@ -826,7 +845,7 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
              * the buffer end, potentially leaking kernel memory (crypto keys,
              * passwords) into the process address space.
              *=================================================================*/
-            if (offset > elf_size || filesz > (elf_size - offset)) {
+            if (offset > parse_size || filesz > (parse_size - offset)) {
                 kprintf("[ELF] SECURITY: Segment %d file offset/size exceeds file bounds\n", i);
                 return -1;
             }
@@ -869,26 +888,43 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
      *   (A_start < B_end) AND (B_start < A_end)
      * - Reject ELF if any overlap detected
      *
+     * PAGE GRANULARITY. The overlap test rounds each segment OUT to whole
+     * pages before comparing. Mapping is page-granular: two segments that do
+     * not overlap byte-for-byte can still land in the same 4KB page (e.g. an
+     * RX segment ending at 0x8049400 and an RW one starting at 0x8049800 share
+     * page 0x8049000). Whoever is copied second wins that page's contents while
+     * its flags were fixed by whoever mapped it first -- a byte-range check
+     * waves this through. The PTEs stay W^X either way (the W and X bits are
+     * never set on one page), so this is defence in depth, not a live W^X hole,
+     * but a binary whose pages collide is malformed and refused rather than
+     * loaded with last-writer-wins contents.
+     *
      * REFERENCES:
      * - ELF Specification: PT_LOAD segments must not overlap
      * - W^X (Write XOR Execute): Memory pages cannot be both writable and executable
      *=========================================================================*/
+    #define ELF_PAGE_SIZE 0x1000u
+    #define ELF_PAGE_DOWN(a) ((a) & ~(ELF_PAGE_SIZE - 1))
+    /* Round the exclusive end up to a page. start+memsz was proven <=
+     * ELF_USER_SPACE_END (0xC0000000) in the per-segment loop above, so
+     * +0xFFF cannot wrap a uint32_t. */
+    #define ELF_PAGE_UP(a)   (((a) + (ELF_PAGE_SIZE - 1)) & ~(ELF_PAGE_SIZE - 1))
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
-        uint32_t seg_i_start = phdr[i].p_vaddr;
-        uint32_t seg_i_end = seg_i_start + phdr[i].p_memsz;
+        uint32_t seg_i_start = ELF_PAGE_DOWN(phdr[i].p_vaddr);
+        uint32_t seg_i_end = ELF_PAGE_UP(phdr[i].p_vaddr + phdr[i].p_memsz);
 
         /* Check for overlap with all subsequent segments */
         for (int j = i + 1; j < ehdr->e_phnum; j++) {
             if (phdr[j].p_type != PT_LOAD) continue;
-            uint32_t seg_j_start = phdr[j].p_vaddr;
-            uint32_t seg_j_end = seg_j_start + phdr[j].p_memsz;
+            uint32_t seg_j_start = ELF_PAGE_DOWN(phdr[j].p_vaddr);
+            uint32_t seg_j_end = ELF_PAGE_UP(phdr[j].p_vaddr + phdr[j].p_memsz);
 
             /* Overlap condition: (seg_i_start < seg_j_end) AND (seg_j_start < seg_i_end) */
             if (seg_i_start < seg_j_end && seg_j_start < seg_i_end) {
-                kprintf("[ELF] SECURITY: Segments %d and %d overlap!\n", i, j);
-                kprintf("[ELF]   Segment %d: [0x%08x - 0x%08x)\n", i, seg_i_start, seg_i_end);
-                kprintf("[ELF]   Segment %d: [0x%08x - 0x%08x)\n", j, seg_j_start, seg_j_end);
+                kprintf("[ELF] SECURITY: Segments %d and %d share a page!\n", i, j);
+                kprintf("[ELF]   Segment %d pages: [0x%08x - 0x%08x)\n", i, seg_i_start, seg_i_end);
+                kprintf("[ELF]   Segment %d pages: [0x%08x - 0x%08x)\n", j, seg_j_start, seg_j_end);
                 return -1;
             }
         }
