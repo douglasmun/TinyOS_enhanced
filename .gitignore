@@ -248,3 +248,5 @@ fat32content.log
 fat32content-trace.log
 fat32stale.log
 fat32stale-trace.log
+fat32mode.log
+fat32mode-trace.log

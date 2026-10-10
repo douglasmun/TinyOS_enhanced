@@ -433,7 +433,14 @@ bool vfs_path_is_protected(const char* canonical) {
      *
      * So compare the whole entry, then require the next char to be end-of-string
      * or '/'. Input is already canonical (absolute, no "." / ".."), so no
-     * traversal can slip a protected path past this. */
+     * traversal can slip a protected path past this.
+     *
+     * The compare folds ASCII case. FAT32 (C:) names are case-insensitive,
+     * so "/ETC/passwd" and "/etc/passwd" name the same file there, and a
+     * case-sensitive match let a non-root caller create C:/ETC/... past this
+     * gate. On ramfs the fold over-matches "/ETC" (fails safe: it denies),
+     * and ramfs's / is 0711, so an unprivileged caller cannot create there
+     * anyway. */
     static const char* const protected_paths[] = {
         "/bin",
         "/sbin",
@@ -445,7 +452,18 @@ bool vfs_path_is_protected(const char* canonical) {
 
     for (int i = 0; protected_paths[i] != NULL; i++) {
         size_t len = strlen(protected_paths[i]);
-        if (strncmp(canonical, protected_paths[i], len) == 0 &&
+        size_t j = 0;
+        while (j < len) {
+            char c = canonical[j];
+            if (c >= 'A' && c <= 'Z') {
+                c = (char)(c + ('a' - 'A'));
+            }
+            if (c != protected_paths[i][j]) {
+                break;
+            }
+            j++;
+        }
+        if (j == len &&
             (canonical[len] == '\0' || canonical[len] == '/')) {
             return true;
         }
@@ -739,7 +757,10 @@ int vfs_open(const char* path, int flags) {
      *
      * NOTE: Path is now canonicalized, so /etc/../etc/passwd attacks are blocked.
      *=======================================================================*/
-    if ((flags & (VFS_O_WRONLY | VFS_O_RDWR))) {
+    /* O_CREAT and O_TRUNC modify the file system whatever the access mode:
+     * O_RDONLY|O_CREAT creates a node and O_RDONLY|O_TRUNC empties one, so
+     * both are write intent here, not just the write access modes. */
+    if ((flags & (VFS_O_WRONLY | VFS_O_RDWR | VFS_O_CREAT | VFS_O_TRUNC))) {
         /* This is a write operation - check if path is protected */
         task_t* current_task = scheduler_get_current_task();
 
@@ -858,6 +879,14 @@ ssize_t vfs_read(int fd, void* buf, size_t size) {
         return VFS_EOVERFLOW;
     }
 
+    /* The access mode is enforced here, once, for every driver. FAT32 kept
+     * no mode at all, so a read on an O_WRONLY fd and a write on an O_RDONLY
+     * fd both reached the disk -- the second one past the protected-path
+     * gate, which only screens opens that ask to write. */
+    if (!vfs_flags_readable(vfs_fd_table[fd].flags)) {
+        return VFS_EBADF;
+    }
+
     /* Handle zero-length read */
     if (size == 0) {
         return 0;
@@ -913,6 +942,11 @@ ssize_t vfs_write(int fd, const void* buf, size_t size) {
         return VFS_EOVERFLOW;
     }
 
+    /* See vfs_read: the access mode is enforced here for every driver. */
+    if (!vfs_flags_writable(vfs_fd_table[fd].flags)) {
+        return VFS_EBADF;
+    }
+
     /* Handle zero-length write */
     if (size == 0) {
         return 0;
@@ -924,6 +958,21 @@ ssize_t vfs_write(int fd, const void* buf, size_t size) {
     if (!vfs_fd_table[fd].ops || !vfs_fd_table[fd].ops->write) {
         // kprintf("[VFS] ERROR: No write operation for FD %d\n", fd);
         return VFS_EINVAL;
+    }
+
+    /* O_APPEND: every write lands at the current end of file, even if
+     * another fd extended it since this one last moved. Neither driver
+     * implemented the flag -- sys_open accepted it and both wrote at the
+     * cursor -- so it is done once here through the driver's own seek. */
+    if (vfs_fd_table[fd].flags & VFS_O_APPEND) {
+        if (!vfs_fd_table[fd].ops->seek) {
+            return VFS_EINVAL;
+        }
+        ssize_t end = vfs_fd_table[fd].ops->seek(vfs_fd_table[fd].private_data,
+                                                 0, VFS_SEEK_END);
+        if (end < 0) {
+            return end;
+        }
     }
 
     return vfs_fd_table[fd].ops->write(vfs_fd_table[fd].private_data, buf, size);
