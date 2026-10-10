@@ -318,6 +318,56 @@ static int flush_dirent(fat32_file_t* file) {
 }
 
 /*-----------------------------------------------------------------------------
+ * Open files are identified by their directory entry, not their first cluster.
+ *
+ * Each descriptor carries its own copy of first_cluster and file_size. The
+ * unlink busy check used to compare first_cluster, which is 0 for an empty
+ * file, so an open empty file could be unlinked: its fd's later flush_dirent
+ * rewrote whichever new file had reused the 0xE5 slot. And O_TRUNC through
+ * one fd freed the chain while every other fd on the file kept its cached
+ * clusters, reading and writing storage the allocator had handed elsewhere.
+ * The dirent location is the one identity that neither of those changes.
+ *---------------------------------------------------------------------------*/
+static bool dirent_is_open(uint32_t dirent_cluster, uint32_t dirent_index) {
+    for (int f = 0; f < FAT32_MAX_OPEN_FILES; f++) {
+        if (open_files[f].in_use && open_files[f].dirent_cluster != 0 &&
+            open_files[f].dirent_cluster == dirent_cluster &&
+            open_files[f].dirent_index == dirent_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Copy `file`'s chain head and size to every other fd on the same dirent.
+ * After a truncate their cursors point into the freed chain, so they restart
+ * at 0 (the only valid offset in an empty file, as fat32_seek also enforces).
+ * After a write the chain only grew, so an existing cursor stays valid; an fd
+ * opened while the file was still empty picks up the new first cluster. */
+static void sync_open_siblings(const fat32_file_t* file, bool truncated) {
+    if (file->dirent_cluster == 0) {
+        return;
+    }
+    for (int f = 0; f < FAT32_MAX_OPEN_FILES; f++) {
+        fat32_file_t* other = &open_files[f];
+        if (other == file || !other->in_use ||
+            other->dirent_cluster != file->dirent_cluster ||
+            other->dirent_index != file->dirent_index) {
+            continue;
+        }
+        other->first_cluster = file->first_cluster;
+        other->file_size = file->file_size;
+        other->dirty = file->dirty;
+        if (truncated) {
+            other->current_cluster = 0;
+            other->position = 0;
+        } else if (other->current_cluster == 0) {
+            other->current_cluster = file->first_cluster;
+        }
+    }
+}
+
+/*-----------------------------------------------------------------------------
  * FUNCTION: parse_path
  * PURPOSE: Parse path into directory components
  *---------------------------------------------------------------------------*/
@@ -1202,6 +1252,7 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
     if (flush_dirent(file) != 0 && bytes_written > 0) {
         kprintf("[FAT32] WARNING: data written but directory entry not updated\n");
     }
+    sync_open_siblings(file, false);
 
     mutex_unlock(&fat32_mutex);
 
@@ -1257,6 +1308,7 @@ int fat32_truncate(int fd) {
     file->dirty = true;
 
     int rc = flush_dirent(file);
+    sync_open_siblings(file, true);
 
     mutex_unlock(&fat32_mutex);
     return rc;
@@ -1501,16 +1553,14 @@ int fat32_unlink(const char* path) {
      * someone else, so a later read or write through that fd would touch
      * another file's data. Without a real unlink-on-last-close this is the
      * only safe answer.
+     *
+     * Matched on the dirent, not the first cluster: an empty file has
+     * cluster 0, and its fd would flush its size into whatever file reused
+     * the freed slot (see dirent_is_open).
      *=======================================================================*/
-    uint32_t ent_cluster = ((uint32_t)found.first_cluster_high << 16) |
-                           found.first_cluster_low;
-    for (int f = 0; f < FAT32_MAX_OPEN_FILES; f++) {
-        if (open_files[f].in_use &&
-            open_files[f].first_cluster == ent_cluster &&
-            ent_cluster != 0) {
-            mutex_unlock(&fat32_mutex);
-            return -3;  // Busy: file is open
-        }
+    if (dirent_is_open(dirent_cluster, dirent_index)) {
+        mutex_unlock(&fat32_mutex);
+        return -3;  // Busy: file is open
     }
 
     /* Clear the directory entry BEFORE freeing the chain. If the entry
@@ -1532,7 +1582,8 @@ int fat32_unlink(const char* path) {
     }
 
     /* Now free the file's clusters, bounded against a cyclic FAT. */
-    uint32_t cluster = ent_cluster;
+    uint32_t cluster = ((uint32_t)found.first_cluster_high << 16) |
+                       found.first_cluster_low;
     uint32_t iteration_count = 0;
     while (cluster > 0 && cluster < FAT32_EOC) {
         if (++iteration_count > chain_limit) {
