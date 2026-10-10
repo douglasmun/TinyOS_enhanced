@@ -22,6 +22,9 @@
  * Mode "mode" (see mode() below): access mode, O_APPEND and the protected-path
  * gate on C:. See verify-fat32-access-mode.sh.
  *
+ * Mode "cap" (see cap() below): the per-uid open cap, and the driver's error
+ * paths staying off the console. See verify-fat32-fd-cap.sh.
+ *
  * bad= is the first differing offset, -1 when the content matches. Runs
  * unprivileged: C: has no ownership model, so uid does not change the path.
  *===========================================================================*/
@@ -320,6 +323,65 @@ static void mode(void) {
            csize, cbad, dsize, dbad);
 }
 
+/*---------------------------------------------------------------------------
+ * Mode "cap": the per-uid cap on fat32's shared open-file table, and the
+ * driver's ring-3-reachable error paths staying off the console. Run as a
+ * non-root user; see verify-fat32-fd-cap.sh.
+ *
+ *   PROBE cap opens=N err=E new=S reopen=R
+ *       N opens of one file succeed before the first refusal E; new= is the
+ *       stat of a file the refused open asked to O_CREAT; reopen= is an open
+ *       after closing them all (the slots came back).
+ *   PROBE cap quiet notdir=A dirread=B dirwrite=C
+ *       open through a file as if it were a directory; read and write on a
+ *       directory opened as a file. Each fails; the harness checks that none
+ *       of them printed on the console.
+ *-------------------------------------------------------------------------*/
+#define CAP_TRIES 16
+
+static void cap(void) {
+    unlink("C:/CAP/NEW.BIN");   /* left by an earlier run on an unfixed kernel */
+    int rc = mkdir("C:/CAP");
+    if (rc < 0 && stat_size("C:/CAP") < 0) printf("PROBE mkdir C:/CAP failed %d\n", rc);
+    int fd = create("C:/CAP/F.BIN");
+    if (fd >= 0) close(fd);
+
+    int fds[CAP_TRIES];
+    int opens = 0, err = 0;
+    while (opens < CAP_TRIES) {
+        fd = open("C:/CAP/F.BIN", O_RDONLY);
+        if (fd < 0) {
+            err = fd;
+            break;
+        }
+        fds[opens++] = fd;
+    }
+    /* At the cap: an O_CREAT open must be refused without creating. */
+    int nfd = open("C:/CAP/NEW.BIN", O_WRONLY | O_CREAT);
+    if (nfd >= 0) close(nfd);
+    int news = stat_size("C:/CAP/NEW.BIN");
+    for (int i = 0; i < opens; i++) close(fds[i]);
+    int reopen = open("C:/CAP/F.BIN", O_RDONLY);
+    if (reopen >= 0) close(reopen);
+    printf("PROBE cap opens=%d err=%d new=%d reopen=%d\n",
+           opens, err, news, reopen >= 0 ? 0 : reopen);
+
+    int notdir = open("C:/CAP/F.BIN/X.BIN", O_RDONLY);
+    if (notdir >= 0) close(notdir);
+    int dirread = -999, dirwrite = -999;
+    fd = open("C:/CAP", O_RDONLY);
+    if (fd >= 0) {
+        dirread = read(fd, rbuf, 10);
+        close(fd);
+    }
+    fd = open("C:/CAP", O_WRONLY);
+    if (fd >= 0) {
+        dirwrite = write(fd, "zz", 2);
+        close(fd);
+    }
+    printf("PROBE cap quiet notdir=%d dirread=%d dirwrite=%d\n", notdir, dirread, dirwrite);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "big")) {
         big();
@@ -327,8 +389,10 @@ int main(int argc, char** argv) {
         stale();
     } else if (argc > 1 && !strcmp(argv[1], "mode")) {
         mode();
+    } else if (argc > 1 && !strcmp(argv[1], "cap")) {
+        cap();
     } else {
-        print("usage: fatprobe big|stale|mode\n");
+        print("usage: fatprobe big|stale|mode|cap\n");
     }
     print("PROBE done\n");
     return 0;

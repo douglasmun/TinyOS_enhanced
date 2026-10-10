@@ -148,6 +148,12 @@ static int fat32_vfs_open(const char* path, int flags, void** private_data) {
     /* Open file using FAT32 */
     int fat32_fd = fat32_open(path);
 
+    /* Over the caller's uid cap: say so, and don't take it for "not found"
+     * -- with O_CREAT that would go on to create the file it may not open. */
+    if (fat32_fd == FAT32_OPEN_LIMIT) {
+        return VFS_EAGAIN;
+    }
+
     /*=========================================================================
      * O_CREAT: create the file, then open it for real.
      *
