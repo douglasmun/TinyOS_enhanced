@@ -121,6 +121,7 @@ SRC := \
   src/pipeprobe_elf_data.c \
   src/fdprobe_elf_data.c \
   src/tcpcap_elf_data.c \
+  src/fatprobe_elf_data.c \
   src/slotbomb_elf_data.c \
   src/slothold_elf_data.c \
   src/shell_elf_data.c \

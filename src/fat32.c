@@ -1022,11 +1022,32 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
             return bytes_read > 0 ? (int)bytes_read : -1;  // Return partial read or error
         }
 
-        // Read cluster
-        if (read_cluster(file->current_cluster, cluster_buffer) != 0) {
+        /*=====================================================================
+         * Cursor convention (shared with fat32_write and fat32_seek): when
+         * `position` sits exactly on a cluster boundary, current_cluster is
+         * still the cluster holding byte position-1. Step onto the successor
+         * only here, once a byte from it is actually wanted.
+         *
+         * The old loop stepped at the BOTTOM, and only if this call still had
+         * bytes to read. A call that ended exactly on a boundary left the
+         * cursor behind, and the next call re-read the same cluster at offset
+         * 0. sys_read reads in 1024-byte chunks and the shipped volume has
+         * 1024-byte clusters, so every file over 1 KB read back as its first
+         * cluster repeated.
+         *===================================================================*/
+        uint32_t cluster = file->current_cluster;
+        if (file->position > 0 && (file->position % bytes_per_cluster) == 0) {
+            cluster = read_fat_entry(cluster);
+            if (cluster < 2 || cluster >= FAT32_BAD_CLUSTER) {
+                break;  /* chain ends before file_size: reported below */
+            }
+        }
+
+        if (read_cluster(cluster, cluster_buffer) != 0) {
             mutex_unlock(&fat32_mutex);
             return -1;
         }
+        file->current_cluster = cluster;
 
         uint32_t cluster_offset = file->position % bytes_per_cluster;
         uint32_t bytes_to_copy = bytes_per_cluster - cluster_offset;
@@ -1037,11 +1058,6 @@ int fat32_read(int fd, void* buffer, uint32_t size) {
         memcpy(buf + bytes_read, cluster_buffer + cluster_offset, bytes_to_copy);
         bytes_read += bytes_to_copy;
         file->position += bytes_to_copy;
-
-        // Move to next cluster if needed
-        if (file->position % bytes_per_cluster == 0 && bytes_read < size) {
-            file->current_cluster = read_fat_entry(file->current_cluster);
-        }
     }
 
     mutex_unlock(&fat32_mutex);
@@ -1118,8 +1134,42 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
             break;
         }
 
-        // Read current cluster (preserves bytes we're not overwriting)
-        if (read_cluster(file->current_cluster, cluster_buffer) != 0) {
+        /*=====================================================================
+         * Same cursor convention as fat32_read: at a cluster boundary the
+         * cursor is still on the cluster holding byte position-1, so step
+         * onto the successor here -- following the chain if it continues,
+         * extending it if not. The old loop stepped at the bottom and only
+         * when this call had more to write, so a write ending exactly on a
+         * boundary left the cursor behind and the NEXT write overwrote that
+         * same cluster from offset 0. sys_write feeds the VFS in 512-byte
+         * chunks; on the shipped 1024-byte-cluster volume, every write past
+         * 1 KB clobbered the file's first cluster and never grew the chain.
+         *
+         * The cursor only moves once the cluster has been written, so a
+         * failed write leaves it where the next call expects it.
+         *===================================================================*/
+        uint32_t cluster = file->current_cluster;
+        if (file->position > 0 && (file->position % bytes_per_cluster) == 0) {
+            uint32_t next = read_fat_entry(cluster);
+
+            if (next == FAT32_BAD_CLUSTER) {
+                break;  /* FAT read failure */
+            }
+
+            if (next >= FAT32_EOC) {
+                next = allocate_cluster(cluster);
+                if (next == 0) {
+                    break;  /* disk full — return the partial write below */
+                }
+            } else if (next < 2) {
+                break;  /* corrupt chain */
+            }
+
+            cluster = next;
+        }
+
+        // Read the cluster (preserves bytes we're not overwriting)
+        if (read_cluster(cluster, cluster_buffer) != 0) {
             break;
         }
 
@@ -1132,9 +1182,10 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
 
         memcpy(cluster_buffer + cluster_offset, buf + bytes_written, bytes_to_write);
 
-        if (write_cluster(file->current_cluster, cluster_buffer) != 0) {
+        if (write_cluster(cluster, cluster_buffer) != 0) {
             break;
         }
+        file->current_cluster = cluster;
 
         bytes_written += bytes_to_write;
         file->position += bytes_to_write;
@@ -1143,30 +1194,6 @@ int fat32_write(int fd, const void* buffer, uint32_t size) {
         if (file->position > file->file_size) {
             file->file_size = file->position;
             file->dirty = true;
-        }
-
-        /*=====================================================================
-         * Advance to the next cluster only when this one is exactly full AND
-         * there is more to write. Follow the existing chain if it continues;
-         * otherwise extend it. The old code `continue`d here and relied on the
-         * top-of-loop test to allocate, which re-read the boundary condition
-         * and could allocate twice or spin.
-         *===================================================================*/
-        if (bytes_written < size && (file->position % bytes_per_cluster) == 0) {
-            uint32_t next = read_fat_entry(file->current_cluster);
-
-            if (next == FAT32_BAD_CLUSTER) {
-                break;  /* FAT read failure */
-            }
-
-            if (next >= FAT32_EOC) {
-                next = allocate_cluster(file->current_cluster);
-                if (next == 0) {
-                    break;  /* disk full — return the partial write below */
-                }
-            }
-
-            file->current_cluster = next;
         }
     }
 
