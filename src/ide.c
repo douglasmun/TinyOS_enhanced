@@ -253,10 +253,28 @@ bool ide_identify(void) {
         if (identify_data[83] & (1 << 10)) {
             // Read LBA48 capacity from words 100-103 (only use lower 32 bits)
             total_sectors = (uint32_t)identify_data[100] | ((uint32_t)identify_data[101] << 16);
+            /* Words 102-103 are the top of the 48-bit count; a disk that
+             * large is far past what we can address anyway. */
+            if (identify_data[102] != 0 || identify_data[103] != 0) {
+                total_sectors = IDE_LBA28_MAX_SECTORS;
+            }
         }
     }
 
-    uint32_t size_mb = (total_sectors * IDE_SECTOR_SIZE) / (1024 * 1024);
+    /* Every command this driver issues is LBA28: ide_set_lba_atomic() sends
+     * 28 address bits and drops the rest. total_sectors is the bound the
+     * read/write paths check, so taking the LBA48 count unclamped let LBA
+     * 2^28 + n pass that check and land on sector n -- a read returned, and
+     * a write overwrote, sector n of the disk (the boot sector for n = 0).
+     * The usable capacity is what LBA28 can name. */
+    if (total_sectors > IDE_LBA28_MAX_SECTORS) {
+        kprintf("[IDE] Disk exceeds LBA28: using the first %u of %u sectors\n",
+                IDE_LBA28_MAX_SECTORS, total_sectors);
+        total_sectors = IDE_LBA28_MAX_SECTORS;
+    }
+
+    /* Sectors per MB, not bytes: total_sectors * 512 wraps past 4 GiB. */
+    uint32_t size_mb = total_sectors / ((1024 * 1024) / IDE_SECTOR_SIZE);
     kprintf("[IDE] Disk capacity: %u MB (%u sectors)\n", size_mb, total_sectors);
 
     return true;
@@ -432,3 +450,34 @@ int ide_write_sectors(uint32_t lba, uint8_t sector_count, const void* buffer) {
 uint32_t ide_get_sector_count(void) {
     return total_sectors;
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * FUNCTION: ide_lba_selftest
+ * PURPOSE: verify-ide-lba28-clamp.sh only -- read three sectors and print the
+ * first 8 bytes of each, so the harness can tell which sector the drive
+ * actually returned. The harness plants a distinct tag at each LBA on a
+ * sparse disk larger than 2^28 sectors:
+ *   5           -- control: ordinary reads work
+ *   0x0FFFFFF0  -- control: the clamp still reaches the top of LBA28 space
+ *   0x10000005  -- must be refused; an unclamped driver aliases it to LBA 5
+ *============================================================================*/
+void ide_lba_selftest(void) {
+    static const uint32_t lbas[] = { 5u, 0x0FFFFFF0u, 0x10000005u };
+    static uint8_t sector[IDE_SECTOR_SIZE];
+
+    kprintf("IDELBA sectors=%u\n", total_sectors);
+    for (unsigned i = 0; i < sizeof(lbas) / sizeof(lbas[0]); i++) {
+        memset(sector, 0, sizeof(sector));
+        int rc = ide_read_sectors(lbas[i], 1, sector);
+        char tag[9];
+        for (int j = 0; j < 8; j++) {
+            uint8_t c = sector[j];
+            tag[j] = (rc == 0 && c >= 0x21 && c <= 0x7E) ? (char)c : '.';
+        }
+        tag[8] = '\0';
+        kprintf("IDELBA lba=%u rc=%d tag=%s\n", lbas[i], rc, tag);
+    }
+    kprintf("IDELBA done\n");
+}
+#endif

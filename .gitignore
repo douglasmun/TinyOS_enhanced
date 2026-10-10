@@ -252,3 +252,5 @@ fat32mode.log
 fat32mode-trace.log
 fat32cap.log
 fat32cap-trace.log
+idelba.log
+idelba-trace.log

@@ -91,6 +91,10 @@
 // Sector size
 #define IDE_SECTOR_SIZE     512
 
+// LBA28 names sectors 0..0x0FFFFFFE; IDENTIFY reports 0x0FFFFFFF there for
+// any disk at least that large, so it is also the usable sector count.
+#define IDE_LBA28_MAX_SECTORS 0x0FFFFFFFu
+
 /*=============================================================================
  * FUNCTION PROTOTYPES
  *============================================================================*/
@@ -99,5 +103,11 @@ bool ide_identify(void);
 int ide_read_sectors(uint32_t lba, uint8_t sector_count, void* buffer);
 int ide_write_sectors(uint32_t lba, uint8_t sector_count, const void* buffer);
 uint32_t ide_get_sector_count(void);
+
+#ifdef TINYOS_FAULT_INJECT
+/* verify-ide-lba28-clamp.sh only: read tagged sectors either side of the
+ * LBA28 limit and print which sector came back. */
+void ide_lba_selftest(void);
+#endif
 
 #endif // IDE_H
