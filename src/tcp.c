@@ -564,8 +564,17 @@ const char* tcp_state_to_string(tcp_state_t state) {
  * @param data Optional payload data
  * @param data_len Length of payload
  */
+#ifdef TINYOS_FAULT_INJECT
+/* tcp_state_selftest() drives the state machine on a synthetic slot; nothing it
+ * provokes may reach the wire (or snd_nxt). */
+static bool tcp_selftest_mute = false;
+#endif
+
 static void tcp_send_segment(tcp_connection_t* conn, uint8_t flags,
                              const void* data, size_t data_len) {
+#ifdef TINYOS_FAULT_INJECT
+    if (tcp_selftest_mute) return;
+#endif
     // DEBUG: All kprintf calls removed to test if kprintf is causing the issue
 
     /*=========================================================================
@@ -713,6 +722,21 @@ static void tcp_send_segment(tcp_connection_t* conn, uint8_t flags,
  * TCP STATE MACHINE
  *=============================================================================*/
 
+/* Is this segment's FIN the next thing in the stream?
+ *
+ * The FIN sits at SEG.SEQ + SEG.LEN. It may be honoured only once everything
+ * before it has been received, i.e. once that position equals RCV.NXT -- which
+ * the ESTABLISHED data branch has already advanced past any in-order payload
+ * in this same segment. Every FIN site used to set rcv_nxt = seq + 1
+ * unconditionally: a FIN carrying data ACKed one byte past the segment START
+ * (so the data was acknowledged short), and an in-window FIN ahead of a gap
+ * jumped rcv_nxt over the missing bytes and closed a stream that had not
+ * ended. Out-of-order FINs are ignored; the peer retransmits. */
+static bool tcp_fin_in_order(const tcp_connection_t* conn, uint32_t seq,
+                             size_t data_len) {
+    return seq + (uint32_t)data_len == conn->rcv_nxt;
+}
+
 /**
  * @brief Handle received TCP segment and update state machine
  */
@@ -763,6 +787,16 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
         if (conn->state >= TCP_ESTABLISHED &&
             !tcp_validate_sequence(seq, conn->rcv_nxt, conn->rcv_wnd)) {
             /* Blind RST injection (RFC 5961). Remote-driven by definition. */
+            net_count_tcp_sequence();
+            return;
+        }
+
+        /* RFC 793 p.66: in SYN_SENT a RST is acceptable only if it carries
+         * an ACK of our SYN (SEG.ACK == SND.NXT). Without this, any host that
+         * guessed the 4-tuple of an outgoing connect() -- the local port is
+         * the only unknown -- could abort it with a bare RST. */
+        if (conn->state == TCP_SYN_SENT &&
+            (!(flags & TCP_ACK) || ack != conn->snd_nxt)) {
             net_count_tcp_sequence();
             return;
         }
@@ -934,7 +968,7 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
             }
             
             // Check for FIN with rate limiting
-            if (flags & TCP_FIN) {
+            if ((flags & TCP_FIN) && tcp_fin_in_order(conn, seq, data_len)) {
                 uint32_t now = tcp_get_time_ms();
                 int conn_idx = conn - tcp_connections;
 
@@ -948,7 +982,7 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
                     last_fin_time[conn_idx] = now;
                 }
 
-                conn->rcv_nxt = seq + 1;
+                conn->rcv_nxt += 1;   /* the FIN occupies one sequence number */
                 conn->fin_received = true;
                 conn->state = TCP_CLOSE_WAIT;
 
@@ -971,8 +1005,8 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
             }
 
             // Peer might also send FIN (simultaneous close)
-            if (flags & TCP_FIN) {
-                conn->rcv_nxt = seq + 1;
+            if ((flags & TCP_FIN) && tcp_fin_in_order(conn, seq, data_len)) {
+                conn->rcv_nxt += 1;   /* the FIN occupies one sequence number */
                 conn->fin_received = true;
 
                 if (conn->state == TCP_FIN_WAIT_2) {
@@ -993,8 +1027,8 @@ static void tcp_process_segment(tcp_connection_t* conn, tcp_header_t* tcp_hdr,
             
         case TCP_FIN_WAIT_2:
             // Waiting for peer's FIN
-            if (flags & TCP_FIN) {
-                conn->rcv_nxt = seq + 1;
+            if ((flags & TCP_FIN) && tcp_fin_in_order(conn, seq, data_len)) {
+                conn->rcv_nxt += 1;   /* the FIN occupies one sequence number */
                 conn->fin_received = true;
                 conn->state = TCP_TIME_WAIT;
                 conn->time_wait_start = tcp_get_time_ms();
@@ -1498,7 +1532,14 @@ int tcp_close(int sockfd) {
 
         case TCP_CLOSED:
         case TCP_LISTEN:
+        /* Handshake still in flight: no data, nothing to FIN. These fell to
+         * the "already closing" default and stayed in_use, so a SYN-ACK
+         * arriving after close() promoted the slot to ESTABLISHED with nobody
+         * left to read or close it -- a socket leaked until reboot. */
+        case TCP_SYN_SENT:
+        case TCP_SYN_RECEIVED:
             // Just mark as free
+            conn->state = TCP_CLOSED;
             conn->in_use = false;
             break;
 
@@ -1677,167 +1718,183 @@ void tcp_handle_packet(const uint8_t* src_ip, const uint8_t* dest_ip,
     TCP_UNLOCK();
 }
 
+/* One slot of tcp_tick(), called with TCP_LOCK held.
+ *
+ * tcp_tick runs in ktimerd task context with interrupts ON, and it
+ * read-modify-writes the same state/in_use fields the knetd RX path and
+ * SYS_TCPSOCK mutate under TCP_LOCK -- a timeout freeing a slot between
+ * the RX path finding it and writing it, or the zero-window probe sharing
+ * tcp_send_segment's static TX buffer with an RX-driven ACK. Each slot is
+ * now processed atomically; the lock is dropped between slots so one tick
+ * never masks interrupts for the whole table. */
+static void tcp_tick_slot(int i, uint32_t current_time) {
+    tcp_connection_t* conn = &tcp_connections[i];
+
+    /* An open connection whose owner exited: close it here, in ktimerd's
+     * task context, rather than from teardown. tcp_close() sends the FIN
+     * and the closing states then time out as for any other close. */
+    if (conn->in_use && conn->orphaned) {
+        conn->orphaned = false;
+        tcp_close(i);
+    }
+    if (!conn->in_use) return;
+
+    /*=====================================================================
+     * SECURITY: SYN_SENT Timeout Protection
+     * CRITICAL: Prevent slow state exhaustion DoS from zombie SYN_SENT
+     * connections that never complete the handshake.
+     *
+     * An attacker can send SYN packets to random ports, forcing the
+     * firewall to allocate connections that never receive SYN-ACK responses.
+     * Without timeout, these zombie connections fill the connection table.
+     *
+     * Timeout: 10 seconds (reasonable for firewall environments)
+     * After timeout: Forcefully close and free the connection
+     *===================================================================*/
+    #define TCP_SYN_SENT_TIMEOUT_MS 10000  // 10 seconds
+
+    if (conn->state == TCP_SYN_SENT) {
+        uint32_t elapsed = current_time - conn->syn_sent_start;
+        /* Counted, not printed: one unprivileged connect() to a host
+         * that never answers would otherwise buy two console lines. */
+        if (elapsed > TCP_SYN_SENT_TIMEOUT_MS) {
+            net_count_tcp_timed_out();
+            conn->state = TCP_CLOSED;
+            conn->in_use = false;
+        }
+    }
+
+    if (conn->state == TCP_SYN_RECEIVED) {
+        uint32_t elapsed = current_time - conn->syn_sent_start;
+        if (elapsed > TCP_SYN_SENT_TIMEOUT_MS) {
+            net_count_tcp_timed_out();
+            conn->state = TCP_CLOSED;
+            conn->in_use = false;
+        }
+    }
+
+    /* Our FIN is out and the peer never finished: FIN_WAIT_1 (no ACK),
+     * CLOSING (no ACK of our FIN) or LAST_ACK. Same limit as FIN_WAIT_2.
+     * Silent: a ring-3 user can drive this, so it is counted by nothing
+     * and printed by nothing. */
+    if ((conn->state == TCP_FIN_WAIT_1 || conn->state == TCP_CLOSING ||
+         conn->state == TCP_LAST_ACK) && conn->fin_sent &&
+        (current_time - conn->close_start) > TCP_FIN_WAIT_2_TIMEOUT) {
+        conn->state = TCP_CLOSED;
+        conn->in_use = false;
+    }
+
+    // Handle TIME_WAIT timeout
+    if (conn->state == TCP_TIME_WAIT) {
+        if (current_time - conn->time_wait_start > TCP_TIME_WAIT_TIMEOUT) {
+            // kprintf("TCP: TIME_WAIT timeout, closing connection %d\n", i);  // Commented for less verbosity
+            conn->state = TCP_CLOSED;
+            conn->in_use = false;
+        }
+    }
+
+    /*=====================================================================
+     * SECURITY: FIN_WAIT_2 Timeout Protection
+     * CRITICAL: Prevent resource exhaustion DoS from zombie FIN_WAIT_2
+     * connections.
+     *
+     * ATTACK SCENARIO:
+     * 1. Malicious client establishes connection
+     * 2. Client sends FIN (enters FIN_WAIT_1)
+     * 3. Server ACKs the FIN (client enters FIN_WAIT_2)
+     * 4. Client NEVER sends its FIN (refuses to complete shutdown)
+     * 5. Connection stuck in FIN_WAIT_2 indefinitely
+     * 6. Attacker repeats → Connection table exhaustion
+     *
+     * RFC 1122 Section 4.2.2.13:
+     * "A TCP implementation SHOULD implement a FIN_WAIT_2 timeout.
+     *  If FIN_WAIT_2 timeout expires, the connection SHOULD be closed."
+     *
+     * Recommended timeout: 60 seconds (RFC 1122 suggests max of 10 minutes,
+     * but we use shorter timeout for high-security firewall environments)
+     *
+     * This is different from TIME_WAIT:
+     * - TIME_WAIT protects against delayed packets (both FINs exchanged)
+     * - FIN_WAIT_2 protects against non-compliant/malicious peers
+     *===================================================================*/
+    if (conn->state == TCP_FIN_WAIT_2) {
+        if (conn->fin_wait_2_start > 0 &&
+            (current_time - conn->fin_wait_2_start) > TCP_FIN_WAIT_2_TIMEOUT) {
+            /* The peer chooses whether this fires. Counted, not printed. */
+            net_count_tcp_timed_out();
+            conn->state = TCP_CLOSED;
+            conn->in_use = false;
+        }
+    }
+
+    /*=====================================================================
+     * CRITICAL: Zero Window Probe (TCP Flow Control Deadlock Prevention)
+     *
+     * RFC 793 Section 3.7: When the peer advertises a zero receive window
+     * (snd_wnd == 0), the connection will stall unless the peer sends a
+     * window update. However, if the peer's window update ACK is lost in
+     * transit, the connection deadlocks permanently:
+     *
+     * - Sender waits for window update (blocking on snd_wnd == 0)
+     * - Receiver already sent window update (but packet was lost)
+     * - Neither side will send anything -> DEADLOCK
+     *
+     * Solution: Zero Window Probes
+     * - Periodically send 1 byte of data to elicit an ACK
+     * - The ACK will contain the current window size
+     * - If window opened, transmission resumes
+     * - If still zero, probe again later
+     *
+     * Timeout: 5 seconds between probes (reasonable for firewall)
+     * Critical for: Long-lived connections, bulk data transfer
+     *===================================================================*/
+    #define TCP_ZERO_WINDOW_PROBE_INTERVAL_MS 5000  // 5 seconds
+
+    if (conn->state == TCP_ESTABLISHED && conn->snd_wnd == 0) {
+        // Check if we have data waiting to send
+        uint16_t tx_available = (conn->tx_head >= conn->tx_tail) ?
+            (conn->tx_head - conn->tx_tail) :
+            (TCP_TX_BUFFER_SIZE - conn->tx_tail + conn->tx_head);
+
+        if (tx_available > 0) {
+            // Need to send zero window probe
+            uint32_t time_since_probe = current_time - conn->zero_window_probe_time;
+
+            if (time_since_probe >= TCP_ZERO_WINDOW_PROBE_INTERVAL_MS ||
+                conn->zero_window_probe_time == 0) {
+
+                // Send 1 byte of data as zero window probe
+                uint8_t probe_byte = conn->tx_buffer[conn->tx_tail];
+
+                /* No print: the peer holds its window shut for as long
+                 * as it likes, and this fired every 5 s for that long.
+                 * The window itself is already counted (zero-window). */
+                /* Do not let the probe advance snd_nxt: tx_tail is not
+                 * advanced either, so the byte is resent at the same
+                 * sequence once the window reopens. */
+                uint32_t saved_snd_nxt = conn->snd_nxt;
+                tcp_send_segment(conn, TCP_PSH | TCP_ACK, &probe_byte, 1);
+                conn->snd_nxt = saved_snd_nxt;
+                conn->zero_window_probe_time = current_time;
+
+                // Note: We do NOT advance tx_tail here. The byte will be
+                // retransmitted if the probe succeeds and window opens.
+            }
+        }
+    }
+
+    /* No retransmission: a lost data segment or FIN is never resent. See the
+     * note at the top of tcp.h. */
+}
+
 /**
  * @brief TCP timer tick (should be called periodically)
  */
 void tcp_tick(uint32_t current_time) {
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-        tcp_connection_t* conn = &tcp_connections[i];
-
-        /* An open connection whose owner exited: close it here, in ktimerd's
-         * task context, rather than from teardown. tcp_close() sends the FIN
-         * and the closing states then time out as for any other close. */
-        if (conn->in_use && conn->orphaned) {
-            conn->orphaned = false;
-            tcp_close(i);
-        }
-        if (!conn->in_use) continue;
-
-        /*=====================================================================
-         * SECURITY: SYN_SENT Timeout Protection
-         * CRITICAL: Prevent slow state exhaustion DoS from zombie SYN_SENT
-         * connections that never complete the handshake.
-         *
-         * An attacker can send SYN packets to random ports, forcing the
-         * firewall to allocate connections that never receive SYN-ACK responses.
-         * Without timeout, these zombie connections fill the connection table.
-         *
-         * Timeout: 10 seconds (reasonable for firewall environments)
-         * After timeout: Forcefully close and free the connection
-         *===================================================================*/
-        #define TCP_SYN_SENT_TIMEOUT_MS 10000  // 10 seconds
-
-        if (conn->state == TCP_SYN_SENT) {
-            uint32_t elapsed = current_time - conn->syn_sent_start;
-            /* Counted, not printed: one unprivileged connect() to a host
-             * that never answers would otherwise buy two console lines. */
-            if (elapsed > TCP_SYN_SENT_TIMEOUT_MS) {
-                net_count_tcp_timed_out();
-                conn->state = TCP_CLOSED;
-                conn->in_use = false;
-            }
-        }
-
-        if (conn->state == TCP_SYN_RECEIVED) {
-            uint32_t elapsed = current_time - conn->syn_sent_start;
-            if (elapsed > TCP_SYN_SENT_TIMEOUT_MS) {
-                net_count_tcp_timed_out();
-                conn->state = TCP_CLOSED;
-                conn->in_use = false;
-            }
-        }
-
-        /* Our FIN is out and the peer never finished: FIN_WAIT_1 (no ACK),
-         * CLOSING (no ACK of our FIN) or LAST_ACK. Same limit as FIN_WAIT_2.
-         * Silent: a ring-3 user can drive this, so it is counted by nothing
-         * and printed by nothing. */
-        if ((conn->state == TCP_FIN_WAIT_1 || conn->state == TCP_CLOSING ||
-             conn->state == TCP_LAST_ACK) && conn->fin_sent &&
-            (current_time - conn->close_start) > TCP_FIN_WAIT_2_TIMEOUT) {
-            conn->state = TCP_CLOSED;
-            conn->in_use = false;
-        }
-
-        // Handle TIME_WAIT timeout
-        if (conn->state == TCP_TIME_WAIT) {
-            if (current_time - conn->time_wait_start > TCP_TIME_WAIT_TIMEOUT) {
-                // kprintf("TCP: TIME_WAIT timeout, closing connection %d\n", i);  // Commented for less verbosity
-                conn->state = TCP_CLOSED;
-                conn->in_use = false;
-            }
-        }
-
-        /*=====================================================================
-         * SECURITY: FIN_WAIT_2 Timeout Protection
-         * CRITICAL: Prevent resource exhaustion DoS from zombie FIN_WAIT_2
-         * connections.
-         *
-         * ATTACK SCENARIO:
-         * 1. Malicious client establishes connection
-         * 2. Client sends FIN (enters FIN_WAIT_1)
-         * 3. Server ACKs the FIN (client enters FIN_WAIT_2)
-         * 4. Client NEVER sends its FIN (refuses to complete shutdown)
-         * 5. Connection stuck in FIN_WAIT_2 indefinitely
-         * 6. Attacker repeats → Connection table exhaustion
-         *
-         * RFC 1122 Section 4.2.2.13:
-         * "A TCP implementation SHOULD implement a FIN_WAIT_2 timeout.
-         *  If FIN_WAIT_2 timeout expires, the connection SHOULD be closed."
-         *
-         * Recommended timeout: 60 seconds (RFC 1122 suggests max of 10 minutes,
-         * but we use shorter timeout for high-security firewall environments)
-         *
-         * This is different from TIME_WAIT:
-         * - TIME_WAIT protects against delayed packets (both FINs exchanged)
-         * - FIN_WAIT_2 protects against non-compliant/malicious peers
-         *===================================================================*/
-        if (conn->state == TCP_FIN_WAIT_2) {
-            if (conn->fin_wait_2_start > 0 &&
-                (current_time - conn->fin_wait_2_start) > TCP_FIN_WAIT_2_TIMEOUT) {
-                /* The peer chooses whether this fires. Counted, not printed. */
-                net_count_tcp_timed_out();
-                conn->state = TCP_CLOSED;
-                conn->in_use = false;
-            }
-        }
-
-        /*=====================================================================
-         * CRITICAL: Zero Window Probe (TCP Flow Control Deadlock Prevention)
-         *
-         * RFC 793 Section 3.7: When the peer advertises a zero receive window
-         * (snd_wnd == 0), the connection will stall unless the peer sends a
-         * window update. However, if the peer's window update ACK is lost in
-         * transit, the connection deadlocks permanently:
-         *
-         * - Sender waits for window update (blocking on snd_wnd == 0)
-         * - Receiver already sent window update (but packet was lost)
-         * - Neither side will send anything -> DEADLOCK
-         *
-         * Solution: Zero Window Probes
-         * - Periodically send 1 byte of data to elicit an ACK
-         * - The ACK will contain the current window size
-         * - If window opened, transmission resumes
-         * - If still zero, probe again later
-         *
-         * Timeout: 5 seconds between probes (reasonable for firewall)
-         * Critical for: Long-lived connections, bulk data transfer
-         *===================================================================*/
-        #define TCP_ZERO_WINDOW_PROBE_INTERVAL_MS 5000  // 5 seconds
-
-        if (conn->state == TCP_ESTABLISHED && conn->snd_wnd == 0) {
-            // Check if we have data waiting to send
-            uint16_t tx_available = (conn->tx_head >= conn->tx_tail) ?
-                (conn->tx_head - conn->tx_tail) :
-                (TCP_TX_BUFFER_SIZE - conn->tx_tail + conn->tx_head);
-
-            if (tx_available > 0) {
-                // Need to send zero window probe
-                uint32_t time_since_probe = current_time - conn->zero_window_probe_time;
-
-                if (time_since_probe >= TCP_ZERO_WINDOW_PROBE_INTERVAL_MS ||
-                    conn->zero_window_probe_time == 0) {
-
-                    // Send 1 byte of data as zero window probe
-                    uint8_t probe_byte = conn->tx_buffer[conn->tx_tail];
-
-                    /* No print: the peer holds its window shut for as long
-                     * as it likes, and this fired every 5 s for that long.
-                     * The window itself is already counted (zero-window). */
-                    /* Do not let the probe advance snd_nxt: tx_tail is not
-                     * advanced either, so the byte is resent at the same
-                     * sequence once the window reopens. */
-                    uint32_t saved_snd_nxt = conn->snd_nxt;
-                    tcp_send_segment(conn, TCP_PSH | TCP_ACK, &probe_byte, 1);
-                    conn->snd_nxt = saved_snd_nxt;
-                    conn->zero_window_probe_time = current_time;
-
-                    // Note: We do NOT advance tx_tail here. The byte will be
-                    // retransmitted if the probe succeeds and window opens.
-                }
-            }
-        }
-
-        // Add retransmission logic here if needed
+        TCP_LOCK();
+        tcp_tick_slot(i, current_time);
+        TCP_UNLOCK();
     }
 }
 
@@ -1870,3 +1927,135 @@ void tcp_dump_connections(void) {
     }
     kprintf("\n");
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * verify-tcp-state-fixes.sh only: drive tcp_close() and tcp_process_segment()
+ * on a synthetic slot and print the resulting state, one line per leg.
+ *
+ * A wire peer cannot witness these deterministically (SLIRP answers for the
+ * remote end, and a lost race reads as a pass), so the segments are built here
+ * and fed straight to the state machine with transmission muted. The peer
+ * address is TEST-NET-3, which nothing real uses. Legs that pass the RST/FIN
+ * rate limiter sleep past its 100 ms window first.
+ *===========================================================================*/
+static int tcp_selftest_slot = -1;
+
+static tcp_connection_t* tcp_selftest_setup(tcp_state_t state, uint32_t rcv_nxt,
+                                            uint32_t snd_nxt) {
+    tcp_connection_t* conn = &tcp_connections[tcp_selftest_slot];
+    TCP_LOCK();
+    memset(conn, 0, sizeof(*conn));
+    conn->in_use = true;
+    conn->state = state;
+    conn->remote_ip[0] = 203; conn->remote_ip[1] = 0;
+    conn->remote_ip[2] = 113; conn->remote_ip[3] = 7;
+    conn->local_port = 49999;
+    conn->remote_port = 9;
+    conn->rcv_nxt = rcv_nxt;
+    conn->rcv_wnd = TCP_RX_BUFFER_SIZE;
+    conn->iss = snd_nxt - 1;
+    conn->snd_una = snd_nxt - 1;
+    conn->snd_nxt = snd_nxt;
+    conn->snd_wnd = TCP_RX_BUFFER_SIZE;
+    conn->syn_sent_start = tcp_get_time_ms();
+    TCP_UNLOCK();
+    return conn;
+}
+
+static void tcp_selftest_feed(tcp_connection_t* conn, uint8_t flags, uint32_t seq,
+                              uint32_t ack, const char* payload, size_t len) {
+    tcp_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.src_port = htons(conn->remote_port);
+    hdr.dest_port = htons(conn->local_port);
+    hdr.sequence_number = htonl(seq);
+    hdr.acknowledgement_number = htonl(ack);
+    hdr.offset_reserved = (sizeof(tcp_header_t) / 4) << 4;
+    hdr.flags = flags;
+    hdr.window_size = htons(1024);
+    TCP_LOCK();
+    tcp_process_segment(conn, &hdr, (const uint8_t*)payload, len, conn->remote_ip);
+    TCP_UNLOCK();
+}
+
+static void tcp_selftest_report(const char* leg, const tcp_connection_t* conn) {
+    kprintf("TCPSTATE %s state=%s rcv_nxt=%u in_use=%d\n", leg,
+            tcp_state_to_string(conn->state), conn->rcv_nxt, conn->in_use ? 1 : 0);
+}
+
+void tcp_state_selftest(void) {
+    tcp_connection_t* conn;
+
+    TCP_LOCK();
+    tcp_selftest_slot = -1;
+    for (int i = TCP_MAX_CONNECTIONS - 1; i >= 0; i--) {
+        if (!tcp_connections[i].in_use) { tcp_selftest_slot = i; break; }
+    }
+    if (tcp_selftest_slot >= 0) {
+        tcp_connections[tcp_selftest_slot].in_use = true;   /* reserve it */
+    }
+    TCP_UNLOCK();
+    if (tcp_selftest_slot < 0) {
+        kprintf("TCPSTATE no-free-slot\n");
+        return;
+    }
+    tcp_selftest_mute = true;
+
+    /* close() during the handshake must free the slot. */
+    conn = tcp_selftest_setup(TCP_SYN_SENT, 0, 5000);
+    tcp_close(tcp_selftest_slot);
+    tcp_selftest_report("close-synsent", conn);
+
+    conn = tcp_selftest_setup(TCP_SYN_RECEIVED, 0, 5000);
+    tcp_close(tcp_selftest_slot);
+    tcp_selftest_report("close-synrcvd", conn);
+
+    /* Control: an established close still sends FIN and waits. */
+    conn = tcp_selftest_setup(TCP_ESTABLISHED, 1000, 5000);
+    tcp_close(tcp_selftest_slot);
+    tcp_selftest_report("close-established", conn);
+
+    /* A FIN beyond a gap must not close the stream or skip rcv_nxt. */
+    task_sleep(20);
+    conn = tcp_selftest_setup(TCP_ESTABLISHED, 1000, 5000);
+    tcp_selftest_feed(conn, TCP_ACK | TCP_FIN, 1500, 5000, NULL, 0);
+    tcp_selftest_report("fin-gap", conn);
+
+    /* Control: the in-order FIN closes and consumes one sequence number. */
+    task_sleep(20);
+    conn = tcp_selftest_setup(TCP_ESTABLISHED, 1000, 5000);
+    tcp_selftest_feed(conn, TCP_ACK | TCP_FIN, 1000, 5000, NULL, 0);
+    tcp_selftest_report("fin-inorder", conn);
+
+    /* A FIN carrying data sits after the data: rcv_nxt = seq + len + 1. */
+    task_sleep(20);
+    conn = tcp_selftest_setup(TCP_ESTABLISHED, 2000, 5000);
+    tcp_selftest_feed(conn, TCP_ACK | TCP_FIN | TCP_PSH, 2000, 5000, "abc", 3);
+    tcp_selftest_report("fin-data", conn);
+
+    /* SYN_SENT: a RST is acceptable only with ACK == SND.NXT. */
+    task_sleep(20);
+    conn = tcp_selftest_setup(TCP_SYN_SENT, 0, 5000);
+    tcp_selftest_feed(conn, TCP_RST, 777, 0, NULL, 0);
+    tcp_selftest_report("rst-bare", conn);
+
+    task_sleep(20);
+    conn = tcp_selftest_setup(TCP_SYN_SENT, 0, 5000);
+    tcp_selftest_feed(conn, TCP_RST | TCP_ACK, 0, 4999, NULL, 0);
+    tcp_selftest_report("rst-badack", conn);
+
+    task_sleep(20);
+    conn = tcp_selftest_setup(TCP_SYN_SENT, 0, 5000);
+    tcp_selftest_feed(conn, TCP_RST | TCP_ACK, 0, 5000, NULL, 0);
+    tcp_selftest_report("rst-goodack", conn);
+
+    TCP_LOCK();
+    memset(conn, 0, sizeof(*conn));
+    conn->state = TCP_CLOSED;
+    conn->rcv_wnd = TCP_RX_BUFFER_SIZE;
+    TCP_UNLOCK();
+    tcp_selftest_mute = false;
+    kprintf("TCPSTATE done\n");
+}
+#endif
