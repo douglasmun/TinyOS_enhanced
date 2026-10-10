@@ -6,7 +6,9 @@
  * - Connection establishment and teardown
  * - Data transmission and reception
  * - Sequence number management
- * - Basic retransmission and timeouts
+ * - Handshake, FIN_WAIT_2 and TIME_WAIT timeouts. NO retransmission:
+ *   a lost data segment or FIN is never resent (only the zero-window
+ *   probe repeats), so a lossy path stalls or truncates the stream.
  * - Multiple simultaneous connections
  *=============================================================================*/
 #pragma once
@@ -269,6 +271,7 @@ bool tcp_owner_visible(int sockfd);
 #ifdef TINYOS_FAULT_INJECT
 void tcp_fault_reassign_owner(int sockfd, uint32_t uid);
 int tcp_fault_slot_owner(int sockfd);
+void tcp_state_selftest(void);
 #endif
 
 /*=============================================================================
