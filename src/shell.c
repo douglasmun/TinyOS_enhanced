@@ -14,6 +14,7 @@
 #include "dns.h"          /* dns_forge_response, under TINYOS_FAULT_INJECT */
 #include "edr_advanced.h" /* edr_alert_selftest, under TINYOS_FAULT_INJECT */
 #include "edr_behavioral.h" /* edr_decay_gap_selftest, under TINYOS_FAULT_INJECT */
+#include "ide.h"            /* ide_lba_selftest, under TINYOS_FAULT_INJECT */
 #include "shell_fileops.h"
 #include "shell_search.h"
 #include "shell_monitor.h"
@@ -972,6 +973,10 @@ static void parse_and_execute(char* cmd_line) {
      * per-syscall kprintf. Run it once per loglevel to prove absent-then-present. */
     else if (strcmp(argv[0], "edrdecaygap") == 0) {
         edr_decay_gap_selftest();
+    }
+    /* verify-ide-lba28-clamp.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "idelba") == 0) {
+        ide_lba_selftest();
     }
     /* verify-dispatch-block-quiet.sh only. Not in the command table. */
     else if (strcmp(argv[0], "edrblock") == 0) {
