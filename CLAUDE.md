@@ -101,6 +101,9 @@ Condensed; full reasoning in `doc/RULES_THAT_BITE.md`. Harness names are in `ver
 - **`MAX_SYSCALL_NUM` must cover the highest syscall number** — bump it when adding one.
 - **Making a path reachable from ring 3 turns latent bugs into corruption primitives** (PRs
   #45, #47, #54, #55). Audit the path in the same PR that exposes it.
+- **C: (FAT32) is shared by design — no per-file ownership.** Cross-user access on C: is not a
+  finding; gate/access-mode/cap bypasses and corruption are. See "C: (FAT32) Is a Shared
+  Volume" in `doc/SECURITY_HARDENING.md`.
 - **Enforce permissions in the ramfs primitive, not the command** (`ramfs_check_permission()`).
   `SYS_CHMOD` inherits the refusal — don't add a second uid check at the boundary.
 - **Check sentinel collisions before returning an errno** — `-EPERM` is `-1`, already

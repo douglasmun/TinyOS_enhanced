@@ -24,9 +24,10 @@ The `(v1.19)`-style tags in headings record when a mechanism first landed; the t
 13. [Account / Authentication Hardening](#account--authentication-hardening)
 14. [Network Anti-Spoofing](#network-anti-spoofing)
 15. [PMM Double-Free Detection + Process Capabilities](#pmm-double-free-detection--process-capabilities)
-16. [Combined Security Impact](#combined-security-impact)
-17. [Testing & Verification](#testing--verification)
-18. [Implementation Files](#implementation-files)
+16. [C: (FAT32) Is a Shared Volume — by Design](#c-fat32-is-a-shared-volume--by-design)
+17. [Combined Security Impact](#combined-security-impact)
+18. [Testing & Verification](#testing--verification)
+19. [Implementation Files](#implementation-files)
 
 ---
 
@@ -1439,6 +1440,52 @@ Connection and transaction identifiers are unpredictable, sourced from the CSPRN
 
 ---
 
+## C: (FAT32) Is a Shared Volume — by Design
+
+**Decision:** the FAT32 drive `C:` has **no per-file ownership or permission
+model**, and that is deliberate, not a gap. Any logged-in user may create,
+read, write, truncate and unlink any file on `C:` outside the protected paths.
+Per-user confidentiality lives on `D:` (ramfs), which has owners, modes and
+`ramfs_check_permission()`.
+
+**Why:** FAT32 has nowhere to store an owner uid or Unix mode bits. Adding them
+would mean an out-of-band side table (a TinyOS-only metadata file, or abusing
+reserved directory-entry bytes) that any other OS mounting the disk would
+neither honour nor preserve — so it would protect nothing the moment the image
+left TinyOS, and would make `C:` no longer a plain FAT32 volume. `C:` is the
+interchange/persistence disk; treat it like a shared USB stick.
+
+**What *is* enforced on C: (do not remove these):**
+- **Protected paths** — `vfs_open`/`vfs_mkdir`/`vfs_rmdir`/`vfs_unlink` refuse writes under
+  `/bin`, `/sbin`, `/etc`, `/boot`, `/kernel` without `CAP_SYS_ADMIN`
+  (`vfs_path_is_protected()`, `src/vfs.c`). The match is case-folded because
+  FAT32 names are case-insensitive, `O_CREAT`/`O_TRUNC` count as write intent,
+  and the driver splits paths on `/` only, so `C:/ETC` and `C:/\etc` cannot
+  slip past it (PR #179). Harness: `verify-protected-path-match.sh`,
+  `verify-fat32-access-mode.sh`.
+- **Access mode** — an `O_RDONLY` fd cannot write and a write-only fd cannot
+  read (PR #179).
+- **Per-uid open-file cap** — a non-root uid holds at most 8 of the 32 FAT32
+  open-file slots and the last 4 free slots are root's, so one user cannot lock
+  everyone out of `C:` (PR #181). Harness: `verify-fat32-fd-cap.sh`.
+- **Kernel memory safety** — cluster numbers and chain lengths are bounded
+  (`cluster_in_range`, `FAT32_MAX_CLUSTER_CHAIN`), path components are bounded
+  (PR #177), and the IDE layer clamps capacity to LBA28 (PR #180).
+
+**Known cosmetic consequence:** `stat`/`ls -l` report `C:` files as `0644`
+and directories as `0755` (`src/fat32_vfs.c`). Those are placeholders, not
+enforced permissions — a non-owner *can* write a file shown as `0644`.
+
+**For auditors:** "user A can read/modify user B's file on C:" is the intended
+behaviour and is **not a finding**. A finding on `C:` is any of: a bypass of
+the protected-path gate, of access mode, or of the per-uid cap; kernel memory
+corruption or a disclosure of kernel/other-process memory; or on-disk
+corruption of a file the caller did not name (as in the 2026-10 FAT32 audit,
+PRs #176–#181). If a confidential file is ever needed on persistent storage,
+the answer is a new storage design, not ownership bits bolted onto FAT32.
+
+---
+
 ## Combined Security Summary
 
 The memory-safety layer, all active in the default build:
@@ -1461,8 +1508,8 @@ The memory-safety layer, all active in the default build:
 - **What**: No page is both writable and executable (PAE NX bit), kernel and user
 - **When**: Enforced at map time; kernel layout verified at boot (panics on a violation)
 
-Sections 5-15 above (credentials, code signing, crypto, audit, user-copy, guard
-pages, accounts, network, PMM) describe the rest.
+Sections 5-16 above (credentials, code signing, crypto, audit, user-copy, guard
+pages, accounts, network, PMM, the shared C: volume) describe the rest.
 
 ---
 
