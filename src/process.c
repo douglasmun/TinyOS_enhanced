@@ -1405,6 +1405,7 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
     if (creator) {
         task->parent_pid = creator->pid;
         task->parent_generation = creator->generation;
+        task->session_id = creator->session_id;
     }
 
     // Allocate guard page and kernel stack (for syscalls) - same as kernel tasks
@@ -2167,6 +2168,61 @@ bool task_terminate_status(uint32_t pid, uint32_t generation, int status) {
     }
     task_terminate_task(task, status);
     return true;
+}
+
+/*=============================================================================
+ * FUNCTION: task_kill_session
+ * PURPOSE: Logout teardown -- terminate every ring-3 task of login session sid.
+ *
+ * The ring-3 login shell exiting used to end only the shell. Its `&` jobs
+ * survived logout, and a background job blocked in read(0) waits on the same
+ * keyboard ring the login prompt, `su` and SYS_CRED read from: the next
+ * user's username and password went to whichever reader the IRQ woke first.
+ *
+ * Victims are SNAPSHOTTED as {pid, generation} under the critical section and
+ * killed outside it, through task_terminate_status() so a slot recycled in
+ * between is refused rather than killed. Teardown itself (stream close, VFS
+ * fd release, TCP cleanup) is not run with interrupts masked. A victim that
+ * spawned in the window between snapshot and kill is caught by the next
+ * pass; passes repeat until one finds nothing, bounded so a pathological
+ * spawner cannot hold the login task here forever.
+ *=============================================================================*/
+int task_kill_session(uint32_t sid) {
+    if (sid == 0) {
+        return 0;
+    }
+
+    task_t* self = scheduler_get_current_task();
+    int killed = 0;
+
+    for (int pass = 0; pass < 8; pass++) {
+        uint32_t pids[MAX_TASKS];
+        uint32_t gens[MAX_TASKS];
+        int n = 0;
+
+        CRITICAL_SECTION_ENTER();
+        for (int i = 0; i < MAX_TASKS; i++) {
+            task_t* t = task_get_slot(i);
+            if (!t || t == self || t->is_kernel_task ||
+                t->session_id != sid || (t->capabilities & CAP_UNKILLABLE)) {
+                continue;
+            }
+            pids[n] = t->pid;
+            gens[n] = t->generation;
+            n++;
+        }
+        CRITICAL_SECTION_EXIT();
+
+        if (n == 0) {
+            break;
+        }
+        for (int i = 0; i < n; i++) {
+            if (task_terminate_status(pids[i], gens[i], 0x7F)) {
+                killed++;
+            }
+        }
+    }
+    return killed;
 }
 
 static void task_terminate_task(task_t* task, int status) {

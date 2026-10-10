@@ -242,7 +242,17 @@ typedef struct task {
      * to list a shell's own children. */
     uint32_t parent_pid;
     uint32_t parent_generation;
-    uint32_t guard_page_phys;        // Physical address of kernel stack guard page (for stack overflow detection)
+
+    /* Login session this task belongs to. The login task stamps a fresh,
+     * nonzero id on itself after each successful login, and task_create_user
+     * copies the creator's id, so every ring-3 process started from that
+     * session -- the login shell, its `&` jobs, their children -- carries it.
+     * At logout task_kill_session() terminates them all. Without it a
+     * background read(0) outlived logout and, sharing the one keyboard ring
+     * with the login prompt and `su`, read the NEXT user's password.
+     * 0 = no session (kernel tasks, early boot). */
+    uint32_t session_id;
+    uint32_t guard_page_phys;       // Physical address of kernel stack guard page (for stack overflow detection)
     uint32_t stack_pages_phys[KERNEL_TASK_STACK_PAGES];   // Physical addresses of kernel stack pages (KERNEL_TASK_STACK_PAGES for kernel tasks, 8 for user tasks)
 
     // Privilege level
@@ -727,6 +737,14 @@ void task_terminate(uint32_t pid);
  * syscall -- see task_t.edr_kill_pending.
  */
 bool task_terminate_status(uint32_t pid, uint32_t generation, int status);
+
+/**
+ * @brief Terminate every ring-3 task of login session `sid` (logout teardown)
+ *
+ * Kernel tasks, CAP_UNKILLABLE tasks and the caller are skipped; sid 0 is a
+ * no-op. Returns the number of tasks terminated.
+ */
+int task_kill_session(uint32_t sid);
 
 /**
  * @brief Free all memory owned by a task (stacks, guard pages, page directory,
