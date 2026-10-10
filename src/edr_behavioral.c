@@ -525,6 +525,51 @@ bool edr_behavioral_check(task_t* task, uint32_t syscall_num, uint32_t arg0) {
     return allow_syscall;
 }
 
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * verify-edr-decay-gap.sh only. Not in the command table.
+ *
+ * Drives the "Large decay gap" trace at edr_behavioral.c (the decay block
+ * above). That branch needs a task with anomaly_score > 0 whose last decay was
+ * more than 1000 ticks (>10 s at 100 Hz) ago -- a condition a real ring-3 task
+ * reaches only by pumping its score and then sleeping ten-plus seconds between
+ * syscalls, which is slow under TCG and buries the witness in alert spam. Here
+ * we set the state on a static task_t shell that is never in the task table
+ * (PID 9996, distinct from the 9997-9999 edr_alert_selftest uses) and make one
+ * BENIGN syscall (SYS_GETPID trips no detector, so no alert prints), spanning
+ * the gap deterministically. The gap fires EXACTLY one decay-gap line.
+ *
+ * That line is the fix under test: it must be kdbg() (default-suppressed,
+ * recoverable with `loglevel debug`), not kprintf() -- it sits on a path every
+ * syscall reaches, which CLAUDE.md forbids from printing per-operation on the
+ * shared serial stream. The harness runs this twice, at `loglevel normal` and
+ * `loglevel debug`, and asserts absent-then-present. The EDRDECAY marker below
+ * is a deliberate kprintf: it bounds each run so the harness can tell "the hook
+ * ran and stayed silent" from "the hook never ran", and it is NOT the line
+ * under test.
+ *===========================================================================*/
+static task_t edrdecay_shell;
+
+void edr_decay_gap_selftest(void) {
+    task_t* t = &edrdecay_shell;
+    memset(t, 0, sizeof(*t));
+    t->pid = 9996;
+    edr_behavioral_init(t);
+
+    /* anomaly_score > 0 so the decay branch's inner guard holds; 500 survives
+     * ~11 rounds of x0.95 (~280) and never reaches 0 mid-loop. */
+    t->edr_state.anomaly_score = 500;
+    /* last decay > 1000 ticks ago => ticks_since_decay ~1100 => decay_periods
+     * = 11 (> 10), the exact threshold the trace guards on. */
+    t->edr_state.last_decay_tick = pit_get_ticks() - 1100;
+
+    kprintf("EDRDECAY selftest begin pid=%u\n", t->pid);
+    /* One benign syscall spans the gap and runs the decay block. */
+    edr_behavioral_check(t, SYS_GETPID, 0);
+    kprintf("EDRDECAY selftest end pid=%u\n", t->pid);
+}
+#endif /* TINYOS_FAULT_INJECT */
+
 /*=============================================================================
  * HELPER FUNCTIONS
  *=============================================================================*/
