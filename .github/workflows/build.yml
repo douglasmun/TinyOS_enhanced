@@ -199,6 +199,17 @@ jobs:
       - name: copy_*_user fault line is a kdbg trace, not a kprintf
         run: bash verify/verify-copyuser-fault-trace.sh
 
+      # vfs_path_is_protected() -- the CAP_SYS_ADMIN gate for the protected
+      # paths -- matches "exact-equal OR entry-followed-by-'/'", never a bare
+      # prefix. The pre-fix strncmp against slash-suffixed entries UNDER-matched
+      # the directory node itself ("/etc" != "/etc/") so a root node named
+      # exactly "/etc" dodged the gate, and OVER-matched ("/kernel" flagged
+      # "/kernelfoo"). Compiles the REAL extracted function body with the host
+      # cc and drives the truth table; the pre-fix bare-prefix arm is a negative
+      # control that forces INCONCLUSIVE unless it is demonstrably wrong.
+      - name: Protected-path gate matches exact-or-slash
+        run: bash verify/verify-protected-path-match.sh
+
       - name: EDR splice helper unit tests
         run: bash verify/edr-rejoin-test.sh
 
