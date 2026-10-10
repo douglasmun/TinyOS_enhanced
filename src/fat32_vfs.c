@@ -148,6 +148,12 @@ static int fat32_vfs_open(const char* path, int flags, void** private_data) {
     /* Open file using FAT32 */
     int fat32_fd = fat32_open(path);
 
+    /* Over the caller's uid cap: say so, and don't take it for "not found"
+     * -- with O_CREAT that would go on to create the file it may not open. */
+    if (fat32_fd == FAT32_OPEN_LIMIT) {
+        return VFS_EAGAIN;
+    }
+
     /*=========================================================================
      * O_CREAT: create the file, then open it for real.
      *
@@ -168,8 +174,11 @@ static int fat32_vfs_open(const char* path, int flags, void** private_data) {
     }
 
     /* O_TRUNC on an existing file: drop its contents so a rewrite doesn't
-     * leave the tail of the previous, longer file behind. */
-    if ((flags & VFS_O_TRUNC) && fat32_truncate(fat32_fd) != 0) {
+     * leave the tail of the previous, longer file behind. Only for an open
+     * that may write: O_RDONLY|O_TRUNC emptied the file on a descriptor that
+     * could not write it back, which ramfs already refuses. */
+    if ((flags & VFS_O_TRUNC) && vfs_flags_writable(flags) &&
+        fat32_truncate(fat32_fd) != 0) {
         fat32_close(fat32_fd);
         return VFS_EINVAL;
     }

@@ -18,7 +18,7 @@ PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
             netprobe.elf msealprobe.elf callprobe.elf \
             busyprobe.elf pipeprobe.elf fdprobe.elf tcpcap.elf \
-            setuidprobe.elf
+            setuidprobe.elf fatprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -180,6 +180,13 @@ tcpcap.elf: tcpcap.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c tcpcap.c -o tcpcap.o
 	$(LD) $(LDFLAGS) -o tcpcap.elf crt0.o tcpcap.o libc.o -lgcc
 	@echo "Built tcpcap.elf"
+
+# fatprobe.elf writes multi-cluster files on C: with plain write()/read()
+# calls and compares them byte for byte. See verify-fat32-content.sh.
+fatprobe.elf: fatprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c fatprobe.c -o fatprobe.o
+	$(LD) $(LDFLAGS) -o fatprobe.elf crt0.o fatprobe.o libc.o -lgcc
+	@echo "Built fatprobe.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld
