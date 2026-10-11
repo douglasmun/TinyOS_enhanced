@@ -644,9 +644,17 @@ void cmd_ls(int argc, char* argv[]) {
         ramfs_debug_root();
     }
 
-    /* Find the node */
-    ramfs_node_t* node = ramfs_find(path);
-    if (!node) {
+    /* The listing primitive enforces READ on the directory (and on a file
+     * whose metadata is shown), as ring 3's open/stat do. Walking
+     * node->children here let any user list root's 0711 `/`. */
+    ramfs_node_t* visible[RAMFS_MAX_CHILDREN_PER_DIR];
+    ramfs_node_t* node = NULL;
+    int listed = ramfs_list(path, &node, visible, RAMFS_MAX_CHILDREN_PER_DIR);
+    if (listed == RAMFS_LIST_EACCES) {
+        stream_printf(ctx, "ls: cannot open '%s': Permission denied\n", path);
+        return;
+    }
+    if (listed < 0) {
         stream_printf(ctx, "ls: cannot access '%s': No such file or directory\n", path);
         return;
     }
@@ -672,32 +680,13 @@ void cmd_ls(int argc, char* argv[]) {
         return;
     }
 
-    /* It's a directory - list its contents */
-    ramfs_node_t* child = node->children;
-    if (!child) {
-        /* Empty directory */
-        if (long_format) {
-            stream_printf(ctx, "total 0\n");
-        }
-        return;
-    }
-
-    /* Build array of visible entries (filter hidden if needed);
-     * never modify the live sibling chain */
-    ramfs_node_t* visible[RAMFS_MAX_CHILDREN_PER_DIR];
+    /* It's a directory: drop dotfiles unless -a. The sibling chain itself
+     * is never modified. */
     int visible_count = 0;
-
-    while (child) {
-        /* Skip hidden files (starting with '.') unless -a specified */
-        if (!show_all && child->name[0] == '.') {
-            child = child->next;
-            continue;
+    for (int i = 0; i < listed; i++) {
+        if (show_all || visible[i]->name[0] != '.') {
+            visible[visible_count++] = visible[i];
         }
-
-        if (visible_count < RAMFS_MAX_CHILDREN_PER_DIR) {
-            visible[visible_count++] = child;
-        }
-        child = child->next;
     }
 
     if (visible_count == 0) {

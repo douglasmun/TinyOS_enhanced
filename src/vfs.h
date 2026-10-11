@@ -199,6 +199,7 @@ typedef struct {
 #define VFS_EAGAIN          -11     /* Try again (a per-user descriptor limit) */
 #define VFS_ENFILE          -23     /* System descriptor table full */
 #define VFS_EMFILE          -24     /* Per-process descriptor limit */
+#define VFS_EFBIG           -27     /* File too large (RAMFS per-file cap) */
 
 /*=============================================================================
  * PHASE 9: No /dev/mem or /dev/kmem (Security-by-Omission)

@@ -58,6 +58,22 @@
  *
  *   PROBE guard rounds=N created=N   fixed: both ROUNDS (and no panic)
  *
+ * Mode "capwrite" (verify-ramfs-vfs-fixes.sh): write 100 bytes, then 4 KB
+ * chunks until one comes back short at the 64 KB per-file cap, then once more.
+ *
+ *   PROBE capwrite total=N short=N next=RC   fixed: 65536, 3996, -27 (EFBIG)
+ *
+ * The write at the cap used to return 0, which a loop on the return value
+ * retries forever, and every short write printed a kernel warning.
+ *
+ * Mode "dirfill" (root, verify-ramfs-vfs-fixes.sh): DIR_CHILDREN children
+ * each open D:/ until refused and hold what they got, then the probe does
+ * the same. Directory opens count against no per-uid cap, so together they
+ * take every VFS descriptor -- which used to panic the kernel.
+ *
+ *   PROBE dirhold opened=N refused=RC     one per child
+ *   PROBE dirfill opened=N refused=RC     fixed: someone is refused -23 (ENFILE)
+ *
  * Mode "quiet" (`/fdprobe.elf quiet`): QUIET_EXITS children exit normally,
  * then one is killed. verify-exit-quiet.sh counts what the kernel printed.
  *
@@ -266,6 +282,47 @@ static void mode_quiet(void) {
     printf("PROBE quiet exits=%d kill=%d\n", exits, rc);
 }
 
+static char chunk[4096];
+
+static void mode_capwrite(void) {
+    int fd = open("/scratch/fdprobe.big", O_WRONLY | O_CREAT | O_TRUNC);
+    int total = 0, rc = write(fd, chunk, 100);
+    if (rc > 0) total += rc;
+    int shortw = rc;
+    for (int i = 0; i < 20 && rc > 0; i++) {
+        rc = write(fd, chunk, sizeof(chunk));
+        if (rc > 0) total += rc;
+        shortw = rc;
+        if (rc != (int)sizeof(chunk)) break;
+    }
+    int next = write(fd, chunk, sizeof(chunk));
+    close(fd);
+    printf("PROBE capwrite total=%d short=%d next=%d\n", total, shortw, next);
+}
+
+#define DIR_CHILDREN 4
+#define DIR_TRIES    20
+
+static int open_dirs(int* refused) {
+    int n = 0;
+    *refused = 0;
+    while (n < DIR_TRIES) {
+        int fd = open("D:/", O_RDONLY | O_DIRECTORY);
+        if (fd < 0) { *refused = fd; break; }
+        n++;
+    }
+    return n;
+}
+
+static void mode_dirfill(void) {
+    int kids[DIR_CHILDREN], refused;
+    for (int i = 0; i < DIR_CHILDREN; i++) kids[i] = run_child("dirhold");
+    sleep_ms(3000);
+    int n = open_dirs(&refused);
+    printf("PROBE dirfill opened=%d refused=%d\n", n, refused);
+    for (int i = 0; i < DIR_CHILDREN; i++) if (kids[i] >= 0) kill(kids[i]);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "noop")) {
         return 0;
@@ -324,6 +381,20 @@ int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "late-write")) {
         sleep_ms(500);
         return write(1, "BBBB", 4);
+    }
+    if (argc > 1 && !strcmp(argv[1], "capwrite")) {
+        mode_capwrite();
+        return 3;
+    }
+    if (argc > 1 && !strcmp(argv[1], "dirfill")) {
+        mode_dirfill();
+        return 3;
+    }
+    if (argc > 1 && !strcmp(argv[1], "dirhold")) {
+        int refused, n = open_dirs(&refused);
+        printf("PROBE dirhold opened=%d refused=%d\n", n, refused);
+        sleep_ms(600000);            /* the parent kills it */
+        return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "quiet")) {
         mode_quiet();
