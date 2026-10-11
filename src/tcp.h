@@ -328,10 +328,9 @@ void tcp_handle_packet(const uint8_t* src_ip, const uint8_t* dest_ip,
  * @param current_time Current time in milliseconds
  * 
  * Should be called periodically (e.g., every 100ms) to handle:
- * - Retransmissions
- * - Keepalives
- * - TIME_WAIT timeout
- * - ACK generation
+ * - Handshake, FIN_WAIT_2 and TIME_WAIT timeouts
+ * - Zero-window probes
+ * No retransmission and no keepalives: see the header comment.
  */
 void tcp_tick(uint32_t current_time);
 

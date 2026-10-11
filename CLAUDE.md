@@ -21,7 +21,8 @@ work in those directories.
 | `SYS_MSEAL` audit: the disproved latency hypothesis, the 16 kprintf sites | `doc/MSEAL_AUDIT.md` |
 | Post-v2.2 roadmap with rationale | `doc/ROADMAP_NEXT.md` |
 | Security mechanism reference (17 mechanisms) | `doc/SECURITY_HARDENING.md` |
-| Latest audit: 16 findings, all fixed (PRs #103–#105) | `doc/SECURITY_AUDIT_2026-08.md` |
+| Latest audit: TCP/memory/ramfs/creds/pipes, all fixed (PRs #183–#188), plus what was left by design | `doc/SECURITY_AUDIT_2026-10.md` |
+| Previous audit: 16 findings, all fixed (PRs #103–#105) | `doc/SECURITY_AUDIT_2026-08.md` |
 | Security history index | `doc/SECURITY_STATUS_COMPLETE.md`, `doc/MULTI_AGENT_SECURITY_AUDIT_2026.md` |
 | RX path, counters, firewall/IDS vehicles | `doc/NETWORK_ISOLATION.md` |
 | `knetd`, the supervisor, why the D1 parser move was withdrawn | `doc/NETDAEMON_DESIGN.md` |
