@@ -15,7 +15,14 @@
 #include "mutex.h"       /* elf_exec_lock: serialize the exec path's static buffers */
 #include "vfs.h"         /* elf_exec_from_path: read the image before loading it */
 #include "errno.h"
+#include "memory.h"      /* USER_IMAGE_BASE */
 #include <stddef.h>
+
+/* User images must link above every address the kernel identity-maps, or
+ * their PTEs replace the kernel's view of RAM (doc/DESIGN_USER_LINK_BASE.md).
+ * Raising PMM_MAX_BYTES past USER_IMAGE_BASE must fail here, not reopen it. */
+_Static_assert(USER_IMAGE_BASE >= PMM_MAX_BYTES,
+               "USER_IMAGE_BASE must sit above the kernel identity map (PMM_MAX_BYTES)");
 
 /*=============================================================================
  * elf_signatures_enforced -- report the ACTUAL signature gate.
@@ -835,6 +842,25 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
             }
 
             /*=================================================================
+             * SECURITY: No segment inside the kernel's identity map
+             *
+             * The kernel maps all RAM 1:1 (virt == phys, up to PMM_MAX_BYTES)
+             * and dereferences frame addresses directly. A user PTE at such a
+             * virtual address replaces the kernel's view of that physical
+             * frame while this process's CR3 is loaded: kernel writes to an
+             * object in that frame land in the process's image page (readable
+             * by it), and kernel reads come from a page it may write. User
+             * images link at USER_IMAGE_BASE, above the whole range. The
+             * overflow check above guarantees end > start, so checking start
+             * covers the segment. See doc/DESIGN_USER_LINK_BASE.md.
+             *=================================================================*/
+            if (start < PMM_MAX_BYTES) {
+                kprintf("[ELF] SECURITY: Segment %d at 0x%08x is inside the kernel RAM map (below 0x%08x)\n",
+                        i, start, PMM_MAX_BYTES);
+                return -1;
+            }
+
+            /*=================================================================
              * SECURITY: Validate File Offset Against Actual File Size
              * CRITICAL: Prevent reading beyond ELF file buffer. This check
              * uses the actual file size instead of a synthetic limit to
@@ -1422,3 +1448,85 @@ static int elf_load_process_argv_impl(const void* elf_data, size_t elf_size,
     kdbg("[ELF] Process created successfully: PID=%d\n", pid);
     return pid;
 }
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * FUNCTION: elf_linkbase_selftest
+ * PURPOSE: verify-user-link-base.sh only -- witness whether a loaded user
+ * image replaces any of the kernel's identity-map PTEs.
+ *
+ * A page is SHADOWED when the kernel PDPT maps v 1:1 (v is RAM the kernel
+ * dereferences by physical address) and the process PDPT maps v to some other
+ * frame. That is the overlap doc/DESIGN_USER_LINK_BASE.md describes. Page
+ * tables only: nothing here reads or writes the frames themselves.
+ *
+ *   hello     the real loader's image of /hello.elf (built, never scheduled).
+ *             The unfixed base 0x08000000 shadows every page; the fixed base
+ *             shadows none. mapped must equal pages, or "none" means nothing.
+ *   control   one page mapped into the same PDPT at an identity-mapped
+ *             address. Must read shadowed=1 on any kernel: proves the probe
+ *             can see a shadow, so the hello leg's 0 is not a blind probe.
+ *   ramprobe  /ramprobe.elf, signed and linked at 0x0C000000 (inside RAM).
+ *             The loader must refuse it (rc < 0); the unfixed loader accepts it.
+ *===========================================================================*/
+#include "hello_elf_data.h"
+
+static bool linkbase_shadowed(uint32_t pdpt, uint32_t v) {
+    uint64_t kview = pae_virt_to_phys_in(pae_get_kernel_pdpt(), v);
+    uint64_t uview = pae_virt_to_phys_in(pdpt, v);
+    return kview == (uint64_t)v && uview != 0 && uview != kview;
+}
+
+void elf_linkbase_selftest(void) {
+    const elf32_ehdr_t* ehdr = (const elf32_ehdr_t*)hello_elf_data;
+    const elf32_phdr_t* phdr =
+        (const elf32_phdr_t*)(hello_elf_data + ehdr->e_phoff);
+    const char* err = NULL;
+
+    int pid = elf_exec_from_path("/hello.elf", "linkbase", 0, NULL, &err);
+    task_t* task = (pid >= 0) ? task_get_any((uint32_t)pid) : NULL;
+    if (!task) {
+        kprintf("LINKBASE hello rc=%d (%s)\n", pid, err ? err : "no task");
+        if (pid >= 0) task_terminate((uint32_t)pid);
+        kprintf("LINKBASE done\n");
+        return;
+    }
+    uint32_t pdpt = task->page_directory;
+
+    uint32_t base = 0xFFFFFFFFu, pages = 0, mapped = 0, shadowed = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+        uint32_t end = phdr[i].p_vaddr + phdr[i].p_memsz;
+        for (uint32_t v = phdr[i].p_vaddr & ~0xFFFu; v < end; v += 0x1000u) {
+            if (v < base) base = v;
+            pages++;
+            if (pae_virt_to_phys_in(pdpt, v) != 0) mapped++;
+            if (linkbase_shadowed(pdpt, v)) shadowed++;
+        }
+    }
+    kprintf("LINKBASE hello base=0x%08x pages=%u mapped=%u shadowed=%u\n",
+            base, pages, mapped, shadowed);
+
+    /* Control: half-way up RAM is identity-mapped on any kernel. */
+    uint32_t ctrl_v = (pmm_total_frames() / 2u) * 0x1000u;
+    uint32_t ctrl_frame = pmm_alloc();
+    if (ctrl_frame) {
+        pae_map_page_into(pdpt, ctrl_v, (uint64_t)ctrl_frame, PAE_PAGE_DATA);
+        kprintf("LINKBASE control v=0x%08x shadowed=%d\n",
+                ctrl_v, linkbase_shadowed(pdpt, ctrl_v) ? 1 : 0);
+    } else {
+        kprintf("LINKBASE control no frame\n");
+    }
+    /* Teardown frees the private PT the control mapping made, never the
+     * frame (no task_t field names it), so that is freed here. */
+    task_terminate((uint32_t)pid);
+    if (ctrl_frame) pmm_free(ctrl_frame);
+
+    err = NULL;
+    int rpid = elf_exec_from_path("/ramprobe.elf", "ramprobe", 0, NULL, &err);
+    kprintf("LINKBASE ramprobe rc=%d\n", rpid);
+    if (rpid >= 0) task_terminate((uint32_t)rpid);
+
+    kprintf("LINKBASE done\n");
+}
+#endif /* TINYOS_FAULT_INJECT */

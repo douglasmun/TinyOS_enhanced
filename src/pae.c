@@ -1115,8 +1115,11 @@ uint32_t pae_create_user_pdpt(void) {
         }
 
         /* Copy kernel mappings from the current page directories.
-         * PD[0] holds the RAM identity map (kernel + user link range; user
-         * PTEs are copy-on-write'd into private PTs by pae_map_page_into).
+         * PD[0] holds the RAM identity map, which tops out at PMM_MAX_BYTES.
+         * User images link at USER_IMAGE_BASE, above it, so no user PTE ever
+         * replaces an identity PTE; user PTEs that land in a kernel-shared
+         * PT's 2 MB range are copy-on-write'd into private PTs by
+         * pae_map_page_into.
          * PD[3] holds supervisor-only MMIO such as the VBE framebuffer
          * (0xFD000000) — it MUST be present in user PDPTs or any fbcon
          * output while a user CR3 is active page-faults and triple-faults.

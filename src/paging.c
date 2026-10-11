@@ -760,7 +760,7 @@ bool is_user_address(uint32_t addr) {
 void print_user_memory_layout(void) {
     kprintf("=== User Memory Layout ===\n");
     kprintf("User space:   0x%08x - 0x%08x\n", USER_SPACE_BASE, USER_SPACE_END);
-    kprintf("Code:         0x%08x\n", USER_CODE_BASE);
+    kprintf("Code:         0x%08x\n", USER_IMAGE_BASE);
     kprintf("Stack:        0x%08x (grows down)\n", USER_STACK_BASE);
     kprintf("Heap:         0x%08x (grows up)\n", USER_HEAP_BASE);
     kprintf("==========================\n");

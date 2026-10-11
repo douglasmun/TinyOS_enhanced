@@ -90,6 +90,9 @@ Condensed; full reasoning in `doc/RULES_THAT_BITE.md`. Harness names are in `ver
 - **Teardown frees only what a `task_t` field names.** ELF image frames are tracked in
   `image_pages_phys[]`, registered only after the last failure return (earlier = double-free).
   Oversize images are refused. `verify-exec-frame-leak.sh` asserts exact equality.
+- **No user mapping below `PMM_MAX_BYTES`** — RAM is identity-mapped up to it, so a user PTE
+  there hides a kernel frame. Images link at `USER_IMAGE_BASE` (static-asserted above it); the
+  loader refuses lower segments. `doc/DESIGN_USER_LINK_BASE.md`, `verify-user-link-base.sh`.
 - **Freeing a guard page requires restoring its mapping first**, or the frame is poisoned for
   whoever allocates it next.
 - **Allocate before you disturb an array** — `editor_insert_row` allocates, then shifts.

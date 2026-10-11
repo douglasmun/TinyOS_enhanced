@@ -69,13 +69,13 @@ def build(c):
 
     # ---- header ----
     text(24, 30, "TinyOS Enhanced — architecture", 19, c["fg"], weight="700")
-    text(24, 50, "32-bit i386 · Multiboot2 · 94 kernel modules · preemptive, single core",
+    text(24, 50, "32-bit i386 · Multiboot2 · 96 kernel modules · preemptive, single core",
          12, c["muted"])
 
     # ---- RING 3 ----
     box(24, 68, 952, 104, c["rule"], dash=True, rx=8, sw=1)
     text(38, 88, "RING 3 · USER MODE", 11.5, c["blue"], weight="700")
-    text(190, 88, "linked at 0x08000000 · private PAE address space per process",
+    text(190, 88, "linked at 0x20000000 · private PAE address space per process",
          10.5, c["muted"], font=MONO)
 
     u = [

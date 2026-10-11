@@ -18,7 +18,7 @@ PROGRAMS := hello.elf shell.elf info.elf sleeper.elf spawner.elf fileio.elf \
             producer.elf counter.elf credprobe.elf slotbomb.elf slothold.elf \
             netprobe.elf msealprobe.elf callprobe.elf \
             busyprobe.elf pipeprobe.elf fdprobe.elf tcpcap.elf \
-            setuidprobe.elf fatprobe.elf capprobe.elf
+            setuidprobe.elf fatprobe.elf capprobe.elf ramprobe.elf
 
 # Common runtime objects for libc-based programs
 LIBC_OBJS := crt0.o libc.o
@@ -194,6 +194,15 @@ capprobe.elf: capprobe.c libc.h $(LIBC_OBJS) user.ld
 	$(CC) $(CFLAGS) -c capprobe.c -o capprobe.o
 	$(LD) $(LDFLAGS) -o capprobe.elf crt0.o capprobe.o libc.o -lgcc
 	@echo "Built capprobe.elf"
+
+# ramprobe.elf is the one program linked INSIDE the kernel's identity-mapped
+# RAM (0x0C000000, 192 MB). The loader must refuse it; the kernel installs it
+# only in TINYOS_FAULT_INJECT builds. See verify-user-link-base.sh.
+ramprobe.elf: ramprobe.c libc.h $(LIBC_OBJS) user.ld
+	$(CC) $(CFLAGS) -c ramprobe.c -o ramprobe.o
+	$(LD) $(LDFLAGS) -Wl,--defsym,__user_image_base=0x0C000000 \
+		-o ramprobe.elf crt0.o ramprobe.o libc.o -lgcc
+	@echo "Built ramprobe.elf"
 
 # shell.elf, like the rest, gets _start from crt0 and main(argc, argv)
 shell.elf: shell.c libc.h $(LIBC_OBJS) user.ld

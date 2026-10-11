@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include "gdt.h"
 #include "paging.h"    // For is_user_address
-#include "memory.h"    // For USER_CODE_BASE, USER_STACK_BASE, etc.
+#include "memory.h"    // For USER_IMAGE_BASE, USER_STACK_BASE, etc.
 #include "kprintf.h"   // For kprintf
 #include "util.h"      // For kernel_panic
 

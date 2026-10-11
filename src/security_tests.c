@@ -410,7 +410,7 @@ static void test_user_exception_containment(void) {
     memset((void*)(uintptr_t)code_frame, 0, PAGE_SIZE);
     memcpy((void*)(uintptr_t)code_frame, fault_code, sizeof(fault_code));
 
-    pid = task_create_user_ex(USER_CODE_BASE, "FaultUD2", USER_STACK_MIN);
+    pid = task_create_user_ex(USER_IMAGE_BASE, "FaultUD2", USER_STACK_MIN);
     if (pid < 0) {
         stream_printf(ctx, "[EXCEPTION] FAILED: unable to create user fault task\n");
         goto cleanup;
@@ -427,13 +427,13 @@ static void test_user_exception_containment(void) {
     __asm__ volatile("mov %%cr3, %0" : "=r"(saved_cr3));
     uint32_t flags = disable_interrupts();
     __asm__ volatile("mov %0, %%cr3" :: "r"(fault_task->page_directory) : "memory");
-    map_page(USER_CODE_BASE, code_frame, PAE_PAGE_CODE);
+    map_page(USER_IMAGE_BASE, code_frame, PAE_PAGE_CODE);
     __asm__ volatile("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
     restore_interrupts(flags);
 
     if (pae_is_active()) {
         uint64_t mapped = pae_virt_to_phys_in(fault_task->page_directory,
-                                              USER_CODE_BASE);
+                                              USER_IMAGE_BASE);
         if ((mapped & PAE_FRAME_MASK) != code_frame) {
             stream_printf(ctx, "[EXCEPTION] FAILED: user code page was not mapped\n");
             goto cleanup;

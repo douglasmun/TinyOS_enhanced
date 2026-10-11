@@ -45,6 +45,7 @@
 #include "tcpcap_elf_data.h"
 #include "fatprobe_elf_data.h"
 #include "capprobe_elf_data.h"
+#include "ramprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -1098,6 +1099,19 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_chmod("/capprobe.elf", 0755);
         }
     }
+
+#ifdef TINYOS_FAULT_INJECT
+    /* ramprobe.elf is linked inside the kernel's identity-mapped RAM, so the
+     * loader must refuse it. Only verify-user-link-base.sh needs it. */
+    {
+        int ramprobe_fd = ramfs_open("/ramprobe.elf", RAMFS_FLAG_WRITE);
+        if (ramprobe_fd >= 0) {
+            ramfs_write(ramprobe_fd, ramprobe_elf_data, ramprobe_elf_data_len);
+            ramfs_close(ramprobe_fd);
+            ramfs_chmod("/ramprobe.elf", 0755);
+        }
+    }
+#endif
 
     /* slotbomb.elf spawns /slothold.elf in a tight loop WITHOUT reaping, to
      * prove the per-user concurrent task cap engages (see verify-slotcap.sh).

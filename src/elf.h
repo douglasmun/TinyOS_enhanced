@@ -254,6 +254,12 @@ int elf_exec_from_path(const char* path, const char* name,
  */
 uint32_t elf_get_entry(const void* elf_data);
 
+#ifdef TINYOS_FAULT_INJECT
+/* verify-user-link-base.sh only: report whether a loaded image shadows any
+ * kernel identity-map PTE, and whether the loader refuses /ramprobe.elf. */
+void elf_linkbase_selftest(void);
+#endif
+
 /**
  * @brief Print ELF header information (debug)
  * @param elf_data Pointer to ELF file data in memory

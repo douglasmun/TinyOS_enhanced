@@ -173,8 +173,9 @@ reachable once a ring-3 parent passed a variable-length vector.
 
 ## FIXED: user address space — page-table copy-on-write (commit `1596a04`)
 
-Userspace links at `0x08000000` (PD[0] index 64), which falls inside the kernel's
-identity-mapped low range. `pae_create_user_pdpt` copies all of the kernel's
+Userspace linked at `0x08000000` (PD[0] index 64) at the time, which falls inside
+the kernel's identity-mapped low range. It now links at `0x20000000`, above the
+identity map; see `doc/DESIGN_USER_LINK_BASE.md`. `pae_create_user_pdpt` copies all of the kernel's
 `PD[0]` entries into the user PDPT *by value*, so user PD[0] slots initially share
 the kernel's identity-map page-table frames.
 
