@@ -1,7 +1,7 @@
 # TinyOS Security Audit — 2026-10 (TCP, memory, ramfs/VFS, credentials, pipes)
 
 > **STATUS: every confirmed finding is FIXED AND MERGED (PRs #183–#188, `main` @
-> `e6012cc`).** §3 lists what was examined and deliberately *not* changed — the
+> `e6012cc`). The two per-uid caps §3 used to list as gaps are added by #191.** §3 lists what was examined and deliberately *not* changed — the
 > latent hazards, accepted trade-offs and gaps that are not worth re-reporting
 > without new information.
 
@@ -48,6 +48,8 @@ login prompt. Harness: `verify-logout-session-teardown.sh`.
 | #187 | Creds | The spray detector compared a truncated stored name against the full one with `strcmp`, so one over-long name counted as many | same |
 | #188 | Memory | `task_create_user_argv()`'s argv-does-not-fit branch freed only the slot (24 frames leaked, measured) | `verify-memory-fixes.sh` |
 | #188 | Memory | `pae_create_user_pdpt()` panicked on allocation failure, though it runs on every exec/spawn | same |
+| #191 | Pipes | No per-uid share of the 8-slot pipe table: one user holding all 8 failed every other user's `PIPE_OP_CREATE`. Now 4 per uid plus a 2-slot root reserve, `-EAGAIN` | `verify-uid-caps.sh` |
+| #191 | VFS | Directory opens met no per-uid cap (a ramfs directory open takes no ramfs fd), so one user could fill the VFS descriptor pool. Now 24 per uid, `-EAGAIN` | same |
 
 #187 also replaced `/etc/issue`'s `root/root` and `user/user` hints with
 neutral text. The text lives in `user_create_etc_structure()`, which nothing
@@ -77,15 +79,6 @@ These are recorded so they are not re-reported as new findings.
 - **Any user can keep root locked out.** The lockout counter is per target
   account, so three failed `su root` a minute keep root locked. This is an
   accepted trade-off; see "Account lockout" in `doc/SECURITY_HARDENING.md`.
-- **No per-uid pipe cap.** `MAX_PIPES` is 8 system-wide (`src/syscall.c`). One
-  user holding all 8 makes every other user's `PIPE_OP_CREATE` return `-EMFILE`.
-  The pipes are released when the holder exits, so this is a DoS only while that
-  user's processes live. If it matters, the fix is the pattern from FAT32 PR
-  #181: a per-uid share plus a root reserve.
-- **No per-uid cap on directory opens.** Since #186 an exhausted pool returns
-  `-ENFILE` instead of panicking. But directory opens are not charged to the
-  per-uid fd cap, so one ordinary user can still fill most of the shared VFS
-  descriptor table and starve other users' opens. The fix is the same pattern.
 - **Kernel-shell `exec /shell.elf | cat` does not hang; the probe lost its
   keystrokes.** Kernel-shell pipelines run their stages one after another (see
   "Pipeline execution" in `src/shell.c`). An interactive program as stage 1

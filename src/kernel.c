@@ -44,6 +44,7 @@
 #include "fdprobe_elf_data.h"
 #include "tcpcap_elf_data.h"
 #include "fatprobe_elf_data.h"
+#include "capprobe_elf_data.h"
 #include "slotbomb_elf_data.h"
 #include "slothold_elf_data.h"
 #include "shell_elf_data.h"
@@ -1084,6 +1085,17 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
             ramfs_write(fatprobe_fd, fatprobe_elf_data, fatprobe_elf_data_len);
             ramfs_close(fatprobe_fd);
             ramfs_chmod("/fatprobe.elf", 0755);
+        }
+    }
+
+    /* capprobe.elf fills the pipe table and the VFS descriptor table as one
+     * unprivileged uid. No builtin can hold either. See verify-uid-caps.sh. */
+    {
+        int capprobe_fd = ramfs_open("/capprobe.elf", RAMFS_FLAG_WRITE);
+        if (capprobe_fd >= 0) {
+            ramfs_write(capprobe_fd, capprobe_elf_data, capprobe_elf_data_len);
+            ramfs_close(capprobe_fd);
+            ramfs_chmod("/capprobe.elf", 0755);
         }
     }
 

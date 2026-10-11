@@ -281,9 +281,16 @@ void vfs_foreach_mount(void (*callback)(char drive_letter, const char* driver_na
  * falls back to the reserved pool (last VFS_RESERVED_FDS entries).
  *
  * If the reserved pool is exhausted too, the open fails with VFS_ENFILE.
- * It used to panic: root's ring-3 processes can hold every slot (directory
- * opens count against no per-uid cap, and a process may hold 16), so a few
- * of them opening D:/ until refused took the whole system down.
+ * It used to panic: root's ring-3 processes can hold every slot (a process
+ * may hold 16), so a few of them opening D:/ until refused took the whole
+ * system down.
+ *
+ * Each unprivileged uid may hold VFS_USER_MAX_FDS slots, and is refused with
+ * VFS_EAGAIN past that. This is the only cap a directory open meets: ramfs
+ * directory opens take no ramfs fd, so the ramfs per-uid share never saw
+ * them, and one user could fill the primary pool and starve every other
+ * user's opens. The count comes from the slots' owner fields (vfs_free_fd
+ * zeroes the slot), so it cannot drift.
  *---------------------------------------------------------------------------*/
 static int vfs_alloc_fd(void) {
     CRITICAL_SECTION_ENTER();
@@ -296,12 +303,31 @@ static int vfs_alloc_fd(void) {
         is_privileged = (current->uid == 0) || (current->capabilities & CAP_SYSTEM_CRITICAL);
     }
 
+    uint32_t uid = current ? current->uid : 0;
+
+    if (current != NULL && !is_privileged) {
+        int uid_held = 0;
+        for (int i = 0; i < VFS_MAX_FDS; i++) {
+            if (vfs_fd_table[i].in_use && vfs_fd_table[i].owner_uid == uid) {
+                uid_held++;
+            }
+        }
+        if (uid_held >= VFS_USER_MAX_FDS) {
+            CRITICAL_SECTION_EXIT();
+            /* Ring 3 reaches this: a trace, not a console line */
+            kdbg("[VFS] open refused: uid %u holds %d descriptors\n",
+                 (unsigned)uid, uid_held);
+            return VFS_EAGAIN;
+        }
+    }
+
     /* Primary pool: available to all processes */
     int primary_limit = VFS_MAX_FDS - VFS_RESERVED_FDS;
 
     for (int i = 0; i < primary_limit; i++) {
         if (!vfs_fd_table[i].in_use) {
             vfs_fd_table[i].in_use = true;
+            vfs_fd_table[i].owner_uid = uid;
             CRITICAL_SECTION_EXIT();
             return i;
         }
@@ -317,6 +343,7 @@ static int vfs_alloc_fd(void) {
     for (int i = primary_limit; i < VFS_MAX_FDS; i++) {
         if (!vfs_fd_table[i].in_use) {
             vfs_fd_table[i].in_use = true;
+            vfs_fd_table[i].owner_uid = uid;
             CRITICAL_SECTION_EXIT();
             return i;   /* Not logged: root's opens reach it at will */
         }

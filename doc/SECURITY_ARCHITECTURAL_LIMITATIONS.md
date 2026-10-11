@@ -78,6 +78,9 @@ There is no general rlimit mechanism and **no per-process memory or CPU-time quo
 - **Task-creation rate:** token bucket (burst 10, 5/s sustained), `-EAGAIN` when empty (`src/process.c`).
 - **ramfs file descriptors:** per-process `PROCESS_MAX_FDS` (`-EMFILE`), plus a per-uid cap (`RAMFS_USER_MAX_FDS`, 8) and a root reserve (`RAMFS_ROOT_RESERVED_FDS`, 4) — `src/ramfs.c`, `src/ramfs.h`.
 - **TCP sockets:** per-uid cap (`TCP_USER_MAX_SOCKETS`, 2) and a root reserve (`TCP_ROOT_RESERVED_SOCKETS`, 2) — `src/tcp.c`, `src/tcp.h`.
+- **FAT32 open files:** per-uid cap (`FAT32_USER_MAX_FDS`, 8) and a root reserve (`FAT32_ROOT_RESERVED_FDS`, 4) — `src/fat32.c`.
+- **Pipes:** per-uid cap (`PIPE_USER_MAX`, 4) and a root reserve (`PIPE_ROOT_RESERVED`, 2) on the 8-slot table, `-EAGAIN` — `src/syscall.c`.
+- **VFS descriptors:** per-process `TASK_FDTABLE_SIZE` (16, `-EMFILE`), plus a per-uid cap (`VFS_USER_MAX_FDS`, 24, `-EAGAIN`) and a root reserve (`VFS_RESERVED_FDS`, 6) on the 64-slot table — `src/vfs.c`, `src/vfs.h`. This is the only cap a ramfs directory open meets.
 
 **Remaining gap:** physical memory and CPU time are not accounted per process or per user.
 

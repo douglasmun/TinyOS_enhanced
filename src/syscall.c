@@ -2545,10 +2545,21 @@ int sys_redirect(int fd, const char* user_path, int mode) {
  *===========================================================================*/
 #define MAX_PIPES 8
 
+/* The table is shared by every user, so without a share one uid could hold all
+ * 8 and every other user's PIPE_OP_CREATE would fail until that uid's processes
+ * exited. A non-root uid may hold PIPE_USER_MAX, and the last
+ * PIPE_ROOT_RESERVED free slots are root's -- the ramfs and FAT32 open-table
+ * pattern. A ring-3 pipeline holds one pipe, so this is four concurrent
+ * pipelines per user. */
+#define PIPE_USER_MAX       4
+#define PIPE_ROOT_RESERVED  2
+
 typedef struct {
     pipe_buffer_t* buf;         /* NULL when the slot is free                */
     uint32_t       owner_pid;
     uint32_t       owner_generation;
+    uint32_t       owner_uid;   /* charged until the buffer is freed, so an
+                                 * orphan a child still holds counts too    */
     uint32_t       pages;       /* frames backing buf, for the free path     */
     bool           orphaned;    /* released, waiting for its last reader/writer */
 } pipe_slot_t;
@@ -2667,6 +2678,7 @@ static void pipe_slot_reap(pipe_slot_t* slot) {
     }
     slot->buf = NULL;
     slot->pages = 0;
+    slot->owner_uid = 0;
     slot->orphaned = false;
 }
 
@@ -2733,17 +2745,11 @@ int sys_pipe(int op, int id) {
 
     if (op == PIPE_OP_CREATE) {
         pipe_reap_orphans();
-        int slot_idx = -1;
-        for (int i = 0; i < MAX_PIPES; i++) {
-            if (!pipe_table[i].buf) {
-                slot_idx = i;
-                break;
-            }
-        }
-        if (slot_idx < 0) {
-            return -EMFILE;
-        }
 
+        /* Build the buffer first and claim a slot afterwards, inside one
+         * critical section: the count, the choice of slot and the claim must
+         * not be split by a switch to another creator. A refused create frees
+         * what it built. */
         uint32_t phys = pmm_alloc_contiguous((uint32_t)PIPE_FRAMES);
         if (phys == 0) {
             return -ENOMEM;
@@ -2775,10 +2781,42 @@ int sys_pipe(int op, int id) {
             return -ENOMEM;
         }
 
-        pipe_table[slot_idx].buf = buf;
-        pipe_table[slot_idx].owner_pid = self->pid;
-        pipe_table[slot_idx].owner_generation = self->generation;
-        pipe_table[slot_idx].pages = (uint32_t)PIPE_FRAMES;
+        int slot_idx = -1, avail = 0, uid_held = 0;
+        CRITICAL_SECTION_ENTER();
+        for (int i = 0; i < MAX_PIPES; i++) {
+            if (!pipe_table[i].buf) {
+                avail++;
+                if (slot_idx < 0) {
+                    slot_idx = i;
+                }
+            } else if (pipe_table[i].owner_uid == self->uid) {
+                uid_held++;
+            }
+        }
+        int refuse = 0;
+        if (slot_idx < 0) {
+            refuse = -EMFILE;
+        } else if (self->euid != 0 &&
+                   (uid_held >= PIPE_USER_MAX || avail <= PIPE_ROOT_RESERVED)) {
+            refuse = -EAGAIN;
+            kdbg("[PIPE] create refused: uid %u holds %d, %d slots free\n",
+                 (unsigned)self->uid, uid_held, avail);
+        } else {
+            pipe_table[slot_idx].buf = buf;
+            pipe_table[slot_idx].owner_pid = self->pid;
+            pipe_table[slot_idx].owner_generation = self->generation;
+            pipe_table[slot_idx].owner_uid = self->uid;
+            pipe_table[slot_idx].pages = (uint32_t)PIPE_FRAMES;
+        }
+        CRITICAL_SECTION_EXIT();
+
+        if (refuse) {
+            pipe_destroy(buf);
+            for (uint32_t i = 0; i < (uint32_t)PIPE_FRAMES; i++) {
+                pmm_free(phys + i * 4096);
+            }
+            return refuse;
+        }
 
         pipe_bind_stream(&self->streams.stdout_stream, buf);
         return slot_idx + 1;

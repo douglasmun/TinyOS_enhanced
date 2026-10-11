@@ -254,3 +254,5 @@ fat32cap.log
 fat32cap-trace.log
 idelba.log
 idelba-trace.log
+uidcaps.log
+uidcaps-trace.log
