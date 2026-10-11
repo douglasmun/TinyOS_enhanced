@@ -758,6 +758,8 @@ void task_free_resources(task_t* task);
 void task_guardsync_test(void);
 /* verify-edr-kill-reap.sh only: EDR kill of a non-running task. */
 void task_edrkill_test(void);
+/* verify-memory-fixes.sh only: forced task-creation failure unwinds. */
+void task_memunwind_test(void);
 #endif
 
 /**

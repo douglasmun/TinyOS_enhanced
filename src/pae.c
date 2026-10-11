@@ -1017,6 +1017,35 @@ void pae_dump_tables(uint32_t virt) {
  *
  * @return Physical address of the new PDPT, or 0 on failure
  *===========================================================================*/
+#ifdef TINYOS_FAULT_INJECT
+/* verify-memory-fixes.sh only: fail the n-th (1-based) frame allocation in
+ * the next pae_create_user_pdpt(); 0 = off. One-shot. */
+static int pae_user_pdpt_fail_at = 0;
+static int pae_user_pdpt_alloc_count = 0;
+
+void pae_user_pdpt_fail_next(int nth) {
+    pae_user_pdpt_fail_at = nth;
+    pae_user_pdpt_alloc_count = 0;
+}
+
+int pae_user_pdpt_fail_armed(void) {
+    return pae_user_pdpt_fail_at;
+}
+
+static uint32_t pae_user_pdpt_alloc(void) {
+    if (pae_user_pdpt_fail_at > 0 &&
+        ++pae_user_pdpt_alloc_count == pae_user_pdpt_fail_at) {
+        pae_user_pdpt_fail_at = 0;
+        return 0;
+    }
+    return pmm_alloc();
+}
+#else
+static uint32_t pae_user_pdpt_alloc(void) {
+    return pmm_alloc();
+}
+#endif
+
 uint32_t pae_create_user_pdpt(void) {
     kdbg("[PAE] Creating new user PDPT...\n");
 
@@ -1024,40 +1053,30 @@ uint32_t pae_create_user_pdpt(void) {
      * STEP 1: Allocate physical frames
      *=========================================================================*/
 
+    /* Allocation failure returns 0; it does not panic. This runs for every
+     * user task (every exec and spawn), not at boot -- PAE init builds the
+     * kernel's own tables elsewhere -- so the "boot-critical" panic that was
+     * here let any user who could exhaust memory take the kernel down by
+     * running one more program. Every caller already handles 0. */
+
     /* Allocate one page for PDPT (only 32 bytes used, but must be page-aligned) */
-    uint32_t pdpt_phys = pmm_alloc();
+    uint32_t pdpt_phys = pae_user_pdpt_alloc();
     if (pdpt_phys == 0) {
-        /*=====================================================================
-         * SECURITY FIX (Issue 4.2): Boot-Path Allocation Failure → Panic
-         *
-         * CRITICAL: PAE initialization is boot-critical. If we can't allocate
-         * the PDPT, the system CANNOT function. Returning 0 and continuing
-         * leads to:
-         * - Silent fallback to 32-bit paging (loses W^X enforcement)
-         * - NULL dereference later → triple fault → silent reboot
-         *
-         * FIX: Panic immediately with clear message about OOM condition.
-         * This is much better than mysterious reboot loops.
-         *===================================================================*/
-        kprintf("[PAE] CRITICAL: Failed to allocate PDPT - out of memory!\n");
-        kprintf("[PAE] Available frames: %u KB\n", (pmm_free_frames() * 4096) / 1024);
-        kernel_panic("PAE initialization failed - insufficient memory");
+        return 0;
     }
     kdbg("[PAE] Allocated PDPT at phys=0x%08x\n", pdpt_phys);
 
     /* Allocate 4 pages for the 4 page directories */
     uint32_t pd_phys[PAE_PDPT_ENTRIES];
     for (int i = 0; i < PAE_PDPT_ENTRIES; i++) {
-        pd_phys[i] = pmm_alloc();
+        pd_phys[i] = pae_user_pdpt_alloc();
         if (pd_phys[i] == 0) {
-            /*=================================================================
-             * SECURITY FIX (Issue 4.2): Boot-Path Allocation Failure → Panic
-             * Page directory allocation is boot-critical - panic on failure.
-             *===============================================================*/
-            kprintf("[PAE] CRITICAL: Failed to allocate page directory %d\n", i);
-            kprintf("[PAE] Available frames: %u KB\n", (pmm_free_frames() * 4096) / 1024);
-            /* No cleanup needed - kernel_panic() halts system */
-            kernel_panic("PAE initialization failed - insufficient memory for page directories");
+            /* Nothing is linked yet: free the frames themselves. */
+            for (int j = 0; j < i; j++) {
+                pmm_free(pd_phys[j]);
+            }
+            pmm_free(pdpt_phys);
+            return 0;
         }
         kdbg("[PAE] Allocated PD[%d] at phys=0x%08x\n", i, pd_phys[i]);
     }
