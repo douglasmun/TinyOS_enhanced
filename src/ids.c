@@ -442,7 +442,12 @@ bool ids_register_login_failure(const char* username) {
             continue;
         }
         distinct++;
-        if (strcmp(spray_table[i].username, username) == 0) {
+        /* Stored names are truncated to the slot; compare only that much, or
+         * a name longer than the slot never matches its own entry and every
+         * retry of it counts as one more distinct name -- a false spray alert
+         * from one user mistyping one over-long name three times. */
+        if (strncmp(spray_table[i].username, username,
+                    sizeof(spray_table[i].username) - 1) == 0) {
             spray_table[i].last_seen = now;
             already_known = true;
         }

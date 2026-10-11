@@ -81,6 +81,11 @@ void user_init(void);
 user_account_t* user_find_by_uid(uint16_t uid);
 user_account_t* user_find_by_username(const char* username);
 
+/* Refusals from user_create()/user_set_password(), distinct from their
+ * existing -1 (NULL argument), -2 (exists / not found), -3 (database full). */
+#define USER_ERR_EMPTY_PASSWORD  (-4)
+#define USER_ERR_NAME_TOO_LONG   (-5)
+
 /* User creation/deletion (root only) */
 int user_create(const char* username, uint16_t uid, uint16_t gid, const char* password);
 int user_delete(uint16_t uid);
