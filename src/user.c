@@ -506,6 +506,15 @@ int user_create(const char* username, uint16_t uid, uint16_t gid, const char* pa
     if (!username || !password) {
         return -1;  /* Invalid parameters */
     }
+    if (password[0] == '\0') {
+        return USER_ERR_EMPTY_PASSWORD;
+    }
+    /* Refuse, never truncate: the duplicate check below sees the full name,
+     * so a truncated copy could store a second account under an existing
+     * user's name. */
+    if (strlen(username) >= USER_MAX_USERNAME) {
+        return USER_ERR_NAME_TOO_LONG;
+    }
 
     /* Check if user already exists */
     if (user_find_by_uid(uid) || user_find_by_username(username)) {
@@ -587,6 +596,9 @@ int user_set_password(uint16_t uid, const char* password) {
     if (!password) {
         kprintf("[USER_SET_PWD] NULL password\n");
         return -1;
+    }
+    if (password[0] == '\0') {
+        return USER_ERR_EMPTY_PASSWORD;
     }
 
     user_account_t* user = user_find_by_uid(uid);
@@ -1510,18 +1522,12 @@ void user_create_etc_structure(void) {
         ramfs_write(fd, TINYOS_VERSION_NAME " - Multi-User Operating System\n",
                     strlen(TINYOS_VERSION_NAME " - Multi-User Operating System\n"));
         ramfs_write(fd, "\n", 1);
-#ifdef TINYOS_DEV
-        /* Development mode: Show default credentials with warning */
-        ramfs_write(fd, "=== DEVELOPMENT MODE - INSECURE ===\n", 36);
-        ramfs_write(fd, "Default users:\n", 15);
-        ramfs_write(fd, "  root  (password: root)\n", 26);
-        ramfs_write(fd, "  user  (password: user)\n", 26);
-        ramfs_write(fd, "WARNING: Change passwords before deployment!\n", 46);
-#else
-        /* Production mode: Generic login prompt without password hints */
+        /* No default-credential hints, in any build: there are none. Every
+         * account's password is set at first boot, and the TINYOS_DEV banner
+         * that advertised root/root and user/user named passwords no account
+         * has ever had. */
         ramfs_write(fd, "Please login with your credentials.\n", 37);
         ramfs_write(fd, "Contact system administrator if you need assistance.\n", 54);
-#endif
         ramfs_write(fd, "\n", 1);
         ramfs_close(fd);
     }

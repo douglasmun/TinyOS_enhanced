@@ -63,31 +63,54 @@
  * with no stream context it falls back to kprintf, so login and su are
  * unchanged.
  *=============================================================================*/
-static int read_password(char* buffer, size_t max_len) {
+/*
+ * Every credential prompt reads through this one loop. It always consumes the
+ * line up to its newline: characters past the buffer are dropped, never left
+ * in the keyboard ring. The su password and login-name loops it replaced
+ * stopped reading once the buffer filled, so an over-long su password's tail
+ * was read back by the kernel shell and run as a command line.
+ *
+ * Returns the number of printable characters typed, which exceeds
+ * max_len - 1 exactly when the line did not fit.
+ */
+static size_t read_line(char* buffer, size_t max_len, bool mask) {
     size_t pos = 0;
+    size_t typed = 0;
 
-    /* Caller has already printed prompt - just read the password */
+    /* Caller has already printed the prompt */
     while (1) {
         char c = keyboard_getchar();
 
         if (c == '\n') {
             buffer[pos] = '\0';
             cred_printf("\n");
-            return pos;
+            return typed;
         } else if (c == '\b' || c == 0x7F) {  /* Backspace */
-            if (pos > 0) {
+            if (typed > pos) {
+                typed--;               /* an unechoed, dropped character */
+            } else if (pos > 0) {
                 pos--;
-                /* Erase the asterisk (v1.13: kbd driver no longer echoes) */
+                typed--;
+                /* v1.13: kbd driver no longer echoes */
                 cred_printf("\b \b");
             }
         } else if (c >= 32 && c < 127) {  /* Printable characters */
-            if (pos < max_len - 1) {  /* Only write if space available */
+            typed++;
+            if (typed == pos + 1 && pos < max_len - 1) {
                 buffer[pos++] = c;
-                cred_printf("*");  /* Echo asterisk instead of actual character */
+                if (mask) {
+                    cred_printf("*");
+                } else {
+                    cred_printf("%c", c);
+                }
             }
-            /* Silently ignore characters that would overflow */
+            /* Silently drop characters that would overflow */
         }
     }
+}
+
+static void read_password(char* buffer, size_t max_len) {
+    (void)read_line(buffer, max_len, true);
 }
 
 /*=============================================================================
@@ -218,25 +241,7 @@ void shell_cmd_su(const char* args) {
     char password[USER_MAX_PASSWORD];
     kprintf("Password for %s: ", target_username);
 
-    /* Read password without showing the prompt (we already printed it) */
-    size_t pos = 0;
-    while (pos < sizeof(password) - 1) {
-        char c = keyboard_getchar();
-        if (c == '\n') {
-            password[pos] = '\0';
-            kprintf("\n");
-            break;
-        } else if (c == '\b' || c == 0x7F) {  /* Backspace */
-            if (pos > 0) {
-                pos--;
-                kprintf("\b \b");
-            }
-        } else if (c >= 32 && c < 127) {  /* Printable characters */
-            password[pos++] = c;
-            kprintf("*");  /* Echo asterisk instead of actual character */
-        }
-    }
-    password[pos] = '\0';
+    read_password(password, sizeof(password));
 
     /* Authenticate (also maintains the per-account lockout counter). Audited as
      * an su, not a login — this verifies a password but establishes no session. */
@@ -365,6 +370,11 @@ int shell_cmd_passwd(const char* args) {
         cred_printf("passwd: passwords do not match\n");
         return -EINVAL;
     }
+    if (pw1_len == 0) {
+        /* Two empty lines match; that is not a password. */
+        cred_printf("passwd: password cannot be empty\n");
+        return -EINVAL;
+    }
 
     /* Set new password */
     int rc = user_set_password(target_uid, new_password);
@@ -403,6 +413,12 @@ int shell_cmd_useradd(const char* args) {
         return -EINVAL;
     }
 
+    if (strlen(args) >= USER_MAX_USERNAME) {
+        cred_printf("useradd: username too long (max %d characters)\n",
+                    USER_MAX_USERNAME - 1);
+        return -ENAMETOOLONG;
+    }
+
     /* Check if user already exists */
     if (user_find_by_username(args)) {
         cred_printf("useradd: user '%s' already exists\n", args);
@@ -424,6 +440,10 @@ int shell_cmd_useradd(const char* args) {
     char password[USER_MAX_PASSWORD];
     cred_printf("Enter password for new user: ");
     read_password(password, sizeof(password));
+    if (password[0] == '\0') {
+        cred_printf("useradd: password cannot be empty\n");
+        return -EINVAL;
+    }
 
     /* Create user */
     int result = user_create(args, new_uid, 100, password);  /* gid=100 (users group) */
@@ -636,26 +656,11 @@ int shell_login_prompt(void) {
 
         /* Get username */
         kprintf("TinyOS login: ");
-        size_t pos = 0;
-        while (pos < USER_MAX_USERNAME - 1) {
-            char c = keyboard_getchar();
-            if (c == '\n') {
-                username[pos] = '\0';
-                kprintf("\n");
-                break;
-            } else if (c == '\b' || c == 0x7F) {  /* Backspace */
-                if (pos > 0) {
-                    pos--;
-                    kprintf("\b \b");  /* Erase character on screen */
-                }
-            } else if (c >= 32 && c < 127) {  /* Printable characters */
-                if (pos < USER_MAX_USERNAME - 1) {
-                    username[pos++] = c;
-                    kprintf("%c", c);  /* Echo character */
-                }
-            }
+        if (read_line(username, USER_MAX_USERNAME, false) >= USER_MAX_USERNAME) {
+            /* No account can have this name; don't log in as its prefix. */
+            kprintf("Login name too long\n");
+            continue;
         }
-        username[pos] = '\0';
 
         /* Skip empty username */
         if (username[0] == '\0') {
@@ -728,29 +733,14 @@ int shell_login_prompt(void) {
 
                             /* Get username */
                             kprintf("Enter username for new account: ");
-                            size_t uname_pos = 0;
-                            while (uname_pos < USER_MAX_USERNAME - 1) {
-                                char c = keyboard_getchar();
-                                if (c == '\n') {
-                                    new_username[uname_pos] = '\0';
-                                    kprintf("\n");
-                                    break;
-                                } else if (c == '\b' || c == 0x7F) {
-                                    if (uname_pos > 0) {
-                                        uname_pos--;
-                                        kprintf("\b \b");
-                                    }
-                                } else if (c >= 32 && c < 127) {
-                                    if (uname_pos < USER_MAX_USERNAME - 1) {
-                                        new_username[uname_pos++] = c;
-                                        kprintf("%c", c);
-                                    }
-                                }
-                            }
-                            new_username[uname_pos] = '\0';
+                            size_t uname_len = read_line(new_username,
+                                                         USER_MAX_USERNAME, false);
 
                             /* Validate username */
-                            if (strlen(new_username) == 0) {
+                            if (uname_len >= USER_MAX_USERNAME) {
+                                kprintf("Username too long (max %d characters). Skipping user creation.\n\n",
+                                        USER_MAX_USERNAME - 1);
+                            } else if (strlen(new_username) == 0) {
                                 kprintf("Username cannot be empty. Skipping user creation.\n\n");
                             } else if (user_find_by_username(new_username) != NULL) {
                                 kprintf("User '%s' already exists. Skipping.\n\n", new_username);
