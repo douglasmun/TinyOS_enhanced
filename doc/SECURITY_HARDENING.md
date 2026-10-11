@@ -1395,6 +1395,19 @@ Hardware-enforced stack-overflow containment and a correct ring-transition path.
   `passwd` (via `SYS_CRED`) all go through it, so a wrong current password at
   `passwd` counts toward the lockout and a locked account cannot change its own
   password (PR #151, `verify-passwd-lockout.sh`).
+  **Accepted trade-off:** the counter is per *target* account, so any logged-in
+  user can keep root locked by failing `su root` three times a minute
+  (`USER_MAX_LOGIN_ATTEMPTS` 3, `USER_LOCKOUT_DURATION` 60 s). Locking the
+  account rather than the source is the point — a guesser on any terminal is
+  stopped — and every failure and lock is audit-logged. Recovery is to wait
+  out the window.
+- **No empty passwords:** `user_create()` and `user_set_password()` refuse an
+  empty password (`USER_ERR_EMPTY_PASSWORD`), so `passwd` and `useradd` cannot
+  store one. Every credential prompt reads through one `read_line()` that
+  consumes the typed line to its newline, so an over-long entry is refused
+  whole and its tail never reaches the next prompt or the shell. Names of 32+
+  characters are refused, never truncated onto an existing account (PR #187,
+  `verify-cred-fixes.sh`).
 - **Identical refusal text:** login prints `Login incorrect` and `su` prints
   `su: authentication failure` whether the user does not exist, the password is
   wrong or the account is locked; `su` asks an unknown name for a password like
@@ -1483,6 +1496,18 @@ corruption or a disclosure of kernel/other-process memory; or on-disk
 corruption of a file the caller did not name (as in the 2026-10 FAT32 audit,
 PRs #176–#181). If a confidential file is ever needed on persistent storage,
 the answer is a new storage design, not ownership bits bolted onto FAT32.
+
+### D:/scratch is shared too — no sticky bit
+
+`/scratch` on `D:` is created `0777` at boot (`src/kernel.c`) as the one place
+an unprivileged user can create files, since `/` is `0711`. ramfs has no
+sticky bit — `ramfs_chmod()` masks mode to `0777` and drops setuid/setgid/
+sticky deliberately — and `unlink` needs only WRITE on the parent. So any user
+may **delete or replace** another user's file in `/scratch`. They still cannot
+**read or write** it: a `0600` file there is refused by
+`ramfs_check_permission()` like anywhere else. Treat `/scratch` as `/tmp`
+without `+t`: private files go in a directory the user owns. "User A unlinked
+user B's file in /scratch" is not a finding; reading it would be.
 
 ---
 

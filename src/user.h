@@ -138,5 +138,6 @@ int group_create(const char* groupname, uint16_t gid);
 void user_list_all(bool show_flags);  /* flags (lock state) for root only */
 int user_count(void);  /* Count number of users in database */
 
-/* /etc directory structure */
+/* /etc directory structure. NOT CALLED anywhere: /etc/issue and the files
+ * it writes never exist on a booted system (doc/SECURITY_AUDIT_2026-10.md). */
 void user_create_etc_structure(void);
