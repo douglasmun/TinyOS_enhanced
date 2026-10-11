@@ -86,14 +86,21 @@ These are recorded so they are not re-reported as new findings.
   `-ENFILE` instead of panicking. But directory opens are not charged to the
   per-uid fd cap, so one ordinary user can still fill most of the shared VFS
   descriptor table and starve other users' opens. The fix is the same pattern.
-- **Kernel-shell `exec /shell.elf | cat` hangs (open, cause not diagnosed).**
-  Kernel-shell pipelines run their stages one after another (see "Pipeline
-  execution" in `src/shell.c`). An interactive program as stage 1 writes its
-  banner, prompt and echo into the pipe, so the console shows nothing. In a
-  2026-10-12 run on `main` (`e6012cc`), typed lines and `exit` got no visible
-  response, and the outer kernel shell had not answered `echo` 60 s later. This
-  is distinct from the more-than-4-KB hang that #185 fixed. It needs the kernel
-  shell, so ring 3 cannot reach it.
+- **Kernel-shell `exec /shell.elf | cat` does not hang; the probe lost its
+  keystrokes.** Kernel-shell pipelines run their stages one after another (see
+  "Pipeline execution" in `src/shell.c`). An interactive program as stage 1
+  writes its banner, prompt and echo into the pipe, so the console shows nothing
+  until it exits and `cat` runs. An earlier run looked like a hang: typed lines
+  and `exit` got no response, and the outer shell did not answer `echo` 60 s
+  later. Serial-direct tracing showed the cause. The probe typed every line
+  while `shell.elf` was still being signature-verified, which runs with
+  interrupts masked. QEMU's PS/2 queue dropped what did not fit: `echo INNER`
+  reached the child as `eche`, and `exit` never arrived. The child therefore
+  waited in `stdin_read`, and the kernel shell correctly waited on the child.
+  With typing held until the child read stdin, the run behaved normally. `INNER`
+  and the inner prompts came out through `cat` after `exit`, and the outer shell
+  answered. Any harness that drives this must wait for the child to be reading
+  before it types.
 - **`user_create_etc_structure()` is dead code.** It is declared in `user.h` and
   defined in `user.c`, but nothing calls it, so `/etc/issue` and the files it
   writes never exist on a booted system.
