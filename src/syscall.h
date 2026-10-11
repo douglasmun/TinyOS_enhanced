@@ -974,8 +974,9 @@ int sys_redirect(int fd, const char* user_path, int mode);
  * @param op One of the PIPE_OP_* values above
  * @param id Pipe ID from a previous CREATE; ignored by CREATE itself
  * @return CREATE returns a positive pipe ID; the others return 0 on success.
- *         -EMFILE if no pipe slot is free, -ENOMEM if the buffer could not be
- *         allocated, -EBADF for an unknown ID, -EPERM for another process's
+ *         -EMFILE if no pipe slot is free, -EAGAIN if a non-root caller's uid
+ *         already holds PIPE_USER_MAX pipes or only root's reserve is left,
+ *         -ENOMEM if the buffer could not be allocated, -EBADF for an unknown ID, -EPERM for another process's
  *         pipe, -EINVAL for an unknown op.
  */
 int sys_pipe(int op, int id);

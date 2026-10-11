@@ -73,6 +73,9 @@ typedef int32_t ssize_t;                /* Signed size type for I/O operations *
  *=============================================================================*/
 #define VFS_MAX_FDS         64      /* Maximum file descriptors */
 #define VFS_RESERVED_FDS    6       /* Reserved FDs for critical processes (10% of VFS_MAX_FDS) */
+#define VFS_USER_MAX_FDS    24      /* Per-uid share for unprivileged callers: above one
+                                     * process's TASK_FDTABLE_SIZE (16), so a process
+                                     * with a full table can still exec and spawn */
 #define VFS_MAX_PATH        256     /* Maximum path length */
 
 /* Drive used for a path with no "X:" prefix. RAMFS holds the embedded system
@@ -406,6 +409,7 @@ typedef struct vfs_file_descriptor {
     size_t offset;                      /* Current offset (for seek) */
     void* private_data;                 /* Driver-specific data */
     const file_operations_t* ops;       /* Operations for this FD */
+    uint32_t owner_uid;                 /* Real uid charged for this slot */
     char path[VFS_MAX_PATH];            /* Path (for debugging) */
 } vfs_file_descriptor_t;
 
