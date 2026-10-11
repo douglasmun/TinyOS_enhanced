@@ -240,6 +240,13 @@ uint32_t pae_get_kernel_pdpt(void);
  */
 uint32_t pae_create_user_pdpt(void);
 
+#ifdef TINYOS_FAULT_INJECT
+/* verify-memory-fixes.sh only: fail the nth (1-based) frame allocation of the
+ * next pae_create_user_pdpt(). One-shot; reads back 0 once it has fired. */
+void pae_user_pdpt_fail_next(int nth);
+int pae_user_pdpt_fail_armed(void);
+#endif
+
 /**
  * @brief Free a user PDPT created by pae_create_user_pdpt()
  *

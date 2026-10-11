@@ -1276,6 +1276,44 @@ void task_edrkill_test(void) {
     syscall_edr_selfkill_arm();
     stream_printf(out, "[EDRKILL] self-kill leg armed\n");
 }
+
+/* verify-memory-fixes.sh: task_create_user_argv()'s two unreachable-by-input
+ * failure paths, forced. Each leg must fail the creation and return every
+ * frame it took. Other tasks allocate concurrently, so a leg is tried three
+ * times and leaks only if every try lost frames. */
+static bool argv_nofit_next = false;
+
+static bool memunwind_leg(stream_context_t* out, const char* leg, int pdpt_fail_at) {
+    int deltas[3];
+    bool clean = false, fired = true;
+    for (int t = 0; t < 3; t++) {
+        uint32_t before = pmm_free_frames();
+        if (pdpt_fail_at > 0) {
+            pae_user_pdpt_fail_next(pdpt_fail_at);
+        } else {
+            argv_nofit_next = true;
+        }
+        int rc = task_create_user_argv(0x08048000u, "memunwind", 8, 0, NULL);
+        bool armed = pdpt_fail_at > 0 ? pae_user_pdpt_fail_armed() != 0 : argv_nofit_next;
+        pae_user_pdpt_fail_next(0);
+        argv_nofit_next = false;
+        deltas[t] = (int)pmm_free_frames() - (int)before;
+        if (rc >= 0 || armed) fired = false;
+        if (deltas[t] == 0) clean = true;
+    }
+    stream_printf(out, "[MEMUNWIND] %s: deltas %d %d %d, fault %s\n", leg,
+                  deltas[0], deltas[1], deltas[2], fired ? "fired" : "NOT-FIRED");
+    return clean && fired;
+}
+
+void task_memunwind_test(void) {
+    stream_context_t* out = get_current_streams();
+    stream_printf(out, "[MEMUNWIND] forced task-creation failures must free their frames\n");
+    bool b = memunwind_leg(out, "argv-nofit", 0);
+    bool p1 = memunwind_leg(out, "pdpt-alloc", 1);
+    bool p3 = memunwind_leg(out, "pd1-alloc", 3);
+    stream_printf(out, "[MEMUNWIND] VERDICT: %s\n", (b && p1 && p3) ? "PASS" : "FAIL");
+}
 #endif
 
 int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages,
@@ -1683,14 +1721,27 @@ int task_create_user_argv(uint32_t entry, const char* name, uint16_t stack_pages
                              + sizeof(uint32_t) + sizeof(uint32_t) + 15u;
         uint32_t stack_low = stack_base - ((uint32_t)stack_pages * 0x1000);
 
-        if (task->user_stack < stack_low ||
-            (size_t)(task->user_stack - stack_low) < block_bytes) {
+        bool argv_fits = task->user_stack >= stack_low &&
+                         (size_t)(task->user_stack - stack_low) >= block_bytes;
+#ifdef TINYOS_FAULT_INJECT
+        if (argv_nofit_next) {
+            argv_nofit_next = false;
+            argv_fits = false;
+        }
+#endif
+        if (!argv_fits) {
             /* Cannot happen with the current limits, but writing outside the
              * mapping would corrupt whatever else lives there, so fail loudly
-             * instead. Restore CR3 first — we are still on the child's PDPT. */
+             * instead. Restore CR3 first — we are still on the child's PDPT.
+             *
+             * Everything this task owns is in its task_t fields by now --
+             * guard page, kernel and user stacks, user guard page, PDPT --
+             * so the one teardown routine frees it; releasing just the slot
+             * leaked about twenty frames. */
             __asm__ volatile("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
             kprintf("[PROCESS] ERROR: argv block (%u bytes) does not fit on user stack\n",
                     (unsigned)block_bytes);
+            task_free_resources(task);
             task->pid = 0;
             task_free_slot(slot);
             return -1;

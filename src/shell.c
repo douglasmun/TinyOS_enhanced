@@ -966,6 +966,10 @@ static void parse_and_execute(char* cmd_line) {
     else if (strcmp(argv[0], "edrkill") == 0) {
         task_edrkill_test();
     }
+    /* verify-memory-fixes.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "memunwind") == 0) {
+        task_memunwind_test();
+    }
     /* verify-context-switch-esp.sh only. Not in the command table. */
     else if (strcmp(argv[0], "ctxswtest") == 0) {
         scheduler_ctxsw_esp_test();
