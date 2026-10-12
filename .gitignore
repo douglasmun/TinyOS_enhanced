@@ -258,3 +258,7 @@ uidcaps.log
 uidcaps-trace.log
 linkbase.log
 linkbase-trace.log
+
+# Harness serial/trace logs land at the repo root (verify/*.sh SERIAL=/TRACE=).
+# One rule instead of a name per harness: 63 names had been missed.
+/*.log
