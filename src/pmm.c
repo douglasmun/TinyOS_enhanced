@@ -68,7 +68,7 @@
  * TODO: Make fully dynamic based on multiboot memory map (allocate bitmap
  * from kernel heap instead of static allocation).
  *============================================================================*/
-#define PMM_MAX_BYTES   (256u * 1024u * 1024u)      /* 256 MiB (was 128 MiB) */
+/* PMM_MAX_BYTES lives in pmm.h: elf.c bounds user segments by it. */
 #define PMM_MAX_FRAMES  (PMM_MAX_BYTES / PMM_PAGE_SIZE)  /* 65,536 frames */
 
 /* Frames below the standard-mode identity-mapped region (first 32 MiB).

@@ -15,7 +15,14 @@
 #define USER_SPACE_END   0xBFFFFFFF
 
 // Standard user memory layout
-#define USER_CODE_BASE   0x08048000  // Where user programs start
+//
+// User images link here (userspace/user.ld). It must sit above every physical
+// address the kernel identity-maps (PMM_MAX_BYTES, static-asserted in elf.c):
+// a user PTE at a virtual address the kernel also maps 1:1 replaces the
+// kernel's view of that physical frame while the process's CR3 is loaded.
+// The old base, 0x08000000, shadowed frames 128 MB and up.
+// See doc/DESIGN_USER_LINK_BASE.md.
+#define USER_IMAGE_BASE  0x20000000
 #define USER_STACK_BASE  0x40000000  // User stack grows down from here
 #define USER_STACK_SIZE  0x00100000  // 1MB stack
 #define USER_HEAP_BASE   0x50000000  // User heap starts here

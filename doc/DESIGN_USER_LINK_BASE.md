@@ -1,7 +1,8 @@
 # Design note: the 128 MB user-code / kernel identity-map overlap
 
-Status: **open, latent**. Nothing is fixed yet. This note records the decision
-that `doc/SECURITY_AUDIT_2026-10.md` §3 left open.
+Status: **fixed** (option A, `0x20000000`, no bridge). See "As implemented"
+at the end for where the code differs from the plan below. This note records
+the decision that `doc/SECURITY_AUDIT_2026-10.md` §3 left open.
 
 ## The problem in one paragraph
 
@@ -197,3 +198,35 @@ Do not raise any per-uid cap before this lands.
   above it). `0x20000000` avoids that and leaves room for RAM up to 512 MB.
 - Should C ship first as a bridge, or can A go straight in? A is small enough
   that a bridge looks unnecessary.
+
+## As implemented
+
+Both open questions were settled by the defaults above: `0x20000000`, and A
+went straight in without C.
+
+- **Base.** `userspace/user.ld` links at `__user_image_base` if defined, else
+  `0x20000000`; the kernel's name for it is `USER_IMAGE_BASE` (`memory.h`). All
+  22 tracked blobs are rebuilt and re-signed with the same key.
+- **Static assert.** It sits in `elf.c`, not beside `PMM_MAX_BYTES`, because
+  `elf.c` is the file that includes both headers. `PMM_MAX_BYTES` moved from
+  `pmm.c` to `pmm.h` so the loader can see it.
+- **Loader refusal.** Any PT_LOAD whose start is below `PMM_MAX_BYTES` is
+  refused with `[ELF] SECURITY: Segment N at 0x... is inside the kernel RAM
+  map`. Checking the start is enough, because the overflow check before it
+  guarantees `end > start`.
+- **No counter.** The plan asked for one. The check runs after the ECDSA
+  gate, so only a validly signed image reaches it. That is one line per exec,
+  each costing a full signature verify, the same as the sibling `SECURITY:
+  Segment` lines, which carry no counter either.
+- **Witness.** The test plan's sentinel read-through was replaced by a
+  page-table-only probe. `linkbase` (`-DTINYOS_FAULT_INJECT`, `elf.c`) loads
+  `hello.elf` unscheduled and counts image pages where the kernel PDPT maps
+  `v` 1:1 and the process PDPT maps `v` elsewhere. A control mapping at an
+  identity address must read as shadowed on any kernel, which proves the
+  probe can see a shadow. The refusal probe is `ramprobe.elf`, linked at
+  `0x0C000000` (inside RAM but above 128 MB, so it is harmless if an unfixed
+  loader accepts it). It is used instead of a `0x00100000` probe.
+  `verify/verify-user-link-base.sh`: the unfixed tree FAILs (8/8 pages
+  shadowed, ramprobe loaded). The fixed tree PASSes. Reverting only the
+  loader check FAILs (ramprobe loaded), and the old `hello` blob with the
+  check present FAILs (refused).

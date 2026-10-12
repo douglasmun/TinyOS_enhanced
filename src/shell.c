@@ -992,6 +992,10 @@ static void parse_and_execute(char* cmd_line) {
     else if (strcmp(argv[0], "idelba") == 0) {
         ide_lba_selftest();
     }
+    /* verify-user-link-base.sh only. Not in the command table. */
+    else if (strcmp(argv[0], "linkbase") == 0) {
+        elf_linkbase_selftest();
+    }
     /* verify-tcp-state-fixes.sh only. Not in the command table. */
     else if (strcmp(argv[0], "tcpstate") == 0) {
         tcp_state_selftest();

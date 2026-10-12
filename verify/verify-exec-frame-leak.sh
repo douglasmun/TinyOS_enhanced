@@ -69,11 +69,12 @@ TRACE=framelk-trace.log
 MON_SOCK=/tmp/tinyos-framelk-mon.sock
 
 # /hello.elf's LOAD segments, as the loader itself reports them at run time:
-#   seg0 vaddr=0x08000000 memsz=0x0bd3 flags=5 (R E) -> 1 page
-#   seg1 vaddr=0x08001000 memsz=0x00ad flags=4 (R  ) -> 1 page
-#   seg2 vaddr=0x08002000 memsz=0x5004 flags=6 (RW ) -> 6 pages
-# = 8 pages of image per exec. Measured leak is 8 frames per exec: exactly the
-# image and nothing else. Don't hardcode a different binary's page count here
+#   seg0 vaddr=0x20000000 memsz=0x11c0 flags=5 (R E) -> 2 pages
+#   seg1 vaddr=0x20002000 memsz=0x00a9 flags=4 (R  ) -> 1 page
+#   seg2 vaddr=0x20003000 memsz=0x5004 flags=6 (RW ) -> 6 pages
+# = 9 pages of image per exec (8 when this harness was written, before libc
+# grew). The measured leak was 8 frames per exec then: exactly the image and
+# nothing else. Don't hardcode a different binary's page count here
 # -- C:/info.elf is a much larger image and would move the expected figure.
 RUNS=5
 
@@ -208,7 +209,7 @@ if [ "$DELTA" -le 2 ]; then
 elif [ "$PER_RUN" -ge 4 ]; then
     echo "RESULT: LEAK CONFIRMED — ~$PER_RUN frames lost per exec, and they do not come back."
     echo ""
-    echo "  /hello.elf's three LOAD segments span exactly 8 pages. Neither"
+    echo "  /hello.elf's three LOAD segments span exactly 9 pages. Neither"
     echo "  task_free_resources() nor pae_free_user_pdpt() frees the frames a"
     echo "  user PTE points AT — both free only bookkeeping-tracked pages and"
     echo "  the page tables themselves. elf_load_process()'s allocated_frames[]"

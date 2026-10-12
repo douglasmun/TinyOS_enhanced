@@ -15,8 +15,14 @@ PHDRS
 
 SECTIONS
 {
-    /* Load user programs at virtual address 0x08000000 (128MB mark) */
-    . = 0x08000000;
+    /* Load user programs at 0x20000000 (512 MB), USER_IMAGE_BASE in
+     * src/memory.h. It must stay above all RAM the kernel identity-maps
+     * (PMM_MAX_BYTES): the old base, 0x08000000, put every image page over
+     * the kernel's view of a physical frame (doc/DESIGN_USER_LINK_BASE.md),
+     * and the loader now refuses any segment below PMM_MAX_BYTES.
+     * __user_image_base exists only so ramprobe.elf can be linked inside RAM
+     * to prove that refusal (-Wl,--defsym). */
+    . = DEFINED(__user_image_base) ? __user_image_base : 0x20000000;
 
     /* Code section */
     . = ALIGN(4K);

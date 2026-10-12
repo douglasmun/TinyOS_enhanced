@@ -8,6 +8,10 @@
 /* 4 KiB frames */
 #define PMM_PAGE_SIZE 4096
 
+/* Most RAM the PMM tracks, and therefore the top of the kernel's identity map.
+ * No user mapping may fall below it (elf.c refuses such segments). */
+#define PMM_MAX_BYTES   (256u * 1024u * 1024u)      /* 256 MiB (was 128 MiB) */
+
 /* Initialize from Multiboot2 info pointer */
 void pmm_init_from_mb2(const void* mb2_info);
 

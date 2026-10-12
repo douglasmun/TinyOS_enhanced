@@ -59,15 +59,15 @@ calls (§3), so no boot can show it.
 
 These are recorded so they are not re-reported as new findings.
 
-- **Kernel RAM map overlaps user code at 128 MB (latent).** User programs link at
-  `0x08000000` (`userspace/user.ld`), inside the range the kernel maps 1:1. While a
-  process's address space is loaded, the kernel's direct view of each physical
-  frame at 128 MB + n×4 KB is replaced by that process's image page n. Nothing
-  reachable allocates that high today: getting there takes about 127 MB of
-  allocations, and the per-uid caps stop that. The real fix is to move the link
-  base and re-sign every binary. That is a design decision, and it should be
-  taken before the per-uid caps are ever raised or RAM above 128 MB is used for
-  kernel objects.
+- **Kernel RAM map overlaps user code at 128 MB (latent; since fixed).** User
+  programs linked at `0x08000000`, inside the range the kernel maps 1:1. While a
+  process's address space was loaded, the kernel's direct view of each physical
+  frame at 128 MB + n×4 KB was replaced by that process's image page n. Nothing
+  reachable allocated that high: getting there takes about 127 MB of
+  allocations, and the per-uid caps stop that. **Fixed afterwards** per
+  `doc/DESIGN_USER_LINK_BASE.md` option A. Images now link at `0x20000000`,
+  above `PMM_MAX_BYTES` (static-asserted), and the loader refuses any segment
+  below it. `verify/verify-user-link-base.sh` is the witness.
 - **TCP has no retransmission and no keepalives.** This is a missing feature,
   not a bug. A lost data segment or FIN is never resent; only the zero-window
   probe repeats. `tcp.h` used to claim retransmission in two places, and both

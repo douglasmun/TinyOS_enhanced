@@ -126,6 +126,7 @@ SRC := \
   src/slotbomb_elf_data.c \
   src/slothold_elf_data.c \
   src/shell_elf_data.c \
+  src/ramprobe_elf_data.c \
   src/ramfs.c \
   src/ramfs_vfs.c \
   src/fat32_vfs.c \
