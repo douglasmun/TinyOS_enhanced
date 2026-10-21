@@ -1,9 +1,37 @@
-# Ephemeral port allocation: open issues
+# Ephemeral port allocation issues
 
-Status: **OPEN**, not yet fixed. Recorded 2026-10-21 from a read-only review of
-`main` at `925458d`. Nothing here is exploitable on its own. TinyOS is a
-client-only TCP stack, there is no inbound accept path, and the TCP ISN is
+Status: **FIXED** (branch `fix/ephemeral-port-random`), witnessed by
+`verify/verify-tcp-ephemeral-port.sh`. Recorded 2026-10-21 from a read-only
+review of `main` at `925458d`. Nothing here was exploitable on its own. TinyOS
+is a client-only TCP stack, there is no inbound accept path, and the TCP ISN is
 already keyed (RFC 6528).
+
+## Resolution
+
+| # | Issue | Outcome |
+|---|---|---|
+| 1 | Sequential TCP ports | **Fixed.** `tcp_allocate_port()` now uses RFC 6056 Algorithm 1: a fresh `global_csprng` draw over 49152-65535 for each connection, retried up to 64 times on collision. There is no fallback: the CSPRNG panics if used before `crypto_init()`, and that runs before any network bring-up. |
+| 2 | Dead exhaustion check | **Removed** along with the counter. The loop is now bounded only by the attempt count. |
+| 3 | Collision check uses the local port only | **Kept** on purpose, and now documented on `tcp_port_is_free()`. |
+| 4 | TIME_WAIT eviction frees the port early | **Fixed.** `tcp_evict_oldest_time_wait()` records the evicted port and the time its 30 s would have ended in `tcp_port_quarantine[]` (16 entries; when full, the entry closest to expiry is overwritten). `tcp_port_is_free()` refuses quarantined ports. The "LIFO" comments now say oldest-first. |
+| 5 | Inconsistent locking | **Fixed.** `tcp_connect()` takes `TCP_LOCK` around its state check, half-open count and allocation. A slot that is in_use but still CLOSED now holds its port too: `tcp_connect()` assigns the port before the slot leaves CLOSED, and that state used to count as free. |
+
+The harness drives ten real `tcp_socket()`/`tcp_connect()`/`tcp_close()`
+cycles (transmission muted) and grades the ports. It also builds a synthetic
+full table so that `tcp_socket()` evicts a TIME_WAIT entry, then checks which
+ports are busy. Each fix was mutation-checked:
+
+| Mutant | Result |
+|---|---|
+| Allocator from `main`, verbatim | FAIL (draws were 49152, 49153, ...) |
+| Quarantine not consulted | FAIL (evicted port reads free) |
+| CLOSED-slot exception restored | FAIL (in-progress connect's port reads free) |
+
+The `TCP_LOCK` part of #5 has no witness. Two kernel-shell connects racing for
+the same random port is a 1-in-16384 event, so no harness can make it happen on
+demand. It is a code-reading fix only.
+
+The original analysis follows unchanged.
 
 ## Where the code lives
 

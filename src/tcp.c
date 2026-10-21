@@ -139,7 +139,29 @@
  * TCP CONNECTION TABLE AND SYN FLOOD PROTECTION
  *=============================================================================*/
 static tcp_connection_t tcp_connections[TCP_MAX_CONNECTIONS];
-static uint16_t next_ephemeral_port = 49152; // Start of ephemeral port range
+
+/*=============================================================================
+ * Ports still owed the rest of a TIME_WAIT that tcp_evict_oldest_time_wait()
+ * cut short. Eviction frees the slot, and with it the only record that the
+ * port is in TIME_WAIT; a random allocator would otherwise hand the port out
+ * again within 30 s. Twice the table size. A client churning connections can
+ * evict more than that inside 30 s; then the entry closest to expiry is
+ * overwritten and that port loses the tail of its TIME_WAIT. A random draw
+ * landing on that exact port is then 1 in 16384 per connect.
+ *=============================================================================*/
+#define TCP_PORT_QUARANTINE_SLOTS (TCP_MAX_CONNECTIONS * 2)
+
+typedef struct {
+    uint16_t port;      /* 0 = empty */
+    uint32_t until_ms;  /* tcp_get_time_ms() at which the TIME_WAIT would end */
+} tcp_port_quarantine_t;
+
+static tcp_port_quarantine_t tcp_port_quarantine[TCP_PORT_QUARANTINE_SLOTS];
+
+/* Wrap-safe "a is before b" on the 32-bit millisecond clock. */
+static inline bool tcp_time_before(uint32_t a, uint32_t b) {
+    return (int32_t)(a - b) < 0;
+}
 
 /*=============================================================================
  * SECURITY: SYN FLOOD PROTECTION
@@ -191,12 +213,34 @@ static int tcp_count_time_wait_connections(void) {
 }
 
 /**
- * @brief Force-close oldest TIME_WAIT connection (LIFO eviction)
+ * @brief Remember a port whose TIME_WAIT was cut short, until it would have
+ * ended. Caller holds TCP_LOCK.
+ */
+static void tcp_quarantine_port(uint16_t port, uint32_t until_ms) {
+    uint32_t now = tcp_get_time_ms();
+    int victim = 0;
+    for (int i = 0; i < TCP_PORT_QUARANTINE_SLOTS; i++) {
+        tcp_port_quarantine_t* q = &tcp_port_quarantine[i];
+        if (q->port == 0 || !tcp_time_before(now, q->until_ms)) {
+            victim = i;
+            break;
+        }
+        if (tcp_time_before(q->until_ms, tcp_port_quarantine[victim].until_ms)) {
+            victim = i;
+        }
+    }
+    tcp_port_quarantine[victim].port = port;
+    tcp_port_quarantine[victim].until_ms = until_ms;
+}
+
+/**
+ * @brief Force-close the oldest TIME_WAIT connection (oldest-first eviction)
  * SECURITY: Fail-Safe for Connection Table Exhaustion
  *
  * When TIME_WAIT entries exceed threshold, forcibly close the oldest
  * to free a slot. This trades a low-risk protocol violation for
- * guaranteed new connection capacity.
+ * guaranteed new connection capacity. The slot is freed but the port is
+ * quarantined for the rest of its TIME_WAIT, so only the slot is reused early.
  *
  * @return true if a connection was evicted
  */
@@ -216,6 +260,8 @@ static bool tcp_evict_oldest_time_wait(void) {
 
     if (oldest_idx >= 0) {
         net_count_tcp_tw_evicted();
+        tcp_quarantine_port(tcp_connections[oldest_idx].local_port,
+                            oldest_time + TCP_TIME_WAIT_TIMEOUT);
         tcp_connections[oldest_idx].state = TCP_CLOSED;
         tcp_connections[oldest_idx].in_use = false;
         return true;
@@ -390,74 +436,74 @@ static uint32_t tcp_generate_isn(const uint8_t* local_ip, uint16_t local_port,
 }
 
 /**
- * @brief Allocate an ephemeral port
- * SECURITY: Check for port collisions to prevent connection confusion
- * In high-traffic scenarios, wrapping ephemeral ports without checking
- * can cause the same port to be assigned to multiple connections
+ * @brief Is `port` free for a new connection? Caller holds TCP_LOCK.
+ *
+ * SECURITY: Port Collision Check (TIME_WAIT Protection)
+ *
+ * RFC 793 requires that we MUST NOT reuse a port that is currently in
+ * TIME_WAIT, as delayed segments from the old connection could corrupt the new
+ * connection's sequence numbers:
+ * 1. Connection A closes, enters TIME_WAIT (port 50000)
+ * 2. New connection B allocated same port 50000 immediately
+ * 3. Delayed ACK from connection A arrives
+ * 4. Connection B processes the ACK, corrupting its sequence numbers
+ *
+ * Busy means either:
+ * - any in_use slot holds it, in ANY state. That includes TIME_WAIT (the slot
+ *   stays in_use until the 30 s timer in tcp_tick() frees it) and
+ *   CLOSED: tcp_connect() assigns the port before the slot leaves CLOSED, so a
+ *   CLOSED slot with a port is a connect in progress, not a free port; or
+ * - tcp_evict_oldest_time_wait() cut its TIME_WAIT short and the 30 s are not
+ *   up yet (tcp_port_quarantine).
+ *
+ * Collisions are checked on the local port alone, not the 4-tuple: stricter
+ * than RFC 793 needs, and free at TCP_MAX_CONNECTIONS = 8.
+ */
+static bool tcp_port_is_free(uint16_t port, uint32_t now) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        if (tcp_connections[i].in_use && tcp_connections[i].local_port == port) {
+            return false;
+        }
+    }
+    for (int i = 0; i < TCP_PORT_QUARANTINE_SLOTS; i++) {
+        if (tcp_port_quarantine[i].port == port &&
+            tcp_time_before(now, tcp_port_quarantine[i].until_ms)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief Allocate an ephemeral port. Caller holds TCP_LOCK. Returns 0 on failure.
+ *
+ * SECURITY: RFC 6056 Algorithm 1 -- a fresh CSPRNG draw over 49152-65535 per
+ * connection, retried on collision. This was a counter starting at 49152 on
+ * every boot, so the first outbound connection always came from 49152 and a
+ * blind off-path attacker knew the local port of every connection after it;
+ * randomising puts ~14 bits back into the 4-tuple they must guess (the keyed
+ * ISN still guards the sequence space). DNS (dns.c) already drew its source
+ * port this way. global_csprng panics if used before crypto_init(), which runs
+ * before any network bring-up, so there is no predictable fallback to reach.
+ *
+ * At most TCP_MAX_CONNECTIONS + TCP_PORT_QUARANTINE_SLOTS = 24 of 16384 ports
+ * are ever busy, so 64 attempts all colliding is (24/16384)^64: never.
  */
 static uint16_t tcp_allocate_port(void) {
     #define EPHEMERAL_PORT_START 49152
-    #define EPHEMERAL_PORT_END   65535
-    #define MAX_PORT_SEARCH_ATTEMPTS 100
+    #define EPHEMERAL_PORT_COUNT 16384   /* 49152-65535; divides 65536, no modulo bias */
+    #define MAX_PORT_SEARCH_ATTEMPTS 64
 
-    uint16_t attempts = 0;
-    uint16_t start_port = next_ephemeral_port;
-
-    while (attempts < MAX_PORT_SEARCH_ATTEMPTS) {
-        uint16_t port = next_ephemeral_port++;
-
-        // Handle wraparound (uint16_t wraps at 65535->0 automatically)
-        if (next_ephemeral_port == 0 || next_ephemeral_port < EPHEMERAL_PORT_START) {
-            next_ephemeral_port = EPHEMERAL_PORT_START;
-        }
-
-        /*=====================================================================
-         * SECURITY: Port Collision Check (TIME_WAIT Protection)
-         *
-         * CRITICAL: RFC 793 requires that we MUST NOT reuse a port that is
-         * currently in TIME_WAIT state, as delayed packets from the old
-         * connection could corrupt the new connection's sequence numbers.
-         *
-         * Attack Scenario:
-         * 1. Connection A closes, enters TIME_WAIT (port 50000)
-         * 2. New connection B allocated same port 50000 immediately
-         * 3. Delayed ACK from connection A arrives
-         * 4. Connection B processes the ACK, corrupting its sequence numbers
-         * 5. Connection B can be hijacked or forced to reset
-         *
-         * Protection:
-         * - Check not only for `in_use`, but also for TIME_WAIT state
-         * - Mark port as unavailable until TIME_WAIT expires (30 seconds)
-         *
-         * RFC 793 Section 3.5:
-         * "The TIME-WAIT state provides protection against two incarnations
-         * of the same connection existing simultaneously."
-         *===================================================================*/
-        bool port_in_use = false;
-        for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-            if (tcp_connections[i].in_use && tcp_connections[i].local_port == port) {
-                // Port is in use - check if it's safe to reuse
-                if (tcp_connections[i].state != TCP_CLOSED) {
-                    // Connection is active or in transitional state - cannot reuse
-                    port_in_use = true;
-                    break;
-                }
-            }
-        }
-
-        if (!port_in_use) {
-            return port;  // Found free port
-        }
-
-        attempts++;
-
-        // Prevent infinite loop if all ports exhausted
-        if (next_ephemeral_port == start_port) {
-            return 0;  // Indicate failure
+    uint32_t now = tcp_get_time_ms();
+    for (int attempt = 0; attempt < MAX_PORT_SEARCH_ATTEMPTS; attempt++) {
+        uint16_t r;
+        csprng_random_bytes(&global_csprng, (uint8_t*)&r, sizeof(r));
+        uint16_t port = (uint16_t)(EPHEMERAL_PORT_START + (r % EPHEMERAL_PORT_COUNT));
+        if (tcp_port_is_free(port, now)) {
+            return port;
         }
     }
-
-    return 0;  // Indicate failure
+    return 0;
 }
 
 /**
@@ -1229,7 +1275,7 @@ int tcp_socket(void) {
      * SECURITY: TIME_WAIT Exhaustion Fail-Safe
      * CRITICAL: If no free sockets, check if TIME_WAIT connections are
      * preventing new allocations. If TIME_WAIT count exceeds threshold,
-     * forcibly evict the oldest to free a slot (LIFO eviction policy).
+     * forcibly evict the oldest to free a slot; its port stays quarantined.
      *
      * Threshold: 50% of TCP_MAX_CONNECTIONS to balance protocol compliance
      * with availability under attack.
@@ -1300,7 +1346,18 @@ int tcp_socket(void) {
 int tcp_connect(int sockfd, const uint8_t* remote_ip, uint16_t remote_port) {
     if (sockfd < 0 || sockfd >= TCP_MAX_CONNECTIONS) return -1;
     tcp_connection_t* conn = &tcp_connections[sockfd];
-    if (!conn->in_use || conn->state != TCP_CLOSED) return -1;
+
+    /* The state check, the half-open count and the port allocation all read
+     * tcp_connections[], so they run as one TCP_LOCK section. SYS_TCPSOCK
+     * already calls in under a critical section; the kernel-shell callers
+     * (shell_network.c, http_test.c, tcp_tests.c) do not, and without this two
+     * of them could both see a port free and both take it -- the race that got
+     * tcp_bind deleted. The lock nests, so the syscall path is unaffected. */
+    TCP_LOCK();
+    if (!conn->in_use || conn->state != TCP_CLOSED) {
+        TCP_UNLOCK();
+        return -1;
+    }
 
     /*=========================================================================
      * SECURITY: SYN Flood Protection
@@ -1315,6 +1372,7 @@ int tcp_connect(int sockfd, const uint8_t* remote_ip, uint16_t remote_port) {
      * stream that user's own output shares. `ifconfig` shows the count. */
     int half_open = tcp_count_half_open_connections();
     if (half_open >= TCP_MAX_HALF_OPEN_CONNECTIONS) {
+        TCP_UNLOCK();
         net_count_tcp_connect_refused();
         return -1;
     }
@@ -1330,9 +1388,11 @@ int tcp_connect(int sockfd, const uint8_t* remote_ip, uint16_t remote_port) {
     /* tcp_allocate_port() returns 0 when exhausted. Port 0 is not a port:
      * connecting from it would emit SYNs nothing can answer. */
     if (conn->local_port == 0) {
+        TCP_UNLOCK();
         net_count_tcp_connect_refused();
         return -1;
     }
+    TCP_UNLOCK();
 
     // Look up remote MAC address
     uint8_t* remote_mac = get_route_mac(remote_ip);
@@ -2057,5 +2117,106 @@ void tcp_state_selftest(void) {
     TCP_UNLOCK();
     tcp_selftest_mute = false;
     kprintf("TCPSTATE done\n");
+}
+#endif
+
+#ifdef TINYOS_FAULT_INJECT
+/*=============================================================================
+ * verify-tcp-ephemeral-port.sh only: grade the ephemeral port allocator.
+ *
+ * Draw legs: ten real tcp_socket() + tcp_connect() + tcp_close() cycles with
+ * transmission muted, each printing the local port connect() assigned. That is
+ * the port tcp_send_segment() puts in every header (conn->local_port), so it is
+ * the wire value without needing a wire peer; the peer is TEST-NET-3. Must run
+ * first after boot: the old counter handed out 49152, 49153, ... from boot.
+ *
+ * Busy legs: a synthetic full table (4 TIME_WAIT, 4 ESTABLISHED) so that
+ * tcp_socket() evicts the oldest TIME_WAIT, then tcp_port_is_free() on the
+ * evicted port, a live TIME_WAIT port, a CLOSED-but-in_use slot's port, and
+ * two controls that must read free (so an allocator that refuses everything
+ * FAILs too).
+ *===========================================================================*/
+#define TCPPORT_DRAWS 10
+#define TCPPORT_BASE  50000   /* synthetic ports; each leg names its own */
+
+void tcp_port_selftest(void) {
+    static const uint8_t peer[4] = { 203, 0, 113, 7 };
+
+    TCP_LOCK();
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        if (tcp_connections[i].in_use) {
+            TCP_UNLOCK();
+            kprintf("TCPPORT table-not-empty\n");
+            return;
+        }
+    }
+    TCP_UNLOCK();
+
+    tcp_selftest_mute = true;
+    for (int d = 0; d < TCPPORT_DRAWS; d++) {
+        int sock = tcp_socket();
+        if (sock < 0) {
+            kprintf("TCPPORT draw %d port=0 rc=%d\n", d, sock);
+            continue;
+        }
+        int rc = tcp_connect(sock, peer, 9);
+        uint16_t port = tcp_connections[sock].local_port;
+        tcp_close(sock);
+        kprintf("TCPPORT draw %d port=%u rc=%d\n", d, (unsigned)port, rc);
+    }
+
+    /* Slot i holds port BASE+i; slots 0-3 are TIME_WAIT with slot 0 oldest. */
+    TCP_LOCK();
+    uint32_t t0 = tcp_get_time_ms();
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_connection_t* c = &tcp_connections[i];
+        memset(c, 0, sizeof(*c));
+        c->in_use = true;
+        c->local_port = (uint16_t)(TCPPORT_BASE + i);
+        if (i < TIME_WAIT_EVICTION_THRESHOLD) {
+            c->state = TCP_TIME_WAIT;
+            c->time_wait_start = t0 - (uint32_t)(TIME_WAIT_EVICTION_THRESHOLD - i) * 1000;
+        } else {
+            c->state = TCP_ESTABLISHED;
+        }
+    }
+    memset(tcp_port_quarantine, 0, sizeof(tcp_port_quarantine));
+    TCP_UNLOCK();
+
+    int sock = tcp_socket();   /* table full: must evict slot 0 */
+    kprintf("TCPPORT evict sock=%d\n", sock);
+
+    TCP_LOCK();
+    uint32_t now = tcp_get_time_ms();
+    uint32_t evicted_until = t0 - (uint32_t)TIME_WAIT_EVICTION_THRESHOLD * 1000
+                             + TCP_TIME_WAIT_TIMEOUT;
+    bool evicted = tcp_port_is_free(TCPPORT_BASE, now);
+    bool timewait = tcp_port_is_free(TCPPORT_BASE + 1, now);
+    bool closed = true;
+    if (sock >= 0) {
+        /* tcp_connect() assigns the port while the slot is still CLOSED. */
+        tcp_connections[sock].local_port = TCPPORT_BASE + 100;
+        closed = tcp_port_is_free(TCPPORT_BASE + 100, now);
+    }
+    bool unrelated = tcp_port_is_free(TCPPORT_BASE + 200, now);
+    bool expired = tcp_port_is_free(TCPPORT_BASE, evicted_until + 10);
+
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_connection_t* c = &tcp_connections[i];
+        memset(c, 0, sizeof(*c));
+        c->state = TCP_CLOSED;
+        c->rcv_wnd = TCP_RX_BUFFER_SIZE;
+    }
+    memset(tcp_port_quarantine, 0, sizeof(tcp_port_quarantine));
+    TCP_UNLOCK();
+    /* Muted throughout: the synthetic ESTABLISHED slots have no real peer. */
+    tcp_selftest_mute = false;
+
+    kprintf("TCPPORT evicted free=%d\n", evicted ? 1 : 0);
+    kprintf("TCPPORT timewait free=%d\n", timewait ? 1 : 0);
+    kprintf("TCPPORT closed free=%d\n", closed ? 1 : 0);
+    kprintf("TCPPORT unrelated free=%d\n", unrelated ? 1 : 0);
+    kprintf("TCPPORT expired free=%d\n", expired ? 1 : 0);
+    kprintf("TCPPORT done\n");
 }
 #endif
