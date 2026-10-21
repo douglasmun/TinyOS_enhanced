@@ -57,7 +57,7 @@
 # compiled-in default. Hardcoding it made an earlier harness drop every frame
 # at handle_packet's destination check while looking perfectly healthy.
 #
-# Exit 0 = PASS, 1 = FAIL, 2 = harness/setup problem.
+# Exit 0 = PASS, 1 = FAIL, 2 = harness/setup problem or lost frames (RX packets gate).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -226,6 +226,28 @@ fi
 
 MAL_D=$(( MAL_A - MAL_B ))
 NC_D=$(( NC_A - NC_B ))
+
+# Transport gate. `RX packets` is the e1000 driver's descriptor-harvest count,
+# the lowest layer the guest has. If it rose by less than we injected, frames
+# were lost between the host and the NIC (the mcast netdev intermittently
+# delivers nothing on this host), so the legs below cannot grade the kernel:
+# every counter above the NIC reads short. Report that, not a kernel FAIL.
+RXP=""
+while read -r n; do RXP="$RXP $n"; done < <(
+    grep -oE "RX packets: +[0-9]+" "$CLEAN" | grep -oE "[0-9]+")
+set -- $RXP; RXP_N=$#; RXP_B="${1:-}"; eval RXP_A=\"\${$RXP_N:-}\"
+SENT=$(( BAD_COUNT + CTL_COUNT ))
+if [ "$RXP_N" -lt 2 ]; then
+    echo "RESULT: harness problem — need two 'RX packets' readings, got $RXP_N"
+    rm -f "$CLEAN"; exit 2
+fi
+RXP_D=$(( RXP_A - RXP_B ))
+echo "  RX packets: $RXP_B -> $RXP_A  (delta $RXP_D, injected $SENT)"
+if [ "$RXP_D" -lt "$SENT" ]; then
+    echo "RESULT: INCONCLUSIVE — only $RXP_D of $SENT injected frames reached the NIC;"
+    echo "        the mcast transport lost them, the kernel was never tested. Rerun."
+    rm -f "$CLEAN"; exit 2
+fi
 
 echo "  malformed : $MAL_B -> $MAL_A  (delta $MAL_D, expected $BAD_COUNT)"
 echo "  no-conn   : $NC_B -> $NC_A  (delta $NC_D, expected $CTL_COUNT)"
