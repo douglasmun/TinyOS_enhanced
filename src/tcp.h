@@ -272,6 +272,7 @@ bool tcp_owner_visible(int sockfd);
 void tcp_fault_reassign_owner(int sockfd, uint32_t uid);
 int tcp_fault_slot_owner(int sockfd);
 void tcp_state_selftest(void);
+void tcp_port_selftest(void);
 #endif
 
 /*=============================================================================
